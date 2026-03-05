@@ -92,6 +92,7 @@
 	import ChatControls from './ChatControls.svelte';
 	import EventConfirmDialog from '../common/ConfirmDialog.svelte';
 	import Placeholder from './Placeholder.svelte';
+	import LandingAmbientBackground from './LandingAmbientBackground.svelte';
 	import NotificationToast from '../NotificationToast.svelte';
 	import Spinner from '../common/Spinner.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
@@ -133,6 +134,14 @@
 		selectedModelIds = selectedModels;
 	}
 
+	let thinkingModeEnabled = false;
+
+	let thinkingModelId: string | null = null;
+	$: thinkingModelId = selectedModelIds[0] ?? null;
+	$: if (!thinkingModelId) {
+		thinkingModeEnabled = false;
+	}
+
 	let selectedToolIds = [];
 	let selectedFilterIds = [];
 	let imageGenerationEnabled = false;
@@ -159,6 +168,124 @@
 	let chatFiles = [];
 	let files = [];
 	let params = {};
+	let messageCount = 0;
+	let hasCustomBackground = false;
+	let showLandingAmbientBackground = false;
+
+	$: messageCount = createMessagesList(history, history.currentId).length;
+	$: hasCustomBackground = Boolean(
+		$selectedFolder?.meta?.background_image_url ||
+			($settings?.backgroundImageUrl ?? $config?.license_metadata?.background_image_url ?? null)
+	);
+	$: showLandingAmbientBackground =
+		$page.url.pathname === '/' && !chatIdProp && messageCount === 0 && !hasCustomBackground;
+
+	const normalizeFileRef = (value: unknown): string | null => {
+		if (typeof value !== 'string') {
+			return null;
+		}
+		const normalized = value.trim();
+		if (normalized === '') {
+			return null;
+		}
+		const lowered = normalized.toLowerCase();
+		if (lowered === 'null' || lowered === 'undefined') {
+			return null;
+		}
+		return normalized;
+	};
+
+	const sanitizeFilesList = (fileList: any[] = []) => {
+		if (!Array.isArray(fileList)) {
+			return [];
+		}
+
+		return fileList
+			.map((file) => {
+				if (!file || typeof file !== 'object') {
+					return null;
+				}
+
+				const fileRef = normalizeFileRef(file?.url) ?? normalizeFileRef(file?.id);
+				const normalizedId = normalizeFileRef(file?.id);
+				const hasInlineContent = typeof file?.content === 'string' && file.content.trim() !== '';
+
+				if (!fileRef && !hasInlineContent) {
+					return null;
+				}
+
+				const sanitized = { ...file };
+
+				if (fileRef) {
+					sanitized.url = fileRef;
+					if (normalizedId) {
+						sanitized.id = normalizedId;
+					} else if (!fileRef.startsWith('http') && !fileRef.startsWith('data:')) {
+						sanitized.id = fileRef;
+					}
+				} else {
+					delete sanitized.url;
+					delete sanitized.id;
+				}
+
+				return sanitized;
+			})
+			.filter(Boolean);
+	};
+
+	const sanitizeHistoryFileRefs = (historyData: any) => {
+		if (!historyData?.messages || typeof historyData.messages !== 'object') {
+			return;
+		}
+
+		for (const message of Object.values(historyData.messages)) {
+			if (message && typeof message === 'object' && Array.isArray((message as any).files)) {
+				(message as any).files = sanitizeFilesList((message as any).files);
+			}
+		}
+	};
+
+	const sourceSignature = (source: any): string => {
+		if (!source || typeof source !== 'object') {
+			return '';
+		}
+
+		const sourceMeta = source?.source ?? {};
+		const metadata = Array.isArray(source?.metadata) ? source.metadata : [];
+		const document = Array.isArray(source?.document) ? source.document : [];
+		const distances = Array.isArray(source?.distances) ? source.distances : [];
+
+		return JSON.stringify({
+			id: source?.id ?? null,
+			source_id: sourceMeta?.id ?? null,
+			source_name: sourceMeta?.name ?? null,
+			source_url: sourceMeta?.url ?? null,
+			metadata,
+			document,
+			distances
+		});
+	};
+
+	const mergeMessageSources = (existingSources: any[] = [], incomingSources: any[] = []) => {
+		const merged: any[] = [];
+		const seen = new Set<string>();
+
+		for (const source of [...existingSources, ...incomingSources]) {
+			if (!source || typeof source !== 'object') {
+				continue;
+			}
+
+			const signature = sourceSignature(source);
+			if (!signature || seen.has(signature)) {
+				continue;
+			}
+
+			seen.add(signature);
+			merged.push(source);
+		}
+
+		return merged;
+	};
 
 	$: if (chatIdProp) {
 		navigateHandler();
@@ -175,6 +302,7 @@
 		selectedFilterIds = [];
 		webSearchEnabled = false;
 		imageGenerationEnabled = false;
+		thinkingModeEnabled = false;
 
 		const storageChatInput = sessionStorage.getItem(
 			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
@@ -191,14 +319,15 @@
 				try {
 					const input = JSON.parse(storageChatInput);
 
-					if (!$temporaryChatEnabled) {
-						messageInput?.setText(input.prompt);
-						files = input.files;
-						selectedToolIds = input.selectedToolIds;
-						selectedFilterIds = input.selectedFilterIds;
-						webSearchEnabled = input.webSearchEnabled;
-						imageGenerationEnabled = input.imageGenerationEnabled;
+						if (!$temporaryChatEnabled) {
+							messageInput?.setText(input.prompt);
+							files = sanitizeFilesList(input.files ?? []);
+							selectedToolIds = input.selectedToolIds;
+							selectedFilterIds = input.selectedFilterIds;
+							webSearchEnabled = input.webSearchEnabled;
+							imageGenerationEnabled = input.imageGenerationEnabled;
 						codeInterpreterEnabled = input.codeInterpreterEnabled;
+						thinkingModeEnabled = input.thinkingModeEnabled ?? false;
 					}
 				} catch (e) {}
 			} else {
@@ -253,12 +382,34 @@
 		oldSelectedModelIds = JSON.parse(JSON.stringify(selectedModelIds));
 	};
 
+	const ensureSelectedModels = () => {
+		const visibleModelIds = $models
+			.filter((m) => !(m?.info?.meta?.hidden ?? false))
+			.map((m) => m.id);
+
+		const configuredDefaultModels = ($config?.default_models ?? '')
+			.split(',')
+			.map((id) => id.trim())
+			.filter((id) => id);
+
+		selectedModels = (selectedModels ?? []).filter((modelId) => visibleModelIds.includes(modelId));
+
+		if (selectedModels.length === 0) {
+			const fallbackModelId =
+				configuredDefaultModels.find((modelId) => visibleModelIds.includes(modelId)) ??
+				visibleModelIds[0] ??
+				'';
+			selectedModels = fallbackModelId ? [fallbackModelId] : [''];
+		}
+	};
+
 	const resetInput = () => {
 		selectedToolIds = [];
 		selectedFilterIds = [];
 		webSearchEnabled = false;
 		imageGenerationEnabled = false;
 		codeInterpreterEnabled = false;
+		thinkingModeEnabled = false;
 
 		if (selectedModelIds.filter((id) => id).length > 0) {
 			setDefaults();
@@ -376,14 +527,14 @@
 					}
 				} else if (type === 'chat:message:delta' || type === 'message') {
 					message.content += data.content;
-				} else if (type === 'chat:message' || type === 'replace') {
-					message.content = data.content;
-				} else if (type === 'chat:message:files' || type === 'files') {
-					message.files = data.files;
-				} else if (type === 'chat:message:embeds' || type === 'embeds') {
-					message.embeds = data.embeds;
-				} else if (type === 'chat:message:error') {
-					message.error = data.error;
+					} else if (type === 'chat:message' || type === 'replace') {
+						message.content = data.content;
+					} else if (type === 'chat:message:files' || type === 'files') {
+						message.files = sanitizeFilesList(data?.files ?? []);
+					} else if (type === 'chat:message:embeds' || type === 'embeds') {
+						message.embeds = data.embeds;
+					} else if (type === 'chat:message:error') {
+						message.error = data.error;
 				} else if (type === 'chat:message:follow_ups') {
 					message.followUps = data.follow_ups;
 
@@ -420,11 +571,8 @@
 						message.code_executions = message.code_executions;
 					} else {
 						// Regular source.
-						if (message?.sources) {
-							message.sources.push(data);
-						} else {
-							message.sources = [data];
-						}
+						const incomingSources = Array.isArray(data) ? data : [data];
+						message.sources = mergeMessageSources(message?.sources ?? [], incomingSources);
 					}
 				} else if (type === 'notification') {
 					const toastType = data?.type ?? 'info';
@@ -584,6 +732,7 @@
 			webSearchEnabled = false;
 			imageGenerationEnabled = false;
 			codeInterpreterEnabled = false;
+			thinkingModeEnabled = false;
 
 			try {
 				const input = JSON.parse(storageChatInput);
@@ -596,6 +745,7 @@
 					webSearchEnabled = input.webSearchEnabled;
 					imageGenerationEnabled = input.imageGenerationEnabled;
 					codeInterpreterEnabled = input.codeInterpreterEnabled;
+					thinkingModeEnabled = input.thinkingModeEnabled ?? false;
 				}
 			} catch (e) {}
 		}
@@ -1104,15 +1254,16 @@
 
 				oldSelectedModelIds = JSON.parse(JSON.stringify(selectedModels));
 
-				history =
-					(chatContent?.history ?? undefined) !== undefined
-						? chatContent.history
-						: convertMessagesToHistory(chatContent.messages);
+					history =
+						(chatContent?.history ?? undefined) !== undefined
+							? chatContent.history
+							: convertMessagesToHistory(chatContent.messages);
+					sanitizeHistoryFileRefs(history);
 
-				chatTitle.set(chatContent.title);
+					chatTitle.set(chatContent.title);
 
-				params = chatContent?.params ?? {};
-				chatFiles = chatContent?.files ?? [];
+					params = chatContent?.params ?? {};
+					chatFiles = sanitizeFilesList(chatContent?.files ?? []);
 
 				autoScroll = true;
 				await tick();
@@ -1276,11 +1427,12 @@
 
 	const createMessagePair = async (userPrompt) => {
 		messageInput?.setText('');
-		if (selectedModels.length === 0) {
+		ensureSelectedModels();
+		if (selectedModels.length === 0 || selectedModels.includes('')) {
 			toast.error($i18n.t('Model not selected'));
 		} else {
 			const modelId = selectedModels[0];
-			const model = $models.filter((m) => m.id === modelId).at(0);
+			const model = getModelById(modelId);
 
 			const messages = createMessagesList(history, history.currentId);
 			const parentMessage = messages.length !== 0 ? messages.at(-1) : null;
@@ -1303,13 +1455,13 @@
 				childrenIds: [],
 				role: 'assistant',
 				content: `[RESPONSE] ${responseMessageId}`,
-				done: true,
+					done: true,
 
-				model: modelId,
-				modelName: model.name ?? model.id,
-				modelIdx: 0,
-				timestamp: Math.floor(Date.now() / 1000)
-			};
+					model: modelId,
+					modelName: model?.name ?? modelId,
+					modelIdx: 0,
+					timestamp: Math.floor(Date.now() / 1000)
+				};
 
 			if (parentMessage) {
 				parentMessage.childrenIds.push(userMessageId);
@@ -1335,7 +1487,7 @@
 	};
 
 	const addMessages = async ({ modelId, parentId, messages }) => {
-		const model = $models.filter((m) => m.id === modelId).at(0);
+		const model = getModelById(modelId);
 
 		let parentMessage = history.messages[parentId];
 		let currentParentId = parentMessage ? parentMessage.id : null;
@@ -1365,8 +1517,8 @@
 					parentId: currentParentId,
 					childrenIds: [],
 					done: true,
-					model: model.id,
-					modelName: model.name ?? model.id,
+					model: model?.id ?? modelId,
+					modelName: model?.name ?? modelId,
 					modelIdx: 0,
 					timestamp: Math.floor(Date.now() / 1000),
 					...message
@@ -1404,8 +1556,9 @@
 			await handleOpenAIError(error, message);
 		}
 
-		if (sources && !message?.sources) {
-			message.sources = sources;
+		if (sources) {
+			const incomingSources = Array.isArray(sources) ? sources : [sources];
+			message.sources = mergeMessageSources(message?.sources ?? [], incomingSources);
 		}
 
 		if (choices) {
@@ -1556,6 +1709,7 @@
 
 	const submitPrompt = async (userPrompt, { _raw = false } = {}) => {
 		console.log('submitPrompt', userPrompt, $chatId);
+		ensureSelectedModels();
 
 		const _selectedModels = selectedModels.map((modelId) =>
 			$models.map((m) => m.id).includes(modelId) ? modelId : ''
@@ -1687,15 +1841,17 @@
 
 		const responseMessageIds: Record<PropertyKey, string> = {};
 		// If modelId is provided, use it, else use selected model
-		let selectedModelIds = modelId
-			? [modelId]
-			: atSelectedModel !== undefined
-				? [atSelectedModel.id]
-				: selectedModels;
+				let selectedModelIds = modelId
+					? [modelId]
+					: atSelectedModel !== undefined
+						? [atSelectedModel.id]
+						: selectedModels;
+
+				selectedModelIds = selectedModelIds.map(getEffectiveModelId);
 
 		// Create response messages for each selected model
 		for (const [_modelIdx, modelId] of selectedModelIds.entries()) {
-			const model = $models.filter((m) => m.id === modelId).at(0);
+			const model = getModelById(modelId);
 
 			if (model) {
 				let responseMessageId = uuidv4();
@@ -1705,8 +1861,8 @@
 					childrenIds: [],
 					role: 'assistant',
 					content: '',
-					model: model.id,
-					modelName: model.name ?? model.id,
+					model: model?.id ?? modelId,
+					modelName: model?.name ?? modelId,
 					modelIdx: modelIdx ? modelIdx : _modelIdx,
 					timestamp: Math.floor(Date.now() / 1000) // Unix epoch
 				};
@@ -1743,7 +1899,7 @@
 		await Promise.all(
 			selectedModelIds.map(async (modelId, _modelIdx) => {
 				console.log('modelId', modelId);
-				const model = $models.filter((m) => m.id === modelId).at(0);
+				const model = getModelById(modelId);
 
 				if (model) {
 					// If there are image files, check if model is vision capable
@@ -1800,7 +1956,7 @@
 				voice: $showCallOverlay,
 				image_generation:
 					$config?.features?.enable_image_generation &&
-					($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
+					($user?.permissions?.features?.image_generation ?? true)
 						? imageGenerationEnabled
 						: false,
 				code_interpreter:
@@ -1810,7 +1966,7 @@
 						: false,
 				web_search:
 					$config?.features?.enable_web_search &&
-					($user?.role === 'admin' || $user?.permissions?.features?.web_search)
+					($user?.permissions?.features?.web_search ?? true)
 						? webSearchEnabled
 						: false
 			};
@@ -1945,102 +2101,113 @@
 			}
 		}
 
-		const res = await generateOpenAIChatCompletion(
-			localStorage.token,
-			{
-				stream: stream,
-				model: model.id,
-				messages: messages,
-				params: {
-					...$settings?.params,
-					...params,
-					stop:
-						(params?.stop ?? $settings?.params?.stop ?? undefined)
-							? (params?.stop.split(',').map((token) => token.trim()) ?? $settings.params.stop).map(
-									(str) => decodeURIComponent(JSON.parse('"' + str.replace(/\"/g, '\\"') + '"'))
-								)
-							: undefined
-				},
+			const effectiveModelId = getEffectiveModelId(model.id);
 
-				files: (files?.length ?? 0) > 0 ? files : undefined,
+			const res = await generateOpenAIChatCompletion(
+				localStorage.token,
+				{
+					stream: stream,
+					model: effectiveModelId,
+					thinking_mode_enabled: thinkingModeEnabled,
+					messages: messages,
+					params: {
+						...$settings?.params,
+						...params,
+						stop:
+							(params?.stop ?? $settings?.params?.stop ?? undefined)
+								? (params?.stop.split(',').map((token) => token.trim()) ?? $settings.params.stop).map(
+										(str) =>
+											decodeURIComponent(
+												JSON.parse('"' + str.replace(/\"/g, '\\"') + '"')
+											)
+									)
+								: undefined
+					},
 
-				filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
-				tool_ids: toolIds.length > 0 ? toolIds : undefined,
-				tool_servers: ($toolServers ?? []).filter(
-					(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
-				),
-				features: getFeatures(),
-				variables: {
-					...getPromptVariables($user?.name, $settings?.userLocation ? userLocation : undefined)
-				},
-				model_item: $models.find((m) => m.id === model.id),
+					files: (files?.length ?? 0) > 0 ? files : undefined,
 
-				session_id: $socket?.id,
-				chat_id: $chatId,
+					filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
+					tool_ids: toolIds.length > 0 ? toolIds : undefined,
+					tool_servers: ($toolServers ?? []).filter(
+						(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
+					),
+					features: getFeatures(),
+					variables: {
+						...getPromptVariables($user?.name, $settings?.userLocation ? userLocation : undefined)
+					},
+					model_item: getModelById(effectiveModelId),
 
-				id: responseMessageId,
-				parent_id: userMessage?.id ?? null,
-				parent_message: userMessage,
+					session_id: $socket?.id,
+					chat_id: $chatId,
 
-				background_tasks: {
-					...(!$temporaryChatEnabled &&
-					(messages.length == 1 ||
-						(messages.length == 2 &&
-							messages.at(0)?.role === 'system' &&
-							messages.at(1)?.role === 'user')) &&
-					(selectedModels[0] === model.id || atSelectedModel !== undefined)
+					id: responseMessageId,
+					parent_id: userMessage?.id ?? null,
+					parent_message: userMessage,
+
+					background_tasks: {
+						...(!$temporaryChatEnabled &&
+						(messages.length == 1 ||
+							(messages.length == 2 &&
+								messages.at(0)?.role === 'system' &&
+								messages.at(1)?.role === 'user')) &&
+						(getEffectiveModelId(selectedModels[0]) === effectiveModelId ||
+							atSelectedModel !== undefined)
+							? {
+									title_generation: $settings?.title?.auto ?? true,
+									tags_generation: $settings?.autoTags ?? true
+								}
+							: {}),
+						follow_up_generation: $settings?.autoFollowUps ?? true
+					},
+
+					...(stream && (model.info?.meta?.capabilities?.usage ?? false)
 						? {
-								title_generation: $settings?.title?.auto ?? true,
-								tags_generation: $settings?.autoTags ?? true
+								stream_options: {
+									include_usage: true
+								}
 							}
-						: {}),
-					follow_up_generation: $settings?.autoFollowUps ?? true
+						: {})
 				},
+				`${WEBUI_BASE_URL}/api`
+			).catch(async (error) => {
+				console.log(error);
 
-				...(stream && (model.info?.meta?.capabilities?.usage ?? false)
-					? {
-							stream_options: {
-								include_usage: true
-							}
-						}
-					: {})
-			},
-			`${WEBUI_BASE_URL}/api`
-		).catch(async (error) => {
-			console.log(error);
+				let errorMessage = error;
+				if (error?.error?.message) {
+					errorMessage = error.error.message;
+				} else if (error?.message) {
+					errorMessage = error.message;
+				}
 
-			let errorMessage = error;
-			if (error?.error?.message) {
-				errorMessage = error.error.message;
-			} else if (error?.message) {
-				errorMessage = error.message;
-			}
+				if (typeof errorMessage === 'object') {
+					errorMessage = $i18n.t(`Uh-oh! There was an issue with the response.`);
+				}
 
-			if (typeof errorMessage === 'object') {
-				errorMessage = $i18n.t(`Uh-oh! There was an issue with the response.`);
-			}
+				toast.error(`${errorMessage}`);
+				responseMessage.error = {
+					content: error
+				};
 
-			toast.error(`${errorMessage}`);
-			responseMessage.error = {
-				content: error
-			};
+				responseMessage.done = true;
 
-			responseMessage.done = true;
+				history.messages[responseMessageId] = responseMessage;
+				history.currentId = responseMessageId;
 
-			history.messages[responseMessageId] = responseMessage;
-			history.currentId = responseMessageId;
-
-			return null;
-		});
+				return null;
+			});
 
 		if (res) {
 			if (res.error) {
 				await handleOpenAIError(res.error, responseMessage);
 			} else {
-				if (taskIds) {
-					taskIds.push(res.task_id);
-				} else {
-					taskIds = [res.task_id];
+				const newTaskId =
+					typeof res.task_id === 'string' && res.task_id.trim() ? res.task_id.trim() : null;
+				if (newTaskId) {
+					if (Array.isArray(taskIds)) {
+						taskIds = [...taskIds, newTaskId];
+					} else {
+						taskIds = [newTaskId];
+					}
 				}
 			}
 		}
@@ -2092,29 +2259,45 @@
 	};
 
 	const stopResponse = async () => {
-		if (taskIds) {
-			for (const taskId of taskIds) {
-				const res = await stopTask(localStorage.token, taskId).catch((error) => {
-					toast.error(`${error}`);
-					return null;
-				});
-			}
+		const normalizeTaskIds = (ids: unknown): string[] =>
+			(Array.isArray(ids) ? ids : [])
+				.map((id) => (typeof id === 'string' ? id.trim() : ''))
+				.filter((id) => id !== '' && id !== 'null' && id !== 'undefined');
 
+		let activeTaskIds = normalizeTaskIds(taskIds);
+
+		// Fallback: recover task IDs from backend if local state missed them.
+		if (activeTaskIds.length === 0 && $chatId && !$chatId.startsWith('local:')) {
+			const taskRes = await getTaskIdsByChatId(localStorage.token, $chatId).catch((error) => {
+				console.error(error);
+				return null;
+			});
+			activeTaskIds = normalizeTaskIds(taskRes?.task_ids);
+		}
+
+		if (activeTaskIds.length > 0) {
+			await Promise.all(
+				activeTaskIds.map((taskId) =>
+					stopTask(localStorage.token, taskId).catch((error) => {
+						console.error(error);
+						return null;
+					})
+				)
+			);
 			taskIds = null;
+		}
 
-			const responseMessage = history.messages[history.currentId];
-			// Set all response messages to done
-			if (responseMessage.parentId && history.messages[responseMessage.parentId]) {
-				for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
-					history.messages[messageId].done = true;
-				}
+		const responseMessage = history.messages[history.currentId];
+		// Force-finish in-progress assistant messages for the current branch in UI.
+		if (responseMessage?.parentId && history.messages[responseMessage.parentId]) {
+			for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
+				history.messages[messageId].done = true;
 			}
-
 			history.messages[history.currentId] = responseMessage;
+		}
 
-			if (autoScroll) {
-				scrollToBottom();
-			}
+		if (autoScroll) {
+			scrollToBottom();
 		}
 
 		if (generating) {
@@ -2204,9 +2387,7 @@
 			responseMessage.done = false;
 			await tick();
 
-			const model = $models
-				.filter((m) => m.id === (responseMessage?.selectedModelId ?? responseMessage.model))
-				.at(0);
+			const model = getModelById(responseMessage?.selectedModelId ?? responseMessage.model);
 
 			if (model) {
 				await sendMessageSocket(
@@ -2350,6 +2531,22 @@
 		}
 	};
 
+	const getEffectiveModelId = (modelId: string): string => {
+		return modelId;
+	};
+
+	const getModelById = (modelId: string): Model | undefined => {
+		const directModel = $models.find((m) => m.id === modelId);
+		if (directModel) return directModel;
+
+		if (modelId.endsWith('-thinking')) {
+			const baseModelId = modelId.slice(0, -'-thinking'.length);
+			return $models.find((m) => m.id === baseModelId);
+		}
+
+		return undefined;
+	};
+
 	const clearDraft = async (chatId = null) => {
 		if (saveDraftTimeout) {
 			clearTimeout(saveDraftTimeout);
@@ -2413,9 +2610,14 @@
 		? '  md:max-w-[calc(100%-var(--sidebar-width))]'
 		: ' '} w-full max-w-full flex flex-col"
 	id="chat-container"
+	class:landing-ambient-mode={showLandingAmbientBackground}
 >
 	{#if !loading}
 		<div in:fade={{ duration: 50 }} class="w-full h-full flex flex-col">
+			{#if showLandingAmbientBackground}
+				<LandingAmbientBackground />
+			{/if}
+
 			{#if $selectedFolder && $selectedFolder?.meta?.background_image_url}
 				<div
 					class="absolute top-0 left-0 w-full h-full bg-cover bg-center bg-no-repeat"
@@ -2441,6 +2643,7 @@
 				<Pane defaultSize={50} minSize={30} class="h-full flex relative max-w-full flex-col">
 					<Navbar
 						bind:this={navbarElement}
+						showModelSelector={false}
 						chat={{
 							id: $chatId,
 							chat: {
@@ -2498,7 +2701,7 @@
 					/>
 
 					<div class="flex flex-col flex-auto z-10 w-full @container overflow-auto">
-						{#if ($settings?.landingPageMode === 'chat' && !$selectedFolder) || createMessagesList(history, history.currentId).length > 0}
+						{#if ($settings?.landingPageMode === 'chat' && !$selectedFolder) || messageCount > 0}
 							<div
 								class=" pb-2.5 flex flex-col justify-between w-full flex-auto overflow-auto h-0 max-w-full z-10 scrollbar-hidden"
 								id="messages-container"
@@ -2541,6 +2744,7 @@
 									{history}
 									{taskIds}
 									{selectedModels}
+									{thinkingModelId}
 									bind:files
 									bind:prompt
 									bind:autoScroll
@@ -2549,6 +2753,7 @@
 									bind:imageGenerationEnabled
 									bind:codeInterpreterEnabled
 									bind:webSearchEnabled
+									bind:thinkingModeEnabled
 									bind:atSelectedModel
 									bind:showCommands
 									toolServers={$toolServers}
@@ -2565,7 +2770,6 @@
 										clearDraft();
 										if (e.detail || files.length > 0) {
 											await tick();
-
 											submitPrompt(e.detail.replaceAll('\n\n', '\n'));
 										}
 									}}
@@ -2582,6 +2786,7 @@
 								<Placeholder
 									{history}
 									{selectedModels}
+									{thinkingModelId}
 									bind:messageInput
 									bind:files
 									bind:prompt
@@ -2591,6 +2796,7 @@
 									bind:imageGenerationEnabled
 									bind:codeInterpreterEnabled
 									bind:webSearchEnabled
+									bind:thinkingModeEnabled
 									bind:atSelectedModel
 									bind:showCommands
 									toolServers={$toolServers}
@@ -2649,8 +2855,31 @@
 </div>
 
 <style>
-	::-webkit-scrollbar {
-		height: 0.5rem;
-		width: 0.5rem;
+	/* On the landing page, keep the input bar "floating" and stable:
+	   don't let moving background blobs refract through backdrop-filter. */
+	:global(#chat-container.landing-ambient-mode #message-input-container) {
+		backdrop-filter: none !important;
+		-webkit-backdrop-filter: none !important;
+		background:
+			linear-gradient(160deg, rgba(255, 255, 255, 0.92) 0%, rgba(255, 255, 255, 0.8) 48%, rgba(255, 255, 255, 0.86) 100%),
+			radial-gradient(circle at 12% -12%, rgba(90, 152, 255, 0.09), rgba(90, 152, 255, 0) 52%),
+			radial-gradient(circle at 88% 122%, rgba(239, 91, 109, 0.07), rgba(239, 91, 109, 0) 58%);
+		border-color: rgba(255, 255, 255, 0.6) !important;
+		box-shadow:
+			0 22px 70px -48px rgba(15, 23, 42, 0.55),
+			0 12px 26px -30px rgba(15, 23, 42, 0.45),
+			inset 0 1px 0 rgba(255, 255, 255, 0.75);
+	}
+
+	:global(.dark #chat-container.landing-ambient-mode #message-input-container) {
+		background:
+			linear-gradient(165deg, rgba(14, 18, 28, 0.9) 0%, rgba(10, 13, 20, 0.78) 52%, rgba(14, 18, 28, 0.88) 100%),
+			radial-gradient(circle at 12% -12%, rgba(90, 152, 255, 0.12), rgba(90, 152, 255, 0) 56%),
+			radial-gradient(circle at 88% 122%, rgba(239, 91, 109, 0.1), rgba(239, 91, 109, 0) 62%);
+		border-color: rgba(255, 255, 255, 0.14) !important;
+		box-shadow:
+			0 26px 78px -52px rgba(0, 0, 0, 0.8),
+			0 12px 26px -34px rgba(0, 0, 0, 0.7),
+			inset 0 1px 0 rgba(255, 255, 255, 0.12);
 	}
 </style>

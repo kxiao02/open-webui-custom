@@ -1626,12 +1626,72 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         # Remove duplicate files based on their content
         files = list({json.dumps(f, sort_keys=True): f for f in files}.values())
 
+        # Drop invalid/incomplete file entries (e.g. null id/url from in-flight uploads).
+        sanitized_files = []
+        for file_item in files:
+            if not isinstance(file_item, dict):
+                continue
+
+            file_type = file_item.get("type", "file")
+            if file_type == "folder":
+                folder_id = file_item.get("id")
+                if (
+                    isinstance(folder_id, str)
+                    and folder_id.strip()
+                    and folder_id.strip().lower() != "null"
+                ):
+                    sanitized_files.append(file_item)
+                continue
+
+            status = str(file_item.get("status", "")).strip().lower()
+            if status == "uploading":
+                continue
+
+            file_id = file_item.get("id")
+            file_url = file_item.get("url")
+
+            has_valid_id = (
+                isinstance(file_id, str)
+                and file_id.strip()
+                and file_id.strip().lower() != "null"
+            )
+            has_valid_url = (
+                isinstance(file_url, str)
+                and file_url.strip()
+                and file_url.strip().lower() != "null"
+            )
+            has_inline_content = (
+                isinstance(file_item.get("content"), str)
+                and file_item.get("content").strip() != ""
+            )
+
+            if has_valid_id or has_valid_url or has_inline_content:
+                sanitized_files.append(file_item)
+
+        files = sanitized_files
+
+    provider_file_ids = []
+    if files:
+        for file_item in files:
+            file_id = file_item.get("id")
+            if isinstance(file_id, str) and file_id:
+                provider_file_ids.append(file_id)
+        # Preserve order while removing duplicates
+        provider_file_ids = list(dict.fromkeys(provider_file_ids))
+
     metadata = {
         **metadata,
         "tool_ids": tool_ids,
         "files": files,
     }
     form_data["metadata"] = metadata
+
+    # Keep explicit file refs in outbound payload for OpenAI-compatible providers.
+    if files:
+        form_data["files"] = files
+        form_data["attachments"] = files
+    if provider_file_ids:
+        form_data["file_ids"] = provider_file_ids
 
     # Server side tools
     tool_ids = metadata.get("tool_ids", None)
@@ -2843,6 +2903,24 @@ async def process_chat_response(
                                         }
                                     )
                                 else:
+                                    sources = data.get("sources", None)
+                                    if isinstance(sources, list):
+                                        for source in sources:
+                                            if isinstance(source, dict):
+                                                await event_emitter(
+                                                    {
+                                                        "type": "source",
+                                                        "data": source,
+                                                    }
+                                                )
+                                    elif isinstance(sources, dict):
+                                        await event_emitter(
+                                            {
+                                                "type": "source",
+                                                "data": sources,
+                                            }
+                                        )
+
                                     choices = data.get("choices", [])
 
                                     # 17421
