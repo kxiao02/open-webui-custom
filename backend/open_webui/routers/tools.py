@@ -49,6 +49,12 @@ def get_tool_module(request, tool_id, load_from_db=True):
     return tool_module
 
 
+def _can_access_workspace_content(user, owner_user_id: str) -> bool:
+    return owner_user_id == user.id or (
+        user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL
+    )
+
+
 ############################
 # GetTools
 ############################
@@ -154,8 +160,13 @@ async def get_tools(
         tools = [
             tool
             for tool in tools
-            if tool.user_id == user.id
-            or has_access(user.id, "read", tool.access_control, user_group_ids, db=db)
+            if (
+                _can_access_workspace_content(user, tool.user_id)
+                if not tool.user_id.startswith("server:")
+                else has_access(
+                    user.id, "read", tool.access_control, user_group_ids, db=db
+                )
+            )
         ]
         return tools
 
@@ -177,11 +188,7 @@ async def get_tool_list(
     return [
         ToolAccessResponse(
             **tool.model_dump(),
-            write_access=(
-                (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                or user.id == tool.user_id
-                or has_access(user.id, "write", tool.access_control, db=db)
-            ),
+            write_access=_can_access_workspace_content(user, tool.user_id),
         )
         for tool in tools
     ]
@@ -377,30 +384,22 @@ async def get_tools_by_id(
 ):
     tools = Tools.get_tool_by_id(id, db=db)
 
-    if tools:
-        if (
-            user.role == "admin"
-            or tools.user_id == user.id
-            or has_access(user.id, "read", tools.access_control, db=db)
-        ):
-            return ToolAccessResponse(
-                **tools.model_dump(),
-                write_access=(
-                    (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or user.id == tools.user_id
-                    or has_access(user.id, "write", tools.access_control, db=db)
-                ),
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-            )
-    else:
+    if not tools:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
+
+    if not _can_access_workspace_content(user, tools.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    return ToolAccessResponse(
+        **tools.model_dump(),
+        write_access=_can_access_workspace_content(user, tools.user_id),
+    )
 
 
 ############################
@@ -423,12 +422,7 @@ async def update_tools_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    # Is the user the original creator, in a group with write access, or an admin
-    if (
-        tools.user_id != user.id
-        and not has_access(user.id, "write", tools.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, tools.user_id):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.UNAUTHORIZED,
@@ -486,11 +480,7 @@ async def delete_tools_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        tools.user_id != user.id
-        and not has_access(user.id, "write", tools.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, tools.user_id):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.UNAUTHORIZED,
@@ -516,6 +506,11 @@ async def get_tools_valves_by_id(
 ):
     tools = Tools.get_tool_by_id(id, db=db)
     if tools:
+        if not _can_access_workspace_content(user, tools.user_id):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+            )
         try:
             valves = Tools.get_tool_valves_by_id(id, db=db)
             return valves
@@ -545,6 +540,11 @@ async def get_tools_valves_spec_by_id(
 ):
     tools = Tools.get_tool_by_id(id, db=db)
     if tools:
+        if not _can_access_workspace_content(user, tools.user_id):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+            )
         if id in request.app.state.TOOLS:
             tools_module = request.app.state.TOOLS[id]
         else:
@@ -582,11 +582,7 @@ async def update_tools_valves_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        tools.user_id != user.id
-        and not has_access(user.id, "write", tools.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, tools.user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -630,6 +626,11 @@ async def get_tools_user_valves_by_id(
 ):
     tools = Tools.get_tool_by_id(id, db=db)
     if tools:
+        if not _can_access_workspace_content(user, tools.user_id):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+            )
         try:
             user_valves = Tools.get_user_valves_by_id_and_user_id(id, user.id, db=db)
             return user_valves
@@ -654,6 +655,11 @@ async def get_tools_user_valves_spec_by_id(
 ):
     tools = Tools.get_tool_by_id(id, db=db)
     if tools:
+        if not _can_access_workspace_content(user, tools.user_id):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+            )
         if id in request.app.state.TOOLS:
             tools_module = request.app.state.TOOLS[id]
         else:
@@ -682,6 +688,11 @@ async def update_tools_user_valves_by_id(
     tools = Tools.get_tool_by_id(id, db=db)
 
     if tools:
+        if not _can_access_workspace_content(user, tools.user_id):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+            )
         if id in request.app.state.TOOLS:
             tools_module = request.app.state.TOOLS[id]
         else:

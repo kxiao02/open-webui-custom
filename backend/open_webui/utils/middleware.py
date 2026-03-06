@@ -146,6 +146,147 @@ DEFAULT_SOLUTION_TAGS = [("<|begin_of_solution|>", "<|end_of_solution|>")]
 DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
 
 
+def _iter_balanced_json_candidates(text: str):
+    if not text:
+        return
+
+    length = len(text)
+    for start in range(length):
+        if text[start] not in "{[":
+            continue
+
+        stack = []
+        in_string = False
+        escaped = False
+
+        for idx in range(start, length):
+            ch = text[idx]
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+
+            if ch in "{[":
+                stack.append(ch)
+                continue
+
+            if ch in "}]":
+                if not stack:
+                    break
+                opener = stack.pop()
+                if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
+                    break
+                if not stack:
+                    yield text[start : idx + 1]
+                    break
+
+
+def _extract_json_from_task_response(text: str):
+    if not isinstance(text, str):
+        return None
+
+    normalized = text.strip()
+    if not normalized:
+        return None
+
+    candidates: list[str] = [normalized]
+    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", normalized, re.I):
+        fenced = (match.group(1) or "").strip()
+        if fenced:
+            candidates.append(fenced)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    for candidate in candidates:
+        for snippet in _iter_balanced_json_candidates(candidate):
+            try:
+                return json.loads(snippet)
+            except Exception:
+                continue
+
+    return None
+
+
+def _message_has_meaningful_content(message: dict) -> bool:
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    return True
+    return False
+
+
+def _extract_follow_up_focus_messages(messages: list[dict]) -> list[dict]:
+    if not isinstance(messages, list) or not messages:
+        return []
+
+    def _role_at(index: int) -> str:
+        role = messages[index].get("role", "")
+        return str(role or "").strip().lower()
+
+    last_assistant_idx = -1
+    for idx in range(len(messages) - 1, -1, -1):
+        role = _role_at(idx)
+        if role == "assistant" and _message_has_meaningful_content(messages[idx]):
+            last_assistant_idx = idx
+            break
+
+    user_search_end = last_assistant_idx if last_assistant_idx >= 0 else len(messages) - 1
+    last_user_idx = -1
+    for idx in range(user_search_end, -1, -1):
+        role = _role_at(idx)
+        if role in {"user", "human"} and _message_has_meaningful_content(messages[idx]):
+            last_user_idx = idx
+            break
+
+    focused: list[dict] = []
+    if last_user_idx >= 0:
+        focused.append(messages[last_user_idx])
+    if last_assistant_idx >= 0 and last_assistant_idx >= last_user_idx:
+        focused.append(messages[last_assistant_idx])
+
+    if focused:
+        return focused
+
+    fallback: list[dict] = []
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "")).strip().lower()
+        if role not in {"user", "human", "assistant"}:
+            continue
+        if not _message_has_meaningful_content(msg):
+            continue
+        fallback.append(msg)
+        if len(fallback) >= 4:
+            break
+    fallback.reverse()
+    return fallback
+
+
 def get_citation_source_from_tool_result(
     tool_name: str, tool_params: dict, tool_result: str, tool_id: str = ""
 ) -> list[dict]:
@@ -950,6 +1091,112 @@ def get_image_urls(delta_images, request, metadata, user) -> list[str]:
     return image_urls
 
 
+def _normalize_generated_file_entry(item: Any) -> Optional[dict]:
+    if isinstance(item, str):
+        ref = item.strip()
+        if not ref or ref.lower() in {"null", "undefined"}:
+            return None
+        return {"url": ref}
+
+    if not isinstance(item, dict):
+        return None
+
+    candidates = [
+        item.get("url"),
+        item.get("download_url"),
+        item.get("downloadUrl"),
+        item.get("id"),
+        item.get("file_id"),
+        item.get("fileId"),
+    ]
+    ref = next(
+        (
+            value.strip()
+            for value in candidates
+            if isinstance(value, str)
+            and value.strip()
+            and value.strip().lower() not in {"null", "undefined"}
+        ),
+        "",
+    )
+    if not ref:
+        return None
+
+    normalized = {"url": ref}
+
+    file_id = item.get("id")
+    if isinstance(file_id, str) and file_id.strip():
+        normalized["id"] = file_id.strip()
+
+    name = item.get("filename") or item.get("fileName") or item.get("name")
+    if isinstance(name, str) and name.strip():
+        normalized["name"] = name.strip()
+
+    file_type = item.get("type")
+    if isinstance(file_type, str) and file_type.strip():
+        normalized["type"] = file_type.strip()
+
+    content_type = item.get("content_type") or item.get("contentType")
+    if isinstance(content_type, str) and content_type.strip():
+        normalized["content_type"] = content_type.strip()
+
+    file_size = item.get("bytes")
+    if isinstance(file_size, (int, float)) and file_size >= 0:
+        normalized["size"] = int(file_size)
+
+    return normalized
+
+
+def _generated_file_ref_key(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    ref = item.get("url") or item.get("id")
+    if isinstance(ref, str):
+        normalized_ref = ref.strip()
+        if normalized_ref:
+            return normalized_ref
+    return ""
+
+
+def _extract_generated_files_from_choices(choices: Any) -> list[dict]:
+    if not isinstance(choices, list):
+        return []
+
+    generated_files: list[dict] = []
+    seen_refs: set[str] = set()
+
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+
+        metadata_candidates = []
+        for key in ("message", "delta"):
+            node = choice.get(key)
+            if not isinstance(node, dict):
+                continue
+            metadata = node.get("metadata")
+            if isinstance(metadata, dict):
+                metadata_candidates.append(metadata)
+
+        for metadata in metadata_candidates:
+            for key in ("generated_files", "generatedFiles"):
+                items = metadata.get(key)
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    normalized = _normalize_generated_file_entry(item)
+                    if not normalized:
+                        continue
+                    ref_key = _generated_file_ref_key(normalized)
+                    if ref_key and ref_key in seen_refs:
+                        continue
+                    if ref_key:
+                        seen_refs.add(ref_key)
+                    generated_files.append(normalized)
+
+    return generated_files
+
+
 def add_file_context(messages: list, chat_id: str, user) -> list:
     """
     Add file URLs to messages for native function calling.
@@ -1301,6 +1548,7 @@ async def chat_completion_files_handler(
                 "data": {
                     "action": "sources_retrieved",
                     "count": sources_count,
+                    "hidden": sources_count == 0,
                     "done": True,
                 },
             }
@@ -2020,11 +2268,14 @@ async def process_chat_response(
                     TASKS.FOLLOW_UP_GENERATION in tasks
                     and tasks[TASKS.FOLLOW_UP_GENERATION]
                 ):
+                    follow_up_messages = _extract_follow_up_focus_messages(messages)
+                    if not follow_up_messages:
+                        follow_up_messages = messages
                     res = await generate_follow_ups(
                         request,
                         {
                             "model": message["model"],
-                            "messages": messages,
+                            "messages": follow_up_messages,
                             "message_id": metadata["message_id"],
                             "chat_id": metadata["chat_id"],
                         },
@@ -2043,15 +2294,29 @@ async def process_chat_response(
                         else:
                             follow_ups_string = ""
 
-                        follow_ups_string = follow_ups_string[
-                            follow_ups_string.find("{") : follow_ups_string.rfind("}")
-                            + 1
-                        ]
-
                         try:
-                            follow_ups = json.loads(follow_ups_string).get(
-                                "follow_ups", []
+                            follow_ups_payload = _extract_json_from_task_response(
+                                follow_ups_string
                             )
+                            follow_ups = []
+                            if isinstance(follow_ups_payload, dict):
+                                candidate = follow_ups_payload.get(
+                                    "follow_ups",
+                                    follow_ups_payload.get("followUps", []),
+                                )
+                                if isinstance(candidate, list):
+                                    follow_ups = [
+                                        item.strip()
+                                        for item in candidate
+                                        if isinstance(item, str) and item.strip()
+                                    ]
+                            elif isinstance(follow_ups_payload, list):
+                                follow_ups = [
+                                    item.strip()
+                                    for item in follow_ups_payload
+                                    if isinstance(item, str) and item.strip()
+                                ]
+
                             await event_emitter(
                                 {
                                     "type": "chat:message:follow_ups",
@@ -2109,16 +2374,22 @@ async def process_chat_response(
                                 else:
                                     title_string = ""
 
-                                title_string = title_string[
-                                    title_string.find("{") : title_string.rfind("}") + 1
-                                ]
-
-                                try:
-                                    title = json.loads(title_string).get(
-                                        "title", user_message
+                                title_payload = _extract_json_from_task_response(
+                                    title_string
+                                )
+                                if isinstance(title_payload, dict):
+                                    title = (
+                                        title_payload.get("title")
+                                        or title_payload.get("chat_title")
+                                        or title_payload.get("name")
+                                        or ""
                                     )
-                                except Exception as e:
+                                else:
                                     title = ""
+
+                                if not isinstance(title, str):
+                                    title = str(title or "")
+                                title = title.strip()
 
                                 if not title:
                                     title = messages[0].get("content", user_message)
@@ -2169,12 +2440,18 @@ async def process_chat_response(
                             else:
                                 tags_string = ""
 
-                            tags_string = tags_string[
-                                tags_string.find("{") : tags_string.rfind("}") + 1
-                            ]
-
                             try:
-                                tags = json.loads(tags_string).get("tags", [])
+                                tags_payload = _extract_json_from_task_response(
+                                    tags_string
+                                )
+                                tags = []
+                                if isinstance(tags_payload, dict):
+                                    candidate = tags_payload.get("tags", [])
+                                    if isinstance(candidate, list):
+                                        tags = candidate
+                                elif isinstance(tags_payload, list):
+                                    tags = tags_payload
+
                                 Chats.update_chat_tags_by_id(
                                     metadata["chat_id"], tags, user
                                 )
@@ -2257,6 +2534,26 @@ async def process_chat_response(
                         )
 
                     choices = response_data.get("choices", [])
+                    generated_files = _extract_generated_files_from_choices(choices)
+                    if generated_files:
+                        message_files = Chats.add_message_files_by_id_and_message_id(
+                            metadata["chat_id"],
+                            metadata["message_id"],
+                            generated_files,
+                        )
+                        await event_emitter(
+                            {
+                                "type": "files",
+                                "data": {
+                                    "files": (
+                                        message_files
+                                        if isinstance(message_files, list)
+                                        else generated_files
+                                    )
+                                },
+                            }
+                        )
+
                     if choices and choices[0].get("message", {}).get("content"):
                         content = response_data["choices"][0]["message"]["content"]
 
@@ -2836,6 +3133,7 @@ async def process_chat_response(
                         ),
                     )
                     last_delta_data = None
+                    emitted_generated_file_refs: set[str] = set()
 
                     async def flush_pending_delta_data(threshold: int = 0):
                         nonlocal delta_count
@@ -2950,6 +3248,39 @@ async def process_chat_response(
                                         continue
 
                                     delta = choices[0].get("delta", {})
+                                    delta_generated_files = (
+                                        _extract_generated_files_from_choices(
+                                            [{"delta": delta}]
+                                        )
+                                    )
+                                    if delta_generated_files:
+                                        new_generated_files = []
+                                        for file_item in delta_generated_files:
+                                            ref_key = _generated_file_ref_key(file_item)
+                                            if ref_key and ref_key in emitted_generated_file_refs:
+                                                continue
+                                            if ref_key:
+                                                emitted_generated_file_refs.add(ref_key)
+                                            new_generated_files.append(file_item)
+
+                                        if new_generated_files:
+                                            message_files = Chats.add_message_files_by_id_and_message_id(
+                                                metadata["chat_id"],
+                                                metadata["message_id"],
+                                                new_generated_files,
+                                            )
+                                            await event_emitter(
+                                                {
+                                                    "type": "files",
+                                                    "data": {
+                                                        "files": (
+                                                            message_files
+                                                            if isinstance(message_files, list)
+                                                            else new_generated_files
+                                                        )
+                                                    },
+                                                }
+                                            )
 
                                     # Handle delta annotations
                                     annotations = delta.get("annotations")

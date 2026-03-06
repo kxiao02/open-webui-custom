@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from typing import Optional
 
 import aiohttp
@@ -16,6 +17,7 @@ from fastapi.responses import (
     StreamingResponse,
     JSONResponse,
     PlainTextResponse,
+    Response,
 )
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -52,9 +54,12 @@ from open_webui.utils.misc import (
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_access
 from open_webui.utils.headers import include_user_info_headers
+from open_webui.utils.model_access import is_model_always_allowed
 
 
 log = logging.getLogger(__name__)
+
+OPENWEBUI_FILE_LINK_RE = re.compile(r"(?<!/openai)/v1/files/")
 
 
 ##########################################
@@ -95,6 +100,122 @@ async def cleanup_response(
         response.close()
     if session:
         await session.close()
+
+
+def _rewrite_openwebui_file_links_in_text(value: str) -> str:
+    if "/v1/files/" not in value:
+        return value
+    return OPENWEBUI_FILE_LINK_RE.sub("/openai/v1/files/", value)
+
+
+def _rewrite_openwebui_file_links(value):
+    if isinstance(value, dict):
+        for key, item in list(value.items()):
+            value[key] = _rewrite_openwebui_file_links(item)
+        return value
+    if isinstance(value, list):
+        for idx, item in enumerate(value):
+            value[idx] = _rewrite_openwebui_file_links(item)
+        return value
+    if isinstance(value, str):
+        return _rewrite_openwebui_file_links_in_text(value)
+    return value
+
+
+def _rewrite_openwebui_sse_line(line: str) -> str:
+    if not line.startswith("data: "):
+        return _rewrite_openwebui_file_links_in_text(line)
+
+    payload = line[6:].strip()
+    if not payload or payload == "[DONE]":
+        return line
+
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        return _rewrite_openwebui_file_links_in_text(line)
+
+    rewritten = _rewrite_openwebui_file_links(parsed)
+    return f"data: {json.dumps(rewritten, ensure_ascii=False)}"
+
+
+async def _rewrite_openwebui_sse_stream(stream):
+    buffer = ""
+    async for chunk in stream:
+        if isinstance(chunk, bytes):
+            text = chunk.decode("utf-8", errors="replace")
+        else:
+            text = str(chunk)
+        buffer += text
+
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            rewritten_line = _rewrite_openwebui_sse_line(line)
+            yield rewritten_line.encode("utf-8")
+            yield b"\n"
+
+    if buffer:
+        rewritten_line = _rewrite_openwebui_sse_line(buffer)
+        yield rewritten_line.encode("utf-8")
+
+
+def _normalize_proxy_path_for_base_url(base_url: str, raw_path: str) -> str:
+    """
+    Avoid duplicating `/v1` when the upstream base URL already includes it.
+    """
+    normalized_path = (raw_path or "").lstrip("/")
+    if not normalized_path:
+        return ""
+
+    base = (base_url or "").rstrip("/")
+    if base.endswith("/v1"):
+        if normalized_path == "v1":
+            return ""
+        if normalized_path.startswith("v1/"):
+            return normalized_path[len("v1/") :]
+
+    return normalized_path
+
+
+def _is_json_content_type(content_type: str) -> bool:
+    return content_type == "application/json" or content_type.endswith("+json")
+
+
+def _is_text_content_type(content_type: str) -> bool:
+    return content_type.startswith("text/")
+
+
+def _get_proxy_passthrough_headers(response: aiohttp.ClientResponse) -> dict:
+    allowed_headers = {
+        "content-disposition",
+        "content-language",
+        "cache-control",
+        "etag",
+        "last-modified",
+        "expires",
+    }
+    return {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() in allowed_headers
+    }
+
+
+async def _read_proxy_response_data(response: aiohttp.ClientResponse):
+    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+    encoding = response.charset or "utf-8"
+    raw = await response.read()
+
+    if _is_json_content_type(content_type):
+        try:
+            return "json", json.loads(raw.decode(encoding))
+        except Exception:
+            return "text", raw.decode(encoding, errors="replace")
+
+    if _is_text_content_type(content_type):
+        return "text", raw.decode(encoding, errors="replace")
+
+    return "bytes", raw
 
 
 def openai_reasoning_model_handler(payload):
@@ -460,6 +581,10 @@ async def get_filtered_models(models, user, db=None):
     # Filter models based on user access control
     filtered_models = []
     for model in models.get("data", []):
+        if is_model_always_allowed(model.get("id")):
+            filtered_models.append(model)
+            continue
+
         model_info = Models.get_model_by_id(model["id"], db=db)
         if model_info:
             if user.id == model_info.user_id or has_access(
@@ -812,6 +937,8 @@ async def generate_chat_completion(
     metadata = payload.pop("metadata", None)
 
     model_id = form_data.get("model")
+    requested_model_id = model_id
+    model_is_always_allowed = is_model_always_allowed(requested_model_id)
     model_info = Models.get_model_by_id(model_id, db=db)
 
     # Check model info and override the payload
@@ -835,7 +962,7 @@ async def generate_chat_completion(
                 payload = apply_system_prompt_to_body(system, payload, metadata, user)
 
         # Check if user has access to the model
-        if not bypass_filter and user.role == "user":
+        if not bypass_filter and user.role == "user" and not model_is_always_allowed:
             if not (
                 user.id == model_info.user_id
                 or has_access(
@@ -850,7 +977,7 @@ async def generate_chat_completion(
                     detail="Model not found",
                 )
     elif not bypass_filter:
-        if user.role != "admin":
+        if user.role != "admin" and not model_is_always_allowed:
             raise HTTPException(
                 status_code=403,
                 detail="Model not found",
@@ -858,6 +985,10 @@ async def generate_chat_completion(
 
     await get_all_models(request, user=user)
     model = request.app.state.OPENAI_MODELS.get(model_id)
+    if not model and isinstance(model_id, str) and model_id.endswith("-thinking"):
+        base_model_id = model_id[: -len("-thinking")]
+        model = request.app.state.OPENAI_MODELS.get(base_model_id)
+
     if model:
         idx = model["urlIdx"]
     else:
@@ -952,7 +1083,7 @@ async def generate_chat_completion(
         if "text/event-stream" in r.headers.get("Content-Type", ""):
             streaming = True
             return StreamingResponse(
-                stream_chunks_handler(r.content),
+                _rewrite_openwebui_sse_stream(stream_chunks_handler(r.content)),
                 status_code=r.status,
                 headers=dict(r.headers),
                 background=BackgroundTask(
@@ -972,7 +1103,7 @@ async def generate_chat_completion(
                 else:
                     return PlainTextResponse(status_code=r.status, content=response)
 
-            return response
+            return _rewrite_openwebui_file_links(response)
     except Exception as e:
         log.exception(e)
 
@@ -1042,20 +1173,40 @@ async def embeddings(request: Request, form_data: dict, user):
                 ),
             )
         else:
-            try:
-                response_data = await r.json()
-            except Exception:
-                response_data = await r.text()
+            response_type, response_data = await _read_proxy_response_data(r)
+
+            if response_type == "json":
+                response_data = _rewrite_openwebui_file_links(response_data)
+            elif response_type == "text":
+                response_data = _rewrite_openwebui_file_links_in_text(response_data)
 
             if r.status >= 400:
-                if isinstance(response_data, (dict, list)):
+                if response_type == "json" and isinstance(response_data, (dict, list)):
                     return JSONResponse(status_code=r.status, content=response_data)
-                else:
+                if response_type == "text":
                     return PlainTextResponse(
                         status_code=r.status, content=response_data
                     )
+                binary_headers = _get_proxy_passthrough_headers(r)
+                content_type = r.headers.get("Content-Type")
+                if content_type:
+                    binary_headers["Content-Type"] = content_type
+                return Response(
+                    status_code=r.status, content=response_data, headers=binary_headers
+                )
 
-            return response_data
+            if response_type == "json":
+                return response_data
+            if response_type == "text":
+                return PlainTextResponse(status_code=r.status, content=response_data)
+
+            binary_headers = _get_proxy_passthrough_headers(r)
+            content_type = r.headers.get("Content-Type")
+            if content_type:
+                binary_headers["Content-Type"] = content_type
+            return Response(
+                status_code=r.status, content=response_data, headers=binary_headers
+            )
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -1110,7 +1261,10 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
 
             request_url = f"{url}/{path}?api-version={api_version}"
         else:
-            request_url = f"{url}/{path}"
+            normalized_path = _normalize_proxy_path_for_base_url(url, path)
+            request_url = (
+                f"{url.rstrip('/')}/{normalized_path}" if normalized_path else url.rstrip("/")
+            )
 
         session = aiohttp.ClientSession(trust_env=True)
         r = await session.request(
@@ -1134,20 +1288,40 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
                 ),
             )
         else:
-            try:
-                response_data = await r.json()
-            except Exception:
-                response_data = await r.text()
+            response_type, response_data = await _read_proxy_response_data(r)
+
+            if response_type == "json":
+                response_data = _rewrite_openwebui_file_links(response_data)
+            elif response_type == "text":
+                response_data = _rewrite_openwebui_file_links_in_text(response_data)
 
             if r.status >= 400:
-                if isinstance(response_data, (dict, list)):
+                if response_type == "json" and isinstance(response_data, (dict, list)):
                     return JSONResponse(status_code=r.status, content=response_data)
-                else:
+                if response_type == "text":
                     return PlainTextResponse(
                         status_code=r.status, content=response_data
                     )
+                binary_headers = _get_proxy_passthrough_headers(r)
+                content_type = r.headers.get("Content-Type")
+                if content_type:
+                    binary_headers["Content-Type"] = content_type
+                return Response(
+                    status_code=r.status, content=response_data, headers=binary_headers
+                )
 
-            return response_data
+            if response_type == "json":
+                return response_data
+            if response_type == "text":
+                return PlainTextResponse(status_code=r.status, content=response_data)
+
+            binary_headers = _get_proxy_passthrough_headers(r)
+            content_type = r.headers.get("Content-Type")
+            if content_type:
+                binary_headers["Content-Type"] = content_type
+            return Response(
+                status_code=r.status, content=response_data, headers=binary_headers
+            )
 
     except Exception as e:
         log.exception(e)

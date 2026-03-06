@@ -246,6 +246,7 @@ async def generate_title(
 
 
 @router.post("/follow_up/completions")
+@router.post("/follow_ups/completions")
 async def generate_follow_ups(
     request: Request, form_data: dict, user=Depends(get_verified_user)
 ):

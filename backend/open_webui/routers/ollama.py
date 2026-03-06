@@ -54,6 +54,7 @@ from open_webui.utils.payload import (
 )
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_access
+from open_webui.utils.model_access import is_model_always_allowed
 
 
 from open_webui.config import (
@@ -428,6 +429,10 @@ async def get_filtered_models(models, user, db=None):
     # Filter models based on user access control
     filtered_models = []
     for model in models.get("models", []):
+        if is_model_always_allowed(model.get("model")):
+            filtered_models.append(model)
+            continue
+
         model_info = Models.get_model_by_id(model["model"], db=db)
         if model_info:
             if user.id == model_info.user_id or has_access(
@@ -1279,6 +1284,7 @@ async def generate_chat_completion(
         del payload["metadata"]
 
     model_id = payload["model"]
+    model_is_always_allowed = is_model_always_allowed(model_id)
     model_info = Models.get_model_by_id(model_id, db=db)
 
     if model_info:
@@ -1300,7 +1306,7 @@ async def generate_chat_completion(
                 payload = apply_system_prompt_to_body(system, payload, metadata, user)
 
         # Check if user has access to the model
-        if not bypass_filter and user.role == "user":
+        if not bypass_filter and user.role == "user" and not model_is_always_allowed:
             if not (
                 user.id == model_info.user_id
                 or has_access(
@@ -1315,7 +1321,7 @@ async def generate_chat_completion(
                     detail="Model not found",
                 )
     elif not bypass_filter:
-        if user.role != "admin":
+        if user.role != "admin" and not model_is_always_allowed:
             raise HTTPException(
                 status_code=403,
                 detail="Model not found",
@@ -1400,6 +1406,7 @@ async def generate_openai_completion(
     if ":" not in model_id:
         model_id = f"{model_id}:latest"
 
+    model_is_always_allowed = is_model_always_allowed(model_id)
     model_info = Models.get_model_by_id(model_id, db=db)
     if model_info:
         if model_info.base_model_id:
@@ -1410,7 +1417,7 @@ async def generate_openai_completion(
             payload = apply_model_params_to_body_openai(params, payload)
 
         # Check if user has access to the model
-        if user.role == "user":
+        if user.role == "user" and not model_is_always_allowed:
             if not (
                 user.id == model_info.user_id
                 or has_access(
@@ -1425,7 +1432,7 @@ async def generate_openai_completion(
                     detail="Model not found",
                 )
     else:
-        if user.role != "admin":
+        if user.role != "admin" and not model_is_always_allowed:
             raise HTTPException(
                 status_code=403,
                 detail="Model not found",
@@ -1483,6 +1490,7 @@ async def generate_openai_chat_completion(
     if ":" not in model_id:
         model_id = f"{model_id}:latest"
 
+    model_is_always_allowed = is_model_always_allowed(model_id)
     model_info = Models.get_model_by_id(model_id, db=db)
     if model_info:
         if model_info.base_model_id:
@@ -1497,7 +1505,7 @@ async def generate_openai_chat_completion(
             payload = apply_system_prompt_to_body(system, payload, metadata, user)
 
         # Check if user has access to the model
-        if user.role == "user":
+        if user.role == "user" and not model_is_always_allowed:
             if not (
                 user.id == model_info.user_id
                 or has_access(
@@ -1512,7 +1520,7 @@ async def generate_openai_chat_completion(
                     detail="Model not found",
                 )
     else:
-        if user.role != "admin":
+        if user.role != "admin" and not model_is_always_allowed:
             raise HTTPException(
                 status_code=403,
                 detail="Model not found",
@@ -1600,6 +1608,10 @@ async def get_openai_models(
         # Filter models based on user access control
         filtered_models = []
         for model in models:
+            if is_model_always_allowed(model.get("id")):
+                filtered_models.append(model)
+                continue
+
             model_info = Models.get_model_by_id(model["id"], db=db)
             if model_info:
                 if user.id == model_info.user_id or has_access(

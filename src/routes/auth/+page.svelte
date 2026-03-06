@@ -209,7 +209,8 @@
 />
 
 <div class="w-full h-screen max-h-[100dvh] text-white relative" id="auth-page">
-	<div class="w-full h-full absolute top-0 left-0 bg-white dark:bg-black"></div>
+	<div class="auth-background absolute inset-0" aria-hidden="true"></div>
+	<div class="auth-overlay absolute inset-0" aria-hidden="true"></div>
 
 	<div class="w-full absolute top-0 left-0 right-0 h-8 drag-region" />
 
@@ -597,3 +598,35 @@
 		{/if}
 	{/if}
 </div>
+
+<style>
+	.auth-background {
+		background-image: url('/background-1.png');
+		background-repeat: no-repeat;
+		background-position: center;
+		background-size: cover;
+	}
+
+	.auth-overlay {
+		background: linear-gradient(
+			165deg,
+			rgba(249, 252, 255, 0.72) 0%,
+			rgba(246, 250, 255, 0.66) 58%,
+			rgba(250, 252, 255, 0.72) 100%
+		);
+		transition: background 260ms ease;
+	}
+
+	:global(.dark) .auth-background {
+		filter: brightness(0.74) saturate(0.92) contrast(1.04);
+	}
+
+	:global(.dark) .auth-overlay {
+		background: linear-gradient(
+			165deg,
+			rgba(7, 12, 23, 0.66) 0%,
+			rgba(10, 15, 28, 0.62) 58%,
+			rgba(12, 18, 34, 0.68) 100%
+		);
+	}
+</style>

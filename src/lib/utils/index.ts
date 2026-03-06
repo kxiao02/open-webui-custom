@@ -32,6 +32,20 @@ function escapeRegExp(string: string): string {
 	return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+const processOutsideCodeBlocks = (
+	text: string,
+	replacementFn: (segment: string) => string
+): string => {
+	return text
+		.split(/(```[\s\S]*?```|`[\s\S]*?`)/)
+		.map((segment) => {
+			return segment.startsWith('```') || segment.startsWith('`')
+				? segment
+				: replacementFn(segment);
+		})
+		.join('');
+};
+
 export const replaceTokens = (content, char, user) => {
 	const tokens = [
 		{ regex: /{{char}}/gi, replacement: char },
@@ -46,18 +60,6 @@ export const replaceTokens = (content, char, user) => {
 			replacement: (_, fileId) => `<file type="html" id="${fileId}" />`
 		}
 	];
-
-	// Replace tokens outside code blocks only
-	const processOutsideCodeBlocks = (text, replacementFn) => {
-		return text
-			.split(/(```[\s\S]*?```|`[\s\S]*?`)/)
-			.map((segment) => {
-				return segment.startsWith('```') || segment.startsWith('`')
-					? segment
-					: replacementFn(segment);
-			})
-			.join('');
-	};
 
 	// Apply replacements
 	content = processOutsideCodeBlocks(content, (segment) => {
@@ -86,8 +88,147 @@ export const sanitizeResponseContent = (content: string) => {
 
 export const processResponseContent = (content: string) => {
 	content = processChineseContent(content);
+	content = processBareMathContent(content);
+	content = normalizeDetailsTags(content);
+	content = linkifyRelativeFileDownloadPaths(content);
 	return content.trim();
 };
+
+const RELATIVE_FILE_DOWNLOAD_PATH_RE =
+	/\/(?:api\/)?v1\/files\/[A-Za-z0-9][A-Za-z0-9._-]*\/content(?:\/[^\s)\]]*)?/g;
+
+function collectMarkdownLinkRanges(segment: string): Array<[number, number]> {
+	const ranges: Array<[number, number]> = [];
+	const markdownLinkRe = /!?\[[^\]]*?\]\((?:[^()\\]|\\.)*?\)/g;
+	let match: RegExpExecArray | null = null;
+	while ((match = markdownLinkRe.exec(segment)) !== null) {
+		ranges.push([match.index, match.index + match[0].length]);
+	}
+	return ranges;
+}
+
+function isInsideRanges(index: number, ranges: Array<[number, number]>): boolean {
+	for (const [start, end] of ranges) {
+		if (index >= start && index < end) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function linkifyRelativeFileDownloadPaths(content: string): string {
+	return processOutsideCodeBlocks(content, (segment) => {
+		if (!segment.includes('/v1/files/') && !segment.includes('/api/v1/files/')) {
+			return segment;
+		}
+
+		const linkRanges = collectMarkdownLinkRanges(segment);
+		return segment.replace(
+			RELATIVE_FILE_DOWNLOAD_PATH_RE,
+			(match: string, ...args: Array<string | number>) => {
+				const index = Number(args[args.length - 2] ?? -1);
+				if (index < 0 || isInsideRanges(index, linkRanges)) {
+					return match;
+				}
+				return `[${match}](${match})`;
+			}
+		);
+	});
+}
+
+const BARE_MATH_ALLOWED_RE =
+	/^[A-Za-z0-9_\\{}()[\]\s+\-*/^×÷=<>≤≥≠≈∏∑√∞.,:;'"%|&\p{Script=Greek}]+$/u;
+
+function looksLikeBareMathBody(body: string): boolean {
+	const trimmed = body.trim();
+	if (!trimmed || trimmed.includes('$')) {
+		return false;
+	}
+	if (/https?:\/\//i.test(trimmed)) {
+		return false;
+	}
+	// Avoid wrapping markup/metadata-like lines such as details attributes.
+	if (
+		/[<>]/.test(trimmed) ||
+		/&(?:lt|gt|quot|amp);/i.test(trimmed) ||
+		/\b(?:details|summary|reasoning|tool_calls|code_interpreter|duration|done)\b/i.test(
+			trimmed
+		)
+	) {
+		return false;
+	}
+	if (!trimmed.includes('=')) {
+		return false;
+	}
+	// Require at least one math-ish operator/structure to avoid `key=value` false positives.
+	if (!/[+\-*/^×÷∑∏√()]/.test(trimmed)) {
+		return false;
+	}
+
+	const normalized = trimmed.replace(/[。！？!?;；,:：.]$/, '').trim();
+	if (normalized.length < 3 || normalized.length > 180) {
+		return false;
+	}
+	if (!/[A-Za-z_\p{Script=Greek}]/u.test(normalized)) {
+		return false;
+	}
+	if (!BARE_MATH_ALLOWED_RE.test(normalized)) {
+		return false;
+	}
+	// Avoid wrapping regular sentence-like English prose.
+	if (/[A-Za-z]{3,}\s+[A-Za-z]{3,}\s+[A-Za-z]{3,}/.test(normalized)) {
+		return false;
+	}
+	return true;
+}
+
+function wrapBareMathLine(line: string): string {
+	let prefix = '';
+	let body = line;
+
+	const prefixMatch = line.match(/^(\s*(?:[-*+]\s+|\d+\.\s+|>\s+))(.*)$/);
+	if (prefixMatch) {
+		prefix = prefixMatch[1];
+		body = prefixMatch[2];
+	}
+
+	let trailing = '';
+	const trailingMatch = body.match(/^(.*?)([。！？!?;；,:：.])$/);
+	if (trailingMatch) {
+		body = trailingMatch[1];
+		trailing = trailingMatch[2];
+	}
+
+	if (!looksLikeBareMathBody(body)) {
+		return line;
+	}
+
+	return `${prefix}$${body.trim()}$${trailing}`;
+}
+
+function processBareMathContent(content: string): string {
+	return processOutsideCodeBlocks(content, (segment) => {
+		return segment
+			.split('\n')
+			.map((line) => wrapBareMathLine(line))
+			.join('\n');
+	});
+}
+
+function normalizeDetailsTags(content: string): string {
+	return processOutsideCodeBlocks(content, (segment) => {
+		return segment
+			// Normalize compact/malformed opening tags from streamed chunks.
+			.replace(
+				/<details(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)/gi,
+				'<details '
+			)
+			.replace(
+				/<summary(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)/gi,
+				'<summary '
+			);
+	});
+}
 
 function isChineseChar(char: string): boolean {
 	return /\p{Script=Han}/u.test(char);

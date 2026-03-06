@@ -9,7 +9,6 @@ import zipfile
 
 from sqlalchemy.orm import Session
 from open_webui.internal.db import get_session
-from open_webui.models.groups import Groups
 from open_webui.models.knowledge import (
     KnowledgeFileListResponse,
     Knowledges,
@@ -29,7 +28,7 @@ from open_webui.storage.provider import Storage
 
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.utils.auth import get_verified_user, get_admin_user
-from open_webui.utils.access_control import has_access, has_permission
+from open_webui.utils.access_control import has_permission
 
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
@@ -39,6 +38,12 @@ from open_webui.models.models import Models, ModelForm
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _can_access_workspace_content(user, owner_user_id: str) -> bool:
+    return owner_user_id == user.id or (
+        user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL
+    )
 
 ############################
 # getKnowledgeBases
@@ -116,10 +121,7 @@ async def get_knowledge_bases(
 
     filter = {}
     if not user.role == "admin" or not BYPASS_ADMIN_ACCESS_CONTROL:
-        groups = Groups.get_groups_by_member_id(user.id, db=db)
-        if groups:
-            filter["group_ids"] = [group.id for group in groups]
-
+        filter["owner_only"] = True
         filter["user_id"] = user.id
 
     result = Knowledges.search_knowledge_bases(
@@ -130,13 +132,7 @@ async def get_knowledge_bases(
         items=[
             KnowledgeAccessResponse(
                 **knowledge_base.model_dump(),
-                write_access=(
-                    user.id == knowledge_base.user_id
-                    or (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or has_access(
-                        user.id, "write", knowledge_base.access_control, db=db
-                    )
-                ),
+                write_access=_can_access_workspace_content(user, knowledge_base.user_id),
             )
             for knowledge_base in result.items
         ],
@@ -163,10 +159,7 @@ async def search_knowledge_bases(
         filter["view_option"] = view_option
 
     if not user.role == "admin" or not BYPASS_ADMIN_ACCESS_CONTROL:
-        groups = Groups.get_groups_by_member_id(user.id, db=db)
-        if groups:
-            filter["group_ids"] = [group.id for group in groups]
-
+        filter["owner_only"] = True
         filter["user_id"] = user.id
 
     result = Knowledges.search_knowledge_bases(
@@ -177,13 +170,7 @@ async def search_knowledge_bases(
         items=[
             KnowledgeAccessResponse(
                 **knowledge_base.model_dump(),
-                write_access=(
-                    user.id == knowledge_base.user_id
-                    or (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or has_access(
-                        user.id, "write", knowledge_base.access_control, db=db
-                    )
-                ),
+                write_access=_can_access_workspace_content(user, knowledge_base.user_id),
             )
             for knowledge_base in result.items
         ],
@@ -206,11 +193,9 @@ async def search_knowledge_files(
     if query:
         filter["query"] = query
 
-    groups = Groups.get_groups_by_member_id(user.id, db=db)
-    if groups:
-        filter["group_ids"] = [group.id for group in groups]
-
-    filter["user_id"] = user.id
+    if not user.role == "admin" or not BYPASS_ADMIN_ACCESS_CONTROL:
+        filter["owner_only"] = True
+        filter["user_id"] = user.id
 
     return Knowledges.search_knowledge_files(
         filter=filter, skip=skip, limit=limit, db=db
@@ -229,14 +214,6 @@ async def create_new_knowledge(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
-    if user.role != "admin" and not has_permission(
-        user.id, "workspace.knowledge", request.app.state.config.USER_PERMISSIONS, db=db
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.UNAUTHORIZED,
-        )
-
     # Check if user can share publicly
     if (
         user.role != "admin"
@@ -376,31 +353,22 @@ async def get_knowledge_by_id(
 ):
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
 
-    if knowledge:
-        if (
-            user.role == "admin"
-            or knowledge.user_id == user.id
-            or has_access(user.id, "read", knowledge.access_control, db=db)
-        ):
-
-            return KnowledgeFilesResponse(
-                **knowledge.model_dump(),
-                write_access=(
-                    user.id == knowledge.user_id
-                    or (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or has_access(user.id, "write", knowledge.access_control, db=db)
-                ),
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-            )
-    else:
+    if not knowledge:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
+
+    if not _can_access_workspace_content(user, knowledge.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    return KnowledgeFilesResponse(
+        **knowledge.model_dump(),
+        write_access=_can_access_workspace_content(user, knowledge.user_id),
+    )
 
 
 ############################
@@ -422,12 +390,7 @@ async def update_knowledge_by_id(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
-    # Is the user the original creator, in a group with write access, or an admin
-    if (
-        knowledge.user_id != user.id
-        and not has_access(user.id, "write", knowledge.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, knowledge.user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -490,11 +453,7 @@ async def get_knowledge_files_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if not (
-        user.role == "admin"
-        or knowledge.user_id == user.id
-        or has_access(user.id, "read", knowledge.access_control, db=db)
-    ):
+    if not _can_access_workspace_content(user, knowledge.user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -544,11 +503,7 @@ def add_file_to_knowledge_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        knowledge.user_id != user.id
-        and not has_access(user.id, "write", knowledge.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, knowledge.user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -613,11 +568,7 @@ def update_file_from_knowledge_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        knowledge.user_id != user.id
-        and not has_access(user.id, "write", knowledge.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, knowledge.user_id):
 
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -682,11 +633,7 @@ def remove_file_from_knowledge_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        knowledge.user_id != user.id
-        and not has_access(user.id, "write", knowledge.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, knowledge.user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -759,11 +706,7 @@ async def delete_knowledge_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        knowledge.user_id != user.id
-        and not has_access(user.id, "write", knowledge.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, knowledge.user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -828,11 +771,7 @@ async def reset_knowledge_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        knowledge.user_id != user.id
-        and not has_access(user.id, "write", knowledge.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, knowledge.user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -871,11 +810,7 @@ async def add_files_to_knowledge_batch(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        knowledge.user_id != user.id
-        and not has_access(user.id, "write", knowledge.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, knowledge.user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,

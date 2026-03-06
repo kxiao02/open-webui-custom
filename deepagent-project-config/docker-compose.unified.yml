@@ -1,0 +1,66 @@
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS}
+      - LANGGRAPH_HOST=${LANGGRAPH_HOST}
+      - LANGGRAPH_PORT=${LANGGRAPH_PORT}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL}
+      - DEEPSEEK_THINKING_MODEL=${DEEPSEEK_THINKING_MODEL}
+      - DEEPSEEK_TEMPERATURE=${DEEPSEEK_TEMPERATURE}
+      - BOCHA_API_KEY=${BOCHA_API_KEY}
+      - BOCHA_API_URL=${BOCHA_API_URL}
+    ports:
+      - "${LANGGRAPH_HOST_PORT}:${LANGGRAPH_PORT}"
+    networks:
+      - appnet
+
+  adapter:
+    build:
+      context: ./openai-adapter
+      dockerfile: Dockerfile
+    environment:
+      - LANGGRAPH_BASE_URL=${LANGGRAPH_BASE_URL}
+      - DEEPAGENT_ASSISTANT_ID=${DEEPAGENT_ASSISTANT_ID}
+      - DEEPAGENT_THINKING_ASSISTANT_ID=${DEEPAGENT_THINKING_ASSISTANT_ID}
+      - DEFAULT_MODEL_ID=${DEFAULT_MODEL_ID}
+      - ADAPTER_HOST=${ADAPTER_HOST:-0.0.0.0}
+      - ADAPTER_PORT=${ADAPTER_PORT:-8081}
+    ports:
+      - "${ADAPTER_HOST_PORT:-8081}:${ADAPTER_PORT:-8081}"
+    depends_on:
+      - agent
+    networks:
+      - appnet
+
+  open_webui:
+    build:
+      context: ../open-webui
+      dockerfile: Dockerfile
+    environment:
+      - OPENAI_API_BASE_URLS=${OPENAI_API_BASE_URLS}
+      - OPENAI_API_KEYS=${OPENAI_API_KEYS}
+      - ENABLE_OPENAI_API=${ENABLE_OPENAI_API}
+      - ENABLE_OLLAMA_API=${ENABLE_OLLAMA_API}
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+      - WEBUI_URL=${WEBUI_URL}
+      - PORT=${OPEN_WEBUI_PORT}
+    ports:
+      - "${OPEN_WEBUI_HOST_PORT}:${OPEN_WEBUI_PORT}"
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - adapter
+    networks:
+      - appnet
+
+volumes:
+  open-webui-data:
+
+networks:
+  appnet:
+    driver: bridge

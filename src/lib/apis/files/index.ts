@@ -42,10 +42,11 @@ export const uploadFile = async (
 		throw error;
 	}
 
-	if (res) {
+	// Poll processing stream only when processing is enabled for this upload.
+	if (res && (process ?? true)) {
 		const status = await getFileProcessStatus(token, res.id);
 
-		if (status && status.ok) {
+		if (status && status.ok && status.body) {
 			const reader = status.body
 				.pipeThrough(new TextDecoderStream())
 				.pipeThrough(splitStream('\n'))
@@ -57,16 +58,18 @@ export const uploadFile = async (
 					break;
 				}
 
+				let streamDone = false;
 				try {
-					let lines = value.split('\n');
+					const lines = (value ?? '').split('\n');
 
 					for (const line of lines) {
 						if (line !== '') {
 							console.log(line);
 							if (line === 'data: [DONE]') {
-								console.log(line);
+								streamDone = true;
+								break;
 							} else {
-								let data = JSON.parse(line.replace(/^data: /, ''));
+								const data = JSON.parse(line.replace(/^data: /, ''));
 								console.log(data);
 
 								if (data?.error) {
@@ -74,14 +77,17 @@ export const uploadFile = async (
 									res.error = data.error;
 								}
 
-								if (res?.data) {
-									res.data = data;
-								}
+								res.data = data;
 							}
 						}
 					}
 				} catch (error) {
 					console.log(error);
+				}
+
+				if (streamDone) {
+					await reader.cancel().catch(() => {});
+					break;
 				}
 			}
 		}

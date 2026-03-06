@@ -103,13 +103,13 @@
 		{:else}
 			{token.text}
 		{/if}
-	{:else if token.text.includes(`<file type="html"`)}
-		{@const match = token.text.match(/<file type="html" id="([^"]+)"/)}
-		{@const fileId = match && match[1]}
-		{#if fileId}
-			<iframe
-				class="w-full my-2"
-				src={`${WEBUI_BASE_URL}/api/v1/files/${fileId}/content/html`}
+		{:else if token.text.includes(`<file type="html"`)}
+			{@const match = token.text.match(/<file type="html" id="([^"]+)"/)}
+			{@const fileId = match && match[1]}
+			{#if fileId && fileId !== 'null' && fileId !== 'undefined'}
+				<iframe
+					class="w-full my-2"
+					src={`${WEBUI_BASE_URL}/api/v1/files/${fileId}/content/html`}
 				title="Content"
 				frameborder="0"
 				sandbox="allow-scripts allow-downloads{($settings?.iframeSandboxAllowForms ?? false)

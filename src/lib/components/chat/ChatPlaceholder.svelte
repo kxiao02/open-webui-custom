@@ -1,6 +1,8 @@
 <script lang="ts">
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 	import { marked } from 'marked';
+	import { generateFollowUps } from '$lib/apis';
+	import { getChatList } from '$lib/apis/chats';
 
 	import { config, user, models as _models, temporaryChatEnabled } from '$lib/stores';
 	import { onMount, getContext } from 'svelte';
@@ -9,6 +11,10 @@
 
 	import Suggestions from './Suggestions.svelte';
 	import { sanitizeResponseContent } from '$lib/utils';
+	import {
+		buildHistoryTitleSuggestions,
+		getHardcodedSuggestionPrompts
+	} from '$lib/utils/historySuggestions';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import EyeSlash from '$lib/components/icons/EyeSlash.svelte';
 
@@ -17,20 +23,141 @@
 	export let modelIds = [];
 	export let models = [];
 	export let atSelectedModel;
+	export let thinkingModelId: string | null = null;
 
 	export let onSelect = (e) => {};
 
 	let mounted = false;
 	let selectedModelIdx = 0;
+	let historySuggestionPrompts = [];
+	let suggestionPrompts = [];
+
+	const buildHistorySummaryPrompt = (titles: string[]): string => {
+		const items = titles
+			.slice(0, 50)
+			.map((title, index) => `${index + 1}. ${title}`)
+			.join('\n');
+
+		return `以下是我全部历史会话标题。请基于这些标题，生成5条新的、可直接发送给助手的问题建议，优先覆盖近期主题。只输出问题本身。\n\n历史标题：\n${items}`;
+	};
+
+	const toSuggestionPrompts = (
+		items: string[],
+		sourceLabel: string
+	): Array<{ id: string; content: string; title: [string, string] }> => {
+		const seen = new Set<string>();
+		const prompts: Array<{ id: string; content: string; title: [string, string] }> = [];
+
+		for (const item of items) {
+			const text = (item ?? '').trim();
+			const key = text.toLowerCase();
+			if (!text || seen.has(key)) continue;
+			seen.add(key);
+			prompts.push({
+				id: `${sourceLabel}-${prompts.length + 1}-${key.slice(0, 24)}`,
+				content: text,
+				title: [text, sourceLabel]
+			});
+			if (prompts.length >= 8) break;
+		}
+
+		return prompts;
+	};
+
+	const resolveTaskModelIds = (): { thinking: string; fallback: string } => {
+		const availableIds = new Set(($_models ?? []).map((m) => m.id));
+		const preferredThinkingId = (thinkingModelId ?? '').trim();
+
+		if (preferredThinkingId && availableIds.has(preferredThinkingId)) {
+			const fallbackId = preferredThinkingId.endsWith('-thinking')
+				? preferredThinkingId.slice(0, -'-thinking'.length)
+				: preferredThinkingId;
+			return { thinking: preferredThinkingId, fallback: fallbackId || preferredThinkingId };
+		}
+
+		const currentModelId =
+			(atSelectedModel?.id ??
+				models[selectedModelIdx]?.id ??
+				models[0]?.id ??
+				modelIds[selectedModelIdx] ??
+				modelIds[0] ??
+				'') || '';
+
+		const normalizedModelId = currentModelId.trim();
+		if (!normalizedModelId) return { thinking: '', fallback: '' };
+
+		if (normalizedModelId.endsWith('-thinking')) {
+			const fallbackId = normalizedModelId.slice(0, -'-thinking'.length);
+			return { thinking: normalizedModelId, fallback: fallbackId || normalizedModelId };
+		}
+
+		const thinkingCandidate = `${normalizedModelId}-thinking`;
+		if (availableIds.has(thinkingCandidate) || !availableIds.size) {
+			return { thinking: thinkingCandidate, fallback: normalizedModelId };
+		}
+
+		return { thinking: thinkingCandidate, fallback: normalizedModelId };
+	};
+
+	const loadHistorySuggestions = async () => {
+		if (!localStorage.token) {
+			historySuggestionPrompts = [];
+			return;
+		}
+
+		try {
+			const allChatTitles = await getChatList(localStorage.token);
+			const baseTitlePrompts = buildHistoryTitleSuggestions(allChatTitles ?? [], 8);
+			historySuggestionPrompts =
+				baseTitlePrompts.length > 0 ? baseTitlePrompts : getHardcodedSuggestionPrompts();
+
+			const historyTitleTexts = buildHistoryTitleSuggestions(allChatTitles ?? [], 50).map(
+				(prompt) => prompt.content
+			);
+			if (historyTitleTexts.length === 0) return;
+
+			const { thinking: thinkingTaskModelId, fallback: fallbackTaskModelId } = resolveTaskModelIds();
+			if (!thinkingTaskModelId) return;
+
+			let generated = await generateFollowUps(localStorage.token, thinkingTaskModelId, [
+				{ role: 'user', content: buildHistorySummaryPrompt(historyTitleTexts) }
+			]).catch(() => []);
+			if (
+				(!Array.isArray(generated) || generated.length === 0) &&
+				fallbackTaskModelId &&
+				fallbackTaskModelId !== thinkingTaskModelId
+			) {
+				generated = await generateFollowUps(localStorage.token, fallbackTaskModelId, [
+					{ role: 'user', content: buildHistorySummaryPrompt(historyTitleTexts) }
+				]).catch(() => []);
+			}
+
+			const generatedPrompts = toSuggestionPrompts(generated ?? [], '历史推荐');
+			if (generatedPrompts.length > 0) {
+				historySuggestionPrompts = generatedPrompts;
+			}
+		} catch (error) {
+			console.error('Failed to load history title suggestions', error);
+			historySuggestionPrompts = getHardcodedSuggestionPrompts();
+		}
+	};
 
 	$: if (modelIds.length > 0) {
 		selectedModelIdx = models.length - 1;
 	}
 
 	$: models = modelIds.map((id) => $_models.find((m) => m.id === id));
+	$: suggestionPrompts =
+		historySuggestionPrompts.length > 0
+			? historySuggestionPrompts
+			: (atSelectedModel?.info?.meta?.suggestion_prompts ??
+				models[selectedModelIdx]?.info?.meta?.suggestion_prompts ??
+				$config?.default_prompt_suggestions ??
+				[]);
 
 	onMount(() => {
 		mounted = true;
+		loadHistorySuggestions();
 	});
 </script>
 
@@ -54,7 +181,7 @@
 						>
 							<img
 								src={`${WEBUI_API_BASE_URL}/models/model/profile/image?id=${model?.id}&lang=${$i18n.language}`}
-								class=" size-[2.7rem] rounded-full border-[1px] border-gray-100 dark:border-none"
+								class="h-[2.7rem] w-[3.5rem] rounded-md object-contain"
 								alt="logo"
 								draggable="false"
 							/>
@@ -127,10 +254,7 @@
 		<div class=" w-full font-primary" in:fade={{ duration: 200, delay: 300 }}>
 			<Suggestions
 				className="grid grid-cols-2"
-				suggestionPrompts={atSelectedModel?.info?.meta?.suggestion_prompts ??
-					models[selectedModelIdx]?.info?.meta?.suggestion_prompts ??
-					$config?.default_prompt_suggestions ??
-					[]}
+				{suggestionPrompts}
 				{onSelect}
 			/>
 		</div>

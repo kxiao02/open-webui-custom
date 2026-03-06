@@ -3,19 +3,24 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 
 from open_webui.models.prompts import (
     PromptForm,
-    PromptUserResponse,
     PromptAccessResponse,
     PromptModel,
     Prompts,
 )
 from open_webui.constants import ERROR_MESSAGES
-from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.access_control import has_access, has_permission
+from open_webui.utils.auth import get_verified_user
+from open_webui.utils.access_control import has_permission
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
 from open_webui.internal.db import get_session
 from sqlalchemy.orm import Session
 
 router = APIRouter()
+
+
+def _can_access_workspace_content(user, owner_user_id: str) -> bool:
+    return owner_user_id == user.id or (
+        user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL
+    )
 
 ############################
 # GetPrompts
@@ -46,11 +51,7 @@ async def get_prompt_list(
     return [
         PromptAccessResponse(
             **prompt.model_dump(),
-            write_access=(
-                (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                or user.id == prompt.user_id
-                or has_access(user.id, "write", prompt.access_control, db=db)
-            ),
+            write_access=_can_access_workspace_content(user, prompt.user_id),
         )
         for prompt in prompts
     ]
@@ -114,25 +115,22 @@ async def get_prompt_by_command(
 ):
     prompt = Prompts.get_prompt_by_command(f"/{command}", db=db)
 
-    if prompt:
-        if (
-            user.role == "admin"
-            or prompt.user_id == user.id
-            or has_access(user.id, "read", prompt.access_control, db=db)
-        ):
-            return PromptAccessResponse(
-                **prompt.model_dump(),
-                write_access=(
-                    (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or user.id == prompt.user_id
-                    or has_access(user.id, "write", prompt.access_control, db=db)
-                ),
-            )
-    else:
+    if not prompt:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
+
+    if not _can_access_workspace_content(user, prompt.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    return PromptAccessResponse(
+        **prompt.model_dump(),
+        write_access=_can_access_workspace_content(user, prompt.user_id),
+    )
 
 
 ############################
@@ -154,12 +152,7 @@ async def update_prompt_by_command(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    # Is the user the original creator, in a group with write access, or an admin
-    if (
-        prompt.user_id != user.id
-        and not has_access(user.id, "write", prompt.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, prompt.user_id):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -191,11 +184,7 @@ async def delete_prompt_by_command(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        prompt.user_id != user.id
-        and not has_access(user.id, "write", prompt.access_control, db=db)
-        and user.role != "admin"
-    ):
+    if not _can_access_workspace_content(user, prompt.user_id):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,

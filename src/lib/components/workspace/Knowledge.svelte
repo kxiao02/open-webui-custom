@@ -330,7 +330,6 @@
 			{:else}
 				<div class=" w-full h-full flex flex-col justify-center items-center my-16 mb-24">
 					<div class="max-w-md text-center">
-						<div class=" text-3xl mb-3">😕</div>
 						<div class=" text-lg font-medium mb-1">{$i18n.t('No knowledge found')}</div>
 						<div class=" text-gray-500 text-center text-xs">
 							{$i18n.t('Try adjusting your search or filter to find what you are looking for.')}

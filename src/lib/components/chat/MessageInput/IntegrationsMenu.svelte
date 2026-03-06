@@ -56,7 +56,7 @@
 	let fileUploadEnabled = true;
 	$: fileUploadEnabled =
 		fileUploadCapableModels.length === selectedModels.length &&
-		($user?.role === 'admin' || $user?.permissions?.chat?.file_upload);
+		($user?.role === 'admin' || ($user?.permissions?.chat?.file_upload ?? true));
 
 	const init = async () => {
 		if ($_tools === null) {
