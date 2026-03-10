@@ -38,9 +38,12 @@
 	export let profile = false;
 	export let help = false;
 
-	export let className = 'max-w-[240px]';
+export let className = 'max-w-[240px]';
 
-	export let showActiveUsers = true;
+export let showActiveUsers = true;
+
+let isAdmin = false;
+$: isAdmin = role === 'admin' || $user?.role === 'admin';
 
 	let showUserStatusModal = false;
 
@@ -63,7 +66,7 @@
 		dispatch('change', state);
 
 		// Fetch usage info when dropdown opens, if user has permission
-		if (state && ($config?.features?.enable_public_active_users_count || role === 'admin')) {
+		if (state && ($config?.features?.enable_public_active_users_count || isAdmin)) {
 			getUsageInfo();
 		}
 	};
@@ -242,7 +245,7 @@
 				<div class=" self-center truncate">{$i18n.t('Archived Chats')}</div>
 			</DropdownMenu.Item>
 
-			{#if role === 'admin'}
+			{#if isAdmin}
 				<DropdownMenu.Item
 					as="a"
 					href="/playground"
@@ -284,7 +287,7 @@
 
 				<!-- {$i18n.t('Help')} -->
 
-				{#if $user?.role === 'admin'}
+				{#if isAdmin}
 					<DropdownMenu.Item
 						as="a"
 						target="_blank"
@@ -352,7 +355,7 @@
 				<div class=" self-center truncate">{$i18n.t('Sign Out')}</div>
 			</DropdownMenu.Item>
 
-			{#if showActiveUsers && ($config?.features?.enable_public_active_users_count || role === 'admin') && usage}
+			{#if showActiveUsers && ($config?.features?.enable_public_active_users_count || isAdmin) && usage}
 				{#if usage?.user_count}
 					<hr class=" border-gray-50/30 dark:border-gray-800/30 my-1 p-0" />
 
@@ -364,7 +367,7 @@
 						<div
 							class="flex rounded-xl py-1 px-3 text-xs gap-2.5 items-center"
 							on:mouseenter={() => {
-								if ($config?.features?.enable_public_active_users_count || role === 'admin') {
+								if ($config?.features?.enable_public_active_users_count || isAdmin) {
 									getUsageInfo();
 								}
 							}}

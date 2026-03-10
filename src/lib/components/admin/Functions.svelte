@@ -573,15 +573,14 @@
 						</div>
 					{/each}
 				</div>
-			{:else}
-				<div class=" w-full h-full flex flex-col justify-center items-center my-16 mb-24">
-					<div class="max-w-md text-center">
-						<div class=" text-3xl mb-3">😕</div>
-						<div class=" text-lg font-medium mb-1">{$i18n.t('No functions found')}</div>
-						<div class=" text-gray-500 text-center text-xs">
-							{$i18n.t('Try adjusting your search or filter to find what you are looking for.')}
+				{:else}
+					<div class=" w-full h-full flex flex-col justify-center items-center my-16 mb-24">
+						<div class="max-w-md text-center">
+							<div class=" text-lg font-medium mb-1">{$i18n.t('No functions found')}</div>
+							<div class=" text-gray-500 text-center text-xs">
+								{$i18n.t('Try adjusting your search or filter to find what you are looking for.')}
+							</div>
 						</div>
-					</div>
 				</div>
 			{/if}
 		</div>
@@ -592,16 +591,12 @@
 	)}
 </div> -->
 
-		{#if $config?.features.enable_community_sharing}
-			<div class=" my-16">
-				<div class=" text-xl font-medium mb-1 line-clamp-1">
-					{$i18n.t('Made by Open WebUI Community')}
-				</div>
-
-				<a
-					class=" flex cursor-pointer items-center justify-between hover:bg-gray-50 dark:hover:bg-gray-850 w-full mb-2 px-3.5 py-1.5 rounded-xl transition"
-					href="https://openwebui.com/functions"
-					target="_blank"
+			{#if $config?.features.enable_community_sharing}
+				<div class=" my-16">
+					<a
+						class=" flex cursor-pointer items-center justify-between hover:bg-gray-50 dark:hover:bg-gray-850 w-full mb-2 px-3.5 py-1.5 rounded-xl transition"
+						href="https://openwebui.com/functions"
+						target="_blank"
 				>
 					<div class=" self-center">
 						<div class=" font-semibold line-clamp-1">{$i18n.t('Discover a function')}</div>
