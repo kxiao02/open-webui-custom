@@ -429,7 +429,7 @@
 		});
 	};
 
-	const uploadFileHandler = async (file, process = true) => {
+	const uploadFileHandler = async (file, process = false) => {
 		const tempItemId = uuidv4();
 		const fileItem = {
 			type: 'file',
@@ -800,12 +800,17 @@
 							{#if files.length > 0}
 								<div class="mx-2 mt-2.5 -mb-1 flex flex-wrap gap-2">
 									{#each files as file, fileIdx}
-										{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
-											{@const fileUrl =
-												file.url.startsWith('data') || file.url.startsWith('http')
-													? file.url
-													: `${WEBUI_API_BASE_URL}/files/${file.url}${file?.content_type ? '/content' : ''}`}
-											<div class=" relative group">
+										{@const fileRef = (file?.url ?? file?.id ?? '').toString().trim()}
+										{@const hasFileRef =
+											fileRef !== '' && fileRef !== 'null' && fileRef !== 'undefined'}
+										{@const isUploading = file?.status === 'uploading'}
+										{#if isUploading || hasFileRef}
+											{#if hasFileRef && (file.type === 'image' || (file?.content_type ?? '').startsWith('image/'))}
+												{@const fileUrl =
+													fileRef.startsWith('data') || fileRef.startsWith('http')
+														? fileRef
+														: `${WEBUI_API_BASE_URL}/files/${fileRef}${file?.content_type ? '/content' : ''}`}
+												<div class=" relative group">
 												<div class="relative">
 													<Image
 														src={fileUrl}
@@ -834,25 +839,26 @@
 														</svg>
 													</button>
 												</div>
-											</div>
-										{:else}
-											<FileItem
-												item={file}
-												name={file.name}
-												type={file.type}
-												size={file?.size}
-												small={true}
-												loading={file.status === 'uploading'}
-												dismissible={true}
-												edit={true}
-												on:dismiss={() => {
-													files.splice(fileIdx, 1);
-													files = files;
-												}}
-												on:click={() => {
-													console.log(file);
-												}}
-											/>
+												</div>
+											{:else}
+												<FileItem
+													item={{ ...file, url: hasFileRef ? fileRef : null }}
+													name={file.name}
+													type={file.type}
+													size={file?.size}
+													small={true}
+													loading={isUploading}
+													dismissible={true}
+													edit={true}
+													on:dismiss={() => {
+														files.splice(fileIdx, 1);
+														files = files;
+													}}
+													on:click={() => {
+														console.log(file);
+													}}
+												/>
+											{/if}
 										{/if}
 									{/each}
 								</div>

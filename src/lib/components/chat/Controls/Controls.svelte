@@ -34,31 +34,34 @@
 		<div class=" dark:text-gray-200 text-sm font-primary py-0.5 px-0.5">
 			{#if chatFiles.length > 0}
 				<Collapsible title={$i18n.t('Files')} open={true} buttonClassName="w-full">
-					<div class="flex flex-col gap-1 mt-1.5" slot="content">
-						{#each chatFiles as file, fileIdx}
-							<FileItem
-								className="w-full"
-								item={file}
-								edit={true}
-								url={file?.url ? file.url : null}
-								name={file.name}
-								type={file.type}
-								size={file?.size}
-								dismissible={true}
-								small={true}
-								on:dismiss={() => {
-									// Remove the file from the chatFiles array
+						<div class="flex flex-col gap-1 mt-1.5" slot="content">
+							{#each chatFiles as file, fileIdx}
+								{@const fileRef = (file?.url ?? file?.id ?? '').toString().trim()}
+								{#if fileRef !== '' && fileRef !== 'null' && fileRef !== 'undefined'}
+									<FileItem
+										className="w-full"
+										item={{ ...file, url: fileRef }}
+										edit={true}
+										url={fileRef}
+										name={file.name}
+										type={file.type}
+										size={file?.size}
+										dismissible={true}
+										small={true}
+										on:dismiss={() => {
+											// Remove the file from the chatFiles array
 
-									chatFiles.splice(fileIdx, 1);
-									chatFiles = chatFiles;
-								}}
-								on:click={() => {
-									console.log(file);
-								}}
-							/>
-						{/each}
-					</div>
-				</Collapsible>
+											chatFiles.splice(fileIdx, 1);
+											chatFiles = chatFiles;
+										}}
+										on:click={() => {
+											console.log(file);
+										}}
+									/>
+								{/if}
+							{/each}
+						</div>
+					</Collapsible>
 
 				<hr class="my-2 border-gray-50 dark:border-gray-700/10" />
 			{/if}
@@ -90,7 +93,7 @@
 				<hr class="my-2 border-gray-50 dark:border-gray-700/10" />
 			{/if}
 
-			{#if $user?.role === 'admin' || ($user?.permissions.chat?.params ?? true)}
+			{#if $user?.role === 'admin'}
 				<Collapsible title={$i18n.t('Advanced Params')} open={true} buttonClassName="w-full">
 					<div class="text-sm mt-1.5" slot="content">
 						<div>

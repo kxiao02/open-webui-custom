@@ -669,12 +669,12 @@ export const generateTitle = async (
 export const generateFollowUps = async (
 	token: string = '',
 	model: string,
-	messages: string,
+	messages: object[],
 	chat_id?: string
 ) => {
 	let error = null;
 
-	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/tasks/follow_ups/completions`, {
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/tasks/follow_up/completions`, {
 		method: 'POST',
 		headers: {
 			Accept: 'application/json',

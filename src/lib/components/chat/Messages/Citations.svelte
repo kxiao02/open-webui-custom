@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
-	import { embed, showControls, showEmbeds } from '$lib/stores';
+	import { embed, showControls, showEmbeds, showFilePreview } from '$lib/stores';
 
 	import CitationModal from './Citations/CitationModal.svelte';
 
@@ -68,6 +68,7 @@
 					} else {
 						showControls.set(true);
 						showEmbeds.set(true);
+						showFilePreview.set(false);
 						embed.set({
 							url: embedUrl,
 							title: citations[index]?.source?.name || 'Embedded Content',

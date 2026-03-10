@@ -10,7 +10,8 @@
 		showCallOverlay,
 		showOverview,
 		showArtifacts,
-		showEmbeds
+		showEmbeds,
+		showFilePreview
 	} from '$lib/stores';
 
 	import Controls from './Controls/Controls.svelte';
@@ -18,6 +19,7 @@
 	import Drawer from '../common/Drawer.svelte';
 	import Artifacts from './Artifacts.svelte';
 	import Embeds from './ChatControls/Embeds.svelte';
+	import FilePreview from './ChatControls/FilePreview.svelte';
 
 	export let history;
 	export let models = [];
@@ -140,6 +142,7 @@
 		showOverview.set(false);
 		showArtifacts.set(false);
 		showEmbeds.set(false);
+		showFilePreview.set(false);
 
 		if ($showCallOverlay) {
 			showCallOverlay.set(false);
@@ -156,11 +159,11 @@
 		<Drawer
 			show={$showControls}
 			onClose={() => {
-				showControls.set(false);
+				closeHandler();
 			}}
 		>
 			<div
-				class=" {$showCallOverlay || $showOverview || $showArtifacts || $showEmbeds
+				class=" {$showCallOverlay || $showOverview || $showArtifacts || $showEmbeds || $showFilePreview
 					? ' h-screen  w-full'
 					: 'px-4 py-3'} h-full"
 			>
@@ -182,6 +185,8 @@
 					</div>
 				{:else if $showEmbeds}
 					<Embeds />
+				{:else if $showFilePreview}
+					<FilePreview {history} />
 				{:else if $showArtifacts}
 					<Artifacts {history} />
 				{:else if $showOverview}
@@ -251,7 +256,7 @@
 		{#if $showControls}
 			<div class="flex max-h-full min-h-full">
 				<div
-					class="w-full {($showOverview || $showArtifacts || $showEmbeds) && !$showCallOverlay
+					class="w-full {($showOverview || $showArtifacts || $showEmbeds || $showFilePreview) && !$showCallOverlay
 						? ' '
 						: 'px-4 py-3 bg-white dark:shadow-lg dark:bg-gray-850 '} z-40 pointer-events-auto overflow-y-auto scrollbar-hidden"
 					id="controls-container"
@@ -272,6 +277,8 @@
 						</div>
 					{:else if $showEmbeds}
 						<Embeds overlay={dragged} />
+					{:else if $showFilePreview}
+						<FilePreview {history} overlay={dragged} />
 					{:else if $showArtifacts}
 						<Artifacts {history} overlay={dragged} />
 					{:else if $showOverview}

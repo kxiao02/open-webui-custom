@@ -54,7 +54,7 @@
 	let fileUploadEnabled = true;
 	$: fileUploadEnabled =
 		fileUploadCapableModels.length === selectedModels.length &&
-		($user?.role === 'admin' || $user?.permissions?.chat?.file_upload);
+		($user?.role === 'admin' || ($user?.permissions?.chat?.file_upload ?? true));
 
 	$: if (!fileUploadEnabled && files.length > 0) {
 		files = [];
@@ -86,6 +86,11 @@
 		];
 
 		show = false;
+	};
+
+	const openUploadFilesPicker = () => {
+		if (!fileUploadEnabled) return;
+		uploadFilesHandler?.();
 	};
 </script>
 
@@ -141,11 +146,8 @@
 							class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 rounded-xl {!fileUploadEnabled
 								? 'opacity-50'
 								: ''}"
-							on:click={() => {
-								if (fileUploadEnabled) {
-									uploadFilesHandler();
-								}
-							}}
+							on:click={openUploadFilesPicker}
+							on:select={openUploadFilesPicker}
 						>
 							<Clip />
 

@@ -1908,5 +1908,10 @@
 	"Your usage stats have been successfully synced.": "已成功同步您的使用統計資料。",
 	"YouTube": "YouTube",
 	"Youtube Language": "YouTube 語言",
-	"Youtube Proxy URL": "YouTube 代理伺服器 URL"
+	"Youtube Proxy URL": "YouTube 代理伺服器 URL",
+	"Tool Workflow": "工具流程",
+	"Tool Result": "工具結果",
+	"Completed": "已完成",
+	"Open Webpage": "開啟網頁",
+	"Server Time": "伺服器時間"
 }

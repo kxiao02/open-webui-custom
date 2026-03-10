@@ -327,23 +327,13 @@
 	};
 
 	const chatEventHandler = async (event, cb) => {
-		const chat = $page.url.pathname.includes(`/c/${event.chat_id}`);
-
-		let isFocused = document.visibilityState !== 'visible';
-		if (window.electronAPI) {
-			const res = await window.electronAPI.send({
-				type: 'window:isFocused'
-			});
-			if (res) {
-				isFocused = res.isFocused;
-			}
-		}
+		const isCurrentChat = event.chat_id === $chatId || $temporaryChatEnabled;
 
 		await tick();
 		const type = event?.data?.type ?? null;
 		const data = event?.data?.data ?? null;
 
-		if ((event.chat_id !== $chatId && !$temporaryChatEnabled) || isFocused) {
+		if (!isCurrentChat) {
 			if (type === 'chat:completion') {
 				const { done, content, title } = data;
 
@@ -853,7 +843,18 @@
 
 <svelte:head>
 	<title>{$WEBUI_NAME}</title>
-	<link crossorigin="anonymous" rel="icon" href="{WEBUI_BASE_URL}/static/favicon.png" />
+	<link
+		crossorigin="anonymous"
+		rel="icon"
+		href="{WEBUI_BASE_URL}/static/favicon.png"
+		media="(prefers-color-scheme: light)"
+	/>
+	<link
+		crossorigin="anonymous"
+		rel="icon"
+		href="{WEBUI_BASE_URL}/static/favicon-dark.png"
+		media="(prefers-color-scheme: dark)"
+	/>
 
 	<meta name="apple-mobile-web-app-title" content={$WEBUI_NAME} />
 	<meta name="description" content={$WEBUI_NAME} />

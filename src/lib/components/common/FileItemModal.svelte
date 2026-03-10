@@ -38,6 +38,27 @@
 	let excelHtml = '';
 	let excelError = '';
 	let rowCount = 0;
+	let itemRef: string | null = null;
+
+	const normalizeFileRef = (value: unknown): string | null => {
+		if (typeof value !== 'string') {
+			return null;
+		}
+
+		const normalized = value.trim();
+		if (normalized === '') {
+			return null;
+		}
+
+		const lowered = normalized.toLowerCase();
+		if (lowered === 'null' || lowered === 'undefined') {
+			return null;
+		}
+
+		return normalized;
+	};
+
+	$: itemRef = normalizeFileRef(item?.url) ?? normalizeFileRef(item?.id);
 
 	$: isPDF =
 		item?.meta?.content_type === 'application/pdf' ||
@@ -92,8 +113,12 @@
 	const loadExcelContent = async () => {
 		try {
 			excelError = '';
+			if (!itemRef) {
+				excelError = $i18n.t('File reference is unavailable.');
+				return;
+			}
 			const [arrayBuffer, { read }] = await Promise.all([
-				getFileContentById(item.id),
+				getFileContentById(itemRef),
 				import('xlsx')
 			]);
 			excelWorkbook = read(arrayBuffer, { type: 'array' });
@@ -143,17 +168,28 @@
 				item.files = knowledge.files || [];
 			}
 			loading = false;
-		} else if (item?.type === 'file') {
-			loading = true;
+			} else if (item?.type === 'file') {
+				loading = true;
+				if (!itemRef) {
+					item.file = item?.file ?? {};
+					loading = false;
+					return;
+				}
 
-			const file = await getFileById(localStorage.token, item.id).catch((e) => {
-				console.error('Error fetching file:', e);
-				return null;
-			});
+				const file = await getFileById(localStorage.token, itemRef).catch((e) => {
+					console.error('Error fetching file:', e);
+					return null;
+				});
 
-			if (file) {
-				item.file = file || {};
-			}
+				if (file) {
+					item.file = file || {};
+					if (!item.id) {
+						item.id = itemRef;
+					}
+					if (!item.url) {
+						item.url = itemRef;
+					}
+				}
 
 			// Load Excel content if it's an Excel file
 			if (isExcel) {
@@ -184,21 +220,21 @@
 			<div class="flex items-start justify-between">
 				<div>
 					<div class=" font-medium text-lg dark:text-gray-100">
-						<a
-							href="#"
-							class="hover:underline line-clamp-1"
-							on:click|preventDefault={() => {
-								if (!isPDF && item.url) {
-									window.open(
-										item.type === 'file'
-											? item?.url?.startsWith('http')
-												? item.url
-												: `${WEBUI_API_BASE_URL}/files/${item.url}/content`
-											: item.url,
-										'_blank'
-									);
-								}
-							}}
+							<a
+								href="#"
+								class="hover:underline line-clamp-1"
+								on:click|preventDefault={() => {
+									if (!isPDF && itemRef) {
+										window.open(
+											item.type === 'file'
+												? itemRef.startsWith('http')
+													? itemRef
+													: `${WEBUI_API_BASE_URL}/files/${itemRef}/content`
+												: itemRef,
+											'_blank'
+										);
+									}
+								}}
 						>
 							{item?.name ?? 'File'}
 						</a>
@@ -348,20 +384,22 @@
 							{(item?.content ?? '').trim() || 'No content'}
 						</div>
 					{/if}
-				{:else if selectedTab === 'preview'}
-					{#if isAudio}
-						<audio
-							src={`${WEBUI_API_BASE_URL}/files/${item.id}/content`}
-							class="w-full border-0 rounded-lg mb-2"
-							controls
-							playsinline
-						/>
-					{:else if isPDF}
-						<iframe
-							title={item?.name}
-							src={`${WEBUI_API_BASE_URL}/files/${item.id}/content`}
-							class="w-full h-[70vh] border-0 rounded-lg"
-						/>
+					{:else if selectedTab === 'preview'}
+						{#if !itemRef}
+							<div class="text-gray-500 text-sm p-4">{$i18n.t('File reference is unavailable.')}</div>
+						{:else if isAudio}
+							<audio
+								src={`${WEBUI_API_BASE_URL}/files/${itemRef}/content`}
+								class="w-full border-0 rounded-lg mb-2"
+								controls
+								playsinline
+							/>
+						{:else if isPDF}
+							<iframe
+								title={item?.name}
+								src={`${WEBUI_API_BASE_URL}/files/${itemRef}/content`}
+								class="w-full h-[70vh] border-0 rounded-lg"
+							/>
 					{:else if isExcel}
 						{#if excelError}
 							<div class="text-red-500 text-sm p-4">

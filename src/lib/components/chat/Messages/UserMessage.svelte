@@ -188,45 +188,50 @@
 		<div class="chat-{message.role} w-full min-w-full markdown-prose">
 			{#if edit !== true}
 				{#if message.files}
-					<div
-						class="mb-1 w-full flex flex-col justify-end overflow-x-auto gap-1 flex-wrap"
-						dir={$settings?.chatDirection ?? 'auto'}
-					>
-						{#each message.files as file}
-							{@const fileUrl =
-								file.url?.startsWith('data') || file.url?.startsWith('http')
-									? file.url
-									: `${WEBUI_API_BASE_URL}/files/${file.url}${file?.content_type ? '/content' : ''}`}
-							<div class={($settings?.chatBubble ?? true) ? 'self-end' : ''}>
-								{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
-									<Image src={fileUrl} imageClassName=" max-h-96 rounded-lg" />
-								{:else}
-									<FileItem
-										item={file}
-										url={file.url}
-										name={file.name}
-										type={file.type}
-										size={file?.size}
-										small={true}
-									/>
+						<div
+							class="mb-1 w-full flex flex-col justify-end overflow-x-auto gap-1 flex-wrap"
+							dir={$settings?.chatDirection ?? 'auto'}
+						>
+							{#each message.files as file}
+								{@const fileRef = (file?.url ?? file?.id ?? '').toString().trim()}
+								{#if fileRef !== '' && fileRef !== 'null' && fileRef !== 'undefined'}
+									{@const fileUrl =
+										fileRef.startsWith('data') || fileRef.startsWith('http')
+											? fileRef
+											: `${WEBUI_API_BASE_URL}/files/${fileRef}${file?.content_type ? '/content' : ''}`}
+									<div class={($settings?.chatBubble ?? true) ? 'self-end' : ''}>
+										{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
+											<Image src={fileUrl} imageClassName=" max-h-96 rounded-lg" />
+										{:else}
+											<FileItem
+												item={{ ...file, url: fileRef }}
+												url={fileRef}
+												name={file.name}
+												type={file.type}
+												size={file?.size}
+												small={true}
+											/>
+										{/if}
+									</div>
 								{/if}
-							</div>
-						{/each}
-					</div>
+							{/each}
+						</div>
+					{/if}
 				{/if}
-			{/if}
 
 			{#if edit === true}
 				<div class=" w-full bg-gray-50 dark:bg-gray-800 rounded-3xl px-5 py-3 mb-2">
 					{#if (editedFiles ?? []).length > 0}
 						<div class="flex items-center flex-wrap gap-2 -mx-2 mb-1">
-							{#each editedFiles as file, fileIdx}
-								{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
-									{@const fileUrl =
-										file.url?.startsWith('data') || file.url?.startsWith('http')
-											? file.url
-											: `${WEBUI_API_BASE_URL}/files/${file.url}${file?.content_type ? '/content' : ''}`}
-									<div class=" relative group">
+								{#each editedFiles as file, fileIdx}
+									{@const fileRef = (file?.url ?? file?.id ?? '').toString().trim()}
+									{#if fileRef !== '' && fileRef !== 'null' && fileRef !== 'undefined'}
+										{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
+										{@const fileUrl =
+											fileRef.startsWith('data') || fileRef.startsWith('http')
+												? fileRef
+												: `${WEBUI_API_BASE_URL}/files/${fileRef}${file?.content_type ? '/content' : ''}`}
+										<div class=" relative group">
 										<div class="relative flex items-center">
 											<Image
 												src={fileUrl}
@@ -262,7 +267,8 @@
 									</div>
 								{:else}
 									<FileItem
-										item={file}
+										item={{ ...file, url: fileRef }}
+										url={fileRef}
 										name={file.name}
 										type={file.type}
 										size={file?.size}
@@ -278,6 +284,7 @@
 											console.log(file);
 										}}
 									/>
+									{/if}
 								{/if}
 							{/each}
 						</div>

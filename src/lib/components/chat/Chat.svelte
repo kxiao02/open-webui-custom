@@ -42,7 +42,8 @@
 		functions,
 		selectedFolder,
 		pinnedChats,
-		showEmbeds
+		showEmbeds,
+		showFilePreview
 	} from '$lib/stores';
 
 	import {
@@ -52,6 +53,7 @@
 		createMessagesList,
 		getPromptVariables,
 		processDetails,
+		removeDetails,
 		removeAllDetails,
 		getCodeBlockContents,
 		isYoutubeUrl
@@ -520,10 +522,18 @@
 					chatCompletionEventHandler(data, message, event.chat_id);
 				} else if (type === 'chat:tasks:cancel') {
 					taskIds = null;
-					const responseMessage = history.messages[history.currentId];
-					// Set all response messages to done
-					for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
-						history.messages[messageId].done = true;
+					const targetMessageId =
+						event?.message_id && history.messages[event.message_id]
+							? event.message_id
+							: history.currentId;
+					const responseMessage = targetMessageId ? history.messages[targetMessageId] : null;
+					// Mark the canceled response branch as done using the message that emitted the event.
+					if (responseMessage?.parentId && history.messages[responseMessage.parentId]) {
+						for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
+							history.messages[messageId].done = true;
+						}
+					} else if (targetMessageId && history.messages[targetMessageId]) {
+						history.messages[targetMessageId].done = true;
 					}
 				} else if (type === 'chat:message:delta' || type === 'message') {
 					message.content += data.content;
@@ -624,9 +634,9 @@
 				}
 
 				history.messages[event.message_id] = message;
+				}
 			}
-		}
-	};
+		};
 
 	const onMessageHandler = async (event: {
 		origin: string;
@@ -768,6 +778,7 @@
 				showOverview.set(false);
 				showArtifacts.set(false);
 				showEmbeds.set(false);
+				showFilePreview.set(false);
 			}
 		});
 
@@ -1143,6 +1154,8 @@
 		await showCallOverlay.set(false);
 		await showOverview.set(false);
 		await showArtifacts.set(false);
+		await showEmbeds.set(false);
+		await showFilePreview.set(false);
 
 		if ($page.url.pathname.includes('/c/')) {
 			window.history.replaceState(history.state, '', `/`);
@@ -1197,6 +1210,7 @@
 		}
 
 		if ($page.url.searchParams.get('call') === 'true') {
+			showFilePreview.set(false);
 			showCallOverlay.set(true);
 			showControls.set(true);
 		}
@@ -1650,7 +1664,12 @@
 			message.done = true;
 
 			if ($settings.responseAutoCopy) {
-				copyToClipboard(message.content);
+				copyToClipboard(
+					removeAllDetails(removeDetails(message.content, ['tool_calls'])).replace(
+						/\n{3,}/g,
+						'\n\n'
+					)
+				);
 			}
 
 			if ($settings.responseAutoPlayback && !$showCallOverlay) {
