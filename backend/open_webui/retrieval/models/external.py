@@ -16,10 +16,12 @@ class ExternalReranker(BaseReranker):
     def __init__(
         self,
         api_key: str,
-        url: str = "http://localhost:8080/v1/rerank",
+        url: str = "",
         model: str = "reranker",
         timeout: Optional[int] = None,
     ):
+        if not url:
+            raise ValueError("External reranker URL must be configured")
         self.api_key = api_key
         self.url = url
         self.model = model

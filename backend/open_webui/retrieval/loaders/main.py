@@ -23,6 +23,7 @@ from langchain_community.document_loaders import (
 )
 from langchain_core.documents import Document
 
+from open_webui.constants import MINERU_LOCAL_API_URL_DEFAULT
 from open_webui.retrieval.loaders.external_document import ExternalDocumentLoader
 
 from open_webui.retrieval.loaders.mistral import MistralLoader
@@ -342,7 +343,7 @@ class Loader:
             loader = MinerULoader(
                 file_path=file_path,
                 api_mode=self.kwargs.get("MINERU_API_MODE", "local"),
-                api_url=self.kwargs.get("MINERU_API_URL", "http://localhost:8000"),
+                api_url=self.kwargs.get("MINERU_API_URL", MINERU_LOCAL_API_URL_DEFAULT),
                 api_key=self.kwargs.get("MINERU_API_KEY", ""),
                 params=self.kwargs.get("MINERU_PARAMS", {}),
                 timeout=mineru_timeout,

@@ -20,11 +20,18 @@
 
 	let loaded = false;
 
-	const getNonAdminWorkspaceFallbackPath = () => {
-		if ($user?.role === 'user') {
+	const getWorkspaceFallbackPath = () => {
+		if ($user?.role === 'admin') {
+			return '/workspace/models';
+		}
+
+		if ($user?.role === 'user' && $user?.permissions?.workspace?.knowledge) {
 			return '/workspace/knowledge';
 		}
 
+		if ($user?.permissions?.workspace?.models) {
+			return '/workspace/models';
+		}
 		if ($user?.permissions?.workspace?.knowledge) {
 			return '/workspace/knowledge';
 		}
@@ -34,28 +41,26 @@
 		if ($user?.permissions?.workspace?.tools) {
 			return '/workspace/tools';
 		}
+
 		return '/';
 	};
 
 	onMount(async () => {
-		if ($user?.role !== 'admin' && $page.url.pathname.includes('/models')) {
-			goto(getNonAdminWorkspaceFallbackPath());
-			return;
-		}
-
-		if ($user?.role !== 'admin' && $user?.role !== 'user') {
-			if (
-				$page.url.pathname.includes('/prompts') &&
-				!$user?.permissions?.workspace?.prompts
-			) {
-				goto('/');
+		if ($user?.role !== 'admin') {
+			if ($page.url.pathname.includes('/models') && !$user?.permissions?.workspace?.models) {
+				goto(getWorkspaceFallbackPath());
 			} else if (
 				$page.url.pathname.includes('/knowledge') &&
 				!$user?.permissions?.workspace?.knowledge
 			) {
-				goto('/');
+				goto(getWorkspaceFallbackPath());
+			} else if (
+				$page.url.pathname.includes('/prompts') &&
+				!$user?.permissions?.workspace?.prompts
+			) {
+				goto(getWorkspaceFallbackPath());
 			} else if ($page.url.pathname.includes('/tools') && !$user?.permissions?.workspace?.tools) {
-				goto('/');
+				goto(getWorkspaceFallbackPath());
 			}
 		}
 
@@ -102,7 +107,7 @@
 					<div
 						class="flex gap-1 scrollbar-none overflow-x-auto w-fit text-center text-sm font-medium rounded-full bg-transparent py-1 touch-auto pointer-events-auto"
 					>
-						{#if $user?.role === 'admin'}
+						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.models}
 							<a
 								class="min-w-fit p-1.5 {$page.url.pathname.includes('/workspace/models')
 									? ''
@@ -111,7 +116,7 @@
 							>
 						{/if}
 
-						{#if $user?.role === 'admin' || $user?.role === 'user' || $user?.permissions?.workspace?.knowledge}
+						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.knowledge}
 							<a
 								class="min-w-fit p-1.5 {$page.url.pathname.includes('/workspace/knowledge')
 									? ''
@@ -122,7 +127,7 @@
 							</a>
 						{/if}
 
-						{#if $user?.role === 'admin' || $user?.role === 'user' || $user?.permissions?.workspace?.prompts}
+						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.prompts}
 							<a
 								class="min-w-fit p-1.5 {$page.url.pathname.includes('/workspace/prompts')
 									? ''
@@ -131,7 +136,7 @@
 							>
 						{/if}
 
-						{#if $user?.role === 'admin' || $user?.role === 'user' || $user?.permissions?.workspace?.tools}
+						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.tools}
 							<a
 								class="min-w-fit p-1.5 {$page.url.pathname.includes('/workspace/tools')
 									? ''

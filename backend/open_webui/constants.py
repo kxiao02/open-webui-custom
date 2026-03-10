@@ -1,5 +1,7 @@
 from enum import Enum
 
+MINERU_LOCAL_API_URL_DEFAULT = "http://localhost:8000"
+
 
 class MESSAGES(str, Enum):
     DEFAULT = lambda msg="": f"{msg if msg else ''}"
