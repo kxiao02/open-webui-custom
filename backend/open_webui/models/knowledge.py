@@ -238,7 +238,10 @@ class KnowledgeTable:
                     elif view_option == "shared":
                         query = query.filter(Knowledge.user_id != user_id)
 
-                    query = has_permission(db, Knowledge, query, filter)
+                    if filter.get("owner_only"):
+                        query = query.filter(Knowledge.user_id == user_id)
+                    else:
+                        query = has_permission(db, Knowledge, query, filter)
 
                 query = query.order_by(Knowledge.updated_at.desc())
 
@@ -289,9 +292,12 @@ class KnowledgeTable:
                     .outerjoin(User, User.id == KnowledgeFile.user_id)
                 )
 
-                # Apply access-control directly to the joined query
-                # This makes the database handle filtering, even with 10k+ KBs
-                query = has_permission(db, Knowledge, query, filter)
+                if filter.get("owner_only"):
+                    query = query.filter(Knowledge.user_id == filter.get("user_id"))
+                else:
+                    # Apply access-control directly to the joined query
+                    # This makes the database handle filtering, even with 10k+ KBs
+                    query = has_permission(db, Knowledge, query, filter)
 
                 # Apply filename search
                 if filter:
@@ -353,16 +359,10 @@ class KnowledgeTable:
         self, user_id: str, permission: str = "write", db: Optional[Session] = None
     ) -> list[KnowledgeUserModel]:
         knowledge_bases = self.get_knowledge_bases(db=db)
-        user_group_ids = {
-            group.id for group in Groups.get_groups_by_member_id(user_id, db=db)
-        }
         return [
             knowledge_base
             for knowledge_base in knowledge_bases
             if knowledge_base.user_id == user_id
-            or has_access(
-                user_id, permission, knowledge_base.access_control, user_group_ids
-            )
         ]
 
     def get_knowledge_by_id(
@@ -383,12 +383,6 @@ class KnowledgeTable:
             return None
 
         if knowledge.user_id == user_id:
-            return knowledge
-
-        user_group_ids = {
-            group.id for group in Groups.get_groups_by_member_id(user_id, db=db)
-        }
-        if has_access(user_id, "write", knowledge.access_control, user_group_ids):
             return knowledge
         return None
 

@@ -1,11 +1,11 @@
 from typing import Optional
 import io
 import base64
+import hashlib
 import json
 import asyncio
 import logging
 
-from open_webui.models.groups import Groups
 from open_webui.models.models import (
     ModelForm,
     ModelModel,
@@ -30,7 +30,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.access_control import has_access, has_permission
+from open_webui.utils.access_control import has_permission
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, STATIC_DIR
 from open_webui.internal.db import get_session
 from sqlalchemy.orm import Session
@@ -39,9 +39,77 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_LEGACY_DEFAULT_PROFILE_IMAGE_URLS = {
+    "/favicon.png",
+    "/static/favicon.png",
+    "/static/favicon-dark.png",
+    "/static/favicon-96x96.png",
+    "/static/apple-touch-icon.png",
+    "/static/logo.png",
+    "/static/favicon.svg",
+    "/static/favicon.ico",
+    "https://openwebui.com/favicon.png",
+}
+
+# Hashes for historical built-in Open WebUI icon binaries.
+_LEGACY_DEFAULT_PROFILE_IMAGE_SHA256 = {
+    "443e444984c0df30efa5d649cc9c1bc73a81aa01b9ec8e75f1c22dd245c89732",  # favicon.png (+ embedded favicon.svg PNG)
+    "5be61c5b4742e43edc1fba9c19c80ea83e48c10cfcffbc699dc40f62a52d3ad0",  # favicon-dark.png
+    "159e33435208b49d10a7a54ba01539314b026d61469e4d6c3caf31ca9a0cc95c",  # favicon-96x96.png
+    "31bec935966104f4403243981687013ea246c3315a902da967f4970700eddb18",  # logo.png
+    "5f03e55a378426d5fa7593503d3cf051b3d8bb1c7861650f7e78419e5a71c731",  # apple-touch-icon.png
+    "ffdc414e31dc08d0f9f85b49d6f356b9eb0fd1438af21bacc3d7957ee8bd0df4",  # web-app-manifest-192x192.png
+    "01b8f5cc95d4a2991bab0d854f71ace436160ec9416a8b31894b8dd68b8a7b9e",  # web-app-manifest-512x512.png
+}
+
+
+def _normalize_profile_image_url(value: str) -> str:
+    return value.strip().split("?", 1)[0].split("#", 1)[0].lower()
+
+
+def _is_legacy_default_profile_image_url(value: str) -> bool:
+    return _normalize_profile_image_url(value) in _LEGACY_DEFAULT_PROFILE_IMAGE_URLS
+
+
+def _decode_data_image(value: str) -> Optional[tuple[bytes, str]]:
+    if not value.startswith("data:image"):
+        return None
+
+    try:
+        header, base64_data = value.split(",", 1)
+        return base64.b64decode(base64_data), header.split(";")[0].lstrip("data:")
+    except Exception:
+        return None
+
+
+def _profile_image_cache_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+
+
+def _is_dark_theme(theme: Optional[str]) -> bool:
+    return (theme or "").strip().lower() in {"dark", "true", "1"}
+
+
+def _get_fallback_profile_image_path(theme: Optional[str]) -> str:
+    if _is_dark_theme(theme):
+        dark_icon_path = STATIC_DIR / "favicon-dark.png"
+        if dark_icon_path.exists():
+            return str(dark_icon_path)
+    return str(STATIC_DIR / "favicon.png")
+
 
 def is_valid_model_id(model_id: str) -> bool:
     return model_id and len(model_id) <= 256
+
+
+def _can_access_workspace_content(user, owner_user_id: str) -> bool:
+    # Models are shared workspace resources in this deployment.
+    # Any verified user can read and manage model entries.
+    return True
 
 
 ###########################
@@ -83,23 +151,12 @@ async def get_models(
     if direction:
         filter["direction"] = direction
 
-    if not user.role == "admin" or not BYPASS_ADMIN_ACCESS_CONTROL:
-        groups = Groups.get_groups_by_member_id(user.id, db=db)
-        if groups:
-            filter["group_ids"] = [group.id for group in groups]
-
-        filter["user_id"] = user.id
-
     result = Models.search_models(user.id, filter=filter, skip=skip, limit=limit, db=db)
     return ModelAccessListResponse(
         items=[
             ModelAccessResponse(
                 **model.model_dump(),
-                write_access=(
-                    (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or user.id == model.user_id
-                    or has_access(user.id, "write", model.access_control, db=db)
-                ),
+                write_access=_can_access_workspace_content(user, model.user_id),
             )
             for model in result.items
         ],
@@ -128,10 +185,7 @@ async def get_base_models(
 async def get_model_tags(
     user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
-        models = Models.get_models(db=db)
-    else:
-        models = Models.get_models_by_user_id(user.id, db=db)
+    models = Models.get_models(db=db)
 
     tags_set = set()
     for model in models:
@@ -152,19 +206,10 @@ async def get_model_tags(
 
 @router.post("/create", response_model=Optional[ModelModel])
 async def create_new_model(
-    request: Request,
     form_data: ModelForm,
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
-    if user.role != "admin" and not has_permission(
-        user.id, "workspace.models", request.app.state.config.USER_PERMISSIONS, db=db
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.UNAUTHORIZED,
-        )
-
     model = Models.get_model_by_id(form_data.id, db=db)
     if model:
         raise HTTPException(
@@ -311,30 +356,22 @@ async def get_model_by_id(
     id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
     model = Models.get_model_by_id(id, db=db)
-    if model:
-        if (
-            (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-            or model.user_id == user.id
-            or has_access(user.id, "read", model.access_control, db=db)
-        ):
-            return ModelAccessResponse(
-                **model.model_dump(),
-                write_access=(
-                    (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or user.id == model.user_id
-                    or has_access(user.id, "write", model.access_control, db=db)
-                ),
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-            )
-    else:
+    if not model:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
+
+    if not _can_access_workspace_content(user, model.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    return ModelAccessResponse(
+        **model.model_dump(),
+        write_access=_can_access_workspace_content(user, model.user_id),
+    )
 
 
 ###########################
@@ -344,41 +381,66 @@ async def get_model_by_id(
 
 @router.get("/model/profile/image")
 def get_model_profile_image(
-    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+    id: str,
+    theme: Optional[str] = None,
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
 ):
     model = Models.get_model_by_id(id, db=db)
+    fallback_image_path = _get_fallback_profile_image_path(theme)
 
     if model:
+        if not _can_access_workspace_content(user, model.user_id):
+            return FileResponse(
+                fallback_image_path, headers=_profile_image_cache_headers()
+            )
         etag = f'"{model.updated_at}"' if model.updated_at else None
 
-        if model.meta.profile_image_url:
-            if model.meta.profile_image_url.startswith("http"):
+        profile_image_url = model.meta.profile_image_url
+        if profile_image_url:
+            if _is_legacy_default_profile_image_url(profile_image_url):
+                return FileResponse(
+                    fallback_image_path, headers=_profile_image_cache_headers()
+                )
+
+            if profile_image_url.startswith("http"):
                 return Response(
                     status_code=status.HTTP_302_FOUND,
-                    headers={"Location": model.meta.profile_image_url},
+                    headers={
+                        **_profile_image_cache_headers(),
+                        "Location": profile_image_url,
+                    },
                 )
-            elif model.meta.profile_image_url.startswith("data:image"):
-                try:
-                    header, base64_data = model.meta.profile_image_url.split(",", 1)
-                    image_data = base64.b64decode(base64_data)
-                    image_buffer = io.BytesIO(image_data)
-                    media_type = header.split(";")[0].lstrip("data:")
 
-                    headers = {"Content-Disposition": "inline"}
-                    if etag:
-                        headers["ETag"] = etag
+            decoded = _decode_data_image(profile_image_url)
+            if decoded:
+                image_data, media_type = decoded
+                image_hash = hashlib.sha256(image_data).hexdigest()
 
-                    return StreamingResponse(
-                        image_buffer,
-                        media_type=media_type,
-                        headers=headers,
+                # If model metadata still holds a legacy built-in icon blob, serve current favicon.
+                if image_hash in _LEGACY_DEFAULT_PROFILE_IMAGE_SHA256:
+                    return FileResponse(
+                        fallback_image_path,
+                        headers=_profile_image_cache_headers(),
                     )
-                except Exception as e:
-                    pass
 
-        return FileResponse(f"{STATIC_DIR}/favicon.png")
+                image_buffer = io.BytesIO(image_data)
+                headers = {
+                    "Content-Disposition": "inline",
+                    **_profile_image_cache_headers(),
+                }
+                if etag:
+                    headers["ETag"] = etag
+
+                return StreamingResponse(
+                    image_buffer,
+                    media_type=media_type,
+                    headers=headers,
+                )
+
+        return FileResponse(fallback_image_path, headers=_profile_image_cache_headers())
     else:
-        return FileResponse(f"{STATIC_DIR}/favicon.png")
+        return FileResponse(fallback_image_path, headers=_profile_image_cache_headers())
 
 
 ############################
@@ -392,11 +454,7 @@ async def toggle_model_by_id(
 ):
     model = Models.get_model_by_id(id, db=db)
     if model:
-        if (
-            user.role == "admin"
-            or model.user_id == user.id
-            or has_access(user.id, "write", model.access_control, db=db)
-        ):
+        if _can_access_workspace_content(user, model.user_id):
             model = Models.toggle_model_by_id(id, db=db)
 
             if model:
@@ -437,9 +495,7 @@ async def update_model_by_id(
         )
 
     if (
-        model.user_id != user.id
-        and not has_access(user.id, "write", model.access_control, db=db)
-        and user.role != "admin"
+        not _can_access_workspace_content(user, model.user_id)
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -470,11 +526,7 @@ async def delete_model_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if (
-        user.role != "admin"
-        and model.user_id != user.id
-        and not has_access(user.id, "write", model.access_control, db=db)
-    ):
+    if not _can_access_workspace_content(user, model.user_id):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.UNAUTHORIZED,

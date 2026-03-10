@@ -18,9 +18,6 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import BigInteger, Column, Text, JSON, Boolean
 
 
-from open_webui.utils.access_control import has_access
-
-
 log = logging.getLogger(__name__)
 
 
@@ -222,15 +219,7 @@ class ModelsTable:
         self, user_id: str, permission: str = "write", db: Optional[Session] = None
     ) -> list[ModelUserResponse]:
         models = self.get_models(db=db)
-        user_group_ids = {
-            group.id for group in Groups.get_groups_by_member_id(user_id, db=db)
-        }
-        return [
-            model
-            for model in models
-            if model.user_id == user_id
-            or has_access(user_id, permission, model.access_control, user_group_ids)
-        ]
+        return [model for model in models if model.user_id == user_id]
 
     def _has_permission(self, db, query, filter: dict, permission: str = "read"):
         group_ids = filter.get("group_ids", [])
@@ -303,13 +292,16 @@ class ModelsTable:
                 elif view_option == "shared":
                     query = query.filter(Model.user_id != user_id)
 
-                # Apply access control filtering
-                query = self._has_permission(
-                    db,
-                    query,
-                    filter,
-                    permission="read",
-                )
+                if filter.get("owner_only"):
+                    query = query.filter(Model.user_id == user_id)
+                else:
+                    # Apply access control filtering
+                    query = self._has_permission(
+                        db,
+                        query,
+                        filter,
+                        permission="read",
+                    )
 
                 tag = filter.get("tag")
                 if tag:

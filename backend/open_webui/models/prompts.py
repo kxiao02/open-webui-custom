@@ -3,13 +3,10 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
-from open_webui.models.groups import Groups
 from open_webui.models.users import Users, UserResponse
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import BigInteger, Column, String, Text, JSON
-
-from open_webui.utils.access_control import has_access
 
 ####################
 # Prompts DB Schema
@@ -136,16 +133,7 @@ class PromptsTable:
         self, user_id: str, permission: str = "write", db: Optional[Session] = None
     ) -> list[PromptUserResponse]:
         prompts = self.get_prompts(db=db)
-        user_group_ids = {
-            group.id for group in Groups.get_groups_by_member_id(user_id, db=db)
-        }
-
-        return [
-            prompt
-            for prompt in prompts
-            if prompt.user_id == user_id
-            or has_access(user_id, permission, prompt.access_control, user_group_ids)
-        ]
+        return [prompt for prompt in prompts if prompt.user_id == user_id]
 
     def update_prompt_by_command(
         self, command: str, form_data: PromptForm, db: Optional[Session] = None

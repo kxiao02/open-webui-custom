@@ -21,6 +21,7 @@ from open_webui.utils.plugin import (
     get_function_module_from_cache,
 )
 from open_webui.utils.access_control import has_access
+from open_webui.utils.model_access import is_model_always_allowed
 
 
 from open_webui.config import (
@@ -338,6 +339,9 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
 
 
 def check_model_access(user, model, db=None):
+    if is_model_always_allowed(model.get("id")):
+        return
+
     if model.get("arena"):
         if not has_access(
             user.id,
@@ -378,6 +382,10 @@ def get_filtered_models(models, user, db=None):
             group.id for group in Groups.get_groups_by_member_id(user.id, db=db)
         }
         for model in models:
+            if is_model_always_allowed(model.get("id")):
+                filtered_models.append(model)
+                continue
+
             if model.get("arena"):
                 if has_access(
                     user.id,

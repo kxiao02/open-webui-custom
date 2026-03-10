@@ -1174,35 +1174,33 @@ except Exception as e:
 if default_prompt_suggestions == []:
     default_prompt_suggestions = [
         {
-            "title": ["Help me study", "vocabulary for a college entrance exam"],
-            "content": "Help me study vocabulary: write a sentence for me to fill in the blank, and I'll try to pick the correct option.",
+            "title": ["核查政策真伪", "电价条款是否有效"],
+            "content": "请核查这条电价政策是否仍然有效，并给出最新官方依据与发布时间。",
         },
         {
-            "title": ["Give me ideas", "for what to do with my kids' art"],
-            "content": "What are 5 creative things I could do with my kids' art? I don't want to throw them away, but it's also so much clutter.",
+            "title": ["对照合规要求", "EPC合同条款审查"],
+            "content": "请根据电力工程相关法规，逐条检查这份EPC合同的合规风险与整改建议。",
         },
         {
-            "title": ["Tell me a fun fact", "about the Roman Empire"],
-            "content": "Tell me a random fun fact about the Roman Empire",
+            "title": ["会计处理判断", "变电站成本归类"],
+            "content": "请帮我把这批变电站项目费用划分为资本化与费用化，并给出会计分录示例。",
         },
         {
-            "title": ["Show me a code snippet", "of a website's sticky header"],
-            "content": "Show me a code snippet of a website's sticky header in CSS and JavaScript.",
+            "title": ["审核进度款", "工程量与税额复核"],
+            "content": "请复核这笔电力施工进度款：工程量、单价、税率和质保金是否一致。",
         },
         {
-            "title": [
-                "Explain options trading",
-                "if I'm familiar with buying and selling stocks",
-            ],
-            "content": "Explain options trading in simple terms if I'm familiar with buying and selling stocks.",
+            "title": ["分析超预算原因", "输电项目成本偏差"],
+            "content": "请对比预算与实际，找出输电项目超支前三项并说明可能原因。",
         },
         {
-            "title": ["Overcome procrastination", "give me tips"],
-            "content": "Could you start by asking me about instances when I procrastinate the most and then give me some suggestions to overcome it?",
+            "title": ["核验税务口径", "设备采购增值税处理"],
+            "content": "请判断电力设备采购与安装的增值税可抵扣范围，并列出高风险点。",
         },
     ]
 
 DEFAULT_PROMPT_SUGGESTIONS = PersistentConfig(
+
     "DEFAULT_PROMPT_SUGGESTIONS",
     "ui.prompt_suggestions",
     default_prompt_suggestions,
@@ -1247,12 +1245,12 @@ RESPONSE_WATERMARK = PersistentConfig(
 
 
 USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS = (
-    os.environ.get("USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS", "False").lower()
+    os.environ.get("USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS", "True").lower()
     == "true"
 )
 
 USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS = (
-    os.environ.get("USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS", "False").lower()
+    os.environ.get("USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS", "True").lower()
     == "true"
 )
 

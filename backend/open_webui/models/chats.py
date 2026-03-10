@@ -258,6 +258,119 @@ class ChatTable:
         """Recursively remove null bytes from strings in dict/list structures."""
         return sanitize_data_for_db(obj)
 
+    def _normalize_file_ref(self, value) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.lower() in {"null", "undefined"}:
+            return None
+        return normalized
+
+    def _sanitize_files_list(self, files: list) -> tuple[list, bool]:
+        if not isinstance(files, list):
+            return files, False
+
+        changed = False
+        sanitized_files: list = []
+
+        for item in files:
+            if isinstance(item, dict):
+                item_type = str(item.get("type", "file"))
+                normalized_id = self._normalize_file_ref(item.get("id"))
+                normalized_url = self._normalize_file_ref(item.get("url"))
+                normalized_ref = normalized_url or normalized_id
+                has_inline_content = (
+                    isinstance(item.get("content"), str)
+                    and item.get("content").strip() != ""
+                )
+
+                if item_type == "folder" and normalized_id is None:
+                    changed = True
+                    continue
+
+                if normalized_ref is None and not has_inline_content:
+                    changed = True
+                    continue
+
+                sanitized_item = {**item}
+
+                if normalized_ref is not None:
+                    sanitized_item["url"] = normalized_ref
+                    if normalized_id is not None:
+                        sanitized_item["id"] = normalized_id
+                    elif not (
+                        normalized_ref.startswith("http://")
+                        or normalized_ref.startswith("https://")
+                        or normalized_ref.startswith("data:")
+                    ):
+                        sanitized_item["id"] = normalized_ref
+                else:
+                    if "url" in sanitized_item:
+                        sanitized_item.pop("url", None)
+                    if "id" in sanitized_item:
+                        sanitized_item.pop("id", None)
+
+                if sanitized_item != item:
+                    changed = True
+
+                sanitized_files.append(sanitized_item)
+                continue
+
+            if isinstance(item, str):
+                normalized = self._normalize_file_ref(item)
+                if normalized is None:
+                    changed = True
+                    continue
+                if normalized != item:
+                    changed = True
+                sanitized_files.append(normalized)
+                continue
+
+            if item is None:
+                changed = True
+                continue
+
+            sanitized_files.append(item)
+
+        if len(sanitized_files) != len(files):
+            changed = True
+
+        return sanitized_files, changed
+
+    def _sanitize_chat_file_refs(self, chat_payload: dict) -> tuple[dict, bool]:
+        if not isinstance(chat_payload, dict):
+            return chat_payload, False
+
+        changed = False
+
+        if isinstance(chat_payload.get("files"), list):
+            sanitized_files, files_changed = self._sanitize_files_list(
+                chat_payload.get("files")
+            )
+            if files_changed:
+                chat_payload["files"] = sanitized_files
+                changed = True
+
+        history = chat_payload.get("history")
+        if isinstance(history, dict):
+            messages = history.get("messages")
+            if isinstance(messages, dict):
+                for message in messages.values():
+                    if not isinstance(message, dict):
+                        continue
+
+                    if isinstance(message.get("files"), list):
+                        sanitized_files, files_changed = self._sanitize_files_list(
+                            message.get("files")
+                        )
+                        if files_changed:
+                            message["files"] = sanitized_files
+                            changed = True
+
+        return chat_payload, changed
+
     def _sanitize_chat_row(self, chat_item):
         """
         Clean a Chat SQLAlchemy model's title + chat JSON,
@@ -275,7 +388,8 @@ class ChatTable:
         # Clean JSON
         if chat_item.chat:
             cleaned = self._clean_null_bytes(chat_item.chat)
-            if cleaned != chat_item.chat:
+            cleaned, file_refs_changed = self._sanitize_chat_file_refs(cleaned)
+            if file_refs_changed or cleaned != chat_item.chat:
                 chat_item.chat = cleaned
                 changed = True
 
@@ -483,9 +597,22 @@ class ChatTable:
 
             message_files = []
 
+            sanitized_files: list[dict] = []
+            for item in files or []:
+                if not isinstance(item, dict):
+                    continue
+                ref = item.get("url")
+                if not (isinstance(ref, str) and ref.strip() and ref.strip().lower() not in {"null", "undefined"}):
+                    ref = item.get("id")
+                if not (isinstance(ref, str) and ref.strip() and ref.strip().lower() not in {"null", "undefined"}):
+                    continue
+                normalized = {**item}
+                normalized["url"] = ref.strip()
+                sanitized_files.append(normalized)
+
             if message_id in history.get("messages", {}):
                 message_files = history["messages"][message_id].get("files", [])
-                message_files = message_files + files
+                message_files = message_files + sanitized_files
                 history["messages"][message_id]["files"] = message_files
 
             chat["history"] = history
@@ -817,6 +944,13 @@ class ChatTable:
         try:
             with get_db_context(db) as db:
                 chat = db.query(Chat).filter_by(id=id, user_id=user_id).first()
+                if chat is None:
+                    return None
+
+                if self._sanitize_chat_row(chat):
+                    db.commit()
+                    db.refresh(chat)
+
                 return ChatModel.model_validate(chat)
         except Exception:
             return None
