@@ -329,47 +329,59 @@
 	const chatEventHandler = async (event, cb) => {
 		const isCurrentChat = event.chat_id === $chatId || $temporaryChatEnabled;
 
+		let isWindowFocused = document.visibilityState === 'visible';
+		if (window.electronAPI) {
+			const res = await window.electronAPI.send({
+				type: 'window:isFocused'
+			});
+			if (res) {
+				isWindowFocused = !!res.isFocused;
+			}
+		}
+
 		await tick();
 		const type = event?.data?.type ?? null;
 		const data = event?.data?.data ?? null;
 
-		if (!isCurrentChat) {
-			if (type === 'chat:completion') {
-				const { done, content, title } = data;
+		if (type === 'chat:completion' && (!isCurrentChat || !isWindowFocused)) {
+			const { done, content, title } = data;
 
-				if (done) {
-					if ($settings?.notificationSoundAlways ?? false) {
-						playingNotificationSound.set(true);
+			if (done) {
+				if ($settings?.notificationSoundAlways ?? false) {
+					playingNotificationSound.set(true);
 
-						const audio = new Audio(`/audio/notification.mp3`);
-						audio.play().finally(() => {
-							// Ensure the global state is reset after the sound finishes
-							playingNotificationSound.set(false);
-						});
-					}
-
-					if ($isLastActiveTab) {
-						if ($settings?.notificationEnabled ?? false) {
-							new Notification(`${title} • Open WebUI`, {
-								body: content,
-								icon: `${WEBUI_BASE_URL}/static/favicon.png`
-							});
-						}
-					}
-
-					toast.custom(NotificationToast, {
-						componentProps: {
-							onClick: () => {
-								goto(`/c/${event.chat_id}`);
-							},
-							content: content,
-							title: title
-						},
-						duration: 15000,
-						unstyled: true
+					const audio = new Audio(`/audio/notification.mp3`);
+					audio.play().finally(() => {
+						// Ensure the global state is reset after the sound finishes
+						playingNotificationSound.set(false);
 					});
 				}
-			} else if (type === 'chat:title') {
+
+				if ($isLastActiveTab) {
+					if ($settings?.notificationEnabled ?? false) {
+						new Notification(`${title} • Open WebUI`, {
+							body: content,
+							icon: `${WEBUI_BASE_URL}/static/favicon.png`
+						});
+					}
+				}
+
+				toast.custom(NotificationToast, {
+					componentProps: {
+						onClick: () => {
+							goto(`/c/${event.chat_id}`);
+						},
+						content: content,
+						title: title
+					},
+					duration: 15000,
+					unstyled: true
+				});
+			}
+		}
+
+		if (!isCurrentChat) {
+			if (type === 'chat:title') {
 				currentChatPage.set(1);
 				await chats.set(await getChatList(localStorage.token, $currentChatPage));
 			} else if (type === 'chat:tags') {

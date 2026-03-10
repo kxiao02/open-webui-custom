@@ -160,6 +160,19 @@ function looksLikeBareMathBody(body: string): boolean {
 	if (!trimmed.includes('=')) {
 		return false;
 	}
+
+	const assignmentMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(\S+)$/);
+	if (assignmentMatch) {
+		const [, lhs, rhs] = assignmentMatch;
+		const looksLikeConfigKey =
+			lhs === lhs.toUpperCase() || lhs.includes('_') || lhs.includes('.');
+		const looksLikePathValue =
+			rhs.startsWith('/') || rhs.startsWith('~/') || rhs.includes('\\') || rhs.includes(':/');
+		if (looksLikeConfigKey && looksLikePathValue) {
+			return false;
+		}
+	}
+
 	// Require at least one math-ish operator/structure to avoid `key=value` false positives.
 	if (!/[+\-*/^×÷∑∏√()]/.test(trimmed)) {
 		return false;

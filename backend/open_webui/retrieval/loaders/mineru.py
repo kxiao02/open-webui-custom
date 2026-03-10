@@ -8,6 +8,8 @@ from typing import List, Optional
 from langchain_core.documents import Document
 from fastapi import HTTPException, status
 
+from open_webui.constants import MINERU_LOCAL_API_URL_DEFAULT
+
 log = logging.getLogger(__name__)
 
 
@@ -23,9 +25,9 @@ class MinerULoader:
         self,
         file_path: str,
         api_mode: str = "local",
-        api_url: str = "http://localhost:8000",
+        api_url: str = MINERU_LOCAL_API_URL_DEFAULT,
         api_key: str = "",
-        params: dict = None,
+        params: Optional[dict] = None,
         timeout: Optional[int] = 300,
     ):
         self.file_path = file_path
@@ -36,11 +38,11 @@ class MinerULoader:
 
         # Parse params dict with defaults
         self.params = params or {}
-        self.enable_ocr = params.get("enable_ocr", False)
-        self.enable_formula = params.get("enable_formula", True)
-        self.enable_table = params.get("enable_table", True)
-        self.language = params.get("language", "en")
-        self.model_version = params.get("model_version", "pipeline")
+        self.enable_ocr = self.params.get("enable_ocr", False)
+        self.enable_formula = self.params.get("enable_formula", True)
+        self.enable_table = self.params.get("enable_table", True)
+        self.language = self.params.get("language", "en")
+        self.model_version = self.params.get("model_version", "pipeline")
 
         self.page_ranges = self.params.pop("page_ranges", "")
 

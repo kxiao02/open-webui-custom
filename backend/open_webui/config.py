@@ -33,6 +33,7 @@ from open_webui.env import (
     WEBUI_NAME,
     log,
 )
+from open_webui.constants import MINERU_LOCAL_API_URL_DEFAULT
 from open_webui.internal.db import Base, get_db
 from open_webui.utils.redis import get_redis_connection
 
@@ -2596,7 +2597,7 @@ MINERU_API_MODE = PersistentConfig(
 MINERU_API_URL = PersistentConfig(
     "MINERU_API_URL",
     "rag.mineru_api_url",
-    os.environ.get("MINERU_API_URL", "http://localhost:8000"),
+    os.environ.get("MINERU_API_URL", MINERU_LOCAL_API_URL_DEFAULT),
 )
 
 MINERU_API_TIMEOUT = PersistentConfig(
