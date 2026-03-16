@@ -21,19 +21,24 @@ from open_webui.models.tools import (
     ToolAccessResponse,
     Tools,
 )
+from open_webui.models.access_grants import AccessGrants
 from open_webui.utils.plugin import (
     load_tool_module_by_id,
     replace_imports,
     get_tool_module_from_cache,
+    resolve_valves_schema_options,
 )
 from open_webui.utils.tools import get_tool_specs
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.access_control import has_access, has_permission
+from open_webui.utils.access_control import (
+    has_permission,
+    has_access,
+    filter_allowed_access_grants,
+)
 from open_webui.utils.tools import get_tool_servers
 
 from open_webui.config import CACHE_DIR, BYPASS_ADMIN_ACCESS_CONTROL
 from open_webui.constants import ERROR_MESSAGES
-
 
 log = logging.getLogger(__name__)
 
@@ -69,24 +74,39 @@ async def get_tools(
     tools = []
 
     # Local Tools
-    for tool in Tools.get_tools(db=db):
-        tool_module = get_tool_module(request, tool.id)
+    for tool in Tools.get_tools(defer_content=True, db=db):
+        tool_module = (
+            request.app.state.TOOLS.get(tool.id)
+            if hasattr(request.app.state, "TOOLS")
+            else None
+        )
         tools.append(
             ToolUserResponse(
                 **{
                     **tool.model_dump(),
-                    "has_user_valves": hasattr(tool_module, "UserValves"),
+                    "has_user_valves": (
+                        hasattr(tool_module, "UserValves") if tool_module else False
+                    ),
                 }
             )
         )
 
     # OpenAPI Tool Servers
+    server_access_grants = {}
     for server in await get_tool_servers(request):
+        connection = request.app.state.config.TOOL_SERVER_CONNECTIONS[
+            server.get("idx", 0)
+        ]
+        server_config = connection.get("config", {})
+
+        server_id = f"server:{server.get('id')}"
+        server_access_grants[server_id] = server_config.get("access_grants", [])
+
         tools.append(
             ToolUserResponse(
                 **{
-                    "id": f"server:{server.get('id')}",
-                    "user_id": f"server:{server.get('id')}",
+                    "id": server_id,
+                    "user_id": server_id,
                     "name": server.get("openapi", {})
                     .get("info", {})
                     .get("title", "Tool Server"),
@@ -95,11 +115,6 @@ async def get_tools(
                         .get("info", {})
                         .get("description", ""),
                     },
-                    "access_control": request.app.state.config.TOOL_SERVER_CONNECTIONS[
-                        server.get("idx", 0)
-                    ]
-                    .get("config", {})
-                    .get("access_control", None),
                     "updated_at": int(time.time()),
                     "created_at": int(time.time()),
                 }
@@ -108,7 +123,9 @@ async def get_tools(
 
     # MCP Tool Servers
     for server in request.app.state.config.TOOL_SERVER_CONNECTIONS:
-        if server.get("type", "openapi") == "mcp":
+        if server.get("type", "openapi") == "mcp" and server.get("config", {}).get(
+            "enable"
+        ):
             server_id = server.get("info", {}).get("id")
             auth_type = server.get("auth_type", "none")
 
@@ -123,20 +140,22 @@ async def get_tools(
                     )
                 )
 
+            server_config = server.get("config", {})
+
+            tool_id = f"server:mcp:{server.get('info', {}).get('id')}"
+            server_access_grants[tool_id] = server_config.get("access_grants", [])
+
             tools.append(
                 ToolUserResponse(
                     **{
-                        "id": f"server:mcp:{server.get('info', {}).get('id')}",
-                        "user_id": f"server:mcp:{server.get('info', {}).get('id')}",
+                        "id": tool_id,
+                        "user_id": tool_id,
                         "name": server.get("info", {}).get("name", "MCP Tool Server"),
                         "meta": {
                             "description": server.get("info", {}).get(
                                 "description", ""
                             ),
                         },
-                        "access_control": server.get("config", {}).get(
-                            "access_control", None
-                        ),
                         "updated_at": int(time.time()),
                         "created_at": int(time.time()),
                         **(
@@ -160,11 +179,23 @@ async def get_tools(
         tools = [
             tool
             for tool in tools
-            if (
-                _can_access_workspace_content(user, tool.user_id)
-                if not tool.user_id.startswith("server:")
-                else has_access(
-                    user.id, "read", tool.access_control, user_group_ids, db=db
+            if tool.user_id == user.id
+            or (
+                has_access(
+                    user.id,
+                    "read",
+                    server_access_grants.get(str(tool.id), []),
+                    user_group_ids,
+                    db=db,
+                )
+                if str(tool.id).startswith("server:")
+                else AccessGrants.has_access(
+                    user_id=user.id,
+                    resource_type="tool",
+                    resource_id=tool.id,
+                    permission="read",
+                    user_group_ids=user_group_ids,
+                    db=db,
                 )
             )
         ]
@@ -181,17 +212,40 @@ async def get_tool_list(
     user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
     if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
-        tools = Tools.get_tools(db=db)
+        tools = Tools.get_tools(defer_content=True, db=db)
     else:
-        tools = Tools.get_tools_by_user_id(user.id, "read", db=db)
+        tools = Tools.get_tools_by_user_id(user.id, "read", defer_content=True, db=db)
 
-    return [
-        ToolAccessResponse(
-            **tool.model_dump(),
-            write_access=_can_access_workspace_content(user, tool.user_id),
+    user_group_ids = {
+        group.id for group in Groups.get_groups_by_member_id(user.id, db=db)
+    }
+
+    result = []
+    for tool in tools:
+        has_write = (
+            (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
+            or user.id == tool.user_id
+            or any(
+                g.permission == "write"
+                and (
+                    (
+                        g.principal_type == "user"
+                        and (g.principal_id == user.id or g.principal_id == "*")
+                    )
+                    or (
+                        g.principal_type == "group" and g.principal_id in user_group_ids
+                    )
+                )
+                for g in tool.access_grants
+            )
         )
-        for tool in tools
-    ]
+        result.append(
+            ToolAccessResponse(
+                **tool.model_dump(),
+                write_access=has_write,
+            )
+        )
+    return result
 
 
 ############################
@@ -384,16 +438,41 @@ async def get_tools_by_id(
 ):
     tools = Tools.get_tool_by_id(id, db=db)
 
-    if not tools:
+    if tools:
+        if (
+            user.role == "admin"
+            or tools.user_id == user.id
+            or AccessGrants.has_access(
+                user_id=user.id,
+                resource_type="tool",
+                resource_id=tools.id,
+                permission="read",
+                db=db,
+            )
+        ):
+            return ToolAccessResponse(
+                **tools.model_dump(),
+                write_access=(
+                    (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
+                    or user.id == tools.user_id
+                    or AccessGrants.has_access(
+                        user_id=user.id,
+                        resource_type="tool",
+                        resource_id=tools.id,
+                        permission="write",
+                        db=db,
+                    )
+                ),
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+            )
+    else:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
-        )
-
-    if not _can_access_workspace_content(user, tools.user_id):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
     return ToolAccessResponse(
@@ -422,7 +501,18 @@ async def update_tools_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if not _can_access_workspace_content(user, tools.user_id):
+    # Is the user the original creator, in a group with write access, or an admin
+    if (
+        tools.user_id != user.id
+        and not AccessGrants.has_access(
+            user_id=user.id,
+            resource_type="tool",
+            resource_id=tools.id,
+            permission="write",
+            db=db,
+        )
+        and user.role != "admin"
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.UNAUTHORIZED,
@@ -462,6 +552,59 @@ async def update_tools_by_id(
 
 
 ############################
+# UpdateToolAccessById
+############################
+
+
+class ToolAccessGrantsForm(BaseModel):
+    access_grants: list[dict]
+
+
+@router.post("/id/{id}/access/update", response_model=Optional[ToolModel])
+async def update_tool_access_by_id(
+    request: Request,
+    id: str,
+    form_data: ToolAccessGrantsForm,
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
+):
+    tools = Tools.get_tool_by_id(id, db=db)
+    if not tools:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if (
+        tools.user_id != user.id
+        and not AccessGrants.has_access(
+            user_id=user.id,
+            resource_type="tool",
+            resource_id=tools.id,
+            permission="write",
+            db=db,
+        )
+        and user.role != "admin"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.UNAUTHORIZED,
+        )
+
+    form_data.access_grants = filter_allowed_access_grants(
+        request.app.state.config.USER_PERMISSIONS,
+        user.id,
+        user.role,
+        form_data.access_grants,
+        "sharing.public_tools",
+    )
+
+    AccessGrants.set_access_grants("tool", id, form_data.access_grants, db=db)
+
+    return Tools.get_tool_by_id(id, db=db)
+
+
+############################
 # DeleteToolsById
 ############################
 
@@ -480,7 +623,17 @@ async def delete_tools_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if not _can_access_workspace_content(user, tools.user_id):
+    if (
+        tools.user_id != user.id
+        and not AccessGrants.has_access(
+            user_id=user.id,
+            resource_type="tool",
+            resource_id=tools.id,
+            permission="write",
+            db=db,
+        )
+        and user.role != "admin"
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.UNAUTHORIZED,
@@ -553,7 +706,10 @@ async def get_tools_valves_spec_by_id(
 
         if hasattr(tools_module, "Valves"):
             Valves = tools_module.Valves
-            return Valves.schema()
+            schema = Valves.schema()
+            # Resolve dynamic options for select dropdowns
+            schema = resolve_valves_schema_options(Valves, schema, user)
+            return schema
         return None
     else:
         raise HTTPException(
@@ -582,7 +738,17 @@ async def update_tools_valves_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if not _can_access_workspace_content(user, tools.user_id):
+    if (
+        tools.user_id != user.id
+        and not AccessGrants.has_access(
+            user_id=user.id,
+            resource_type="tool",
+            resource_id=tools.id,
+            permission="write",
+            db=db,
+        )
+        and user.role != "admin"
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -668,7 +834,10 @@ async def get_tools_user_valves_spec_by_id(
 
         if hasattr(tools_module, "UserValves"):
             UserValves = tools_module.UserValves
-            return UserValves.schema()
+            schema = UserValves.schema()
+            # Resolve dynamic options for select dropdowns
+            schema = resolve_valves_schema_options(UserValves, schema, user)
+            return schema
         return None
     else:
         raise HTTPException(

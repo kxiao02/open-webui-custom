@@ -107,6 +107,10 @@
 	onMount(async () => {
 		languages = await getLanguages();
 
+		if (!$config?.features?.enable_easter_eggs) {
+			languages = languages.filter((l) => l.code !== 'dg-DG');
+		}
+
 		notificationEnabled = $settings.notificationEnabled ?? false;
 		system = $settings.system ?? '';
 
@@ -120,11 +124,33 @@
 		<div class="">
 			<div class=" mb-1 text-sm font-medium">{$i18n.t('WebUI Settings')}</div>
 
+			<div class="flex w-full justify-between">
+				<div class=" self-center text-xs font-medium">{$i18n.t('Theme')}</div>
+				<div class="flex items-center relative">
+					<select
+						class="w-fit pr-8 rounded-sm py-2 px-2 text-xs bg-transparent text-right {$settings.highContrastMode
+							? ''
+							: 'outline-hidden'}"
+						bind:value={selectedTheme}
+						placeholder={$i18n.t('Select a theme')}
+						on:change={() => themeChangeHandler(selectedTheme)}
+					>
+						<option value="system">⚙️ {$i18n.t('System')}</option>
+						<option value="dark">🌑 {$i18n.t('Dark')}</option>
+						<option value="oled-dark">🌃 {$i18n.t('OLED Dark')}</option>
+						<option value="light">☀️ {$i18n.t('Light')}</option>
+						{#if $config?.features?.enable_easter_eggs}
+							<option value="her">🌷 Her</option>
+						{/if}
+					</select>
+				</div>
+			</div>
+
 			<div class=" flex w-full justify-between">
 				<div class=" self-center text-xs font-medium">{$i18n.t('Language')}</div>
 				<div class="flex items-center relative">
 					<select
-						class="dark:bg-gray-900 w-fit pr-8 rounded-sm py-2 px-2 text-xs bg-transparent text-right {$settings.highContrastMode
+						class="w-fit pr-8 rounded-sm py-2 px-2 text-xs bg-transparent text-right {$settings.highContrastMode
 							? ''
 							: 'outline-hidden'}"
 						bind:value={lang}
@@ -168,6 +194,8 @@
 							toggleNotification();
 						}}
 						type="button"
+						role="switch"
+						aria-checked={notificationEnabled}
 					>
 						{#if notificationEnabled === true}
 							<span class="ml-2 self-center">{$i18n.t('On')}</span>
@@ -205,6 +233,7 @@
 							? 'text-gray-800 dark:text-gray-100'
 							: 'text-gray-400 dark:text-gray-500'}"
 						type="button"
+						aria-expanded={showAdvanced}
 						on:click={() => {
 							showAdvanced = !showAdvanced;
 						}}>{showAdvanced ? $i18n.t('Hide') : $i18n.t('Show')}</button

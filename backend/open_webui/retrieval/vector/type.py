@@ -4,6 +4,7 @@ from enum import StrEnum
 class VectorType(StrEnum):
     NOOP = "noop"
     MILVUS = "milvus"
+    MARIADB_VECTOR = "mariadb-vector"
     QDRANT = "qdrant"
     CHROMA = "chroma"
     PINECONE = "pinecone"

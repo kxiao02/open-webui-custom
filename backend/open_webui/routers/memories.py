@@ -71,8 +71,11 @@ async def add_memory(
     request: Request,
     form_data: AddMemoryForm,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
+    # NOTE: We intentionally do NOT use Depends(get_session) here.
+    # Database operations (insert_new_memory) manage their own short-lived sessions.
+    # This prevents holding a connection during EMBEDDING_FUNCTION()
+    # which makes external embedding API calls (1-5+ seconds).
     if not request.app.state.config.ENABLE_MEMORIES:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -87,7 +90,7 @@ async def add_memory(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    memory = Memories.insert_new_memory(user.id, form_data.content, db=db)
+    memory = Memories.insert_new_memory(user.id, form_data.content)
 
     ensure_retrieval_runtime(request.app)
     vector = await request.app.state.EMBEDDING_FUNCTION(memory.content, user=user)
@@ -122,8 +125,11 @@ async def query_memory(
     request: Request,
     form_data: QueryMemoryForm,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
+    # NOTE: We intentionally do NOT use Depends(get_session) here.
+    # Database operations (get_memories_by_user_id) manage their own short-lived sessions.
+    # This prevents holding a connection during EMBEDDING_FUNCTION()
+    # which makes external embedding API calls (1-5+ seconds).
     if not request.app.state.config.ENABLE_MEMORIES:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -138,7 +144,7 @@ async def query_memory(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    memories = Memories.get_memories_by_user_id(user.id, db=db)
+    memories = Memories.get_memories_by_user_id(user.id)
     if not memories:
         raise HTTPException(status_code=404, detail="No memories found for user")
 
@@ -161,8 +167,15 @@ async def query_memory(
 async def reset_memory_from_vector_db(
     request: Request,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
+    """Reset user's memory vector embeddings.
+
+    CRITICAL: We intentionally do NOT use Depends(get_session) here.
+    This endpoint generates embeddings for ALL user memories in parallel using
+    asyncio.gather(). A user with 100 memories would trigger 100 embedding API
+    calls simultaneously. With a session held, this could block a connection
+    for MINUTES, completely exhausting the connection pool.
+    """
     if not request.app.state.config.ENABLE_MEMORIES:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -179,7 +192,7 @@ async def reset_memory_from_vector_db(
 
     VECTOR_DB_CLIENT.delete_collection(f"user-memory-{user.id}")
 
-    memories = Memories.get_memories_by_user_id(user.id, db=db)
+    memories = Memories.get_memories_by_user_id(user.id)
 
     # Generate vectors in parallel
     ensure_retrieval_runtime(request.app)
@@ -257,8 +270,11 @@ async def update_memory_by_id(
     request: Request,
     form_data: MemoryUpdateModel,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
+    # NOTE: We intentionally do NOT use Depends(get_session) here.
+    # Database operations (update_memory_by_id_and_user_id) manage their own
+    # short-lived sessions. This prevents holding a connection during
+    # EMBEDDING_FUNCTION() which makes external API calls (1-5+ seconds).
     if not request.app.state.config.ENABLE_MEMORIES:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -274,7 +290,7 @@ async def update_memory_by_id(
         )
 
     memory = Memories.update_memory_by_id_and_user_id(
-        memory_id, user.id, form_data.content, db=db
+        memory_id, user.id, form_data.content
     )
     if memory is None:
         raise HTTPException(status_code=404, detail="Memory not found")

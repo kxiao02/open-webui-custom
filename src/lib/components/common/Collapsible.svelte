@@ -406,7 +406,6 @@
 					<div class="">
 						{attributes.name}
 					</div>
-				</div>
 
 				{#each embeds as embed, idx}
 					<div class="my-2" id={`${collapsibleId}-tool-calls-${attributes?.id}-embed-${idx}`}>
@@ -610,59 +609,59 @@
 				{/each}
 			{/if}
 		{/if}
-	{:else}
-		{#if title !== null}
-			<!-- svelte-ignore a11y-no-static-element-interactions -->
-			<!-- svelte-ignore a11y-click-events-have-key-events -->
+	{:else if title !== null}
+		<!-- svelte-ignore a11y-no-static-element-interactions -->
+		<!-- svelte-ignore a11y-click-events-have-key-events -->
+		<div
+			class="{buttonClassName} {disabled ? '' : 'cursor-pointer'}"
+			on:pointerup={() => {
+				if (!disabled) {
+					open = !open;
+				}
+			}}
+		>
 			<div
-				class="{buttonClassName} cursor-pointer"
-				on:pointerup={() => {
-					if (!disabled) {
-						open = !open;
-					}
-				}}
-			>
-				<div
-					class=" w-full font-medium flex items-center justify-between gap-2 {attributes?.done &&
-					attributes?.done !== 'true'
-						? 'shimmer'
-						: ''}
+				class=" w-full flex items-center justify-between gap-2 {attributes?.done &&
+				attributes?.done !== 'true'
+					? 'shimmer'
+					: ''}
 			"
-				>
-					{#if attributes?.done && attributes?.done !== 'true'}
-						<div>
-							<Spinner className="size-4" />
-						</div>
-					{/if}
+			>
+				{#if attributes?.done && attributes?.done !== 'true'}
+					<div>
+						<Spinner className="size-4" />
+					</div>
+				{/if}
 
-					<div class="">
-						{#if attributes?.type === 'reasoning'}
-							{#if attributes?.done === 'true' && attributes?.duration}
-								{#if attributes.duration < 1}
-									{$i18n.t('Thought for less than a second')}
-								{:else if attributes.duration < 60}
-									{$i18n.t('Thought for {{DURATION}} seconds', {
-										DURATION: attributes.duration
-									})}
-								{:else}
-									{$i18n.t('Thought for {{DURATION}}', {
-										DURATION: dayjs.duration(attributes.duration, 'seconds').humanize()
-									})}
-								{/if}
+				<div class="">
+					{#if attributes?.type === 'reasoning'}
+						{#if attributes?.done === 'true' && attributes?.duration}
+							{#if attributes.duration < 1}
+								{$i18n.t('Thought for less than a second')}
+							{:else if attributes.duration < 60}
+								{$i18n.t('Thought for {{DURATION}} seconds', {
+									DURATION: attributes.duration
+								})}
 							{:else}
-								{$i18n.t('Thinking...')}
-							{/if}
-						{:else if attributes?.type === 'code_interpreter'}
-							{#if attributes?.done === 'true'}
-								{$i18n.t('Analyzed')}
-							{:else}
-								{$i18n.t('Analyzing...')}
+								{$i18n.t('Thought for {{DURATION}}', {
+									DURATION: dayjs.duration(attributes.duration, 'seconds').humanize()
+								})}
 							{/if}
 						{:else}
-							{title}
+							{$i18n.t('Thinking...')}
 						{/if}
-					</div>
+					{:else if attributes?.type === 'code_interpreter'}
+						{#if attributes?.done === 'true'}
+							{$i18n.t('Analyzed')}
+						{:else}
+							{$i18n.t('Analyzing...')}
+						{/if}
+					{:else}
+						{title}
+					{/if}
+				</div>
 
+				{#if !disabled}
 					<div class="flex self-center translate-y-[1px]">
 						{#if open}
 							<ChevronUp strokeWidth="3.5" className="size-3.5" />
@@ -670,59 +669,59 @@
 							<ChevronDown strokeWidth="3.5" className="size-3.5" />
 						{/if}
 					</div>
-				</div>
+				{/if}
 			</div>
-		{:else}
-			<!-- svelte-ignore a11y-no-static-element-interactions -->
-			<!-- svelte-ignore a11y-click-events-have-key-events -->
-			<div
-				class="{buttonClassName} cursor-pointer"
-				on:click={(e) => {
-					e.stopPropagation();
-				}}
-				on:pointerup={(e) => {
-					if (!disabled) {
-						open = !open;
-					}
-				}}
-			>
-				<div>
-					<div class="flex items-start justify-between">
-						<slot />
+		</div>
+	{:else}
+		<!-- svelte-ignore a11y-no-static-element-interactions -->
+		<!-- svelte-ignore a11y-click-events-have-key-events -->
+		<div
+			class="{buttonClassName} cursor-pointer"
+			on:click={(e) => {
+				e.stopPropagation();
+			}}
+			on:pointerup={(e) => {
+				if (!disabled) {
+					open = !open;
+				}
+			}}
+		>
+			<div>
+				<div class="flex items-start justify-between">
+					<slot />
 
-						{#if chevron}
-							<div class="flex self-start translate-y-1">
-								{#if open}
-									<ChevronUp strokeWidth="3.5" className="size-3.5" />
-								{:else}
-									<ChevronDown strokeWidth="3.5" className="size-3.5" />
-								{/if}
-							</div>
-						{/if}
-					</div>
-
-					{#if grow}
-						{#if open && !hide}
-							<div
-								transition:slide={{ duration: 300, easing: quintOut, axis: 'y' }}
-								on:pointerup={(e) => {
-									e.stopPropagation();
-								}}
-							>
-								<slot name="content" />
-							</div>
-						{/if}
+					{#if chevron}
+						<div class="flex self-start translate-y-1">
+							{#if open}
+								<ChevronUp strokeWidth="3.5" className="size-3.5" />
+							{:else}
+								<ChevronDown strokeWidth="3.5" className="size-3.5" />
+							{/if}
+						</div>
 					{/if}
 				</div>
-			</div>
-		{/if}
 
-		{#if !grow}
-			{#if open && !hide}
-				<div transition:slide={{ duration: 300, easing: quintOut, axis: 'y' }}>
-					<slot name="content" />
-				</div>
-			{/if}
+				{#if grow}
+					{#if open && !hide}
+						<div
+							transition:slide={{ duration: 300, easing: quintOut, axis: 'y' }}
+							on:pointerup={(e) => {
+								e.stopPropagation();
+							}}
+						>
+							<slot name="content" />
+						</div>
+					{/if}
+				{/if}
+			</div>
+		</div>
+	{/if}
+
+	{#if !grow}
+		{#if open && !hide}
+			<div transition:slide={{ duration: 300, easing: quintOut, axis: 'y' }}>
+				<slot name="content" />
+			</div>
 		{/if}
 	{/if}
 </div>

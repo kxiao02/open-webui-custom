@@ -52,7 +52,6 @@ except ImportError:
     BlobServiceClient = None
     ResourceNotFoundError = Exception
 
-
 log = logging.getLogger(__name__)
 
 

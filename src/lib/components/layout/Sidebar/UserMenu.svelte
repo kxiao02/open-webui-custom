@@ -38,7 +38,8 @@
 	export let profile = false;
 	export let help = false;
 
-export let className = 'max-w-[240px]';
+	export let className = 'max-w-[240px]';
+	export let align = 'end';
 
 export let showActiveUsers = true;
 
@@ -91,7 +92,7 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 			class="w-full {className}  rounded-2xl px-1 py-1  border border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg text-sm"
 			sideOffset={4}
 			side="top"
-			align="end"
+			{align}
 			transition={(e) => fade(e, { duration: 100 })}
 		>
 			{#if profile}
@@ -113,9 +114,6 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 							{#if $user?.is_active ?? true}
 								<div>
 									<span class="relative flex size-2">
-										<span
-											class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"
-										/>
 										<span class="relative inline-flex rounded-full size-2 bg-green-500" />
 									</span>
 								</div>
@@ -207,7 +205,7 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 			{/if}
 
 			<DropdownMenu.Item
-				class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer"
+				class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer select-none"
 				on:click={async () => {
 					show = false;
 
@@ -226,7 +224,7 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 			</DropdownMenu.Item>
 
 			<DropdownMenu.Item
-				class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer"
+				class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer select-none"
 				on:click={async () => {
 					show = false;
 
@@ -249,7 +247,8 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 				<DropdownMenu.Item
 					as="a"
 					href="/playground"
-					class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition select-none"
+					draggable="false"
+					class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer select-none"
 					on:click={async () => {
 						show = false;
 						if ($mobile) {
@@ -266,7 +265,8 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 				<DropdownMenu.Item
 					as="a"
 					href="/admin"
-					class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition select-none"
+					draggable="false"
+					class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer select-none"
 					on:click={async () => {
 						show = false;
 						if ($mobile) {
@@ -290,36 +290,42 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 				{#if isAdmin}
 					<DropdownMenu.Item
 						as="a"
+						href="https://docs.openwebui.com"
 						target="_blank"
-						class="flex gap-3 items-center py-1.5 px-3 text-sm select-none w-full cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl transition"
+						draggable="false"
+						class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer select-none"
 						id="chat-share-button"
 						on:click={() => {
 							show = false;
 						}}
-						href="https://docs.openwebui.com"
 					>
-						<QuestionMarkCircle className="size-5" />
-						<div class="flex items-center">{$i18n.t('Documentation')}</div>
+						<div class=" self-center mr-3">
+							<QuestionMarkCircle className="size-5" />
+						</div>
+						<div class=" self-center truncate">{$i18n.t('Documentation')}</div>
 					</DropdownMenu.Item>
 
 					<!-- Releases -->
 					<DropdownMenu.Item
 						as="a"
+						href="https://github.com/open-webui/open-webui/releases"
 						target="_blank"
-						class="flex gap-3 items-center py-1.5 px-3 text-sm select-none w-full cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl transition"
+						draggable="false"
+						class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer select-none"
 						id="chat-share-button"
 						on:click={() => {
 							show = false;
 						}}
-						href="https://github.com/open-webui/open-webui/releases"
 					>
-						<Map className="size-5" />
-						<div class="flex items-center">{$i18n.t('Releases')}</div>
+						<div class=" self-center mr-3">
+							<Map className="size-5" />
+						</div>
+						<div class=" self-center truncate">{$i18n.t('Releases')}</div>
 					</DropdownMenu.Item>
 				{/if}
 
 				<DropdownMenu.Item
-					class="flex gap-3 items-center py-1.5 px-3 text-sm select-none w-full  hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl transition cursor-pointer"
+					class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer select-none"
 					id="chat-share-button"
 					on:click={async () => {
 						show = false;
@@ -331,15 +337,17 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 						}
 					}}
 				>
-					<Keyboard className="size-5" />
-					<div class="flex items-center">{$i18n.t('Keyboard shortcuts')}</div>
+					<div class=" self-center mr-3">
+						<Keyboard className="size-5" />
+					</div>
+					<div class=" self-center truncate">{$i18n.t('Keyboard shortcuts')}</div>
 				</DropdownMenu.Item>
 			{/if}
 
 			<hr class=" border-gray-50/30 dark:border-gray-800/30 my-1 p-0" />
 
 			<DropdownMenu.Item
-				class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition"
+				class="flex rounded-xl py-1.5 px-3 w-full hover:bg-gray-50 dark:hover:bg-gray-800 transition cursor-pointer select-none"
 				on:click={async () => {
 					const res = await userSignOut();
 					user.set(null);
@@ -374,9 +382,6 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 						>
 							<div class=" flex items-center">
 								<span class="relative flex size-2">
-									<span
-										class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"
-									/>
 									<span class="relative inline-flex rounded-full size-2 bg-green-500" />
 								</span>
 							</div>
