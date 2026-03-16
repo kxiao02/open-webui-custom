@@ -15,7 +15,10 @@ from typing import Optional
 from fastapi import Request
 
 from open_webui.models.users import UserModel
-from open_webui.routers.retrieval import search_web as _search_web
+from open_webui.routers.retrieval import (
+    ensure_retrieval_runtime,
+    search_web as _search_web,
+)
 from open_webui.retrieval.utils import get_content_from_url
 from open_webui.routers.images import (
     image_generations,
@@ -1450,6 +1453,7 @@ async def query_knowledge_files(
         user_role = __user__.get("role", "user")
         user_group_ids = [group.id for group in Groups.get_groups_by_member_id(user_id)]
 
+        ensure_retrieval_runtime(__request__.app)
         embedding_function = __request__.app.state.EMBEDDING_FUNCTION
         if not embedding_function:
             return json.dumps({"error": "Embedding function not configured"})
@@ -1594,6 +1598,7 @@ async def query_knowledge_bases(
 
         user_id = __user__.get("id")
         user_group_ids = [group.id for group in Groups.get_groups_by_member_id(user_id)]
+        ensure_retrieval_runtime(__request__.app)
         query_embedding = await __request__.app.state.EMBEDDING_FUNCTION(query)
 
         # Min-heap of (distance, knowledge_base_id) - only holds top `count` results

@@ -1,91 +1,100 @@
-from test.util.abstract_integration_test import AbstractPostgresTest
-from test.util.mock_user import mock_webui_user
+from open_webui.test_support import AbstractPostgresTest, mock_webui_user
+from open_webui.models.prompts import PromptForm
+from open_webui.routers import prompts
 
 
 class TestPrompts(AbstractPostgresTest):
     BASE_PATH = "/api/v1/prompts"
 
     def test_prompts(self):
-        # Get all prompts
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.get(self.create_url("/"))
-        assert response.status_code == 200
-        assert len(response.json()) == 0
+        create_request = self.make_request(self.create_url("/create"), method="POST")
 
-        # Create a two new prompts
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.post(
-                self.create_url("/create"),
-                json={
-                    "command": "/my-command",
-                    "title": "Hello World",
-                    "content": "description",
-                },
+        with mock_webui_user(id="2", role="admin") as user:
+            response = self.run_async(prompts.get_prompts(user=user, db=self.db))
+            assert response == []
+
+            created = self.run_async(
+                prompts.create_new_prompt(
+                    request=create_request,
+                    form_data=PromptForm(
+                        command="/my-command",
+                        title="Hello World",
+                        content="description",
+                    ),
+                    user=user,
+                    db=self.db,
+                )
             )
-        assert response.status_code == 200
-        with mock_webui_user(id="3"):
-            response = self.fast_api_client.post(
-                self.create_url("/create"),
-                json={
-                    "command": "/my-command2",
-                    "title": "Hello World 2",
-                    "content": "description 2",
-                },
+            assert created.command == "/my-command"
+            assert created.user_id == "2"
+
+            created = self.run_async(
+                prompts.create_new_prompt(
+                    request=create_request,
+                    form_data=PromptForm(
+                        command="/my-command2",
+                        title="Hello World 2",
+                        content="description 2",
+                    ),
+                    user=user,
+                    db=self.db,
+                )
             )
-        assert response.status_code == 200
+            assert created.command == "/my-command2"
 
-        # Get all prompts
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.get(self.create_url("/"))
-        assert response.status_code == 200
-        assert len(response.json()) == 2
+            response = self.run_async(prompts.get_prompts(user=user, db=self.db))
+            assert len(response) == 2
 
-        # Get prompt by command
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.get(self.create_url("/command/my-command"))
-        assert response.status_code == 200
-        data = response.json()
-        assert data["command"] == "/my-command"
-        assert data["title"] == "Hello World"
-        assert data["content"] == "description"
-        assert data["user_id"] == "2"
-
-        # Update prompt
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.post(
-                self.create_url("/command/my-command2/update"),
-                json={
-                    "command": "irrelevant for request",
-                    "title": "Hello World Updated",
-                    "content": "description Updated",
-                },
+            fetched = self.run_async(
+                prompts.get_prompt_by_command(
+                    command="my-command",
+                    user=user,
+                    db=self.db,
+                )
             )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["command"] == "/my-command2"
-        assert data["title"] == "Hello World Updated"
-        assert data["content"] == "description Updated"
-        assert data["user_id"] == "3"
+            assert fetched.command == "/my-command"
+            assert fetched.title == "Hello World"
+            assert fetched.content == "description"
+            assert fetched.user_id == "2"
+            assert fetched.write_access is True
 
-        # Get prompt by command
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.get(self.create_url("/command/my-command2"))
-        assert response.status_code == 200
-        data = response.json()
-        assert data["command"] == "/my-command2"
-        assert data["title"] == "Hello World Updated"
-        assert data["content"] == "description Updated"
-        assert data["user_id"] == "3"
-
-        # Delete prompt
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.delete(
-                self.create_url("/command/my-command/delete")
+            updated = self.run_async(
+                prompts.update_prompt_by_command(
+                    command="my-command2",
+                    form_data=PromptForm(
+                        command="irrelevant for request",
+                        title="Hello World Updated",
+                        content="description Updated",
+                    ),
+                    user=user,
+                    db=self.db,
+                )
             )
-        assert response.status_code == 200
+            assert updated.command == "/my-command2"
+            assert updated.title == "Hello World Updated"
+            assert updated.content == "description Updated"
+            assert updated.user_id == "2"
 
-        # Get all prompts
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.get(self.create_url("/"))
-        assert response.status_code == 200
-        assert len(response.json()) == 1
+            fetched = self.run_async(
+                prompts.get_prompt_by_command(
+                    command="my-command2",
+                    user=user,
+                    db=self.db,
+                )
+            )
+            assert fetched.command == "/my-command2"
+            assert fetched.title == "Hello World Updated"
+            assert fetched.content == "description Updated"
+
+            deleted = self.run_async(
+                prompts.delete_prompt_by_command(
+                    command="my-command",
+                    user=user,
+                    db=self.db,
+                )
+            )
+            assert deleted is True
+
+            response = self.run_async(prompts.get_prompts(user=user, db=self.db))
+            assert len(response) == 1
+            assert response[0].command == "/my-command2"

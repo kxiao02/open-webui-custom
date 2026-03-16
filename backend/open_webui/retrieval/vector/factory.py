@@ -15,6 +15,10 @@ class Vector:
         get vector db instance by vector type
         """
         match vector_type:
+            case VectorType.NOOP:
+                from open_webui.retrieval.vector.dbs.noop import NoopVectorClient
+
+                return NoopVectorClient()
             case VectorType.MILVUS:
                 if ENABLE_MILVUS_MULTITENANCY_MODE:
                     from open_webui.retrieval.vector.dbs.milvus_multitenancy import (

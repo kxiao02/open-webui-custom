@@ -23,6 +23,7 @@ from open_webui.routers.retrieval import (
     ProcessFileForm,
     process_files_batch,
     BatchProcessFilesForm,
+    ensure_retrieval_runtime,
 )
 from open_webui.storage.provider import Storage
 
@@ -67,6 +68,7 @@ async def embed_knowledge_base_metadata(
     """Generate and store embedding for knowledge base."""
     try:
         content = f"{name}\n\n{description}" if description else name
+        ensure_retrieval_runtime(request.app)
         embedding = await request.app.state.EMBEDDING_FUNCTION(content)
         VECTOR_DB_CLIENT.upsert(
             collection_name=KNOWLEDGE_BASES_COLLECTION,

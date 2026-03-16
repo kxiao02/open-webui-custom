@@ -797,6 +797,15 @@ def get_embedding_function(
     enable_async=True,
 ) -> Awaitable:
     if embedding_engine == "":
+        if embedding_function is None:
+            async def missing_embedding_function(query, prefix=None, user=None):
+                raise RuntimeError(
+                    "Local sentence-transformers embeddings are unavailable. "
+                    "Install sentence-transformers or configure an external embedding engine."
+                )
+
+            return missing_embedding_function
+
         # Sentence transformers: CPU-bound sync operation
         async def async_embedding_function(query, prefix=None, user=None):
             return await asyncio.to_thread(

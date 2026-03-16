@@ -43,6 +43,7 @@ from open_webui.routers.tasks import (
 from open_webui.routers.retrieval import (
     process_web_search,
     SearchForm,
+    ensure_retrieval_runtime,
 )
 from open_webui.utils.tools import get_builtin_tools
 from open_webui.routers.images import (
@@ -1492,6 +1493,7 @@ async def chat_completion_files_handler(
             queries = [get_last_user_message(body["messages"])]
 
         try:
+            ensure_retrieval_runtime(request.app)
             # Directly await async get_sources_from_items (no thread needed - fully async now)
             sources = await get_sources_from_items(
                 request=request,

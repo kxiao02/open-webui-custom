@@ -76,8 +76,13 @@ from typing import Optional, List
 
 from ssl import CERT_NONE, CERT_REQUIRED, PROTOCOL_TLS
 
-from ldap3 import Server, Connection, NONE, Tls
-from ldap3.utils.conv import escape_filter_chars
+try:
+    from ldap3 import Server, Connection, NONE, Tls
+    from ldap3.utils.conv import escape_filter_chars
+except ImportError:
+    Server = Connection = Tls = None
+    NONE = None
+    escape_filter_chars = None
 
 router = APIRouter()
 
@@ -261,6 +266,12 @@ async def ldap_auth(
     # Security checks FIRST - before loading any config
     if not request.app.state.config.ENABLE_LDAP:
         raise HTTPException(400, detail="LDAP authentication is not enabled")
+
+    if Server is None or Connection is None or Tls is None or escape_filter_chars is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ldap3 is required when LDAP authentication is enabled",
+        )
 
     if not ENABLE_PASSWORD_AUTH:
         raise HTTPException(

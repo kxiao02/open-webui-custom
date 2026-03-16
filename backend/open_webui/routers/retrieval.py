@@ -134,9 +134,9 @@ def get_ef(
 ):
     ef = None
     if embedding_model and engine == "":
-        from sentence_transformers import SentenceTransformer
-
         try:
+            from sentence_transformers import SentenceTransformer
+
             ef = SentenceTransformer(
                 get_model_path(embedding_model, auto_update),
                 device=DEVICE_TYPE,
@@ -191,10 +191,10 @@ def get_rf(
                     log.error(f"ExternalReranking: {e}")
                     raise Exception(ERROR_MESSAGES.DEFAULT(e))
             else:
-                import sentence_transformers
-                import torch
-
                 try:
+                    import sentence_transformers
+                    import torch
+
                     rf = sentence_transformers.CrossEncoder(
                         get_model_path(reranking_model, auto_update),
                         device=DEVICE_TYPE,
@@ -232,6 +232,103 @@ def get_rf(
                     log.warning(f"Failed to adjust pad_token_id on CrossEncoder: {e2}")
 
     return rf
+
+
+def _get_retrieval_runtime_signature(app) -> tuple:
+    return (
+        app.state.config.RAG_EMBEDDING_ENGINE,
+        app.state.config.RAG_EMBEDDING_MODEL,
+        app.state.config.RAG_OPENAI_API_BASE_URL,
+        app.state.config.RAG_OPENAI_API_KEY,
+        app.state.config.RAG_OLLAMA_BASE_URL,
+        app.state.config.RAG_OLLAMA_API_KEY,
+        app.state.config.RAG_AZURE_OPENAI_BASE_URL,
+        app.state.config.RAG_AZURE_OPENAI_API_KEY,
+        app.state.config.RAG_AZURE_OPENAI_API_VERSION,
+        app.state.config.RAG_EMBEDDING_BATCH_SIZE,
+        app.state.config.ENABLE_ASYNC_EMBEDDING,
+        app.state.config.ENABLE_RAG_HYBRID_SEARCH,
+        app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL,
+        app.state.config.RAG_RERANKING_ENGINE,
+        app.state.config.RAG_RERANKING_MODEL,
+        app.state.config.RAG_EXTERNAL_RERANKER_URL,
+        app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
+        app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
+    )
+
+
+def initialize_retrieval_runtime(app, force: bool = False):
+    signature = _get_retrieval_runtime_signature(app)
+
+    if (
+        not force
+        and getattr(app.state, "_retrieval_runtime_signature", None) == signature
+        and app.state.EMBEDDING_FUNCTION is not None
+    ):
+        return
+
+    app.state.ef = None
+    app.state.rf = None
+
+    try:
+        app.state.ef = get_ef(
+            app.state.config.RAG_EMBEDDING_ENGINE,
+            app.state.config.RAG_EMBEDDING_MODEL,
+        )
+        if (
+            app.state.config.ENABLE_RAG_HYBRID_SEARCH
+            and not app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
+        ):
+            app.state.rf = get_rf(
+                app.state.config.RAG_RERANKING_ENGINE,
+                app.state.config.RAG_RERANKING_MODEL,
+                app.state.config.RAG_EXTERNAL_RERANKER_URL,
+                app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
+                app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
+            )
+    except Exception as e:
+        log.error(f"Error updating retrieval runtime: {e}")
+
+    app.state.EMBEDDING_FUNCTION = get_embedding_function(
+        app.state.config.RAG_EMBEDDING_ENGINE,
+        app.state.config.RAG_EMBEDDING_MODEL,
+        app.state.ef,
+        (
+            app.state.config.RAG_OPENAI_API_BASE_URL
+            if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else (
+                app.state.config.RAG_OLLAMA_BASE_URL
+                if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
+                else app.state.config.RAG_AZURE_OPENAI_BASE_URL
+            )
+        ),
+        (
+            app.state.config.RAG_OPENAI_API_KEY
+            if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else (
+                app.state.config.RAG_OLLAMA_API_KEY
+                if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
+                else app.state.config.RAG_AZURE_OPENAI_API_KEY
+            )
+        ),
+        app.state.config.RAG_EMBEDDING_BATCH_SIZE,
+        azure_api_version=(
+            app.state.config.RAG_AZURE_OPENAI_API_VERSION
+            if app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
+            else None
+        ),
+        enable_async=app.state.config.ENABLE_ASYNC_EMBEDDING,
+    )
+    app.state.RERANKING_FUNCTION = get_reranking_function(
+        app.state.config.RAG_RERANKING_ENGINE,
+        app.state.config.RAG_RERANKING_MODEL,
+        app.state.rf,
+    )
+    app.state._retrieval_runtime_signature = signature
+
+
+def ensure_retrieval_runtime(app):
+    initialize_retrieval_runtime(app)
 
 
 ##########################################
@@ -323,9 +420,8 @@ class EmbeddingModelUpdateForm(BaseModel):
 
 def unload_embedding_model(request: Request):
     if request.app.state.config.RAG_EMBEDDING_ENGINE == "":
-        # unloads current internal embedding model and clears VRAM cache
+        # Unload the currently cached internal embedding model.
         request.app.state.ef = None
-        request.app.state.EMBEDDING_FUNCTION = None
         import gc
 
         gc.collect()
@@ -334,6 +430,9 @@ def unload_embedding_model(request: Request):
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    request.app.state.EMBEDDING_FUNCTION = None
+    request.app.state._retrieval_runtime_signature = None
 
 
 @router.post("/embedding/update")
@@ -386,41 +485,7 @@ async def update_embedding_config(
                     form_data.azure_openai_config.version
                 )
 
-        request.app.state.ef = get_ef(
-            request.app.state.config.RAG_EMBEDDING_ENGINE,
-            request.app.state.config.RAG_EMBEDDING_MODEL,
-        )
-
-        request.app.state.EMBEDDING_FUNCTION = get_embedding_function(
-            request.app.state.config.RAG_EMBEDDING_ENGINE,
-            request.app.state.config.RAG_EMBEDDING_MODEL,
-            request.app.state.ef,
-            (
-                request.app.state.config.RAG_OPENAI_API_BASE_URL
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else (
-                    request.app.state.config.RAG_OLLAMA_BASE_URL
-                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-                    else request.app.state.config.RAG_AZURE_OPENAI_BASE_URL
-                )
-            ),
-            (
-                request.app.state.config.RAG_OPENAI_API_KEY
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else (
-                    request.app.state.config.RAG_OLLAMA_API_KEY
-                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-                    else request.app.state.config.RAG_AZURE_OPENAI_API_KEY
-                )
-            ),
-            request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
-            azure_api_version=(
-                request.app.state.config.RAG_AZURE_OPENAI_API_VERSION
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
-                else None
-            ),
-            enable_async=request.app.state.config.ENABLE_ASYNC_EMBEDDING,
-        )
+        initialize_retrieval_runtime(request.app, force=True)
 
         return {
             "status": True,
@@ -938,6 +1003,7 @@ async def update_rag_config(
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+    request.app.state._retrieval_runtime_signature = None
     request.app.state.config.RAG_RERANKING_ENGINE = (
         form_data.RAG_RERANKING_ENGINE
         if form_data.RAG_RERANKING_ENGINE is not None
@@ -977,19 +1043,7 @@ async def update_rag_config(
                 request.app.state.config.ENABLE_RAG_HYBRID_SEARCH
                 and not request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
             ):
-                request.app.state.rf = get_rf(
-                    request.app.state.config.RAG_RERANKING_ENGINE,
-                    request.app.state.config.RAG_RERANKING_MODEL,
-                    request.app.state.config.RAG_EXTERNAL_RERANKER_URL,
-                    request.app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
-                    request.app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
-                )
-
-                request.app.state.RERANKING_FUNCTION = get_reranking_function(
-                    request.app.state.config.RAG_RERANKING_ENGINE,
-                    request.app.state.config.RAG_RERANKING_MODEL,
-                    request.app.state.rf,
-                )
+                initialize_retrieval_runtime(request.app, force=True)
         except Exception as e:
             log.error(f"Error loading reranking model: {e}")
             request.app.state.config.ENABLE_RAG_HYBRID_SEARCH = False
@@ -1494,6 +1548,7 @@ def save_docs_to_vector_db(
     ]
 
     try:
+        ensure_retrieval_runtime(request.app)
         if VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
             log.info(f"collection {collection_name} already exists")
 
@@ -1507,36 +1562,7 @@ def save_docs_to_vector_db(
                 return True
 
         log.info(f"generating embeddings for {collection_name}")
-        embedding_function = get_embedding_function(
-            request.app.state.config.RAG_EMBEDDING_ENGINE,
-            request.app.state.config.RAG_EMBEDDING_MODEL,
-            request.app.state.ef,
-            (
-                request.app.state.config.RAG_OPENAI_API_BASE_URL
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else (
-                    request.app.state.config.RAG_OLLAMA_BASE_URL
-                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-                    else request.app.state.config.RAG_AZURE_OPENAI_BASE_URL
-                )
-            ),
-            (
-                request.app.state.config.RAG_OPENAI_API_KEY
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else (
-                    request.app.state.config.RAG_OLLAMA_API_KEY
-                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-                    else request.app.state.config.RAG_AZURE_OPENAI_API_KEY
-                )
-            ),
-            request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
-            azure_api_version=(
-                request.app.state.config.RAG_AZURE_OPENAI_API_VERSION
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
-                else None
-            ),
-            enable_async=request.app.state.config.ENABLE_ASYNC_EMBEDDING,
-        )
+        embedding_function = request.app.state.EMBEDDING_FUNCTION
 
         # Run async embedding in sync context
         embeddings = asyncio.run(
@@ -2396,6 +2422,7 @@ async def query_doc_handler(
     user=Depends(get_verified_user),
 ):
     try:
+        ensure_retrieval_runtime(request.app)
         if request.app.state.config.ENABLE_RAG_HYBRID_SEARCH and (
             form_data.hybrid is None or form_data.hybrid
         ):
@@ -2470,6 +2497,7 @@ async def query_collection_handler(
     user=Depends(get_verified_user),
 ):
     try:
+        ensure_retrieval_runtime(request.app)
         if request.app.state.config.ENABLE_RAG_HYBRID_SEARCH and (
             form_data.hybrid is None or form_data.hybrid
         ):
@@ -2598,6 +2626,7 @@ if ENV == "dev":
 
     @router.get("/ef/{text}")
     async def get_embeddings(request: Request, text: Optional[str] = "Hello World!"):
+        ensure_retrieval_runtime(request.app)
         return {
             "result": await request.app.state.EMBEDDING_FUNCTION(
                 text, prefix=RAG_EMBEDDING_QUERY_PREFIX

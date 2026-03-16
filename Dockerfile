@@ -192,6 +192,7 @@ RUN if [ -n "$APT_MIRROR" ] || [ -n "$APT_SECURITY_MIRROR" ]; then \
 
 # install python dependencies
 COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
+COPY --chown=$UID:$GID ./backend/requirements-min.txt ./requirements-min.txt
 
 RUN pip3 install --no-cache-dir uv && \
     if [ "$USE_CUDA" = "true" ]; then \
@@ -214,29 +215,33 @@ RUN pip3 install --no-cache-dir uv && \
     python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])"; \
     fi; \
     fi; \
+    pip3 install --no-cache-dir -r requirements-min.txt && \
     mkdir -p /app/backend/data && chown -R $UID:$GID /app/backend/data/ && \
     rm -rf /var/lib/apt/lists/*;
 
-# Guard against transient/cached partial installs: ensure core backend deps exist.
+# Fail the build if the runtime image still lacks core backend packages.
 RUN python3 - <<'PY'
 import importlib.util
-import subprocess
-import sys
 
-if importlib.util.find_spec("uvicorn") is None:
-    print("uvicorn missing after dependency layer; installing minimal runtime package...")
-    subprocess.check_call(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-cache-dir",
-            "uvicorn[standard]==0.40.0",
-        ]
+required_modules = {
+    "fastapi": "fastapi",
+    "pydantic": "pydantic",
+    "uvicorn": "uvicorn",
+    "typer": "typer",
+}
+missing = sorted(
+    package_name
+    for module_name, package_name in required_modules.items()
+    if importlib.util.find_spec(module_name) is None
+)
+
+if missing:
+    raise RuntimeError(
+        "Missing core runtime packages after dependency install: "
+        + ", ".join(missing)
     )
-else:
-    print("Dependency check OK: uvicorn present.")
+
+print("Dependency check OK: core runtime packages present.")
 PY
 
 # Preload NLTK resources required by unstructured Excel/document loaders.

@@ -4,7 +4,10 @@ import ftfy
 import sys
 import json
 
-from azure.identity import DefaultAzureCredential
+try:
+    from azure.identity import DefaultAzureCredential
+except ModuleNotFoundError:
+    DefaultAzureCredential = None
 from langchain_community.document_loaders import (
     AzureAIDocumentIntelligenceLoader,
     BSHTMLLoader,
@@ -323,6 +326,8 @@ class Loader:
                     api_model=self.kwargs.get("DOCUMENT_INTELLIGENCE_MODEL"),
                 )
             else:
+                if DefaultAzureCredential is None:
+                    raise RuntimeError("azure-identity is required for Azure Document Intelligence")
                 loader = AzureAIDocumentIntelligenceLoader(
                     file_path=file_path,
                     api_endpoint=self.kwargs.get("DOCUMENT_INTELLIGENCE_ENDPOINT"),

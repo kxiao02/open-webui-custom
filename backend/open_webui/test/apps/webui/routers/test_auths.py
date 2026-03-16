@@ -1,200 +1,179 @@
-from test.util.abstract_integration_test import AbstractPostgresTest
-from test.util.mock_user import mock_webui_user
+import pytest
+from fastapi import HTTPException
+
+from open_webui.test_support import AbstractPostgresTest
+from open_webui.models.auths import (
+    AddUserForm,
+    Auths,
+    SigninForm,
+    SignupForm,
+    UpdatePasswordForm,
+)
+from open_webui.models.users import UpdateProfileForm, Users
+from open_webui.routers import auths
+from open_webui.utils.auth import (
+    get_current_user,
+    get_http_authorization_cred,
+    get_password_hash,
+    verify_password,
+)
 
 
 class TestAuths(AbstractPostgresTest):
     BASE_PATH = "/api/v1/auths"
 
-    def setup_class(cls):
-        super().setup_class()
-        from open_webui.models.auths import Auths
-        from open_webui.models.users import Users
+    def test_signup_signin_and_session_user(self):
+        signup_request = self.make_request(self.create_url("/signup"), method="POST")
+        signup_response = self.make_response()
 
-        cls.users = Users
-        cls.auths = Auths
-
-    def test_get_session_user(self):
-        with mock_webui_user():
-            response = self.fast_api_client.get(self.create_url(""))
-        assert response.status_code == 200
-        assert response.json() == {
-            "id": "1",
-            "name": "John Doe",
-            "email": "john.doe@openwebui.com",
-            "role": "user",
-            "profile_image_url": "/user.png",
-        }
-
-    def test_update_profile(self):
-        from open_webui.utils.auth import get_password_hash
-
-        user = self.auths.insert_new_auth(
-            email="john.doe@openwebui.com",
-            password=get_password_hash("old_password"),
-            name="John Doe",
-            profile_image_url="/user.png",
-            role="user",
-        )
-
-        with mock_webui_user(id=user.id):
-            response = self.fast_api_client.post(
-                self.create_url("/update/profile"),
-                json={"name": "John Doe 2", "profile_image_url": "/user2.png"},
+        signed_up = self.run_async(
+            auths.signup(
+                request=signup_request,
+                response=signup_response,
+                form_data=SignupForm(
+                    name="Admin User",
+                    email="admin@example.com",
+                    password="StrongPass123!",
+                ),
+                db=self.db,
             )
-        assert response.status_code == 200
-        db_user = self.users.get_user_by_id(user.id)
-        assert db_user.name == "John Doe 2"
-        assert db_user.profile_image_url == "/user2.png"
-
-    def test_update_password(self):
-        from open_webui.utils.auth import get_password_hash
-
-        user = self.auths.insert_new_auth(
-            email="john.doe@openwebui.com",
-            password=get_password_hash("old_password"),
-            name="John Doe",
-            profile_image_url="/user.png",
-            role="user",
         )
+        assert signed_up["email"] == "admin@example.com"
+        assert signed_up["role"] == "admin"
+        assert signup_request.app.state.config.ENABLE_SIGNUP is False
 
-        with mock_webui_user(id=user.id):
-            response = self.fast_api_client.post(
-                self.create_url("/update/password"),
-                json={"password": "old_password", "new_password": "new_password"},
+        signin_request = self.make_request(self.create_url("/signin"), method="POST")
+        signin_response = self.make_response()
+        signed_in = self.run_async(
+            auths.signin(
+                request=signin_request,
+                response=signin_response,
+                form_data=SigninForm(
+                    email="admin@example.com",
+                    password="StrongPass123!",
+                ),
+                db=self.db,
             )
-        assert response.status_code == 200
-
-        old_auth = self.auths.authenticate_user(
-            "john.doe@openwebui.com", "old_password"
         )
-        assert old_auth is None
-        new_auth = self.auths.authenticate_user(
-            "john.doe@openwebui.com", "new_password"
-        )
-        assert new_auth is not None
+        assert signed_in["id"] == signed_up["id"]
+        assert signed_in["token"]
 
-    def test_signin(self):
-        from open_webui.utils.auth import get_password_hash
-
-        user = self.auths.insert_new_auth(
-            email="john.doe@openwebui.com",
-            password=get_password_hash("password"),
-            name="John Doe",
-            profile_image_url="/user.png",
-            role="user",
+        token = signed_in["token"]
+        session_request = self.make_request(
+            self.create_url("/"),
+            headers={"Authorization": f"Bearer {token}"},
         )
-        response = self.fast_api_client.post(
-            self.create_url("/signin"),
-            json={"email": "john.doe@openwebui.com", "password": "password"},
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["id"] == user.id
-        assert data["name"] == "John Doe"
-        assert data["email"] == "john.doe@openwebui.com"
-        assert data["role"] == "user"
-        assert data["profile_image_url"] == "/user.png"
-        assert data["token"] is not None and len(data["token"]) > 0
-        assert data["token_type"] == "Bearer"
-
-    def test_signup(self):
-        response = self.fast_api_client.post(
-            self.create_url("/signup"),
-            json={
-                "name": "John Doe",
-                "email": "john.doe@openwebui.com",
-                "password": "password",
-            },
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["id"] is not None and len(data["id"]) > 0
-        assert data["name"] == "John Doe"
-        assert data["email"] == "john.doe@openwebui.com"
-        assert data["role"] in ["admin", "user", "pending"]
-        assert data["profile_image_url"] == "/user.png"
-        assert data["token"] is not None and len(data["token"]) > 0
-        assert data["token_type"] == "Bearer"
-
-    def test_add_user(self):
-        with mock_webui_user():
-            response = self.fast_api_client.post(
-                self.create_url("/add"),
-                json={
-                    "name": "John Doe 2",
-                    "email": "john.doe2@openwebui.com",
-                    "password": "password2",
-                    "role": "admin",
-                },
+        auth_token = get_http_authorization_cred(f"Bearer {token}")
+        session_user = self.run_async(
+            get_current_user(
+                session_request,
+                self.make_response(),
+                self.make_background_tasks(),
+                auth_token=auth_token,
             )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["id"] is not None and len(data["id"]) > 0
-        assert data["name"] == "John Doe 2"
-        assert data["email"] == "john.doe2@openwebui.com"
-        assert data["role"] == "admin"
-        assert data["profile_image_url"] == "/user.png"
-        assert data["token"] is not None and len(data["token"]) > 0
-        assert data["token_type"] == "Bearer"
-
-    def test_get_admin_details(self):
-        self.auths.insert_new_auth(
-            email="john.doe@openwebui.com",
-            password="password",
-            name="John Doe",
-            profile_image_url="/user.png",
-            role="admin",
         )
-        with mock_webui_user():
-            response = self.fast_api_client.get(self.create_url("/admin/details"))
-
-        assert response.status_code == 200
-        assert response.json() == {
-            "name": "John Doe",
-            "email": "john.doe@openwebui.com",
-        }
-
-    def test_create_api_key_(self):
-        user = self.auths.insert_new_auth(
-            email="john.doe@openwebui.com",
-            password="password",
-            name="John Doe",
-            profile_image_url="/user.png",
-            role="admin",
+        session = self.run_async(
+            auths.get_session_user(
+                request=session_request,
+                response=self.make_response(),
+                user=session_user,
+                db=self.db,
+            )
         )
-        with mock_webui_user(id=user.id):
-            response = self.fast_api_client.post(self.create_url("/api_key"))
-        assert response.status_code == 200
-        data = response.json()
-        assert data["api_key"] is not None
-        assert len(data["api_key"]) > 0
+        assert session["email"] == "admin@example.com"
+        assert session["role"] == "admin"
+        assert session["permissions"]["features"]["api_keys"] is True
 
-    def test_delete_api_key(self):
-        user = self.auths.insert_new_auth(
-            email="john.doe@openwebui.com",
-            password="password",
-            name="John Doe",
-            profile_image_url="/user.png",
-            role="admin",
+    def test_profile_password_and_api_key_lifecycle(self):
+        user = Auths.insert_new_auth(
+            email="user@example.com",
+            password=get_password_hash("StrongPass123!"),
+            name="Example User",
+            role="user",
+            db=self.db,
         )
-        self.users.update_user_api_key_by_id(user.id, "abc")
-        with mock_webui_user(id=user.id):
-            response = self.fast_api_client.delete(self.create_url("/api_key"))
-        assert response.status_code == 200
-        assert response.json() == True
-        db_user = self.users.get_user_by_id(user.id)
-        assert db_user.api_key is None
 
-    def test_get_api_key(self):
-        user = self.auths.insert_new_auth(
-            email="john.doe@openwebui.com",
-            password="password",
-            name="John Doe",
-            profile_image_url="/user.png",
-            role="admin",
+        updated = self.run_async(
+            auths.update_profile(
+                form_data=UpdateProfileForm(
+                    name="Updated User",
+                    profile_image_url="/updated.png",
+                    bio="bio",
+                    gender="other",
+                ),
+                session_user=user,
+                db=self.db,
+            )
         )
-        self.users.update_user_api_key_by_id(user.id, "abc")
-        with mock_webui_user(id=user.id):
-            response = self.fast_api_client.get(self.create_url("/api_key"))
-        assert response.status_code == 200
-        assert response.json() == {"api_key": "abc"}
+        assert updated.name == "Updated User"
+        assert updated.profile_image_url == "/updated.png"
+
+        changed = self.run_async(
+            auths.update_password(
+                form_data=UpdatePasswordForm(
+                    password="StrongPass123!",
+                    new_password="NewStrongPass123!",
+                ),
+                session_user=Users.get_user_by_id(user.id, db=self.db),
+                db=self.db,
+            )
+        )
+        assert changed is True
+        authenticated = Auths.authenticate_user(
+            "user@example.com",
+            lambda pw: verify_password("NewStrongPass123!", pw),
+            db=self.db,
+        )
+        assert authenticated is not None
+
+        request = self.make_request(self.create_url("/api_key"), method="POST")
+        generated = self.run_async(
+            auths.generate_api_key(request=request, user=authenticated, db=self.db)
+        )
+        assert generated["api_key"].startswith("sk-")
+
+        fetched = self.run_async(auths.get_api_key(user=authenticated, db=self.db))
+        assert fetched == generated
+
+        deleted = self.run_async(auths.delete_api_key(user=authenticated, db=self.db))
+        assert deleted is True
+
+        with pytest.raises(HTTPException) as exc_info:
+            self.run_async(auths.get_api_key(user=authenticated, db=self.db))
+        assert exc_info.value.status_code == 404
+
+    def test_add_user_and_get_admin_details(self):
+        admin = Auths.insert_new_auth(
+            email="root@example.com",
+            password=get_password_hash("StrongPass123!"),
+            name="Root User",
+            role="admin",
+            db=self.db,
+        )
+
+        request = self.make_request(self.create_url("/add"), method="POST")
+        added = self.run_async(
+            auths.add_user(
+                request=request,
+                form_data=AddUserForm(
+                    name="Added User",
+                    email="added@example.com",
+                    password="StrongPass123!",
+                    role="user",
+                ),
+                user=admin,
+                db=self.db,
+            )
+        )
+        assert added["email"] == "added@example.com"
+        assert added["role"] == "user"
+        assert added["token"]
+
+        details = self.run_async(
+            auths.get_admin_details(
+                request=self.make_request(self.create_url("/admin/details")),
+                user=admin,
+                db=self.db,
+            )
+        )
+        assert details == {"name": "Root User", "email": "root@example.com"}
