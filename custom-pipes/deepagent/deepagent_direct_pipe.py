@@ -112,13 +112,14 @@ class Pipe:
             reasoning_parts = []
             tool_calls_seen = []
 
-            for text, reasoning, tool_info in self._iter_events(messages):
+            for text, reasoning, tool_infos in self._iter_events(messages):
                 if text:
                     collected_text = text
                 if reasoning:
                     reasoning_parts.append(reasoning)
-                if tool_info:
-                    tool_calls_seen.append(tool_info)
+                for ti in tool_infos:
+                    if ti not in tool_calls_seen:
+                        tool_calls_seen.append(ti)
 
             parts = []
             if self.valves.show_reasoning and reasoning_parts:
@@ -147,21 +148,23 @@ class Pipe:
         try:
             sent_reasoning = set()
             sent_tools = set()
-            sent_text = set()
+            last_text_len = 0
 
-            for text, reasoning, tool_info in self._iter_events(messages):
+            for text, reasoning, tool_infos in self._iter_events(messages):
                 if self.valves.show_reasoning and reasoning and reasoning not in sent_reasoning:
                     sent_reasoning.add(reasoning)
                     yield f"\n<details>\n<summary>🧠 Reasoning</summary>\n\n{reasoning}\n</details>\n\n"
 
-                if self.valves.show_tool_calls and tool_info and tool_info not in sent_tools:
-                    sent_tools.add(tool_info)
-                    name, args = tool_info
-                    yield f"\n> 🔧 **{name}**(`{args}`)\n\n"
+                if self.valves.show_tool_calls and tool_infos:
+                    for ti in tool_infos:
+                        if ti not in sent_tools:
+                            sent_tools.add(ti)
+                            name, args = ti
+                            yield f"\n> 🔧 **{name}**(`{args}`)\n\n"
 
-                if text and text not in sent_text:
-                    sent_text.add(text)
-                    yield text
+                if text and len(text) > last_text_len:
+                    yield text[last_text_len:]
+                    last_text_len = len(text)
         except httpx.ConnectError:
             yield "Error: Could not connect to the LangGraph agent. Please check that it is running."
         except httpx.TimeoutException:
@@ -174,9 +177,10 @@ class Pipe:
 
     def _iter_events(
         self, messages: list[dict]
-    ) -> Iterator[tuple[str, str | None, tuple | None]]:
+    ) -> Iterator[tuple[str, str | None, list[tuple]]]:
         """
-        Iterate over LangGraph SSE events, yielding (text, reasoning, tool_info).
+        Iterate over LangGraph SSE events, yielding (text, reasoning, tool_infos).
+        tool_infos is a list of (name, args) tuples (may be empty).
         """
         with httpx.Client(timeout=httpx.Timeout(self.valves.timeout, connect=10)) as client:
             assistant_id = self._find_assistant(client)
@@ -205,7 +209,7 @@ class Pipe:
                     except json.JSONDecodeError:
                         continue
 
-                    text, reasoning, tool_info = "", None, None
+                    text, reasoning, tool_infos = "", None, []
 
                     # Messages stream mode: [event_type, payload]
                     if isinstance(event, list) and len(event) == 2:
@@ -230,7 +234,7 @@ class Pipe:
                                     name = fn.get("name", "")
                                     args = fn.get("arguments", "")
                                     if name:
-                                        tool_info = (name, args)
+                                        tool_infos.append((name, args))
 
                     # Values stream mode: full state snapshot
                     elif isinstance(event, dict):
@@ -246,4 +250,4 @@ class Pipe:
                                     .get("reasoning_content")
                                 )
 
-                    yield text, reasoning, tool_info
+                    yield text, reasoning, tool_infos
