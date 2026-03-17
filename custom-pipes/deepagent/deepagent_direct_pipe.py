@@ -225,16 +225,19 @@ class Pipe:
                                     .get("additional_kwargs", {})
                                     .get("reasoning_content")
                                 )
-                                for tc in (
-                                    payload_data
-                                    .get("additional_kwargs", {})
-                                    .get("tool_calls", [])
-                                ):
-                                    fn = tc.get("function", {})
-                                    name = fn.get("name", "")
-                                    args = fn.get("arguments", "")
+                                # LangChain serializes tool_calls as a
+                                # top-level field on AIMessage, not inside
+                                # additional_kwargs.
+                                for tc in payload_data.get("tool_calls", []):
+                                    name = tc.get("name", "")
+                                    args = tc.get("args", {})
                                     if name:
-                                        tool_infos.append((name, args))
+                                        args_str = (
+                                            json.dumps(args)
+                                            if isinstance(args, dict)
+                                            else str(args)
+                                        )
+                                        tool_infos.append((name, args_str))
 
                     # Values stream mode: full state snapshot
                     elif isinstance(event, dict):
