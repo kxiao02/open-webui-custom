@@ -259,6 +259,30 @@ select {
 	scrollbar-width: none; /* Firefox */
 }
 
+/* CEEC primary action theme: remap legacy black primary buttons globally. */
+:is(button, a)[class~='bg-black'][class~='text-white'][class~='dark:bg-white'][class~='dark:text-black'],
+:is(button, a)[class~='bg-gray-900'][class~='text-gray-100'][class~='dark:bg-white'][class~='dark:text-black'],
+:is(button, a)[class~='bg-gray-900'][class~='text-gray-100'][class~='dark:bg-white'][class~='dark:text-gray-800'] {
+	background-image: linear-gradient(90deg, #ef5b6d 0%, #4a87ff 100%) !important;
+	background-color: transparent !important;
+	border-color: transparent !important;
+	color: #ffffff !important;
+	box-shadow: 0 8px 20px rgba(74, 135, 255, 0.22);
+}
+
+:is(button, a)[class~='bg-black'][class~='text-white'][class~='dark:bg-white'][class~='dark:text-black']:hover,
+:is(button, a)[class~='bg-gray-900'][class~='text-gray-100'][class~='dark:bg-white'][class~='dark:text-black']:hover,
+:is(button, a)[class~='bg-gray-900'][class~='text-gray-100'][class~='dark:bg-white'][class~='dark:text-gray-800']:hover {
+	background-image: linear-gradient(90deg, #e45166 0%, #3f79f1 100%) !important;
+}
+
+:is(button, a)[class~='bg-black'][class~='text-white'][class~='dark:bg-white'][class~='dark:text-black']:disabled,
+:is(button, a)[class~='bg-gray-900'][class~='text-gray-100'][class~='dark:bg-white'][class~='dark:text-black']:disabled,
+:is(button, a)[class~='bg-gray-900'][class~='text-gray-100'][class~='dark:bg-white'][class~='dark:text-gray-800']:disabled {
+	box-shadow: none;
+	opacity: 0.58;
+}
+
 input::-webkit-outer-spin-button,
 input::-webkit-inner-spin-button {
 	/* display: none; <- Crashes Chrome on hover */
@@ -352,6 +376,14 @@ input[type='number'] {
 
 .bg-gray-950-90 {
 	background-color: rgba(var(--color-gray-950, #0d0d0d), 0.9);
+}
+
+#thinking-mode-toggle,
+#thinking-mode-toggle:focus,
+#thinking-mode-toggle:focus-visible,
+#thinking-mode-toggle:active {
+	outline: none !important;
+	box-shadow: none !important;
 }
 
 .ProseMirror {

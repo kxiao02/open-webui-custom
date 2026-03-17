@@ -47,6 +47,7 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import WebSearchResults from './ResponseMessage/WebSearchResults.svelte';
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
+	import Download from '$lib/components/icons/Download.svelte';
 
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 
@@ -55,13 +56,13 @@
 	import CodeExecutions from './CodeExecutions.svelte';
 	import ContentRenderer from './ContentRenderer.svelte';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
-	import FileItem from '$lib/components/common/FileItem.svelte';
 	import FollowUps from './ResponseMessage/FollowUps.svelte';
 	import { fade } from 'svelte/transition';
 	import { flyAndScale } from '$lib/utils/transitions';
 	import RegenerateMenu from './ResponseMessage/RegenerateMenu.svelte';
 	import StatusHistory from './ResponseMessage/StatusHistory.svelte';
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
+	import Collapsible from '$lib/components/common/Collapsible.svelte';
 
 	interface MessageType {
 		id: string;
@@ -180,9 +181,397 @@
 	let loadingSpeech = false;
 
 	let showRateComment = false;
+	type GeneratedFileItem = {
+		id: string;
+		name: string;
+		url: string;
+		source: string;
+		size?: number;
+		isImage?: boolean;
+	};
+
+	let generatedFiles: GeneratedFileItem[] = [];
+
+	const normalizeFileRef = (value: unknown): string | null => {
+		if (typeof value !== 'string') return null;
+		const normalized = value.trim();
+		if (!normalized) return null;
+		const lowered = normalized.toLowerCase();
+		if (lowered === 'null' || lowered === 'undefined') return null;
+		return normalized;
+	};
+
+	const inferFileName = (value: string, fallback = 'generated-file') => {
+		const sanitized = (value || '').split('?')[0];
+		const pathPart = sanitized.split('/').pop() || sanitized;
+		const windowsPathPart = pathPart.split('\\').pop() || pathPart;
+		return windowsPathPart.trim() || fallback;
+	};
+
+	const normalizeOpenWebUiFileUrl = (value: string): string => {
+		if (!value) return value;
+
+		let output = value;
+		if (output.includes('/v1/files/') && !output.includes('/openai/v1/files/')) {
+			output = output.replace(/(^|[^/])\/v1\/files\//g, '$1/openai/v1/files/');
+		}
+
+		if (output.startsWith('http') || output.startsWith('data:') || output.startsWith('/')) {
+			return output;
+		}
+
+		return `${WEBUI_API_BASE_URL}/files/${output}/content`;
+	};
+
+	const isImageRef = (name: string, type?: string, contentType?: string): boolean => {
+		const ext = (name.split('.').pop() || '').toLowerCase();
+		if ((contentType || '').startsWith('image/')) return true;
+		if ((type || '').toLowerCase() === 'image') return true;
+		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext);
+	};
+
+	const toGeneratedFile = (item: any, source: string): GeneratedFileItem | null => {
+		if (typeof item === 'string') {
+			const ref = normalizeFileRef(item);
+			if (!ref) return null;
+			const name = inferFileName(ref);
+			return {
+				id: `${source}:${ref}`,
+				name,
+				url: normalizeOpenWebUiFileUrl(ref),
+				source,
+				isImage: isImageRef(name)
+			};
+		}
+
+		if (!item || typeof item !== 'object') return null;
+
+		const ref =
+			normalizeFileRef(item.url) ??
+			normalizeFileRef(item.download_url) ??
+			normalizeFileRef(item.downloadUrl) ??
+			normalizeFileRef(item.ossUrl) ??
+			normalizeFileRef(item.domainUrl) ??
+			normalizeFileRef(item.id) ??
+			normalizeFileRef(item.file_id) ??
+			normalizeFileRef(item.fileId);
+
+		if (!ref) return null;
+
+		const name =
+			(typeof item.name === 'string' && item.name.trim()) ||
+			(typeof item.filename === 'string' && item.filename.trim()) ||
+			(typeof item.fileName === 'string' && item.fileName.trim()) ||
+			inferFileName(ref);
+
+		const type = typeof item.type === 'string' ? item.type : undefined;
+		const contentType = typeof item.content_type === 'string' ? item.content_type : undefined;
+
+		return {
+			id: `${source}:${ref}:${name}`,
+			name,
+			url: normalizeOpenWebUiFileUrl(ref),
+			source,
+			size: typeof item.size === 'number' ? item.size : undefined,
+			isImage: isImageRef(name, type, contentType)
+		};
+	};
+
+	const collectGeneratedFiles = (messageData: MessageType): GeneratedFileItem[] => {
+		const files: GeneratedFileItem[] = [];
+
+		if (Array.isArray((messageData as any)?.files)) {
+			for (const item of (messageData as any).files) {
+				const normalized = toGeneratedFile(item, 'assistant');
+				if (normalized) files.push(normalized);
+			}
+		}
+
+		const deduped = new Map<string, GeneratedFileItem>();
+		for (const file of files) {
+			deduped.set(`${file.url}|${file.name}`, file);
+		}
+
+		return Array.from(deduped.values());
+	};
+
+	$: generatedFiles = collectGeneratedFiles(message);
+	const INLINE_GENERATED_FILES_MARKER = '<!--__GENERATED_FILES__-->';
+
+	const normalizeSourcesHeading = (content: string): string => {
+		if (!content) return '';
+		return content.replace(
+			/(^|\n)(#{1,6}\s*)?Sources\s*(?=\n|$)/gim,
+			(_, prefix: string, headingPrefix: string) => `${prefix}${headingPrefix || '### '}参考来源`
+		);
+	};
+
+	const TOOL_CALL_BLOCK_REGEX = /<details\b[^>]*\btype="tool_calls"[^>]*>[\s\S]*?<\/details>/gim;
+	const TOOL_CALL_OPEN_TAG_REGEX = /^<details\b([^>]*)>/i;
+	const TOOL_CALL_ATTR_REGEX = /(\w+)="([^"]*)"/g;
+
+	const getToolCallAttrs = (block: string): Record<string, string> => {
+		const openTag = block.match(TOOL_CALL_OPEN_TAG_REGEX)?.[1] ?? '';
+		const attrs: Record<string, string> = {};
+		for (const item of openTag.matchAll(TOOL_CALL_ATTR_REGEX)) {
+			attrs[item[1]] = item[2];
+		}
+		return attrs;
+	};
+
+	const getToolCallKey = (attrs: Record<string, string>): string => {
+		const callKey = (attrs.call_key || '').trim();
+		if (callKey) return `call_key:${callKey}`;
+		const id = (attrs.id || '').trim();
+		if (id) return `id:${id}`;
+		const name = (attrs.name || '').trim();
+		const args = (attrs.arguments || '').trim();
+		if (!name && !args) return '';
+		return `name_args:${name}|${args}`;
+	};
+
+	const getToolCallFallbackKey = (attrs: Record<string, string>): string => {
+		const name = (attrs.name || '').trim();
+		const args = (attrs.arguments || '').trim();
+		if (!name && !args) return '';
+		return `name_args:${name}|${args}`;
+	};
+
+	const dedupeToolCallBlocks = (content: string): string => {
+		if (!content || !content.includes('type="tool_calls"')) return content;
+
+		const matches = Array.from(content.matchAll(TOOL_CALL_BLOCK_REGEX));
+		if (matches.length === 0) return content;
+		const blocks = matches.map((match) => {
+			const block = match[0] || '';
+			const attrs = getToolCallAttrs(block);
+			const isPending = (attrs.done || '').toLowerCase() !== 'true';
+			const name = (attrs.name || '').trim();
+			return {
+				index: match.index ?? -1,
+				block,
+				attrs,
+				isPending,
+				name
+			};
+		});
+
+		const completedKeys = new Set<string>();
+		const completedFallbackKeys = new Set<string>();
+		for (const item of blocks) {
+			const { attrs, isPending } = item;
+			if (isPending) continue;
+			const key = getToolCallKey(attrs);
+			if (key) completedKeys.add(key);
+			const fallbackKey = getToolCallFallbackKey(attrs);
+			if (fallbackKey) completedFallbackKeys.add(fallbackKey);
+		}
+
+		let cursor = 0;
+		let out = '';
+		for (let i = 0; i < blocks.length; i += 1) {
+			const { index, block, attrs, isPending } = blocks[i];
+			if (index < 0) continue;
+
+			out += content.slice(cursor, index);
+			cursor = index + block.length;
+
+			const key = getToolCallKey(attrs);
+			const fallbackKey = getToolCallFallbackKey(attrs);
+			const shouldDrop =
+				isPending &&
+				((key && completedKeys.has(key)) || (fallbackKey && completedFallbackKeys.has(fallbackKey)));
+
+			if (!shouldDrop) {
+				out += block;
+			}
+		}
+
+		out += content.slice(cursor);
+		return out.replace(/\n{3,}/g, '\n\n').trim();
+	};
+
+	const stripDownloadSection = (content: string, allowInlineFiles: boolean): string => {
+		if (!content) return '';
+
+		const lines = content.split('\n');
+		const output: string[] = [];
+		let markerInserted = false;
+
+		for (const line of lines) {
+			const trimmed = line.trim();
+			const linkMatch = trimmed.match(/\[[^\]]+\]\(([^)]+)\)/);
+			const linkTarget = (linkMatch?.[1] || '').toLowerCase();
+			const hasGeneratedFileLink =
+				!!linkTarget &&
+				(linkTarget.includes('/openai/v1/files/') ||
+					linkTarget.includes('/v1/files/') ||
+					linkTarget.includes('sandbox:/mnt/data/'));
+
+			const hasDownloadLabel = /(文件下载|下载链接|下载地址|生成文件（可下载）|生成文件\(可下载\))/i.test(
+				trimmed
+			);
+
+			if (hasDownloadLabel || hasGeneratedFileLink) {
+				if (allowInlineFiles && !markerInserted) {
+					output.push(INLINE_GENERATED_FILES_MARKER);
+					markerInserted = true;
+				}
+				continue;
+			}
+
+			output.push(line);
+		}
+
+		return output.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+	};
+
+	const splitToolCallSection = (content: string): { process: string; final: string } => {
+		if (!content) return { process: '', final: '' };
+
+		const toolCallRegex = /<details\b[^>]*\btype="tool_calls"[^>]*>[\s\S]*?<\/details>/gim;
+		let lastToolBlockEnd = -1;
+
+		for (const match of content.matchAll(toolCallRegex)) {
+			const start = match.index ?? -1;
+			if (start >= 0) {
+				lastToolBlockEnd = start + match[0].length;
+			}
+		}
+
+		if (lastToolBlockEnd < 0) {
+			return {
+				process: '',
+				final: content.trim()
+			};
+		}
+
+		return {
+			process: content.slice(0, lastToolBlockEnd).trim(),
+			final: content.slice(lastToolBlockEnd).replace(/\n{3,}/g, '\n\n').trim()
+		};
+	};
+
+	let processContent = '';
+	let finalMessageContent = '';
+	let finalContentBeforeGeneratedFiles = '';
+	let finalContentAfterGeneratedFiles = '';
+	let placeInlineGeneratedFiles = false;
+	let processPanelOpen = false;
+	let processPanelAutoCollapsed = false;
+	let processPanelAutoOpened = false;
+	let lastProcessSnapshot = '';
+	let processPanelDisplayTitle = '当前执行的操作';
+	let processPanelCollapsedTitle: string | null = null;
+	let processPanelStatusDone = false;
+
+	$: {
+		const rawContent = message?.content ?? '';
+		const normalizedContent = dedupeToolCallBlocks(normalizeSourcesHeading(rawContent));
+		const { process, final } = splitToolCallSection(normalizedContent);
+		processContent = process;
+		const cleanedFinal = stripDownloadSection(final, generatedFiles.length > 0);
+		finalMessageContent = cleanedFinal;
+
+		if (cleanedFinal.includes(INLINE_GENERATED_FILES_MARKER)) {
+			const [before = '', after = ''] = cleanedFinal.split(INLINE_GENERATED_FILES_MARKER, 2);
+			finalContentBeforeGeneratedFiles = before.trim();
+			finalContentAfterGeneratedFiles = after.trim();
+			placeInlineGeneratedFiles = true;
+		} else {
+			finalContentBeforeGeneratedFiles = '';
+			finalContentAfterGeneratedFiles = '';
+			placeInlineGeneratedFiles = false;
+		}
+	}
+
+	$: {
+		const processText = processContent.trim();
+		const finalText = finalMessageContent.trim();
+
+		if (!processText) {
+			processPanelOpen = false;
+			processPanelAutoCollapsed = false;
+			processPanelAutoOpened = false;
+			lastProcessSnapshot = '';
+		} else {
+			if (processText !== lastProcessSnapshot) {
+				lastProcessSnapshot = processText;
+			}
+
+			if (!finalText && !processPanelAutoOpened) {
+				processPanelOpen = true;
+				processPanelAutoOpened = true;
+			}
+
+			if (finalText && !processPanelAutoCollapsed) {
+				processPanelOpen = false;
+				processPanelAutoCollapsed = true;
+			}
+		}
+	}
+
+	const getProcessPanelState = (
+		process: string,
+		final: string,
+		messageDone: boolean
+	): { title: string; done: boolean } => {
+		if (!process) {
+			return { title: '当前执行的操作', done: true };
+		}
+
+		const matches = Array.from(process.matchAll(TOOL_CALL_BLOCK_REGEX));
+		let lastName = '';
+		let lastPendingName = '';
+
+		for (const match of matches) {
+			const attrs = getToolCallAttrs(match[0] || '');
+			const name = (attrs.name || '').trim();
+			const isPending = (attrs.done || '').toLowerCase() !== 'true';
+			if (name) {
+				lastName = name;
+			}
+			if (isPending && name) {
+				lastPendingName = name;
+			}
+		}
+
+		if (lastPendingName) {
+			return {
+				title: `当前执行：${lastPendingName}`,
+				done: false
+			};
+		}
+
+		if (final.trim() || messageDone) {
+			return {
+				title: '已完成',
+				done: true
+			};
+		}
+
+		return {
+			title: lastName ? `当前执行：${lastName}` : '当前执行的操作',
+			done: false
+		};
+	};
+
+	$: {
+		const panelState = getProcessPanelState(
+			processContent,
+			finalMessageContent,
+			Boolean(message?.done ?? false)
+		);
+		processPanelDisplayTitle = panelState.title;
+		processPanelStatusDone = panelState.done;
+	}
+
+	$: processPanelCollapsedTitle = processPanelOpen ? null : processPanelDisplayTitle;
 
 	const copyToClipboard = async (text) => {
+		text = removeDetails(text, ['tool_calls']);
 		text = removeAllDetails(text);
+		text = text.replace(/\n{3,}/g, '\n\n').trim();
 
 		if (($config?.ui?.response_watermark ?? '').trim() !== '') {
 			text = `${text}\n\n${$config?.ui?.response_watermark}`;
@@ -560,11 +949,19 @@
 			e.preventDefault();
 			// Get the selected HTML
 			const selection = window.getSelection();
+			if (!selection || selection.rangeCount === 0) {
+				return;
+			}
 			const range = selection.getRangeAt(0);
 			const tempDiv = document.createElement('div');
 
 			// Remove background, color, and font styles
 			tempDiv.appendChild(range.cloneContents());
+
+			// Exclude tool-call cards from copy result.
+			tempDiv
+				.querySelectorAll('[data-tool-call-container="true"], [data-tool-call-content="true"]')
+				.forEach((el) => el.remove());
 
 			tempDiv.querySelectorAll('table').forEach((table) => {
 				table.style.borderCollapse = 'collapse';
@@ -579,7 +976,7 @@
 
 			// Put cleaned HTML + plain text into clipboard
 			e.clipboardData.setData('text/html', tempDiv.innerHTML);
-			e.clipboardData.setData('text/plain', selection.toString());
+			e.clipboardData.setData('text/plain', (tempDiv.innerText || '').trim());
 		}
 	};
 
@@ -660,7 +1057,7 @@
 				<div class="chat-{message.role} w-full min-w-full markdown-prose">
 					<div>
 						{#if model?.info?.meta?.capabilities?.status_updates ?? true}
-							<StatusHistory statusHistory={message?.statusHistory} />
+							<StatusHistory statusHistory={message?.statusHistory} expand={true} />
 						{/if}
 
 						{#if message?.files && message.files?.filter((f) => f.type === 'image').length > 0}
@@ -774,63 +1171,268 @@
 							</div>
 						{/if}
 
-						<div
-							bind:this={contentContainerElement}
-							class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
-							id="response-content-container"
-						>
-							{#if message.content === '' && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
-								<Skeleton />
-							{:else if message.content && message.error !== true}
-								<!-- always show message contents even if there's an error -->
-								<!-- unless message.error === true which is legacy error handling, where the error message is stored in message.content -->
-								<ContentRenderer
-									id={`${chatId}-${message.id}`}
-									messageId={message.id}
-									{history}
-									{selectedModels}
-									content={message.content}
-									sources={message.sources}
-									floatingButtons={message?.done &&
-										!readOnly &&
-										($settings?.showFloatingActionButtons ?? true)}
-									save={!readOnly}
-									preview={!readOnly}
-									{editCodeBlock}
-									{topPadding}
-									done={($settings?.chatFadeStreamingText ?? true)
-										? (message?.done ?? false)
-										: true}
-									{model}
-									onTaskClick={async (e) => {
-										console.log(e);
-									}}
-									onSourceClick={async (id) => {
-										console.log(id);
+							<div
+								bind:this={contentContainerElement}
+								class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
+								id="response-content-container"
+							>
+								{#if processContent}
+									<div class="mb-2 rounded-xl border border-gray-200/80 bg-gray-50/60 px-2 py-1.5 dark:border-gray-800 dark:bg-gray-900/50">
+										<Collapsible
+											title={processPanelCollapsedTitle}
+											attributes={{ done: processPanelStatusDone ? 'true' : 'false' }}
+											chevron={true}
+											open={processPanelOpen}
+											onChange={(isOpen) => {
+												processPanelOpen = Boolean(isOpen);
+											}}
+											className="w-full"
+											buttonClassName="w-full text-xs font-semibold text-gray-700 hover:text-gray-900 dark:text-gray-300 dark:hover:text-gray-100"
+										>
+											<div class="pt-1" slot="content">
+												<ContentRenderer
+													id={`${chatId}-${message.id}-process`}
+													messageId={message.id}
+													{history}
+													{selectedModels}
+													content={processContent}
+													floatingButtons={false}
+													save={false}
+													preview={false}
+													editCodeBlock={false}
+													topPadding={false}
+													done={true}
+													{model}
+												/>
+											</div>
+										</Collapsible>
+									</div>
+								{/if}
 
-										if (citationsElement) {
-											citationsElement?.showSourceModal(id);
-										}
-									}}
-									onAddMessages={({ modelId, parentId, messages }) => {
-										addMessages({ modelId, parentId, messages });
-									}}
-									onSave={({ raw, oldContent, newContent }) => {
-										history.messages[message.id].content = history.messages[
-											message.id
-										].content.replace(raw, raw.replace(oldContent, newContent));
+								{#if finalMessageContent === '' && !processContent && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
+									<Skeleton />
+								{:else if finalMessageContent && message.error !== true}
+									<!-- always show message contents even if there's an error -->
+									<!-- unless message.error === true which is legacy error handling, where the error message is stored in message.content -->
+									{#if placeInlineGeneratedFiles}
+										{#if finalContentBeforeGeneratedFiles}
+											<ContentRenderer
+												id={`${chatId}-${message.id}-before-generated-files`}
+												messageId={message.id}
+												{history}
+												{selectedModels}
+												content={finalContentBeforeGeneratedFiles}
+												sources={message.sources}
+												floatingButtons={false}
+												save={!readOnly}
+												preview={!readOnly}
+												{editCodeBlock}
+												{topPadding}
+												done={($settings?.chatFadeStreamingText ?? true)
+													? (message?.done ?? false)
+													: true}
+												{model}
+												onTaskClick={async (e) => {
+													console.log(e);
+												}}
+												onSourceClick={async (id) => {
+													console.log(id);
 
-										updateChat();
-									}}
-								/>
-							{/if}
+													if (citationsElement) {
+														citationsElement?.showSourceModal(id);
+													}
+												}}
+												onAddMessages={({ modelId, parentId, messages }) => {
+													addMessages({ modelId, parentId, messages });
+												}}
+												onSave={({ raw, oldContent, newContent }) => {
+													history.messages[message.id].content = history.messages[
+														message.id
+													].content.replace(raw, raw.replace(oldContent, newContent));
 
-							{#if message?.error}
-								<Error content={message?.error?.content ?? message.content} />
-							{/if}
+													updateChat();
+												}}
+											/>
+										{/if}
+									{:else}
+										<ContentRenderer
+											id={`${chatId}-${message.id}`}
+											messageId={message.id}
+											{history}
+											{selectedModels}
+											content={finalMessageContent}
+											sources={message.sources}
+											floatingButtons={message?.done &&
+												!readOnly &&
+											($settings?.showFloatingActionButtons ?? true)}
+											save={!readOnly}
+											preview={!readOnly}
+											{editCodeBlock}
+											{topPadding}
+											done={($settings?.chatFadeStreamingText ?? true)
+												? (message?.done ?? false)
+												: true}
+											{model}
+											onTaskClick={async (e) => {
+												console.log(e);
+											}}
+											onSourceClick={async (id) => {
+												console.log(id);
 
-							{#if (message?.sources || message?.citations) && (model?.info?.meta?.capabilities?.citations ?? true)}
-								<Citations
+												if (citationsElement) {
+													citationsElement?.showSourceModal(id);
+												}
+											}}
+											onAddMessages={({ modelId, parentId, messages }) => {
+												addMessages({ modelId, parentId, messages });
+											}}
+											onSave={({ raw, oldContent, newContent }) => {
+												history.messages[message.id].content = history.messages[
+													message.id
+												].content.replace(raw, raw.replace(oldContent, newContent));
+
+												updateChat();
+											}}
+										/>
+									{/if}
+								{/if}
+
+									{#if message?.error}
+										<Error content={message?.error?.content ?? message.content} />
+									{/if}
+
+									{#if generatedFiles.length > 0 && placeInlineGeneratedFiles}
+										<div class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900/70">
+											<div
+												class="border-b border-gray-200 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:border-gray-800 dark:text-gray-300"
+											>
+												生成文件
+											</div>
+											<div class="space-y-1.5 p-2">
+												{#each generatedFiles as file}
+													<div class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850">
+														<div class="min-w-0 flex items-center gap-2">
+															{#if file.isImage}
+																<img
+																	src={file.url}
+																	alt={file.name}
+																	class="size-8 rounded-md border border-gray-200 object-cover dark:border-gray-700"
+																/>
+															{/if}
+															<div class="min-w-0">
+																<a
+																	href={file.url}
+																	target="_blank"
+																	rel="noreferrer"
+																	class="line-clamp-1 text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
+																>
+																	{file.name}
+																</a>
+															</div>
+														</div>
+														<a
+															href={file.url}
+															target="_blank"
+															rel="noreferrer"
+															class="shrink-0 inline-flex size-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
+															title={$i18n.t('Download')}
+														>
+															<Download className="size-3.5" />
+														</a>
+													</div>
+												{/each}
+											</div>
+										</div>
+
+										{#if finalContentAfterGeneratedFiles}
+											<ContentRenderer
+												id={`${chatId}-${message.id}-after-generated-files`}
+												messageId={message.id}
+												{history}
+												{selectedModels}
+												content={finalContentAfterGeneratedFiles}
+												sources={message.sources}
+												floatingButtons={message?.done &&
+													!readOnly &&
+												($settings?.showFloatingActionButtons ?? true)}
+												save={!readOnly}
+												preview={!readOnly}
+												{editCodeBlock}
+												{topPadding}
+												done={($settings?.chatFadeStreamingText ?? true)
+													? (message?.done ?? false)
+													: true}
+												{model}
+												onTaskClick={async (e) => {
+													console.log(e);
+												}}
+												onSourceClick={async (id) => {
+													console.log(id);
+
+													if (citationsElement) {
+														citationsElement?.showSourceModal(id);
+													}
+												}}
+												onAddMessages={({ modelId, parentId, messages }) => {
+													addMessages({ modelId, parentId, messages });
+												}}
+												onSave={({ raw, oldContent, newContent }) => {
+													history.messages[message.id].content = history.messages[
+														message.id
+													].content.replace(raw, raw.replace(oldContent, newContent));
+
+													updateChat();
+												}}
+											/>
+										{/if}
+									{/if}
+
+									{#if generatedFiles.length > 0 && !placeInlineGeneratedFiles}
+										<div class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900/70">
+											<div
+												class="border-b border-gray-200 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:border-gray-800 dark:text-gray-300"
+										>
+											生成文件
+										</div>
+										<div class="space-y-1.5 p-2">
+											{#each generatedFiles as file}
+												<div class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850">
+													<div class="min-w-0 flex items-center gap-2">
+														{#if file.isImage}
+															<img
+																src={file.url}
+																alt={file.name}
+																class="size-8 rounded-md border border-gray-200 object-cover dark:border-gray-700"
+															/>
+														{/if}
+														<div class="min-w-0">
+															<a
+																href={file.url}
+																target="_blank"
+																rel="noreferrer"
+																class="line-clamp-1 text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
+															>
+																{file.name}
+															</a>
+														</div>
+													</div>
+													<a
+														href={file.url}
+														target="_blank"
+														rel="noreferrer"
+														class="shrink-0 inline-flex size-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
+														title={$i18n.t('Download')}
+													>
+														<Download className="size-3.5" />
+													</a>
+												</div>
+											{/each}
+										</div>
+									</div>
+								{/if}
+
+								{#if (message?.sources || message?.citations) && (model?.info?.meta?.capabilities?.citations ?? true)}
+									<Citations
 									bind:this={citationsElement}
 									id={message?.id}
 									{chatId}
@@ -1010,7 +1612,7 @@
 									</button>
 								</Tooltip>
 
-								{#if $user?.role === 'admin' || ($user?.permissions?.chat?.tts ?? true)}
+								{#if $user?.permissions?.chat?.tts ?? true}
 									<Tooltip content={$i18n.t('Read Aloud')} placement="bottom">
 										<button
 											aria-label={$i18n.t('Read Aloud')}

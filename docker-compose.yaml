@@ -12,17 +12,48 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        - NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+        - GITHUB_MIRROR_PREFIX=${GITHUB_MIRROR_PREFIX}
+        - NODE_MAX_OLD_SPACE_SIZE=${NODE_MAX_OLD_SPACE_SIZE}
+        - HF_ENDPOINT=${HF_ENDPOINT}
+        - PIP_INDEX_URL=${PIP_INDEX_URL}
+        - UV_INDEX_URL=${UV_INDEX_URL}
+        - PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
+        - PYTORCH_INDEX_URL_CPU=${PYTORCH_INDEX_URL_CPU}
+        - PYTORCH_INDEX_URL_CUDA=${PYTORCH_INDEX_URL_CUDA}
+        - APT_MIRROR=${APT_MIRROR}
+        - APT_SECURITY_MIRROR=${APT_SECURITY_MIRROR}
     image: ghcr.io/open-webui/open-webui:${WEBUI_DOCKER_TAG-main}
     container_name: open-webui
     volumes:
       - open-webui:/app/backend/data
     depends_on:
-      - ollama
+      ollama:
+        condition: service_started
     ports:
-      - ${OPEN_WEBUI_PORT-3000}:8080
+      - ${OPEN_WEBUI_PORT-8080}:8080
     environment:
-      - 'OLLAMA_BASE_URL=http://ollama:11434'
-      - 'WEBUI_SECRET_KEY='
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL-http://ollama:11434}
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL-http://host.docker.internal:8081/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY-}
+      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URLS-http://host.docker.internal:8081/v1}
+      OPENAI_API_KEYS: ${OPENAI_API_KEYS-}
+      ENABLE_OPENAI_API: ${ENABLE_OPENAI_API-true}
+      ENABLE_OLLAMA_API: ${ENABLE_OLLAMA_API-false}
+      PUBLIC_WEBUI_BASE_URL: ${PUBLIC_WEBUI_BASE_URL-}
+      CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN-*}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS-*}
+      CONTENT_SECURITY_POLICY: ${CONTENT_SECURITY_POLICY-}
+      XFRAME_OPTIONS: ${XFRAME_OPTIONS-}
+      WEBUI_SESSION_COOKIE_SAME_SITE: ${WEBUI_SESSION_COOKIE_SAME_SITE-lax}
+      WEBUI_SESSION_COOKIE_SECURE: ${WEBUI_SESSION_COOKIE_SECURE-false}
+      WEBUI_AUTH_COOKIE_SAME_SITE: ${WEBUI_AUTH_COOKIE_SAME_SITE-lax}
+      WEBUI_AUTH_COOKIE_SECURE: ${WEBUI_AUTH_COOKIE_SECURE-false}
+      VECTOR_DB: ${VECTOR_DB-chroma}
+      SKIP_PLUGIN_DEPENDENCY_INSTALL: ${SKIP_PLUGIN_DEPENDENCY_INSTALL-false}
+      HF_ENDPOINT: ${HF_ENDPOINT-}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY-}
     extra_hosts:
       - host.docker.internal:host-gateway
     restart: unless-stopped

@@ -17,6 +17,7 @@
 		showCallOverlay,
 		showArtifacts,
 		showEmbeds,
+		showFilePreview,
 		settings,
 		showFileNavPath,
 		selectedTerminalId,
@@ -31,6 +32,7 @@
 	import Drawer from '../common/Drawer.svelte';
 	import Artifacts from './Artifacts.svelte';
 	import Embeds from './ChatControls/Embeds.svelte';
+	import FilePreview from './ChatControls/FilePreview.svelte';
 	import FileNav from './FileNav.svelte';
 	import PyodideFileNav from './PyodideFileNav.svelte';
 	import Overview from './Overview.svelte';
@@ -250,6 +252,7 @@
 		}
 		showArtifacts.set(false);
 		showEmbeds.set(false);
+		showFilePreview.set(false);
 		if ($showCallOverlay) showCallOverlay.set(false);
 	};
 
@@ -263,7 +266,9 @@
 	{#if $showControls}
 		<Drawer
 			show={$showControls}
-			onClose={() => showControls.set(false)}
+			onClose={() => {
+				closeHandler();
+			}}
 			className="min-h-[100dvh] !bg-white dark:!bg-gray-850"
 		>
 			<div class="h-[100dvh] flex flex-col">
@@ -283,6 +288,8 @@
 					</div>
 				{:else if $showEmbeds}
 					<Embeds />
+				{:else if $showFilePreview}
+					<FilePreview {history} />
 				{:else if $showArtifacts}
 					<Artifacts {history} />
 				{:else}
@@ -429,6 +436,8 @@
 						</div>
 					{:else if $showEmbeds}
 						<Embeds overlay={dragged} />
+					{:else if $showFilePreview}
+						<FilePreview {history} overlay={dragged} />
 					{:else if $showArtifacts}
 						<Artifacts {history} overlay={dragged} />
 					{:else}

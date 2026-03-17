@@ -88,6 +88,14 @@
 		// Use FileSaver.js's saveAs function to save the generated CSV file.
 		saveAs(blob, `table-${id}-${tokenIdx}.csv`);
 	};
+
+	const normalizeFileRef = (value) => {
+		const normalized = typeof value === 'string' ? value.trim() : String(value ?? '').trim();
+		if (!normalized) return null;
+		const lowered = normalized.toLowerCase();
+		if (lowered === 'null' || lowered === 'undefined') return null;
+		return normalized;
+	};
 </script>
 
 <!-- {JSON.stringify(tokens)} -->
@@ -366,18 +374,21 @@
 	{:else if token.type === 'html'}
 		<HtmlToken {id} {token} {onSourceClick} />
 	{:else if token.type === 'iframe'}
-		<iframe
-			src="{WEBUI_BASE_URL}/api/v1/files/{token.fileId}/content"
-			title={token.fileId}
-			width="100%"
-			frameborder="0"
-			on:load={(e) => {
-				try {
-					e.currentTarget.style.height =
-						e.currentTarget.contentWindow.document.body.scrollHeight + 20 + 'px';
-				} catch {}
-			}}
-		></iframe>
+		{@const iframeFileRef = normalizeFileRef(token?.fileId)}
+		{#if iframeFileRef}
+			<iframe
+				src={`${WEBUI_BASE_URL}/api/v1/files/${iframeFileRef}/content`}
+				title={iframeFileRef}
+				width="100%"
+				frameborder="0"
+				on:load={(e) => {
+					try {
+						e.currentTarget.style.height =
+							e.currentTarget.contentWindow.document.body.scrollHeight + 20 + 'px';
+					} catch {}
+				}}
+			></iframe>
+		{/if}
 	{:else if token.type === 'paragraph'}
 		{#if paragraphTag == 'span'}
 			<span dir="auto">

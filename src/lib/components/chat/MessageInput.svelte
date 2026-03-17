@@ -31,6 +31,7 @@
 		terminalServers,
 		user as _user,
 		showControls,
+		showFilePreview,
 		showSettings,
 		selectedTerminalId,
 		TTSWorker,
@@ -79,6 +80,7 @@
 	import Photo from '../icons/Photo.svelte';
 	import Wrench from '../icons/Wrench.svelte';
 	import Sparkles from '../icons/Sparkles.svelte';
+	import LightBulb from '../icons/LightBulb.svelte';
 
 	import InputVariablesModal from './MessageInput/InputVariablesModal.svelte';
 	import Voice from '../icons/Voice.svelte';
@@ -131,6 +133,8 @@
 	export let imageGenerationEnabled = false;
 	export let webSearchEnabled = false;
 	export let codeInterpreterEnabled = false;
+	export let thinkingModeEnabled = false;
+	export let thinkingModelId: string | null = null;
 
 	let showTerminalMenu = false;
 
@@ -170,7 +174,8 @@
 		selectedFilterIds,
 		imageGenerationEnabled,
 		webSearchEnabled,
-		codeInterpreterEnabled
+		codeInterpreterEnabled,
+		thinkingModeEnabled
 	});
 
 	const inputVariableHandler = async (text: string): Promise<string> => {
@@ -462,6 +467,8 @@
 	$: fileUploadCapableModels = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).filter(
 		(model) => $models.find((m) => m.id === model)?.info?.meta?.capabilities?.file_upload ?? true
 	);
+	let hasUploadingFiles = false;
+	$: hasUploadingFiles = files.some((file) => file?.status === 'uploading');
 
 	let webSearchCapableModels = [];
 	$: webSearchCapableModels = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).filter(
@@ -497,14 +504,14 @@
 		(atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).length ===
 			webSearchCapableModels.length &&
 		$config?.features?.enable_web_search &&
-		($_user.role === 'admin' || $_user?.permissions?.features?.web_search);
+		($_user?.permissions?.features?.web_search ?? true);
 
 	let showImageGenerationButton = false;
 	$: showImageGenerationButton =
 		(atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).length ===
 			imageGenerationCapableModels.length &&
 		$config?.features?.enable_image_generation &&
-		($_user.role === 'admin' || $_user?.permissions?.features?.image_generation);
+		($_user?.permissions?.features?.image_generation ?? true);
 
 	let showCodeInterpreterButton = false;
 	$: showCodeInterpreterButton =
@@ -565,7 +572,7 @@
 		}
 	};
 
-	const uploadFileHandler = async (file, process = true, itemData = {}) => {
+	const uploadFileHandler = async (file, process = false, itemData = {}) => {
 		if ($_user?.role !== 'admin' && !($_user?.permissions?.chat?.file_upload ?? true)) {
 			toast.error($i18n.t('You do not have permission to upload files.'));
 			return null;
@@ -780,7 +787,7 @@
 
 				reader.readAsDataURL(file['type'] === 'image/heic' ? await convertHeicToJpeg(file) : file);
 			} else {
-				uploadFileHandler(file);
+				uploadFileHandler(file, false);
 			}
 		});
 	};
@@ -1165,13 +1172,16 @@
 							}}
 						/>
 					</div>
-					<form
-						class="w-full flex flex-col gap-1.5 {recording ? 'hidden' : ''}"
-						on:submit|preventDefault={() => {
-							// check if selectedModels support image input
-							dispatch('submit', prompt);
-						}}
-					>
+						<form
+							class="w-full flex flex-col gap-1.5 {recording ? 'hidden' : ''}"
+							on:submit|preventDefault={() => {
+								if (hasUploadingFiles) {
+									toast.error($i18n.t('Please wait until all files are uploaded.'));
+									return;
+								}
+								dispatch('submit', prompt);
+							}}
+						>
 						<button
 							id="generate-message-pair-button"
 							class="hidden"
@@ -1236,12 +1246,17 @@
 									dir={$settings?.chatDirection ?? 'auto'}
 								>
 									{#each files as file, fileIdx}
-										{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
-											{@const fileUrl =
-												file.url.startsWith('data') || file.url.startsWith('http')
-													? file.url
-													: `${WEBUI_API_BASE_URL}/files/${file.url}${file?.content_type ? '/content' : ''}`}
-											<div class=" relative group">
+										{@const fileRef = (file?.url ?? file?.id ?? '').toString().trim()}
+										{@const hasFileRef =
+											fileRef !== '' && fileRef !== 'null' && fileRef !== 'undefined'}
+										{@const isUploading = file?.status === 'uploading'}
+										{#if isUploading || hasFileRef}
+											{#if hasFileRef && (file.type === 'image' || (file?.content_type ?? '').startsWith('image/'))}
+												{@const fileUrl =
+													fileRef.startsWith('data') || fileRef.startsWith('http')
+														? fileRef
+														: `${WEBUI_API_BASE_URL}/files/${fileRef}${file?.content_type ? '/content' : ''}`}
+												<div class=" relative group">
 												<div class="relative flex items-center">
 													<Image
 														src={fileUrl}
@@ -1299,27 +1314,28 @@
 														</svg>
 													</button>
 												</div>
-											</div>
-										{:else}
-											<FileItem
-												item={file}
-												name={file.name}
-												type={file.type}
-												size={file?.size}
-												loading={file.status === 'uploading'}
-												dismissible={true}
-												edit={true}
-												small={true}
-												modal={['file', 'collection'].includes(file?.type)}
-												on:dismiss={async () => {
-													// Remove from UI state
-													files.splice(fileIdx, 1);
-													files = files;
-												}}
-												on:click={() => {
-													console.log(file);
-												}}
-											/>
+												</div>
+											{:else}
+												<FileItem
+													item={{ ...file, url: hasFileRef ? fileRef : null }}
+													name={file.name}
+													type={file.type}
+													size={file?.size}
+													loading={isUploading}
+													dismissible={true}
+													edit={true}
+													small={true}
+													modal={['file', 'collection'].includes(file?.type)}
+													on:dismiss={async () => {
+														// Remove from UI state
+														files.splice(fileIdx, 1);
+														files = files;
+													}}
+													on:click={() => {
+														console.log(file);
+													}}
+												/>
+											{/if}
 										{/if}
 									{/each}
 								</div>
@@ -1416,7 +1432,15 @@
 															document.getElementById('suggestions-container');
 
 														if (e.key === 'Escape') {
-															stopResponse();
+															const hasActiveGeneration = Boolean(
+																generating ||
+																	(taskIds && taskIds.length > 0) ||
+																	(history.currentId &&
+																		history.messages[history.currentId]?.done != true)
+															);
+															if (hasActiveGeneration) {
+																stopResponse();
+															}
 														}
 
 														if (prompt === '' && e.key == 'ArrowUp') {
@@ -1458,12 +1482,18 @@
 																		? (e.key === 'Enter' || e.keyCode === 13) && isCtrlPressed
 																		: (e.key === 'Enter' || e.keyCode === 13) && !e.shiftKey;
 
-																if (enterPressed) {
-																	e.preventDefault();
-																	if (prompt !== '' || files.length > 0) {
-																		dispatch('submit', prompt);
+																	if (enterPressed) {
+																		e.preventDefault();
+																		if (hasUploadingFiles) {
+																			toast.error(
+																				$i18n.t('Please wait until all files are uploaded.')
+																			);
+																			return;
+																		}
+																		if (prompt !== '' || files.length > 0) {
+																			dispatch('submit', prompt);
+																		}
 																	}
-																}
 															}
 														}
 
@@ -1522,8 +1552,41 @@
 							</div>
 
 							<div class=" flex justify-between mt-0.5 mb-2.5 mx-0.5 max-w-full" dir="ltr">
-								<div class="ml-1 self-end flex items-center flex-1 max-w-[80%]">
-									<InputMenu
+									<div class="ml-1 self-end flex items-center flex-1 max-w-[80%]">
+										<Tooltip content={$i18n.t('Thinking Mode')} placement="top">
+											<button
+												id="thinking-mode-toggle"
+												aria-label={thinkingModeEnabled
+													? $i18n.t('Disable Thinking Mode')
+													: $i18n.t('Enable Thinking Mode')}
+												aria-pressed={thinkingModeEnabled}
+												on:mousedown|preventDefault
+												on:click|preventDefault={(event) => {
+													thinkingModeEnabled = !thinkingModeEnabled;
+													(event.currentTarget as HTMLButtonElement | null)?.blur();
+												}}
+												type="button"
+												class="mr-1 inline-flex size-8 items-center justify-center rounded-full border-0 px-0 text-xs font-medium outline-none ring-0 shadow-none transition-colors focus:outline-none focus-visible:outline-none focus:ring-0 focus-visible:ring-0 sm:h-8 sm:w-auto sm:justify-start sm:gap-1.5 sm:px-2.5 {thinkingModeEnabled
+													? 'bg-gradient-to-r from-[#ef5b6d]/20 to-[#4a87ff]/20 text-[#b53c4f] dark:from-[#ef5b6d]/25 dark:to-[#4a87ff]/25 dark:text-[#dbe8ff]'
+													: 'bg-transparent text-gray-600 hover:bg-gradient-to-r hover:from-[#ef5b6d]/10 hover:to-[#4a87ff]/10 hover:text-[#7b3b8d] dark:bg-transparent dark:text-gray-300 dark:hover:bg-gradient-to-r dark:hover:from-[#ef5b6d]/10 dark:hover:to-[#4a87ff]/15 dark:hover:text-gray-100'}"
+											>
+												<LightBulb className="size-3.5" strokeWidth="1.75" />
+												<span class="hidden sm:inline">{$i18n.t('Thinking')}</span>
+												<div
+													class="relative hidden h-4 w-7 rounded-full transition-colors sm:block {thinkingModeEnabled
+														? 'bg-gradient-to-r from-[#ef5b6d] to-[#4a87ff]'
+														: 'bg-gray-300 dark:bg-gray-600'}"
+												>
+													<span
+														class="absolute left-[2px] top-[2px] h-3 w-3 rounded-full bg-white transition-transform {thinkingModeEnabled
+															? 'translate-x-3'
+															: ''}"
+													></span>
+												</div>
+											</button>
+										</Tooltip>
+
+										<InputMenu
 										bind:files
 										selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
 										{fileUploadCapableModels}
@@ -1747,24 +1810,24 @@
 														: $i18n.t('Enable Code Interpreter')}
 													aria-pressed={codeInterpreterEnabled}
 													on:click|preventDefault={() =>
-														(codeInterpreterEnabled = !codeInterpreterEnabled)}
+													(codeInterpreterEnabled = !codeInterpreterEnabled)}
 													type="button"
 													class=" group p-[7px] flex gap-1.5 items-center text-sm transition-colors duration-300 max-w-full overflow-hidden {codeInterpreterEnabled
 														? ' text-sky-500 dark:text-sky-300 bg-sky-50 hover:bg-sky-100 dark:bg-sky-400/10 dark:hover:bg-sky-700/10 border border-sky-200/40 dark:border-sky-500/20'
-														: 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 '} {($settings?.highContrastMode ??
+													: 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 '} {($settings?.highContrastMode ??
 													false)
 														? 'm-1'
 														: 'focus:outline-hidden rounded-full'}"
 												>
 													<Cloud className="size-3.5" strokeWidth="2" />
 
-													<div class="hidden group-hover:block">
-														<XMark className="size-4" strokeWidth="1.75" />
-													</div>
-												</button>
-											</Tooltip>
+												<div class="hidden group-hover:block">
+													<XMark className="size-4" strokeWidth="1.75" />
+												</div>
+											</button>
+										</Tooltip>
 										{/if}
-									</div>
+				</div>
 								</div>
 
 								<div class="self-end flex space-x-1 mr-1 shrink-0 gap-[0.5px]">
@@ -1773,7 +1836,8 @@
 											<Tooltip content={$i18n.t('Stop')}>
 												<button
 													class="bg-white hover:bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-1.5"
-													on:click={() => {
+													type="button"
+													on:click|preventDefault|stopPropagation={() => {
 														stopResponse();
 													}}
 												>
@@ -1867,7 +1931,7 @@
 											{/if}
 										{/if}
 
-										{#if prompt === '' && files.length === 0 && ($_user?.role === 'admin' || ($_user?.permissions?.chat?.call ?? true))}
+									{#if prompt === '' && files.length === 0 && ($_user?.permissions?.chat?.call ?? true)}
 											<div class=" flex items-center">
 												<!-- {$i18n.t('Call')} -->
 												<Tooltip content={$i18n.t('Voice mode')}>
@@ -1916,6 +1980,7 @@
 																}
 
 																showCallOverlay.set(true);
+																showFilePreview.set(false);
 																showControls.set(true);
 															} catch (err) {
 																// If the user denies the permission or an error occurs, show an error message

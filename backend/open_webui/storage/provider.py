@@ -6,9 +6,15 @@ import re
 from abc import ABC, abstractmethod
 from typing import BinaryIO, Tuple, Dict
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
+try:
+    import boto3
+    from botocore.config import Config
+    from botocore.exceptions import ClientError
+except ImportError:
+    boto3 = None
+    Config = None
+    ClientError = Exception
+
 from open_webui.config import (
     S3_ACCESS_KEY_ID,
     S3_BUCKET_NAME,
@@ -27,14 +33,35 @@ from open_webui.config import (
     STORAGE_PROVIDER,
     UPLOAD_DIR,
 )
-from google.cloud import storage
-from google.cloud.exceptions import GoogleCloudError, NotFound
 from open_webui.constants import ERROR_MESSAGES
-from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobServiceClient
-from azure.core.exceptions import ResourceNotFoundError
+
+try:
+    from google.cloud import storage
+    from google.cloud.exceptions import GoogleCloudError, NotFound
+except ImportError:
+    storage = None
+    GoogleCloudError = Exception
+    NotFound = Exception
+
+try:
+    from azure.identity import DefaultAzureCredential
+    from azure.storage.blob import BlobServiceClient
+    from azure.core.exceptions import ResourceNotFoundError
+except ImportError:
+    DefaultAzureCredential = None
+    BlobServiceClient = None
+    ResourceNotFoundError = Exception
 
 log = logging.getLogger(__name__)
+
+
+def _require_dependency(name: str, value):
+    if value is None:
+        raise RuntimeError(
+            f"{name} is required for the configured storage provider. "
+            "Install the full backend requirements or the provider-specific SDK."
+        )
+    return value
 
 
 class StorageProvider(ABC):
@@ -104,7 +131,9 @@ class LocalStorageProvider(StorageProvider):
 
 class S3StorageProvider(StorageProvider):
     def __init__(self):
-        config = Config(
+        _require_dependency("boto3", boto3)
+        config_cls = _require_dependency("botocore", Config)
+        config = config_cls(
             s3={
                 "use_accelerate_endpoint": S3_USE_ACCELERATE_ENDPOINT,
                 "addressing_style": S3_ADDRESSING_STYLE,
@@ -222,17 +251,18 @@ class S3StorageProvider(StorageProvider):
 
 class GCSStorageProvider(StorageProvider):
     def __init__(self):
+        storage_client = _require_dependency("google-cloud-storage", storage)
         self.bucket_name = GCS_BUCKET_NAME
 
         if GOOGLE_APPLICATION_CREDENTIALS_JSON:
-            self.gcs_client = storage.Client.from_service_account_info(
+            self.gcs_client = storage_client.Client.from_service_account_info(
                 info=json.loads(GOOGLE_APPLICATION_CREDENTIALS_JSON)
             )
         else:
             # if no credentials json is provided, credentials will be picked up from the environment
             # if running on local environment, credentials would be user credentials
             # if running on a Compute Engine instance, credentials would be from Google Metadata server
-            self.gcs_client = storage.Client()
+            self.gcs_client = storage_client.Client()
         self.bucket = self.gcs_client.bucket(GCS_BUCKET_NAME)
 
     def upload_file(
@@ -288,20 +318,24 @@ class GCSStorageProvider(StorageProvider):
 
 class AzureStorageProvider(StorageProvider):
     def __init__(self):
+        blob_service_client = _require_dependency(
+            "azure-storage-blob", BlobServiceClient
+        )
         self.endpoint = AZURE_STORAGE_ENDPOINT
         self.container_name = AZURE_STORAGE_CONTAINER_NAME
         storage_key = AZURE_STORAGE_KEY
 
         if storage_key:
             # Configure using the Azure Storage Account Endpoint and Key
-            self.blob_service_client = BlobServiceClient(
+            self.blob_service_client = blob_service_client(
                 account_url=self.endpoint, credential=storage_key
             )
         else:
             # Configure using the Azure Storage Account Endpoint and DefaultAzureCredential
             # If the key is not configured, then the DefaultAzureCredential will be used to support Managed Identity authentication
-            self.blob_service_client = BlobServiceClient(
-                account_url=self.endpoint, credential=DefaultAzureCredential()
+            credential = _require_dependency("azure-identity", DefaultAzureCredential)
+            self.blob_service_client = blob_service_client(
+                account_url=self.endpoint, credential=credential()
             )
         self.container_client = self.blob_service_client.get_container_client(
             self.container_name

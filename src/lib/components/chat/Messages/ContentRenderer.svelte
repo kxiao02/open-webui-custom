@@ -10,7 +10,9 @@
 		settings,
 		showArtifacts,
 		showControls,
-		showEmbeds
+		showEmbeds,
+		showOverview,
+		showFilePreview
 	} from '$lib/stores';
 	import FloatingButtons from '../ContentRenderer/FloatingButtons.svelte';
 	import { createMessagesList } from '$lib/utils';
@@ -181,6 +183,7 @@
 				$chatId
 			) {
 				await tick();
+				showFilePreview.set(false);
 				showArtifacts.set(true);
 				showControls.set(true);
 			}
@@ -191,6 +194,7 @@
 			await showControls.set(true);
 			await showArtifacts.set(true);
 			await showEmbeds.set(false);
+			await showFilePreview.set(false);
 		}}
 	/>
 </div>

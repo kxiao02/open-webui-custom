@@ -406,7 +406,7 @@
 	};
 
 	const chatEventHandler = async (event, cb) => {
-		const chat = $page.url.pathname.includes(`/c/${event.chat_id}`);
+		const isCurrentChat = event.chat_id === $chatId || $temporaryChatEnabled;
 
 		// Skip events from temporary chats that are not the current chat.
 		// This prevents notifications from being sent to other tabs/devices
@@ -416,13 +416,13 @@
 			return;
 		}
 
-		let isFocused = document.visibilityState !== 'visible';
+		let isWindowFocused = document.visibilityState === 'visible';
 		if (window.electronAPI) {
 			const res = await window.electronAPI.send({
 				type: 'window:isFocused'
 			});
 			if (res) {
-				isFocused = res.isFocused;
+				isWindowFocused = !!res.isFocused;
 			}
 		}
 
@@ -430,44 +430,45 @@
 		const type = event?.data?.type ?? null;
 		const data = event?.data?.data ?? null;
 
-		if ((event.chat_id !== $chatId && !$temporaryChatEnabled) || isFocused) {
-			if (type === 'chat:completion') {
-				const { done, content, title } = data;
-				const displayTitle = title || $i18n.t('New Chat');
+		if (type === 'chat:completion' && (!isCurrentChat || !isWindowFocused)) {
+			const { done, content, title } = data;
 
-				if (done) {
-					if ($settings?.notificationSoundAlways ?? false) {
-						playingNotificationSound.set(true);
+			if (done) {
+				if ($settings?.notificationSoundAlways ?? false) {
+					playingNotificationSound.set(true);
 
-						const audio = new Audio(`/audio/notification.mp3`);
-						audio.play().finally(() => {
-							// Ensure the global state is reset after the sound finishes
-							playingNotificationSound.set(false);
-						});
-					}
-
-					if ($isLastActiveTab) {
-						if ($settings?.notificationEnabled ?? false) {
-							new Notification(`${displayTitle} • Open WebUI`, {
-								body: content,
-								icon: `${WEBUI_BASE_URL}/static/favicon.png`
-							});
-						}
-					}
-
-					toast.custom(NotificationToast, {
-						componentProps: {
-							onClick: () => {
-								goto(`/c/${event.chat_id}`);
-							},
-							content: content,
-							title: displayTitle
-						},
-						duration: 15000,
-						unstyled: true
+					const audio = new Audio(`/audio/notification.mp3`);
+					audio.play().finally(() => {
+						// Ensure the global state is reset after the sound finishes
+						playingNotificationSound.set(false);
 					});
 				}
-			} else if (type === 'chat:title') {
+
+				if ($isLastActiveTab) {
+					if ($settings?.notificationEnabled ?? false) {
+						new Notification(`${title} • Open WebUI`, {
+							body: content,
+							icon: `${WEBUI_BASE_URL}/static/favicon.png`
+						});
+					}
+				}
+
+				toast.custom(NotificationToast, {
+					componentProps: {
+						onClick: () => {
+							goto(`/c/${event.chat_id}`);
+						},
+						content: content,
+						title: title
+					},
+					duration: 15000,
+					unstyled: true
+				});
+			}
+		}
+
+		if (!isCurrentChat) {
+			if (type === 'chat:title') {
 				currentChatPage.set(1);
 				await chats.set(await getChatList(localStorage.token, $currentChatPage));
 			} else if (type === 'chat:tags') {
@@ -957,7 +958,18 @@
 
 <svelte:head>
 	<title>{$WEBUI_NAME}</title>
-	<link crossorigin="anonymous" rel="icon" href="{WEBUI_BASE_URL}/static/favicon.png" />
+	<link
+		crossorigin="anonymous"
+		rel="icon"
+		href="{WEBUI_BASE_URL}/static/favicon.png"
+		media="(prefers-color-scheme: light)"
+	/>
+	<link
+		crossorigin="anonymous"
+		rel="icon"
+		href="{WEBUI_BASE_URL}/static/favicon-dark.png"
+		media="(prefers-color-scheme: dark)"
+	/>
 
 	<meta name="apple-mobile-web-app-title" content={$WEBUI_NAME} />
 	<meta name="description" content={$WEBUI_NAME} />

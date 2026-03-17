@@ -345,31 +345,34 @@
 					<div
 						class="my-2.5 w-full flex overflow-x-auto gap-2 flex-wrap"
 						dir={$settings?.chatDirection ?? 'auto'}
-					>
-						{#each message?.data?.files as file}
-							{@const fileUrl =
-								file.url.startsWith('data') || file.url.startsWith('http')
-									? file.url
-									: `${WEBUI_API_BASE_URL}/files/${file.url}${file?.content_type ? '/content' : ''}`}
-							<div>
-								{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
-									<Image src={fileUrl} alt={file.name} imageClassName=" max-h-96 rounded-lg" />
-								{:else if file.type === 'video' || (file?.content_type ?? '').startsWith('video/')}
-									<video src={fileUrl} controls class=" max-h-96 rounded-lg"></video>
-								{:else}
-									<FileItem
-										item={file}
-										url={file.url}
-										name={file.name}
-										type={file.type}
-										size={file?.size}
-										small={true}
-									/>
+						>
+							{#each message?.data?.files as file}
+								{@const fileRef = (file?.url ?? file?.id ?? '').toString().trim()}
+								{#if fileRef !== '' && fileRef !== 'null' && fileRef !== 'undefined'}
+									{@const fileUrl =
+										fileRef.startsWith('data') || fileRef.startsWith('http')
+											? fileRef
+											: `${WEBUI_API_BASE_URL}/files/${fileRef}${file?.content_type ? '/content' : ''}`}
+									<div>
+										{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
+											<Image src={fileUrl} alt={file.name} imageClassName=" max-h-96 rounded-lg" />
+										{:else if file.type === 'video' || (file?.content_type ?? '').startsWith('video/')}
+											<video src={fileUrl} controls class=" max-h-96 rounded-lg"></video>
+										{:else}
+											<FileItem
+												item={{ ...file, url: fileRef }}
+												url={fileRef}
+												name={file.name}
+												type={file.type}
+												size={file?.size}
+												small={true}
+											/>
+										{/if}
+									</div>
 								{/if}
-							</div>
-						{/each}
-					</div>
-				{/if}
+							{/each}
+						</div>
+					{/if}
 
 				{#if edit}
 					<div class="py-2">

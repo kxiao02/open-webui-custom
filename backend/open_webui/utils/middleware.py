@@ -44,6 +44,7 @@ from open_webui.routers.tasks import (
 from open_webui.routers.retrieval import (
     process_web_search,
     SearchForm,
+    ensure_retrieval_runtime,
 )
 from open_webui.utils.tools import get_builtin_tools
 from open_webui.routers.images import (
@@ -155,6 +156,147 @@ DEFAULT_REASONING_TAGS = [
 ]
 DEFAULT_SOLUTION_TAGS = [("<|begin_of_solution|>", "<|end_of_solution|>")]
 DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
+
+
+def _iter_balanced_json_candidates(text: str):
+    if not text:
+        return
+
+    length = len(text)
+    for start in range(length):
+        if text[start] not in "{[":
+            continue
+
+        stack = []
+        in_string = False
+        escaped = False
+
+        for idx in range(start, length):
+            ch = text[idx]
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+
+            if ch in "{[":
+                stack.append(ch)
+                continue
+
+            if ch in "}]":
+                if not stack:
+                    break
+                opener = stack.pop()
+                if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
+                    break
+                if not stack:
+                    yield text[start : idx + 1]
+                    break
+
+
+def _extract_json_from_task_response(text: str):
+    if not isinstance(text, str):
+        return None
+
+    normalized = text.strip()
+    if not normalized:
+        return None
+
+    candidates: list[str] = [normalized]
+    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", normalized, re.I):
+        fenced = (match.group(1) or "").strip()
+        if fenced:
+            candidates.append(fenced)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    for candidate in candidates:
+        for snippet in _iter_balanced_json_candidates(candidate):
+            try:
+                return json.loads(snippet)
+            except Exception:
+                continue
+
+    return None
+
+
+def _message_has_meaningful_content(message: dict) -> bool:
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    return True
+    return False
+
+
+def _extract_follow_up_focus_messages(messages: list[dict]) -> list[dict]:
+    if not isinstance(messages, list) or not messages:
+        return []
+
+    def _role_at(index: int) -> str:
+        role = messages[index].get("role", "")
+        return str(role or "").strip().lower()
+
+    last_assistant_idx = -1
+    for idx in range(len(messages) - 1, -1, -1):
+        role = _role_at(idx)
+        if role == "assistant" and _message_has_meaningful_content(messages[idx]):
+            last_assistant_idx = idx
+            break
+
+    user_search_end = last_assistant_idx if last_assistant_idx >= 0 else len(messages) - 1
+    last_user_idx = -1
+    for idx in range(user_search_end, -1, -1):
+        role = _role_at(idx)
+        if role in {"user", "human"} and _message_has_meaningful_content(messages[idx]):
+            last_user_idx = idx
+            break
+
+    focused: list[dict] = []
+    if last_user_idx >= 0:
+        focused.append(messages[last_user_idx])
+    if last_assistant_idx >= 0 and last_assistant_idx >= last_user_idx:
+        focused.append(messages[last_assistant_idx])
+
+    if focused:
+        return focused
+
+    fallback: list[dict] = []
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "")).strip().lower()
+        if role not in {"user", "human", "assistant"}:
+            continue
+        if not _message_has_meaningful_content(msg):
+            continue
+        fallback.append(msg)
+        if len(fallback) >= 4:
+            break
+    fallback.reverse()
+    return fallback
 
 
 def output_id(prefix: str) -> str:
@@ -1645,6 +1787,112 @@ def get_image_urls(delta_images, request, metadata, user) -> list[str]:
     return image_urls
 
 
+def _normalize_generated_file_entry(item: Any) -> Optional[dict]:
+    if isinstance(item, str):
+        ref = item.strip()
+        if not ref or ref.lower() in {"null", "undefined"}:
+            return None
+        return {"url": ref}
+
+    if not isinstance(item, dict):
+        return None
+
+    candidates = [
+        item.get("url"),
+        item.get("download_url"),
+        item.get("downloadUrl"),
+        item.get("id"),
+        item.get("file_id"),
+        item.get("fileId"),
+    ]
+    ref = next(
+        (
+            value.strip()
+            for value in candidates
+            if isinstance(value, str)
+            and value.strip()
+            and value.strip().lower() not in {"null", "undefined"}
+        ),
+        "",
+    )
+    if not ref:
+        return None
+
+    normalized = {"url": ref}
+
+    file_id = item.get("id")
+    if isinstance(file_id, str) and file_id.strip():
+        normalized["id"] = file_id.strip()
+
+    name = item.get("filename") or item.get("fileName") or item.get("name")
+    if isinstance(name, str) and name.strip():
+        normalized["name"] = name.strip()
+
+    file_type = item.get("type")
+    if isinstance(file_type, str) and file_type.strip():
+        normalized["type"] = file_type.strip()
+
+    content_type = item.get("content_type") or item.get("contentType")
+    if isinstance(content_type, str) and content_type.strip():
+        normalized["content_type"] = content_type.strip()
+
+    file_size = item.get("bytes")
+    if isinstance(file_size, (int, float)) and file_size >= 0:
+        normalized["size"] = int(file_size)
+
+    return normalized
+
+
+def _generated_file_ref_key(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    ref = item.get("url") or item.get("id")
+    if isinstance(ref, str):
+        normalized_ref = ref.strip()
+        if normalized_ref:
+            return normalized_ref
+    return ""
+
+
+def _extract_generated_files_from_choices(choices: Any) -> list[dict]:
+    if not isinstance(choices, list):
+        return []
+
+    generated_files: list[dict] = []
+    seen_refs: set[str] = set()
+
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+
+        metadata_candidates = []
+        for key in ("message", "delta"):
+            node = choice.get(key)
+            if not isinstance(node, dict):
+                continue
+            metadata = node.get("metadata")
+            if isinstance(metadata, dict):
+                metadata_candidates.append(metadata)
+
+        for metadata in metadata_candidates:
+            for key in ("generated_files", "generatedFiles"):
+                items = metadata.get(key)
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    normalized = _normalize_generated_file_entry(item)
+                    if not normalized:
+                        continue
+                    ref_key = _generated_file_ref_key(normalized)
+                    if ref_key and ref_key in seen_refs:
+                        continue
+                    if ref_key:
+                        seen_refs.add(ref_key)
+                    generated_files.append(normalized)
+
+    return generated_files
+
+
 def add_file_context(messages: list, chat_id: str, user) -> list:
     """
     Add file URLs to messages for native function calling.
@@ -1944,6 +2192,7 @@ async def chat_completion_files_handler(
             queries = [get_last_user_message(body["messages"])]
 
         try:
+            ensure_retrieval_runtime(request.app)
             # Directly await async get_sources_from_items (no thread needed - fully async now)
             sources = await get_sources_from_items(
                 request=request,
@@ -2000,6 +2249,7 @@ async def chat_completion_files_handler(
                 "data": {
                     "action": "sources_retrieved",
                     "count": sources_count,
+                    "hidden": sources_count == 0,
                     "done": True,
                 },
             }
@@ -2469,6 +2719,59 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         # Remove duplicate files based on their content
         files = list({json.dumps(f, sort_keys=True): f for f in files}.values())
 
+        # Drop invalid/incomplete file entries (e.g. null id/url from in-flight uploads).
+        sanitized_files = []
+        for file_item in files:
+            if not isinstance(file_item, dict):
+                continue
+
+            file_type = file_item.get("type", "file")
+            if file_type == "folder":
+                folder_id = file_item.get("id")
+                if (
+                    isinstance(folder_id, str)
+                    and folder_id.strip()
+                    and folder_id.strip().lower() != "null"
+                ):
+                    sanitized_files.append(file_item)
+                continue
+
+            status = str(file_item.get("status", "")).strip().lower()
+            if status == "uploading":
+                continue
+
+            file_id = file_item.get("id")
+            file_url = file_item.get("url")
+
+            has_valid_id = (
+                isinstance(file_id, str)
+                and file_id.strip()
+                and file_id.strip().lower() != "null"
+            )
+            has_valid_url = (
+                isinstance(file_url, str)
+                and file_url.strip()
+                and file_url.strip().lower() != "null"
+            )
+            has_inline_content = (
+                isinstance(file_item.get("content"), str)
+                and file_item.get("content").strip() != ""
+            )
+
+            if has_valid_id or has_valid_url or has_inline_content:
+                sanitized_files.append(file_item)
+
+        files = sanitized_files
+
+    provider_file_ids = []
+    if files:
+        for file_item in files:
+            file_id = file_item.get("id")
+            if isinstance(file_id, str) and file_id:
+                provider_file_ids.append(file_id)
+        # Preserve order while removing duplicates
+        provider_file_ids = list(dict.fromkeys(provider_file_ids))
+
     metadata = {
         **metadata,
         "tool_ids": tool_ids,
@@ -2476,6 +2779,13 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         "files": files,
     }
     form_data["metadata"] = metadata
+
+    # Keep explicit file refs in outbound payload for OpenAI-compatible providers.
+    if files:
+        form_data["files"] = files
+        form_data["attachments"] = files
+    if provider_file_ids:
+        form_data["file_ids"] = provider_file_ids
 
     # When the caller provides an explicit OpenAI-style `tools` array in the
     # request body, skip all server-side tool resolution and pass the caller's
@@ -3623,6 +3933,7 @@ async def streaming_chat_response_handler(response, ctx):
                         ),
                     )
                     last_delta_data = None
+                    emitted_generated_file_refs: set[str] = set()
 
                     async def flush_pending_delta_data(threshold: int = 0):
                         nonlocal delta_count
@@ -3715,6 +4026,24 @@ async def streaming_chat_response_handler(response, ctx):
                                     )
                                     continue
                                 else:
+                                    sources = data.get("sources", None)
+                                    if isinstance(sources, list):
+                                        for source in sources:
+                                            if isinstance(source, dict):
+                                                await event_emitter(
+                                                    {
+                                                        "type": "source",
+                                                        "data": source,
+                                                    }
+                                                )
+                                    elif isinstance(sources, dict):
+                                        await event_emitter(
+                                            {
+                                                "type": "source",
+                                                "data": sources,
+                                            }
+                                        )
+
                                     choices = data.get("choices", [])
 
                                     # Normalize usage data to standard format
@@ -3747,6 +4076,39 @@ async def streaming_chat_response_handler(response, ctx):
                                         continue
 
                                     delta = choices[0].get("delta", {})
+                                    delta_generated_files = (
+                                        _extract_generated_files_from_choices(
+                                            [{"delta": delta}]
+                                        )
+                                    )
+                                    if delta_generated_files:
+                                        new_generated_files = []
+                                        for file_item in delta_generated_files:
+                                            ref_key = _generated_file_ref_key(file_item)
+                                            if ref_key and ref_key in emitted_generated_file_refs:
+                                                continue
+                                            if ref_key:
+                                                emitted_generated_file_refs.add(ref_key)
+                                            new_generated_files.append(file_item)
+
+                                        if new_generated_files:
+                                            message_files = Chats.add_message_files_by_id_and_message_id(
+                                                metadata["chat_id"],
+                                                metadata["message_id"],
+                                                new_generated_files,
+                                            )
+                                            await event_emitter(
+                                                {
+                                                    "type": "files",
+                                                    "data": {
+                                                        "files": (
+                                                            message_files
+                                                            if isinstance(message_files, list)
+                                                            else new_generated_files
+                                                        )
+                                                    },
+                                                }
+                                            )
 
                                     # Handle delta annotations
                                     annotations = delta.get("annotations")

@@ -3,7 +3,6 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request
 
 from open_webui.models.prompts import (
     PromptForm,
-    PromptUserResponse,
     PromptAccessResponse,
     PromptAccessListResponse,
     PromptModel,
@@ -38,7 +37,6 @@ class PromptMetadataForm(BaseModel):
 router = APIRouter()
 
 PAGE_ITEM_COUNT = 30
-
 
 ############################
 # GetPrompts

@@ -19,24 +19,49 @@
 
 	let loaded = false;
 
+	const getWorkspaceFallbackPath = () => {
+		if ($user?.role === 'admin') {
+			return '/workspace/models';
+		}
+
+		if ($user?.role === 'user' && $user?.permissions?.workspace?.knowledge) {
+			return '/workspace/knowledge';
+		}
+
+		if ($user?.permissions?.workspace?.models) {
+			return '/workspace/models';
+		}
+		if ($user?.permissions?.workspace?.knowledge) {
+			return '/workspace/knowledge';
+		}
+		if ($user?.permissions?.workspace?.prompts) {
+			return '/workspace/prompts';
+		}
+		if ($user?.permissions?.workspace?.tools) {
+			return '/workspace/tools';
+		}
+
+		return '/';
+	};
+
 	onMount(async () => {
 		if ($user?.role !== 'admin') {
 			if ($page.url.pathname.includes('/models') && !$user?.permissions?.workspace?.models) {
-				goto('/');
+				goto(getWorkspaceFallbackPath());
 			} else if (
 				$page.url.pathname.includes('/knowledge') &&
 				!$user?.permissions?.workspace?.knowledge
 			) {
-				goto('/');
+				goto(getWorkspaceFallbackPath());
 			} else if (
 				$page.url.pathname.includes('/prompts') &&
 				!$user?.permissions?.workspace?.prompts
 			) {
-				goto('/');
+				goto(getWorkspaceFallbackPath());
 			} else if ($page.url.pathname.includes('/tools') && !$user?.permissions?.workspace?.tools) {
-				goto('/');
+				goto(getWorkspaceFallbackPath());
 			} else if ($page.url.pathname.includes('/skills') && !$user?.permissions?.workspace?.skills) {
-				goto('/');
+				goto(getWorkspaceFallbackPath());
 			}
 		}
 

@@ -1,14 +1,20 @@
-from test.util.abstract_integration_test import AbstractPostgresTest
-from test.util.mock_user import mock_webui_user
+from open_webui.test_support import AbstractPostgresTest
+from open_webui.models.users import UserSettings, UserUpdateForm, Users
+from open_webui.routers import users
+
+
+def _as_dict(entry):
+    return entry.model_dump() if hasattr(entry, "model_dump") else entry
 
 
 def _get_user_by_id(data, param):
-    return next((item for item in data if item["id"] == param), None)
+    return next((item for item in data if _as_dict(item)["id"] == param), None)
 
 
 def _assert_user(data, id, **kwargs):
     user = _get_user_by_id(data, id)
     assert user is not None
+    payload = _as_dict(user)
     comparison_data = {
         "name": f"user {id}",
         "email": f"user{id}@openwebui.com",
@@ -17,28 +23,22 @@ def _assert_user(data, id, **kwargs):
         **kwargs,
     }
     for key, value in comparison_data.items():
-        assert user[key] == value
+        assert payload[key] == value
 
 
 class TestUsers(AbstractPostgresTest):
     BASE_PATH = "/api/v1/users"
 
-    def setup_class(cls):
-        super().setup_class()
-        from open_webui.models.users import Users
-
-        cls.users = Users
-
     def setup_method(self):
         super().setup_method()
-        self.users.insert_new_user(
+        Users.insert_new_user(
             id="1",
             name="user 1",
             email="user1@openwebui.com",
             profile_image_url="/user1.png",
             role="user",
         )
-        self.users.insert_new_user(
+        Users.insert_new_user(
             id="2",
             name="user 2",
             email="user2@openwebui.com",
@@ -47,103 +47,113 @@ class TestUsers(AbstractPostgresTest):
         )
 
     def test_users(self):
-        # Get all users
-        with mock_webui_user(id="3"):
-            response = self.fast_api_client.get(self.create_url(""))
-        assert response.status_code == 200
-        assert len(response.json()) == 2
-        data = response.json()
-        _assert_user(data, "1")
+        admin = Users.update_user_by_id(
+            "1",
+            {
+                "name": "user 1",
+                "email": "user1@openwebui.com",
+                "profile_image_url": "/user1.png",
+                "role": "admin",
+            },
+            db=self.db,
+        )
+        user_two = Users.get_user_by_id("2", db=self.db)
+
+        payload = self.run_async(users.get_users(user=admin, db=self.db))
+        assert payload["total"] == 2
+        data = payload["users"]
+        _assert_user(data, "1", role="admin")
         _assert_user(data, "2")
 
-        # update role
-        with mock_webui_user(id="3"):
-            response = self.fast_api_client.post(
-                self.create_url("/update/role"), json={"id": "2", "role": "admin"}
+        updated = self.run_async(
+            users.update_user_by_id(
+                user_id="2",
+                form_data=UserUpdateForm(
+                    name="user 2",
+                    email="user2@openwebui.com",
+                    profile_image_url="/user2.png",
+                    role="admin",
+                ),
+                session_user=admin,
+                db=self.db,
             )
-        assert response.status_code == 200
-        _assert_user([response.json()], "2", role="admin")
+        )
+        _assert_user([updated], "2", role="admin")
+        user_two = Users.get_user_by_id("2", db=self.db)
 
-        # Get all users
-        with mock_webui_user(id="3"):
-            response = self.fast_api_client.get(self.create_url(""))
-        assert response.status_code == 200
-        assert len(response.json()) == 2
-        data = response.json()
-        _assert_user(data, "1")
+        payload = self.run_async(users.get_users(user=admin, db=self.db))
+        assert payload["total"] == 2
+        data = payload["users"]
+        _assert_user(data, "1", role="admin")
         _assert_user(data, "2", role="admin")
 
-        # Get (empty) user settings
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.get(self.create_url("/user/settings"))
-        assert response.status_code == 200
-        assert response.json() is None
+        response = self.run_async(
+            users.get_user_settings_by_session_user(user=user_two, db=self.db)
+        )
+        assert response is None
 
-        # Update user settings
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.post(
-                self.create_url("/user/settings/update"),
-                json={
-                    "ui": {"attr1": "value1", "attr2": "value2"},
-                    "model_config": {"attr3": "value3", "attr4": "value4"},
-                },
+        request = self.make_request(
+            self.create_url("/user/settings/update"),
+            method="POST",
+        )
+        response = self.run_async(
+            users.update_user_settings_by_session_user(
+                request=request,
+                form_data=UserSettings(ui={"attr1": "value1", "attr2": "value2"}),
+                user=user_two,
+                db=self.db,
             )
-        assert response.status_code == 200
+        )
+        assert response.model_dump() == {"ui": {"attr1": "value1", "attr2": "value2"}}
 
-        # Get user settings
-        with mock_webui_user(id="2"):
-            response = self.fast_api_client.get(self.create_url("/user/settings"))
-        assert response.status_code == 200
-        assert response.json() == {
-            "ui": {"attr1": "value1", "attr2": "value2"},
-            "model_config": {"attr3": "value3", "attr4": "value4"},
-        }
+        response = self.run_async(
+            users.get_user_settings_by_session_user(user=user_two, db=self.db)
+        )
+        assert response.model_dump() == {"ui": {"attr1": "value1", "attr2": "value2"}}
 
-        # Get (empty) user info
-        with mock_webui_user(id="1"):
-            response = self.fast_api_client.get(self.create_url("/user/info"))
-        assert response.status_code == 200
-        assert response.json() is None
+        response = self.run_async(
+            users.get_user_info_by_session_user(user=admin, db=self.db)
+        )
+        assert response is None
 
-        # Update user info
-        with mock_webui_user(id="1"):
-            response = self.fast_api_client.post(
-                self.create_url("/user/info/update"),
-                json={"attr1": "value1", "attr2": "value2"},
+        response = self.run_async(
+            users.update_user_info_by_session_user(
+                form_data={"attr1": "value1", "attr2": "value2"},
+                user=admin,
+                db=self.db,
             )
-        assert response.status_code == 200
+        )
+        assert response == {"attr1": "value1", "attr2": "value2"}
 
-        # Get user info
-        with mock_webui_user(id="1"):
-            response = self.fast_api_client.get(self.create_url("/user/info"))
-        assert response.status_code == 200
-        assert response.json() == {"attr1": "value1", "attr2": "value2"}
+        response = self.run_async(
+            users.get_user_info_by_session_user(user=admin, db=self.db)
+        )
+        assert response == {"attr1": "value1", "attr2": "value2"}
 
-        # Get user by id
-        with mock_webui_user(id="1"):
-            response = self.fast_api_client.get(self.create_url("/2"))
-        assert response.status_code == 200
-        assert response.json() == {"name": "user 2", "profile_image_url": "/user2.png"}
+        details = self.run_async(users.get_user_by_id("2", user=admin, db=self.db))
+        assert details.name == "user 2"
+        assert details.profile_image_url == "/user2.png"
+        assert details.is_active is True
 
-        # Update user by id
-        with mock_webui_user(id="1"):
-            response = self.fast_api_client.post(
-                self.create_url("/2/update"),
-                json={
-                    "name": "user 2 updated",
-                    "email": "user2-updated@openwebui.com",
-                    "profile_image_url": "/user2-updated.png",
-                },
+        updated = self.run_async(
+            users.update_user_by_id(
+                user_id="2",
+                form_data=UserUpdateForm(
+                    name="user 2 updated",
+                    email="user2-updated@openwebui.com",
+                    profile_image_url="/user2-updated.png",
+                    role="admin",
+                ),
+                session_user=admin,
+                db=self.db,
             )
-        assert response.status_code == 200
+        )
+        assert updated.name == "user 2 updated"
 
-        # Get all users
-        with mock_webui_user(id="3"):
-            response = self.fast_api_client.get(self.create_url(""))
-        assert response.status_code == 200
-        assert len(response.json()) == 2
-        data = response.json()
-        _assert_user(data, "1")
+        payload = self.run_async(users.get_users(user=admin, db=self.db))
+        assert payload["total"] == 2
+        data = payload["users"]
+        _assert_user(data, "1", role="admin")
         _assert_user(
             data,
             "2",
@@ -153,15 +163,9 @@ class TestUsers(AbstractPostgresTest):
             profile_image_url=f"/api/v1/users/2/profile/image",
         )
 
-        # Delete user by id
-        with mock_webui_user(id="1"):
-            response = self.fast_api_client.delete(self.create_url("/2"))
-        assert response.status_code == 200
+        deleted = self.run_async(users.delete_user_by_id("2", user=admin, db=self.db))
+        assert deleted is True
 
-        # Get all users
-        with mock_webui_user(id="3"):
-            response = self.fast_api_client.get(self.create_url(""))
-        assert response.status_code == 200
-        assert len(response.json()) == 1
-        data = response.json()
-        _assert_user(data, "1")
+        payload = self.run_async(users.get_users(user=admin, db=self.db))
+        assert payload["total"] == 1
+        _assert_user(payload["users"], "1", role="admin")

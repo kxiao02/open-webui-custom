@@ -60,15 +60,16 @@
 		if (item?.file?.data?.content || item?.type === 'file' || item?.content || modal) {
 			showModal = !showModal;
 		} else {
-			if (url) {
+			const normalizedUrl = typeof url === 'string' ? url.trim() : '';
+			if (normalizedUrl && normalizedUrl !== 'null' && normalizedUrl !== 'undefined') {
 				if (type === 'file') {
-					if (url.startsWith('http')) {
-						window.open(`${url}/content`, '_blank').focus();
+					if (normalizedUrl.startsWith('http')) {
+						window.open(`${normalizedUrl}/content`, '_blank').focus();
 					} else {
-						window.open(`${WEBUI_API_BASE_URL}/files/${url}/content`, '_blank').focus();
+						window.open(`${WEBUI_API_BASE_URL}/files/${normalizedUrl}/content`, '_blank').focus();
 					}
 				} else {
-					window.open(`${url}`, '_blank').focus();
+					window.open(`${normalizedUrl}`, '_blank').focus();
 				}
 			}
 		}
@@ -166,7 +167,11 @@
 			<div class="flex flex-col justify-center -space-y-0.5 px-1 w-full">
 				<div class=" dark:text-gray-100 text-sm flex justify-between items-center">
 					<div class="font-medium line-clamp-1 flex-1 pr-1">{decodeString(name)}</div>
-					{#if size}
+					{#if loading}
+						<div class="text-gray-500 text-xs capitalize shrink-0">
+							{$i18n.t('Uploading...')}
+						</div>
+					{:else if size}
 						<div class="text-gray-500 text-xs capitalize shrink-0">{formatFileSize(size)}</div>
 					{:else}
 						<div class="text-gray-500 text-xs capitalize shrink-0">{type}</div>

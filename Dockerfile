@@ -22,28 +22,56 @@ ARG BUILD_HASH=dev-build
 # Override at your own risk - non-root configurations are untested
 ARG UID=0
 ARG GID=0
+ARG NODE_IMAGE=node:22-alpine3.20
+ARG PYTHON_IMAGE=python:3.11.14-slim-bookworm
+ARG NPM_CONFIG_REGISTRY
+ARG GITHUB_MIRROR_PREFIX
+ARG NODE_MAX_OLD_SPACE_SIZE=4096
+ARG SKIP_PYODIDE_FETCH=false
+ARG HF_ENDPOINT
+ARG PIP_INDEX_URL
+ARG UV_INDEX_URL
+ARG PIP_TRUSTED_HOST
+ARG PYTORCH_INDEX_URL_CPU
+ARG PYTORCH_INDEX_URL_CUDA
+ARG APT_MIRROR
+ARG APT_SECURITY_MIRROR
 
 ######## WebUI frontend ########
-FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS build
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS build
 ARG BUILD_HASH
+ARG NPM_CONFIG_REGISTRY
+ARG GITHUB_MIRROR_PREFIX
+ARG NODE_MAX_OLD_SPACE_SIZE
+ARG SKIP_PYODIDE_FETCH
 
-# Set Node.js options (heap limit Allocation failed - JavaScript heap out of memory)
-# ENV NODE_OPTIONS="--max-old-space-size=4096"
+ENV NODE_MAX_OLD_SPACE_SIZE=${NODE_MAX_OLD_SPACE_SIZE}
 
 WORKDIR /app
 
 # to store git revision in build
 RUN apk add --no-cache git
 
+ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+ENV GITHUB_MIRROR_PREFIX=${GITHUB_MIRROR_PREFIX}
+
+COPY scripts/github-mirror.js /app/scripts/github-mirror.js
 COPY package.json package-lock.json ./
+RUN if [ -n "$NPM_CONFIG_REGISTRY" ]; then npm config set registry "$NPM_CONFIG_REGISTRY"; fi
+ENV NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE} --require /app/scripts/github-mirror.js"
 RUN npm ci --force
 
 COPY . .
 ENV APP_BUILD_HASH=${BUILD_HASH}
-RUN npm run build
+RUN if [ "$SKIP_PYODIDE_FETCH" = "true" ]; then \
+    echo "Skipping pyodide fetch for faster build"; \
+    npx vite build; \
+  else \
+    npm run build; \
+  fi
 
 ######## WebUI backend ########
-FROM python:3.11.14-slim-bookworm AS base
+FROM ${PYTHON_IMAGE} AS base
 
 # Use args
 ARG USE_CUDA
@@ -56,6 +84,15 @@ ARG USE_RERANKING_MODEL
 ARG USE_AUXILIARY_EMBEDDING_MODEL
 ARG UID
 ARG GID
+ARG HF_ENDPOINT
+ARG PIP_INDEX_URL
+ARG UV_INDEX_URL
+ARG PIP_TRUSTED_HOST
+ARG PYTORCH_INDEX_URL_CPU
+ARG PYTORCH_INDEX_URL_CUDA
+ARG GITHUB_MIRROR_PREFIX
+ARG APT_MIRROR
+ARG APT_SECURITY_MIRROR
 
 # Python settings
 ENV PYTHONUNBUFFERED=1
@@ -83,6 +120,13 @@ ENV OPENAI_API_KEY="" \
     DO_NOT_TRACK=true \
     ANONYMIZED_TELEMETRY=false
 
+## Python package mirrors ##
+ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
+    UV_INDEX_URL=${UV_INDEX_URL} \
+    PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST} \
+    PYTORCH_INDEX_URL_CPU=${PYTORCH_INDEX_URL_CPU} \
+    PYTORCH_INDEX_URL_CUDA=${PYTORCH_INDEX_URL_CUDA}
+
 #### Other models #########################################################
 ## whisper TTS model settings ##
 ENV WHISPER_MODEL="base" \
@@ -100,6 +144,11 @@ ENV TIKTOKEN_ENCODING_NAME="cl100k_base" \
 
 ## Hugging Face download cache ##
 ENV HF_HOME="/app/backend/data/cache/embedding/models"
+ENV HF_ENDPOINT=${HF_ENDPOINT}
+
+## NLTK settings for deterministic unstructured parsing at runtime ##
+ENV NLTK_DATA="/usr/local/share/nltk_data" \
+    AUTO_DOWNLOAD_NLTK="False"
 
 ## Torch Extensions ##
 # ENV TORCH_EXTENSIONS_DIR="/.cache/torch_extensions"
@@ -124,7 +173,17 @@ RUN echo -n 00000000-0000-0000-0000-000000000000 > $HOME/.cache/chroma/telemetry
 RUN chown -R $UID:$GID /app $HOME
 
 # Install common system dependencies
-RUN apt-get update && \
+RUN if [ -n "$APT_MIRROR" ] || [ -n "$APT_SECURITY_MIRROR" ]; then \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+    if [ -n "$APT_MIRROR" ]; then \
+    sed -i "s|http://deb.debian.org/debian|${APT_MIRROR}|g; s|https://deb.debian.org/debian|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    if [ -n "$APT_SECURITY_MIRROR" ]; then \
+    sed -i "s|http://deb.debian.org/debian-security|${APT_SECURITY_MIRROR}|g; s|https://deb.debian.org/debian-security|${APT_SECURITY_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    fi; \
+    fi && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
     git build-essential pandoc gcc netcat-openbsd curl jq \
     libmariadb-dev \
@@ -134,12 +193,14 @@ RUN apt-get update && \
 
 # install python dependencies
 COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
+COPY --chown=$UID:$GID ./backend/requirements-min.txt ./requirements-min.txt
 
 RUN pip3 install --no-cache-dir uv && \
     if [ "$USE_CUDA" = "true" ]; then \
     # If you use CUDA the whisper and embedding model will be downloaded on first use
     # fix: pin torch<=2.9.1 - torch 2.10.0 aarch64 wheels cause SIGILL on ARM devices (RPi 4 Cortex-A72) #21349
-    pip3 install 'torch<=2.9.1' torchvision torchaudio --index-url https://download.pytorch.org/whl/$USE_CUDA_DOCKER_VER --no-cache-dir && \
+    PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL_CUDA:-https://download.pytorch.org/whl/$USE_CUDA_DOCKER_VER}" && \
+    pip3 install 'torch<=2.9.1' torchvision torchaudio --index-url "$PYTORCH_INDEX_URL" --trusted-host "$(echo "$PYTORCH_INDEX_URL" | sed -E 's#^https?://([^/]+)/?.*#\1#')" --no-cache-dir && \
     uv pip install --system -r requirements.txt --no-cache-dir && \
     python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')" && \
     python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ.get('AUXILIARY_EMBEDDING_MODEL', 'TaylorAI/bge-micro-v2'), device='cpu')" && \
@@ -147,7 +208,8 @@ RUN pip3 install --no-cache-dir uv && \
     python -c "import os; import tiktoken; tiktoken.get_encoding(os.environ['TIKTOKEN_ENCODING_NAME'])"; \
     python -c "import nltk; nltk.download('punkt_tab')"; \
     else \
-    pip3 install 'torch<=2.9.1' torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --no-cache-dir && \
+    PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL_CPU:-https://download.pytorch.org/whl/cpu}" && \
+    pip3 install 'torch<=2.9.1' torchvision torchaudio --index-url "$PYTORCH_INDEX_URL" --trusted-host "$(echo "$PYTORCH_INDEX_URL" | sed -E 's#^https?://([^/]+)/?.*#\1#')" --no-cache-dir && \
     uv pip install --system -r requirements.txt --no-cache-dir && \
     if [ "$USE_SLIM" != "true" ]; then \
     python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['RAG_EMBEDDING_MODEL'], device='cpu')" && \
@@ -157,8 +219,129 @@ RUN pip3 install --no-cache-dir uv && \
     python -c "import nltk; nltk.download('punkt_tab')"; \
     fi; \
     fi; \
+    pip3 install --no-cache-dir -r requirements-min.txt && \
     mkdir -p /app/backend/data && chown -R $UID:$GID /app/backend/data/ && \
     rm -rf /var/lib/apt/lists/*;
+
+# Fail the build if the runtime image still lacks core backend packages.
+RUN python3 - <<'PY'
+import importlib.util
+
+required_modules = {
+    "fastapi": "fastapi",
+    "pydantic": "pydantic",
+    "uvicorn": "uvicorn",
+    "typer": "typer",
+}
+missing = sorted(
+    package_name
+    for module_name, package_name in required_modules.items()
+    if importlib.util.find_spec(module_name) is None
+)
+
+if missing:
+    raise RuntimeError(
+        "Missing core runtime packages after dependency install: "
+        + ", ".join(missing)
+    )
+
+print("Dependency check OK: core runtime packages present.")
+PY
+
+# Preload NLTK resources required by unstructured Excel/document loaders.
+# We use mirror-first direct package URLs (if provided), then fall back to upstream.
+RUN python3 - <<'PY'
+import io
+import os
+import urllib.request
+import zipfile
+
+download_dir = os.environ.get("NLTK_DATA", "/usr/local/share/nltk_data")
+mirror_prefix = (os.environ.get("GITHUB_MIRROR_PREFIX") or "").strip().rstrip("/")
+
+resources = [
+    ("taggers", "averaged_perceptron_tagger_eng"),
+    ("tokenizers", "punkt_tab"),
+]
+
+os.makedirs(download_dir, exist_ok=True)
+
+def candidates(category: str, package: str):
+    paths = []
+    if mirror_prefix:
+        paths.append(
+            f"{mirror_prefix}/nltk/nltk_data/raw/gh-pages/packages/{category}/{package}.zip"
+        )
+    paths.append(
+        f"https://raw.githubusercontent.com/nltk/nltk_data/gh-pages/packages/{category}/{package}.zip"
+    )
+    return paths
+
+def present(category: str, package: str) -> bool:
+    return os.path.isdir(os.path.join(download_dir, category, package))
+
+def normalize(category: str, package: str):
+    # Handle previously flattened layout: /nltk_data/<package> -> /nltk_data/<category>/<package>
+    flat = os.path.join(download_dir, package)
+    nested = os.path.join(download_dir, category, package)
+    if os.path.isdir(flat) and not os.path.isdir(nested):
+        os.makedirs(os.path.join(download_dir, category), exist_ok=True)
+        os.replace(flat, nested)
+
+def extract_archive(zf: zipfile.ZipFile, category: str, package: str):
+    names = [n for n in zf.namelist() if n and not n.startswith("__MACOSX/")]
+    category_prefix = f"{category}/"
+    package_prefix = f"{package}/"
+
+    if any(n.startswith(category_prefix) for n in names):
+        zf.extractall(download_dir)
+    elif any(n.startswith(package_prefix) for n in names):
+        zf.extractall(os.path.join(download_dir, category))
+    else:
+        target_root = os.path.join(download_dir, category, package)
+        os.makedirs(target_root, exist_ok=True)
+        for name in names:
+            if name.endswith("/"):
+                os.makedirs(os.path.join(target_root, name), exist_ok=True)
+                continue
+            dest = os.path.join(target_root, name)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with zf.open(name) as src, open(dest, "wb") as out:
+                out.write(src.read())
+
+for category, package in resources:
+    normalize(category, package)
+    if present(category, package):
+        print(f"NLTK resource already present: {category}/{package}")
+        continue
+
+    last_error = None
+    for url in candidates(category, package):
+        try:
+            print(f"Downloading {category}/{package} from {url}")
+            with urllib.request.urlopen(url, timeout=120) as response:
+                archive = response.read()
+            with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+                extract_archive(zf, category, package)
+            normalize(category, package)
+            if present(category, package):
+                print(f"Installed {category}/{package} via {url}")
+                last_error = None
+                break
+            last_error = RuntimeError(
+                f"Package extracted but not discoverable: {category}/{package}"
+            )
+        except Exception as exc:  # pragma: no cover - build-time path
+            print(f"Download failed from {url}: {exc}")
+            last_error = exc
+
+    if last_error is not None:
+        raise RuntimeError(
+            f"Failed to preload NLTK resource {category}/{package}: {last_error}"
+        )
+
+print("NLTK preload complete.")
+PY
 
 # Install Ollama if requested
 RUN if [ "$USE_OLLAMA" = "true" ]; then \

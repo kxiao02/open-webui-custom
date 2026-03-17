@@ -19,6 +19,7 @@
 
 	import { reindexKnowledgeFiles } from '$lib/apis/knowledge';
 	import { deleteAllFiles } from '$lib/apis/files';
+	import { MINERU_CLOUD_API_URL, MINERU_LOCAL_API_URL_EXAMPLE } from '$lib/constants';
 
 	import ResetUploadDirConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import ResetVectorDBConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
@@ -668,17 +669,19 @@
 										class="w-fit pr-8 rounded-sm px-2 text-xs bg-transparent outline-hidden"
 										bind:value={RAGConfig.MINERU_API_MODE}
 										on:change={() => {
-											// Auto-update URL when switching modes if it's empty or matches the opposite mode's default
-											const cloudUrl = 'https://mineru.net/api/v4';
-											const localUrl = 'http://localhost:8000';
-
 											if (RAGConfig.MINERU_API_MODE === 'cloud') {
-												if (!RAGConfig.MINERU_API_URL || RAGConfig.MINERU_API_URL === localUrl) {
-													RAGConfig.MINERU_API_URL = cloudUrl;
+												if (
+													!RAGConfig.MINERU_API_URL ||
+													RAGConfig.MINERU_API_URL === MINERU_LOCAL_API_URL_EXAMPLE
+												) {
+													RAGConfig.MINERU_API_URL = MINERU_CLOUD_API_URL;
 												}
 											} else {
-												if (!RAGConfig.MINERU_API_URL || RAGConfig.MINERU_API_URL === cloudUrl) {
-													RAGConfig.MINERU_API_URL = localUrl;
+												if (
+													!RAGConfig.MINERU_API_URL ||
+													RAGConfig.MINERU_API_URL === MINERU_CLOUD_API_URL
+												) {
+													RAGConfig.MINERU_API_URL = MINERU_LOCAL_API_URL_EXAMPLE;
 												}
 											}
 										}}
@@ -691,13 +694,13 @@
 
 							<!-- API URL -->
 							<div class="flex w-full mt-2">
-								<input
-									class="flex-1 w-full text-sm bg-transparent outline-hidden"
-									placeholder={RAGConfig.MINERU_API_MODE === 'cloud'
-										? $i18n.t('https://mineru.net/api/v4')
-										: $i18n.t('http://localhost:8000')}
-									bind:value={RAGConfig.MINERU_API_URL}
-								/>
+									<input
+										class="flex-1 w-full text-sm bg-transparent outline-hidden"
+										placeholder={RAGConfig.MINERU_API_MODE === 'cloud'
+											? $i18n.t(MINERU_CLOUD_API_URL)
+											: $i18n.t(MINERU_LOCAL_API_URL_EXAMPLE)}
+										bind:value={RAGConfig.MINERU_API_URL}
+									/>
 							</div>
 
 							<div class="flex w-full mt-2">

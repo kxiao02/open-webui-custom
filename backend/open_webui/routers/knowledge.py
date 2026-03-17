@@ -9,7 +9,6 @@ import zipfile
 
 from sqlalchemy.orm import Session
 from open_webui.internal.db import get_session
-from open_webui.models.groups import Groups
 from open_webui.models.knowledge import (
     KnowledgeFileListResponse,
     Knowledges,
@@ -24,6 +23,7 @@ from open_webui.routers.retrieval import (
     ProcessFileForm,
     process_files_batch,
     BatchProcessFilesForm,
+    ensure_retrieval_runtime,
 )
 from open_webui.storage.provider import Storage
 
@@ -39,6 +39,12 @@ from open_webui.models.models import Models, ModelForm
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _can_access_workspace_content(user, owner_user_id: str) -> bool:
+    return owner_user_id == user.id or (
+        user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL
+    )
 
 ############################
 # getKnowledgeBases
@@ -62,6 +68,7 @@ async def embed_knowledge_base_metadata(
     """Generate and store embedding for knowledge base."""
     try:
         content = f"{name}\n\n{description}" if description else name
+        ensure_retrieval_runtime(request.app)
         embedding = await request.app.state.EMBEDDING_FUNCTION(content)
         VECTOR_DB_CLIENT.upsert(
             collection_name=KNOWLEDGE_BASES_COLLECTION,
@@ -228,11 +235,9 @@ async def search_knowledge_files(
     if query:
         filter["query"] = query
 
-    groups = Groups.get_groups_by_member_id(user.id, db=db)
-    if groups:
-        filter["group_ids"] = [group.id for group in groups]
-
-    filter["user_id"] = user.id
+    if not user.role == "admin" or not BYPASS_ADMIN_ACCESS_CONTROL:
+        filter["owner_only"] = True
+        filter["user_id"] = user.id
 
     return Knowledges.search_knowledge_files(
         filter=filter, skip=skip, limit=limit, db=db

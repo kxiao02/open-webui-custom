@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
-	import { embed, showControls, showEmbeds } from '$lib/stores';
+	import { embed, showControls, showEmbeds, showFilePreview } from '$lib/stores';
 
 	import CitationModal from './Citations/CitationModal.svelte';
 
@@ -26,16 +26,33 @@
 	export const showSourceModal = (sourceId) => {
 		let index;
 		let suffix = null;
+		let sourceIdentifier = null;
 
 		if (typeof sourceId === 'string') {
 			const output = sourceId.split('#');
 			index = parseInt(output[0]) - 1;
+			sourceIdentifier = output[0];
 
 			if (output.length > 1) {
 				suffix = output[1];
 			}
 		} else {
 			index = sourceId - 1;
+		}
+
+		if (!Number.isInteger(index) || index < 0 || index >= citations.length) {
+			if (sourceIdentifier) {
+				index = citations.findIndex((citation) => {
+					const citationId = citation?.id?.toString?.() ?? '';
+					const sourceMetaId = citation?.source?.id?.toString?.() ?? '';
+					const sourceMetaName = citation?.source?.name?.toString?.() ?? '';
+					return (
+						citationId === sourceIdentifier ||
+						sourceMetaId === sourceIdentifier ||
+						sourceMetaName === sourceIdentifier
+					);
+				});
+			}
 		}
 
 		if (citations[index]) {
@@ -51,6 +68,7 @@
 					} else {
 						showControls.set(true);
 						showEmbeds.set(true);
+						showFilePreview.set(false);
 						embed.set({
 							url: embedUrl,
 							title: citations[index]?.source?.name || 'Embedded Content',

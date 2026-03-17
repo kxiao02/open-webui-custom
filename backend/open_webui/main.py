@@ -99,14 +99,6 @@ from open_webui.routers import (
     terminals,
 )
 
-from open_webui.routers.retrieval import (
-    get_embedding_function,
-    get_reranking_function,
-    get_ef,
-    get_rf,
-)
-
-
 from sqlalchemy.orm import Session
 from open_webui.internal.db import ScopedSession, engine, get_session
 
@@ -1106,6 +1098,7 @@ app.state.EMBEDDING_FUNCTION = None
 app.state.RERANKING_FUNCTION = None
 app.state.ef = None
 app.state.rf = None
+app.state._retrieval_runtime_signature = None
 
 app.state.YOUTUBE_LOADER_TRANSLATION = None
 
@@ -1169,7 +1162,6 @@ app.state.RERANKING_FUNCTION = get_reranking_function(
     app.state.config.RAG_RERANKING_MODEL,
     reranking_function=app.state.rf,
 )
-
 ########################################
 #
 # CODE EXECUTION

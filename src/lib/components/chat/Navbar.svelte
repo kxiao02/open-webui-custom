@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getContext } from 'svelte';
+	import { getContext, onDestroy, onMount } from 'svelte';
 	import { toast } from 'svelte-sonner';
 
 	import {
@@ -11,7 +11,13 @@
 		settings,
 		showArchivedChats,
 		showControls,
+		showOverview,
+		showArtifacts,
+		showEmbeds,
+		showCallOverlay,
+		showFilePreview,
 		showSidebar,
+		theme,
 		temporaryChatEnabled,
 		user
 	} from '$lib/stores';
@@ -38,6 +44,7 @@
 	import ChatPlus from '../icons/ChatPlus.svelte';
 	import ChatCheck from '../icons/ChatCheck.svelte';
 	import Knobs from '../icons/Knobs.svelte';
+	import Document from '../icons/Document.svelte';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
 	const i18n = getContext('i18n');
@@ -59,6 +66,123 @@
 
 	let showShareChatModal = false;
 	let showDownloadChatModal = false;
+	let previewAvailable = false;
+
+	let isDarkMode = false;
+	let themeObserver: MutationObserver | null = null;
+
+	const syncThemeState = () => {
+		isDarkMode = document.documentElement.classList.contains('dark');
+	};
+
+	const applyTheme = (_theme: string) => {
+		const themes = ['dark', 'light', 'oled-dark', 'her'];
+		let themeToApply = _theme === 'oled-dark' ? 'dark' : _theme === 'her' ? 'light' : _theme;
+
+		if (_theme === 'system') {
+			themeToApply = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+		}
+
+		if (themeToApply === 'dark' && !_theme.includes('oled')) {
+			document.documentElement.style.setProperty('--color-gray-800', '#333');
+			document.documentElement.style.setProperty('--color-gray-850', '#262626');
+			document.documentElement.style.setProperty('--color-gray-900', '#171717');
+			document.documentElement.style.setProperty('--color-gray-950', '#0d0d0d');
+		}
+
+		themes
+			.filter((e) => e !== themeToApply)
+			.forEach((e) => {
+				e.split(' ').forEach((className) => {
+					document.documentElement.classList.remove(className);
+				});
+			});
+
+		themeToApply.split(' ').forEach((className) => {
+			document.documentElement.classList.add(className);
+		});
+
+		const metaThemeColor = document.querySelector('meta[name="theme-color"]');
+		if (metaThemeColor) {
+			metaThemeColor.setAttribute(
+				'content',
+				_theme === 'dark'
+					? '#171717'
+					: _theme === 'oled-dark'
+						? '#000000'
+						: _theme === 'her'
+							? '#983724'
+							: '#ffffff'
+			);
+		}
+
+		if (typeof window !== 'undefined' && window.applyTheme) {
+			window.applyTheme();
+		}
+
+		if (_theme.includes('oled')) {
+			document.documentElement.style.setProperty('--color-gray-800', '#101010');
+			document.documentElement.style.setProperty('--color-gray-850', '#050505');
+			document.documentElement.style.setProperty('--color-gray-900', '#000000');
+			document.documentElement.style.setProperty('--color-gray-950', '#000000');
+			document.documentElement.classList.add('dark');
+		}
+
+		syncThemeState();
+	};
+
+	const toggleTheme = () => {
+		const nextTheme = isDarkMode ? 'light' : 'dark';
+		theme.set(nextTheme);
+		localStorage.setItem('theme', nextTheme);
+		applyTheme(nextTheme);
+	};
+
+	const hasFilePreviewData = (historyData: any) => {
+		if (!historyData?.messages || typeof historyData.messages !== 'object') {
+			return false;
+		}
+
+		for (const message of Object.values(historyData.messages) as Array<Record<string, any>>) {
+			if (Array.isArray(message?.files) && message.files.length > 0) {
+				return true;
+			}
+			if (typeof message?.content === 'string' && message.content.trim()) {
+				const content = message.content;
+				if (content.includes('/v1/files/')) {
+					return true;
+				}
+				if (
+					content.includes('type="tool_calls"') &&
+					(content.includes(' files="') || content.includes('generated_files'))
+				) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	};
+
+	$: previewAvailable = hasFilePreviewData(history);
+
+	onMount(() => {
+		syncThemeState();
+
+		themeObserver = new MutationObserver(() => {
+			syncThemeState();
+		});
+
+		themeObserver.observe(document.documentElement, {
+			attributes: true,
+			attributeFilter: ['class']
+		});
+	});
+
+	onDestroy(() => {
+		themeObserver?.disconnect();
+		themeObserver = null;
+	});
 </script>
 
 <ShareChatModal bind:show={showShareChatModal} chatId={$chatId} />
@@ -212,7 +336,58 @@
 						</Menu>
 					{/if}
 
-					{#if $user?.role === 'admin' || ($user?.permissions.chat?.controls ?? true)}
+					{#if previewAvailable}
+						<Tooltip content={$i18n.t('File Preview')}>
+							<button
+								class="flex cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+								on:click={async () => {
+									await showOverview.set(false);
+									await showArtifacts.set(false);
+									await showEmbeds.set(false);
+									await showCallOverlay.set(false);
+									await showFilePreview.set(true);
+									await showControls.set(true);
+								}}
+								aria-label={$i18n.t('File Preview')}
+							>
+								<div class="m-auto self-center">
+									<Document className="size-4.5" />
+								</div>
+							</button>
+						</Tooltip>
+					{/if}
+
+					<Tooltip content={isDarkMode ? $i18n.t('Light') : $i18n.t('Dark')}>
+						<button
+							class="flex cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+							on:click={toggleTheme}
+							aria-label={$i18n.t('Theme')}
+						>
+							<div class="m-auto self-center">
+								{#if isDarkMode}
+									<svg viewBox="0 0 24 24" fill="none" class="size-5" stroke="currentColor">
+										<circle cx="12" cy="12" r="4" stroke-width="1.75" />
+										<path
+											stroke-width="1.75"
+											stroke-linecap="round"
+											d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.64 5.64l1.56 1.56M16.8 16.8l1.56 1.56M5.64 18.36l1.56-1.56M16.8 7.2l1.56-1.56"
+										/>
+									</svg>
+								{:else}
+									<svg viewBox="0 0 24 24" fill="none" class="size-5" stroke="currentColor">
+										<path
+											stroke-width="1.75"
+											stroke-linecap="round"
+											stroke-linejoin="round"
+											d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79Z"
+										/>
+									</svg>
+								{/if}
+							</div>
+						</button>
+					</Tooltip>
+
+					{#if $user?.role === 'admin'}
 						<Tooltip content={$i18n.t('Controls')}>
 							<button
 								class=" flex cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"

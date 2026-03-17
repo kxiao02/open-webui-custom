@@ -9,6 +9,7 @@ itsdangerous==2.2.0
 
 python-socketio==5.16.1
 python-jose==3.5.0
+python-mimeparse==2.0.0
 cryptography
 bcrypt==5.0.0
 argon2-cffi==25.1.0
@@ -24,6 +25,9 @@ starlette-compress==1.7.0
 Brotli==1.1.0
 httpx[socks,http2,zstd,cli,brotli]==0.28.1
 starsessions[redis]==2.2.1
+pytz
+beautifulsoup4
+Markdown
 
 sqlalchemy==2.0.48
 alembic==1.18.4
@@ -41,6 +45,8 @@ asgiref==3.11.1
 
 mcp==1.26.0
 openai
+tiktoken
+validators==0.35.0
 
 langchain==1.2.10
 langchain-community==0.4.1
@@ -48,9 +54,10 @@ langchain-classic==1.0.1
 langchain-text-splitters==1.1.1
 
 fake-useragent==2.2.0
+ftfy==6.3.1
 
 chromadb==1.5.2
 black==26.1.0
 pydub
 chardet==5.2.0
-beautifulsoup4
+fpdf2==2.8.5
