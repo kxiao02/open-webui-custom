@@ -3,6 +3,10 @@
 #
 # Disables Ollama and points Open WebUI at the agent-bridge instead.
 # The agent-bridge must be running separately (see deepagent-project).
+#
+# NOTE: This assumes the bridge is accessible on the Docker host at
+# BRIDGE_PORT (default 8000). If running deepagent-project on the same
+# machine, ensure its bridge port is exposed (it is by default).
 
 services:
   ollama:
@@ -11,7 +15,9 @@ services:
 
   open-webui:
     environment:
-      - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-http://agent-bridge:8000/v1}
+      - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-http://host.docker.internal:8000/v1}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-placeholder}
       - ENABLE_OLLAMA_API=false
     depends_on: []
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

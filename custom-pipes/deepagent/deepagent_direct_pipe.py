@@ -6,7 +6,6 @@ This talks to the LangGraph server's native API, giving you:
   - Full reasoning trace visibility
   - Tool call details with arguments
   - Thread-based conversation state
-  - Proper error handling
 
 Requires the LangGraph agent to be running (the 'agent' service in docker-compose).
 """
@@ -108,50 +107,70 @@ class Pipe:
 
     def _sync_langgraph(self, messages: list[dict]) -> str:
         """Non-streaming: run agent to completion and return formatted text."""
-        collected_text = ""
-        reasoning_parts = []
-        tool_calls_seen = []
+        try:
+            collected_text = ""
+            reasoning_parts = []
+            tool_calls_seen = []
 
-        for text, reasoning, tool_info in self._iter_events(messages):
-            if text:
-                collected_text = text
-            if reasoning:
-                reasoning_parts.append(reasoning)
-            if tool_info:
-                tool_calls_seen.append(tool_info)
+            for text, reasoning, tool_info in self._iter_events(messages):
+                if text:
+                    collected_text = text
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                if tool_info:
+                    tool_calls_seen.append(tool_info)
 
-        parts = []
-        if self.valves.show_reasoning and reasoning_parts:
-            reasoning_block = "\n\n".join(reasoning_parts)
-            parts.append(
-                f"<details>\n<summary>🧠 Reasoning</summary>\n\n"
-                f"{reasoning_block}\n</details>\n"
-            )
-        if self.valves.show_tool_calls and tool_calls_seen:
-            for name, args in tool_calls_seen:
-                parts.append(f"> 🔧 **{name}**(`{args}`)\n")
-        parts.append(collected_text)
-        return "\n".join(parts)
+            parts = []
+            if self.valves.show_reasoning and reasoning_parts:
+                reasoning_block = "\n\n".join(reasoning_parts)
+                parts.append(
+                    f"<details>\n<summary>🧠 Reasoning</summary>\n\n"
+                    f"{reasoning_block}\n</details>\n"
+                )
+            if self.valves.show_tool_calls and tool_calls_seen:
+                for name, args in tool_calls_seen:
+                    parts.append(f"> 🔧 **{name}**(`{args}`)\n")
+            parts.append(collected_text)
+            return "\n".join(parts)
+        except httpx.ConnectError:
+            return "Error: Could not connect to the LangGraph agent. Please check that it is running."
+        except httpx.TimeoutException:
+            return "Error: The LangGraph agent did not respond in time. Please try again."
+        except httpx.HTTPStatusError as exc:
+            return f"Error: LangGraph agent returned status {exc.response.status_code}."
+        except Exception as exc:
+            log.error("Unexpected error in sync handler: %s", exc)
+            return "Error: An unexpected error occurred while contacting the agent."
 
     def _stream_langgraph(self, messages: list[dict]) -> Iterator[str]:
         """Streaming: yield formatted chunks as they arrive."""
-        sent_reasoning = set()
-        sent_tools = set()
-        sent_text = set()
+        try:
+            sent_reasoning = set()
+            sent_tools = set()
+            sent_text = set()
 
-        for text, reasoning, tool_info in self._iter_events(messages):
-            if self.valves.show_reasoning and reasoning and reasoning not in sent_reasoning:
-                sent_reasoning.add(reasoning)
-                yield f"\n<details>\n<summary>🧠 Reasoning</summary>\n\n{reasoning}\n</details>\n\n"
+            for text, reasoning, tool_info in self._iter_events(messages):
+                if self.valves.show_reasoning and reasoning and reasoning not in sent_reasoning:
+                    sent_reasoning.add(reasoning)
+                    yield f"\n<details>\n<summary>🧠 Reasoning</summary>\n\n{reasoning}\n</details>\n\n"
 
-            if self.valves.show_tool_calls and tool_info and tool_info not in sent_tools:
-                sent_tools.add(tool_info)
-                name, args = tool_info
-                yield f"\n> 🔧 **{name}**(`{args}`)\n\n"
+                if self.valves.show_tool_calls and tool_info and tool_info not in sent_tools:
+                    sent_tools.add(tool_info)
+                    name, args = tool_info
+                    yield f"\n> 🔧 **{name}**(`{args}`)\n\n"
 
-            if text and text not in sent_text:
-                sent_text.add(text)
-                yield text
+                if text and text not in sent_text:
+                    sent_text.add(text)
+                    yield text
+        except httpx.ConnectError:
+            yield "Error: Could not connect to the LangGraph agent. Please check that it is running."
+        except httpx.TimeoutException:
+            yield "Error: The LangGraph agent did not respond in time. Please try again."
+        except httpx.HTTPStatusError as exc:
+            yield f"Error: LangGraph agent returned status {exc.response.status_code}."
+        except Exception as exc:
+            log.error("Unexpected error in streaming handler: %s", exc)
+            yield "Error: An unexpected error occurred while contacting the agent."
 
     def _iter_events(
         self, messages: list[dict]
