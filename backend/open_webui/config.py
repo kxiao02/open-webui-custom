@@ -2305,6 +2305,16 @@ CODE_INTERPRETER_BLOCKED_MODULES = [
     if library.strip()
 ]
 
+####################################
+# Tool Creator
+####################################
+
+ENABLE_TOOL_CREATOR = PersistentConfig(
+    "ENABLE_TOOL_CREATOR",
+    "tool_creator.enable",
+    os.environ.get("ENABLE_TOOL_CREATOR", "False").lower() == "true",
+)
+
 DEFAULT_CODE_INTERPRETER_PROMPT = """
 #### Code Interpreter
 

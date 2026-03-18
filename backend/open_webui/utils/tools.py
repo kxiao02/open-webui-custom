@@ -82,6 +82,7 @@ from open_webui.tools.builtin import (
     view_file,
     view_knowledge_file,
     view_skill,
+    create_python_tool,
 )
 
 import copy
@@ -508,6 +509,14 @@ def get_builtin_tools(
         and features.get("code_interpreter")
     ):
         builtin_functions.append(execute_code)
+
+    # Tool creator - allows the model to create new tools programmatically
+    if (
+        is_builtin_tool_enabled("tool_creator")
+        and getattr(request.app.state.config, "ENABLE_TOOL_CREATOR", False)
+        and get_model_capability("tool_creator", default=False)
+    ):
+        builtin_functions.append(create_python_tool)
 
     # Notes tools - search, view, create, and update user's notes (if builtin category enabled AND notes enabled globally)
     if is_builtin_tool_enabled("notes") and getattr(

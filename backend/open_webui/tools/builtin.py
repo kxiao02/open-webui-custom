@@ -2104,3 +2104,190 @@ async def view_skill(
     except Exception as e:
         log.exception(f"view_skill error: {e}")
         return json.dumps({"error": str(e)})
+
+
+# =============================================================================
+# TOOL CREATOR
+# =============================================================================
+
+
+async def create_python_tool(
+    tool_name: str,
+    tool_id: str,
+    description: str,
+    code: str,
+    test_code: str = "",
+    __request__: Request = None,
+    __user__: dict = None,
+    __event_emitter__: callable = None,
+) -> str:
+    """
+    Create and register a new Python tool in the user's workspace.
+    The code must define a `Tools` class with public methods that become tool functions.
+    Each method should have type-annotated parameters and a docstring.
+
+    :param tool_name: Human-readable name for the tool (e.g. "CSV Analyzer")
+    :param tool_id: Unique identifier using only lowercase alphanumeric and underscores (e.g. "csv_analyzer")
+    :param description: Brief description of what the tool does
+    :param code: Complete Python source code defining a Tools class
+    :param test_code: Optional Python test code to validate the tool works correctly
+    :return: JSON with status, tool_id, and any validation errors
+    """
+    try:
+        # Lazy imports to avoid circular dependency with utils/tools.py
+        from open_webui.utils.plugin import load_tool_module_by_id, replace_imports
+        from open_webui.utils.tools import get_tool_specs
+        from open_webui.models.tools import Tools as ToolsModel, ToolForm, ToolMeta
+        from open_webui.config import CACHE_DIR
+
+        if __request__ is None:
+            return json.dumps({"error": "Request context not available"})
+
+        user_id = __user__.get("id") if __user__ else None
+        if not user_id:
+            return json.dumps({"error": "User not authenticated"})
+
+        # Sanitize code
+        code = sanitize_code(code)
+
+        # Validate and normalize tool_id
+        tool_id = tool_id.strip().lower()
+        if not tool_id.isidentifier():
+            return json.dumps(
+                {
+                    "error": f"Invalid tool_id '{tool_id}'. Must be a valid Python identifier (lowercase alphanumeric and underscores, cannot start with a number)."
+                }
+            )
+
+        # Check for duplicate
+        existing = ToolsModel.get_tool_by_id(tool_id)
+        if existing:
+            return json.dumps(
+                {"error": f"A tool with id '{tool_id}' already exists."}
+            )
+
+        # Emit progress
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Validating tool code...",
+                        "done": False,
+                    },
+                }
+            )
+
+        # Normalize imports
+        code = replace_imports(code)
+
+        # Validate code by loading it as a module
+        try:
+            tool_module, frontmatter = load_tool_module_by_id(tool_id, content=code)
+        except Exception as e:
+            error_msg = str(e)
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": "Tool validation failed",
+                            "done": True,
+                        },
+                    }
+                )
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": f"Code validation failed: {error_msg}",
+                }
+            )
+
+        # Run test code if provided
+        if test_code and test_code.strip():
+            import sys as _sys
+
+            test_code = sanitize_code(test_code)
+            try:
+                # tool_module is a Tools() instance; get the module namespace
+                module_ns = _sys.modules.get(f"tool_{tool_id}", None)
+                test_globals = dict(module_ns.__dict__) if module_ns else {}
+                exec(test_code, test_globals)
+            except Exception as e:
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": "Tool tests failed",
+                                "done": True,
+                            },
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": f"Test code failed: {str(e)}",
+                    }
+                )
+
+        # Emit progress
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Registering tool...",
+                        "done": False,
+                    },
+                }
+            )
+
+        # Generate tool specs
+        specs = get_tool_specs(tool_module)
+
+        # Build form data and save to DB
+        form_data = ToolForm(
+            id=tool_id,
+            name=tool_name,
+            content=code,
+            meta=ToolMeta(description=description),
+        )
+        tool_record = ToolsModel.insert_new_tool(user_id, form_data, specs)
+        if not tool_record:
+            return json.dumps({"error": "Failed to save tool to database"})
+
+        # Cache the module in app state
+        if hasattr(__request__.app.state, "TOOLS"):
+            __request__.app.state.TOOLS[tool_id] = tool_module
+        else:
+            __request__.app.state.TOOLS = {tool_id: tool_module}
+
+        # Create cache directory
+        cache_dir = CACHE_DIR / "tools" / tool_id
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": "Tool created successfully",
+                        "done": True,
+                    },
+                }
+            )
+
+        return json.dumps(
+            {
+                "status": "success",
+                "tool_id": tool_id,
+                "name": tool_name,
+                "description": description,
+                "specs": specs,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        log.exception(f"create_python_tool error: {e}")
+        return json.dumps({"error": str(e)})
