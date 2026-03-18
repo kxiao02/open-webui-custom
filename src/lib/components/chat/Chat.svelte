@@ -861,6 +861,11 @@
 		);
 
 		const init = async () => {
+			if (!chatIdProp) {
+				loading = false;
+				await tick();
+			}
+
 			if (storageChatInput) {
 				prompt = '';
 				messageInput?.setText('');
@@ -1172,7 +1177,6 @@
 		}
 
 		const runId = ++initNewChatRunId;
-		loading = true;
 
 		if ($user?.role !== 'admin' && $user?.permissions?.chat?.temporary_enforced) {
 			await temporaryChatEnabled.set(true);
@@ -1909,6 +1913,7 @@
 
 	const submitPrompt = async (userPrompt, { _raw = false } = {}) => {
 		console.log('submitPrompt', userPrompt, $chatId);
+		initNewChatRunId++;
 		ensureSelectedModels();
 
 		const _selectedModels = selectedModels.map((modelId) =>
@@ -2063,7 +2068,6 @@
 		}
 
 		let _chatId = JSON.parse(JSON.stringify($chatId));
-		let navigateToCreatedChat = false;
 		_history = structuredClone(_history);
 
 		const responseMessageIds: Record<PropertyKey, string> = {};
@@ -2118,8 +2122,6 @@
 		// Create new chat if newChat is true and first user message
 		if (newChat && _history.messages[_history.currentId].parentId === null) {
 			_chatId = await initChatHandler(_history);
-			navigateToCreatedChat =
-				!chatIdProp && $page.url.pathname === '/' && !_chatId.startsWith('local:');
 		}
 
 		await tick();
@@ -2127,10 +2129,6 @@
 		_history = structuredClone(history);
 		// Save chat after all messages have been created
 		await saveChatHandler(_chatId, _history);
-
-		if (navigateToCreatedChat) {
-			await goto(`/c/${_chatId}`, { replaceState: true, noScroll: true, keepFocus: true });
-		}
 
 		await Promise.all(
 			selectedModelIds.map(async (modelId, _modelIdx) => {
@@ -2775,10 +2773,14 @@
 			_chatId = chat.id;
 			await chatId.set(_chatId);
 
+			window.history.replaceState(history.state, '', `/c/${_chatId}`);
+
 			await tick();
 
 			await chats.set(await getChatList(localStorage.token, $currentChatPage));
 			currentChatPage.set(1);
+
+			selectedFolder.set(null);
 		} else {
 			_chatId = `local:${$socket?.id}`; // Use socket id for temporary chat
 			await chatId.set(_chatId);
