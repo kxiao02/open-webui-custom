@@ -15,6 +15,7 @@
 		description: string;
 		content: string;
 		is_active: boolean;
+		meta?: Record<string, any>;
 		access_grants: any[];
 	} | null = null;
 
@@ -45,6 +46,7 @@
 				description: _skill.description || '',
 				content: _skill.content || '',
 				is_active: _skill.is_active ?? true,
+				meta: _skill.meta || {},
 				access_grants: _skill.access_grants !== undefined ? _skill.access_grants : []
 			};
 		}

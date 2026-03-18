@@ -37,6 +37,9 @@
 		if ($user?.permissions?.workspace?.prompts) {
 			return '/workspace/prompts';
 		}
+		if ($user?.permissions?.workspace?.skills) {
+			return '/workspace/skills';
+		}
 		if ($user?.permissions?.workspace?.tools) {
 			return '/workspace/tools';
 		}

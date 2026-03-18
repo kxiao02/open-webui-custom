@@ -246,7 +246,7 @@
 			</div>
 
 			<div class="flex w-full justify-end gap-1.5">
-				{#if $user?.role === 'admin' || $user?.permissions?.workspace?.tools_import}
+				{#if $user?.role === 'admin'}
 					<button
 						class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
 						on:click={() => {
@@ -259,7 +259,7 @@
 					</button>
 				{/if}
 
-				{#if tools.length && ($user?.role === 'admin' || $user?.permissions?.workspace?.tools_export)}
+				{#if tools.length && $user?.role === 'admin'}
 					<button
 						class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
 						on:click={async () => {
@@ -299,15 +299,6 @@
 							<div class=" hidden md:block md:ml-1 text-xs">{$i18n.t('New Tool')}</div>
 						</div>
 					</AddToolMenu>
-				{:else}
-					<a
-						class=" px-2 py-1.5 rounded-xl bg-black text-white dark:bg-white dark:text-black transition font-medium text-sm flex items-center"
-						href="/workspace/tools/create"
-					>
-						<Plus className="size-3" strokeWidth="2.5" />
-
-						<div class=" hidden md:block md:ml-1 text-xs">{$i18n.t('New Tool')}</div></a
-					>
 				{/if}
 			</div>
 		</div>
@@ -389,6 +380,12 @@
 													<div class="line-clamp-1 text-sm">
 														{tool.name}
 													</div>
+													{#if !tool?.meta?.published}
+														<Badge type="muted" content={$i18n.t('Draft')} />
+													{/if}
+													{#if tool?.meta?.visibility === 'hidden'}
+														<Badge type="muted" content={$i18n.t('Hidden')} />
+													{/if}
 													{#if tool?.meta?.manifest?.version}
 														<div class=" text-gray-500 text-xs font-medium shrink-0">
 															v{tool?.meta?.manifest?.version ?? ''}
@@ -424,6 +421,12 @@
 														<div class="line-clamp-1 text-sm">
 															{tool.name}
 														</div>
+														{#if !tool?.meta?.published}
+															<Badge type="muted" content={$i18n.t('Draft')} />
+														{/if}
+														{#if tool?.meta?.visibility === 'hidden'}
+															<Badge type="muted" content={$i18n.t('Hidden')} />
+														{/if}
 														{#if tool?.meta?.manifest?.version}
 															<div class=" text-gray-500 text-xs font-medium shrink-0">
 																v{tool?.meta?.manifest?.version ?? ''}

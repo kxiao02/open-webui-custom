@@ -24,7 +24,8 @@
 
 	import { slide } from 'svelte/transition';
 	import { page } from '$app/stores';
-	import { goto } from '$app/navigation';
+	import { goto, replaceState } from '$app/navigation';
+	import { get } from 'svelte/store';
 
 	import ShareChatModal from '../chat/ShareChatModal.svelte';
 	import ModelSelector from '../chat/ModelSelector.svelte';
@@ -71,8 +72,22 @@
 	let isDarkMode = false;
 	let themeObserver: MutationObserver | null = null;
 
+	type ThemeSwitchWindow = Window & {
+		__withoutThemeTransitions?: (callback: () => void) => void;
+	};
+
 	const syncThemeState = () => {
 		isDarkMode = document.documentElement.classList.contains('dark');
+	};
+
+	const withoutThemeTransitions = (callback: () => void) => {
+		const themedWindow = window as ThemeSwitchWindow;
+		if (typeof themedWindow.__withoutThemeTransitions === 'function') {
+			themedWindow.__withoutThemeTransitions(callback);
+			return;
+		}
+
+		callback();
 	};
 
 	const applyTheme = (_theme: string) => {
@@ -83,23 +98,33 @@
 			themeToApply = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 		}
 
-		if (themeToApply === 'dark' && !_theme.includes('oled')) {
-			document.documentElement.style.setProperty('--color-gray-800', '#333');
-			document.documentElement.style.setProperty('--color-gray-850', '#262626');
-			document.documentElement.style.setProperty('--color-gray-900', '#171717');
-			document.documentElement.style.setProperty('--color-gray-950', '#0d0d0d');
-		}
+		withoutThemeTransitions(() => {
+			if (themeToApply === 'dark' && !_theme.includes('oled')) {
+				document.documentElement.style.setProperty('--color-gray-800', '#333');
+				document.documentElement.style.setProperty('--color-gray-850', '#262626');
+				document.documentElement.style.setProperty('--color-gray-900', '#171717');
+				document.documentElement.style.setProperty('--color-gray-950', '#0d0d0d');
+			}
 
-		themes
-			.filter((e) => e !== themeToApply)
-			.forEach((e) => {
-				e.split(' ').forEach((className) => {
-					document.documentElement.classList.remove(className);
+			themes
+				.filter((e) => e !== themeToApply)
+				.forEach((e) => {
+					e.split(' ').forEach((className) => {
+						document.documentElement.classList.remove(className);
+					});
 				});
+
+			themeToApply.split(' ').forEach((className) => {
+				document.documentElement.classList.add(className);
 			});
 
-		themeToApply.split(' ').forEach((className) => {
-			document.documentElement.classList.add(className);
+			if (_theme.includes('oled')) {
+				document.documentElement.style.setProperty('--color-gray-800', '#101010');
+				document.documentElement.style.setProperty('--color-gray-850', '#050505');
+				document.documentElement.style.setProperty('--color-gray-900', '#000000');
+				document.documentElement.style.setProperty('--color-gray-950', '#000000');
+				document.documentElement.classList.add('dark');
+			}
 		});
 
 		const metaThemeColor = document.querySelector('meta[name="theme-color"]');
@@ -118,14 +143,6 @@
 
 		if (typeof window !== 'undefined' && window.applyTheme) {
 			window.applyTheme();
-		}
-
-		if (_theme.includes('oled')) {
-			document.documentElement.style.setProperty('--color-gray-800', '#101010');
-			document.documentElement.style.setProperty('--color-gray-850', '#050505');
-			document.documentElement.style.setProperty('--color-gray-900', '#000000');
-			document.documentElement.style.setProperty('--color-gray-950', '#000000');
-			document.documentElement.classList.add('dark');
 		}
 
 		syncThemeState();
@@ -263,9 +280,9 @@
 
 										// add 'temporary-chat=true' to the URL
 										if ($temporaryChatEnabled) {
-											window.history.replaceState(null, '', '?temporary-chat=true');
+											replaceState('?temporary-chat=true', get(page).state);
 										} else {
-											window.history.replaceState(null, '', location.pathname);
+											replaceState(location.pathname, get(page).state);
 										}
 									}}
 								>

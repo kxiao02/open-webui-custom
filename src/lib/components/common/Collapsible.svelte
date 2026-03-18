@@ -420,6 +420,7 @@
 					</div>
 				{/each}
 			</div>
+		</div>
 		{:else}
 			{@const parsedArgs = parseJSONString(args)}
 			{@const parsedResult = parseJSONString(result)}

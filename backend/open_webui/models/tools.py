@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Optional
+from typing import Literal, Optional
 
 from sqlalchemy.orm import Session, defer
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
@@ -35,7 +35,12 @@ class Tool(Base):
 
 class ToolMeta(BaseModel):
     description: Optional[str] = None
-    manifest: Optional[dict] = {}
+    manifest: dict = Field(default_factory=dict)
+    published: bool = False
+    category: Optional[str] = None
+    visibility: Literal["public", "restricted", "hidden"] = "public"
+    dependencies: list[str] = Field(default_factory=list)
+    is_default: bool = False
 
 
 class ToolModel(BaseModel):

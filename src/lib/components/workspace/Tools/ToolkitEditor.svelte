@@ -13,6 +13,7 @@
 	import ChevronLeft from '$lib/components/icons/ChevronLeft.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import LockClosed from '$lib/components/icons/LockClosed.svelte';
+	import Switch from '$lib/components/common/Switch.svelte';
 	import AccessControlModal from '../common/AccessControlModal.svelte';
 
 	let formElement = null;
@@ -29,7 +30,12 @@
 	export let id = '';
 	export let name = '';
 	export let meta = {
-		description: ''
+		description: '',
+		published: false,
+		category: '',
+		visibility: 'public',
+		dependencies: [],
+		is_default: false
 	};
 	export let content = '';
 	export let accessGrants = [];
@@ -47,6 +53,16 @@
 	$: if (name && !edit && !clone) {
 		id = name.replace(/\s+/g, '_').toLowerCase();
 	}
+
+	$: meta = {
+		description: '',
+		published: false,
+		category: '',
+		visibility: 'public',
+		dependencies: [],
+		is_default: false,
+		...meta
+	};
 
 	let codeEditor;
 	let boilerplate = `import os
@@ -300,6 +316,61 @@ class Tools:
 								required
 							/>
 						</Tooltip>
+					</div>
+
+					<div class="grid gap-2 px-1 pt-2 md:grid-cols-2">
+						<Tooltip content={$i18n.t('Optional grouping shown in the catalog')} placement="top-start">
+							<input
+								class="w-full text-sm bg-transparent outline-hidden"
+								type="text"
+								placeholder={$i18n.t('Category')}
+								aria-label={$i18n.t('Category')}
+								bind:value={meta.category}
+							/>
+						</Tooltip>
+
+						<label class="flex items-center gap-2 text-sm text-gray-500">
+							<span>{$i18n.t('Visibility')}</span>
+							<select
+								class="flex-1 rounded-lg border border-gray-200 bg-white px-2 py-1 text-sm dark:border-gray-800 dark:bg-gray-900"
+								bind:value={meta.visibility}
+							>
+								<option value="public">{$i18n.t('Public')}</option>
+								<option value="restricted">{$i18n.t('Restricted')}</option>
+								<option value="hidden">{$i18n.t('Hidden')}</option>
+							</select>
+						</label>
+
+						<Tooltip
+							content={$i18n.t('Comma-separated tool IDs that should also be enabled')}
+							placement="top-start"
+						>
+							<input
+								class="w-full text-sm bg-transparent outline-hidden"
+								type="text"
+								placeholder={$i18n.t('Dependencies')}
+								aria-label={$i18n.t('Dependencies')}
+								value={(meta.dependencies ?? []).join(', ')}
+								on:input={(event) => {
+									meta.dependencies = event.currentTarget.value
+										.split(',')
+										.map((value) => value.trim())
+										.filter(Boolean);
+								}}
+							/>
+						</Tooltip>
+
+						<div class="flex items-center gap-4 text-sm text-gray-500">
+							<label class="flex items-center gap-2">
+								<Switch bind:state={meta.published} />
+								<span>{$i18n.t('Published')}</span>
+							</label>
+
+							<label class="flex items-center gap-2">
+								<Switch bind:state={meta.is_default} />
+								<span>{$i18n.t('Default')}</span>
+							</label>
+						</div>
 					</div>
 				</div>
 

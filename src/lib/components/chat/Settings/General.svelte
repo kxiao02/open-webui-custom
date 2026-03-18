@@ -4,7 +4,7 @@
 	import { getLanguages, changeLanguage } from '$lib/i18n';
 	const dispatch = createEventDispatcher();
 
-	import { config, models, settings, user } from '$lib/stores';
+	import { config, models, settings, theme, user } from '$lib/stores';
 
 	const i18n = getContext('i18n');
 
@@ -18,8 +18,22 @@
 	let lang = $i18n.language;
 	let notificationEnabled = false;
 	let system = '';
+	let selectedTheme = 'system';
 
 	let showAdvanced = false;
+
+	const themeChangeHandler = (nextTheme: string) => {
+		selectedTheme = nextTheme;
+		theme.set(nextTheme);
+
+		if (typeof localStorage !== 'undefined') {
+			localStorage.setItem('theme', nextTheme);
+		}
+
+		if (typeof window !== 'undefined' && window.applyTheme) {
+			window.applyTheme();
+		}
+	};
 
 	const toggleNotification = async () => {
 		const permission = await Notification.requestPermission();
@@ -113,6 +127,7 @@
 
 		notificationEnabled = $settings.notificationEnabled ?? false;
 		system = $settings.system ?? '';
+		selectedTheme = (typeof localStorage !== 'undefined' && localStorage.theme) || $theme || 'system';
 
 		params = { ...params, ...$settings.params };
 		params.stop = $settings?.params?.stop ? ($settings?.params?.stop ?? []).join(',') : null;

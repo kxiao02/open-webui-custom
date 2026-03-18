@@ -12,6 +12,7 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { updateSkillAccessGrants } from '$lib/apis/skills';
 	import { goto } from '$app/navigation';
+	import Switch from '$lib/components/common/Switch.svelte';
 
 	export let onSubmit: Function;
 	export let edit = false;
@@ -27,6 +28,14 @@
 	let id = '';
 	let description = '';
 	let content = '';
+	let meta = {
+		tags: [],
+		published: false,
+		category: '',
+		visibility: 'public',
+		dependencies: [],
+		is_default: false
+	};
 
 	let accessGrants = [];
 	let showAccessControlModal = false;
@@ -85,7 +94,7 @@
 			description,
 			content,
 			is_active: true,
-			meta: { tags: [] },
+			meta,
 			access_grants: accessGrants
 		});
 
@@ -99,6 +108,15 @@
 			id = skill.id || '';
 			description = skill.description || '';
 			content = skill.content || '';
+			meta = {
+				tags: [],
+				published: false,
+				category: '',
+				visibility: 'public',
+				dependencies: [],
+				is_default: false,
+				...(skill.meta || {})
+			};
 			accessGrants = skill?.access_grants === undefined ? [] : skill?.access_grants;
 
 			if (name) hasManualName = true;
@@ -224,6 +242,64 @@
 								{disabled}
 							/>
 						</Tooltip>
+					</div>
+
+					<div class="grid gap-2 px-1 pt-2 md:grid-cols-2">
+						<Tooltip content={$i18n.t('Optional grouping shown in the catalog')} placement="top-start">
+							<input
+								class="w-full text-sm bg-transparent outline-hidden"
+								type="text"
+								placeholder={$i18n.t('Category')}
+								aria-label={$i18n.t('Category')}
+								bind:value={meta.category}
+								{disabled}
+							/>
+						</Tooltip>
+
+						<label class="flex items-center gap-2 text-sm text-gray-500">
+							<span>{$i18n.t('Visibility')}</span>
+							<select
+								class="flex-1 rounded-lg border border-gray-200 bg-white px-2 py-1 text-sm dark:border-gray-800 dark:bg-gray-900"
+								bind:value={meta.visibility}
+								disabled={disabled}
+							>
+								<option value="public">{$i18n.t('Public')}</option>
+								<option value="restricted">{$i18n.t('Restricted')}</option>
+								<option value="hidden">{$i18n.t('Hidden')}</option>
+							</select>
+						</label>
+
+						<Tooltip
+							content={$i18n.t('Comma-separated skill IDs that should be bundled with this skill')}
+							placement="top-start"
+						>
+							<input
+								class="w-full text-sm bg-transparent outline-hidden"
+								type="text"
+								placeholder={$i18n.t('Dependencies')}
+								aria-label={$i18n.t('Dependencies')}
+								value={(meta.dependencies ?? []).join(', ')}
+								disabled={disabled}
+								on:input={(event) => {
+									meta.dependencies = event.currentTarget.value
+										.split(',')
+										.map((value) => value.trim())
+										.filter(Boolean);
+								}}
+							/>
+						</Tooltip>
+
+						<div class="flex items-center gap-4 text-sm text-gray-500">
+							<label class="flex items-center gap-2">
+								<Switch bind:state={meta.published} />
+								<span>{$i18n.t('Published')}</span>
+							</label>
+
+							<label class="flex items-center gap-2">
+								<Switch bind:state={meta.is_default} />
+								<span>{$i18n.t('Default')}</span>
+							</label>
+						</div>
 					</div>
 				</div>
 

@@ -185,8 +185,6 @@
 				'stylizedpdfexport',
 				'title autogeneration',
 				'titleautogeneration',
-				'toast notifications for new updates',
-				'toastnotificationsfornewupdates',
 				'upload background',
 				'uploadbackground',
 				'user interface',

@@ -68,6 +68,11 @@ from open_webui.socket.main import (
     get_event_emitter,
     get_models_in_use,
 )
+from open_webui.routers.retrieval import get_ef, get_rf
+from open_webui.retrieval.utils import (
+    get_embedding_function,
+    get_reranking_function,
+)
 from open_webui.routers import (
     analytics,
     audio,

@@ -10,7 +10,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 
-	import { get, type Unsubscriber, type Writable } from 'svelte/store';
+	import { type Unsubscriber, type Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
 	import { WEBUI_BASE_URL } from '$lib/constants';
 
@@ -113,6 +113,7 @@
 	export let chatIdProp = '';
 
 	let loading = true;
+	let initNewChatRunId = 0;
 
 	const eventTarget = new EventTarget();
 	let controlPane: Pane | undefined;
@@ -806,7 +807,7 @@
 		const pageSubscribe = page.subscribe(async (p) => {
 			if (p.url.pathname === '/') {
 				await tick();
-				initNewChat();
+				await initNewChat();
 
 				// Re-fetch banners on navigation to homepage so newly configured banners appear
 				try {
@@ -814,6 +815,8 @@
 				} catch (e) {
 					console.error('Failed to refresh banners:', e);
 				}
+			} else {
+				initNewChatRunId += 1;
 			}
 
 			stopAudio();
@@ -858,11 +861,6 @@
 		);
 
 		const init = async () => {
-			if (!chatIdProp) {
-				loading = false;
-				await tick();
-			}
-
 			if (storageChatInput) {
 				prompt = '';
 				messageInput?.setText('');
@@ -1162,8 +1160,20 @@
 	// Web functions
 	//////////////////////////
 
+	const isActiveNewChatInit = (runId: number) => {
+		return runId === initNewChatRunId && $page.url.pathname === '/' && !chatIdProp;
+	};
+
 	const initNewChat = async () => {
 		console.log('initNewChat');
+		if ($page.url.pathname !== '/') {
+			await goto('/', { replaceState: true, noScroll: true, keepFocus: true });
+			return;
+		}
+
+		const runId = ++initNewChatRunId;
+		loading = true;
+
 		if ($user?.role !== 'admin' && $user?.permissions?.chat?.temporary_enforced) {
 			await temporaryChatEnabled.set(true);
 		}
@@ -1179,6 +1189,10 @@
 
 		if ($user?.role !== 'admin' && !$user?.permissions?.chat?.temporary) {
 			await temporaryChatEnabled.set(false);
+		}
+
+		if (!isActiveNewChatInit(runId)) {
+			return;
 		}
 
 		const availableModels = $models
@@ -1273,8 +1287,8 @@
 		await showEmbeds.set(false);
 		await showFilePreview.set(false);
 
-		if ($page.url.pathname.includes('/c/')) {
-			window.history.replaceState(history.state, '', `/`);
+		if (!isActiveNewChatInit(runId)) {
+			return;
 		}
 
 		autoScroll = true;
@@ -1299,6 +1313,10 @@
 
 		if ($page.url.searchParams.get('load-url')) {
 			await uploadWeb($page.url.searchParams.get('load-url'));
+		}
+
+		if (!isActiveNewChatInit(runId)) {
+			return;
 		}
 
 		if ($page.url.searchParams.get('web-search') === 'true') {
@@ -1348,6 +1366,12 @@
 		selectedModels = selectedModels.map((modelId) =>
 			$models.map((m) => m.id).includes(modelId) ? modelId : ''
 		);
+
+		if (!isActiveNewChatInit(runId)) {
+			return;
+		}
+
+		loading = false;
 
 		const chatInput = document.getElementById('chat-input');
 		setTimeout(() => chatInput?.focus(), 0);
@@ -2005,6 +2029,11 @@
 			history.messages[messages.at(-1).id].childrenIds.push(userMessageId);
 		}
 
+		history = {
+			...history,
+			messages: { ...history.messages }
+		};
+
 		// focus on chat input
 		const chatInput = document.getElementById('chat-input');
 		chatInput?.focus();
@@ -2034,6 +2063,7 @@
 		}
 
 		let _chatId = JSON.parse(JSON.stringify($chatId));
+		let navigateToCreatedChat = false;
 		_history = structuredClone(_history);
 
 		const responseMessageIds: Record<PropertyKey, string> = {};
@@ -2080,11 +2110,16 @@
 				responseMessageIds[`${modelId}-${modelIdx ? modelIdx : _modelIdx}`] = responseMessageId;
 			}
 		}
-		history = history;
+		history = {
+			...history,
+			messages: { ...history.messages }
+		};
 
 		// Create new chat if newChat is true and first user message
 		if (newChat && _history.messages[_history.currentId].parentId === null) {
 			_chatId = await initChatHandler(_history);
+			navigateToCreatedChat =
+				!chatIdProp && $page.url.pathname === '/' && !_chatId.startsWith('local:');
 		}
 
 		await tick();
@@ -2092,6 +2127,10 @@
 		_history = structuredClone(history);
 		// Save chat after all messages have been created
 		await saveChatHandler(_chatId, _history);
+
+		if (navigateToCreatedChat) {
+			await goto(`/c/${_chatId}`, { replaceState: true, noScroll: true, keepFocus: true });
+		}
 
 		await Promise.all(
 			selectedModelIds.map(async (modelId, _modelIdx) => {
@@ -2736,14 +2775,10 @@
 			_chatId = chat.id;
 			await chatId.set(_chatId);
 
-			window.history.replaceState(history.state, '', `/c/${_chatId}`);
-
 			await tick();
 
 			await chats.set(await getChatList(localStorage.token, $currentChatPage));
 			currentChatPage.set(1);
-
-			selectedFolder.set(null);
 		} else {
 			_chatId = `local:${$socket?.id}`; // Use socket id for temporary chat
 			await chatId.set(_chatId);

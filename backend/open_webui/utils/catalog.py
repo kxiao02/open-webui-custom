@@ -1,0 +1,126 @@
+from typing import Any, Iterable
+
+from open_webui.models.access_grants import AccessGrants
+from open_webui.models.groups import Groups
+
+
+VALID_VISIBILITY = {"public", "restricted", "hidden"}
+
+
+def _meta_value(meta: Any, key: str, default: Any = None) -> Any:
+    if meta is None:
+        return default
+    if isinstance(meta, dict):
+        return meta.get(key, default)
+    return getattr(meta, key, default)
+
+
+def is_catalog_published(meta: Any) -> bool:
+    return bool(_meta_value(meta, "published", False))
+
+
+def get_catalog_visibility(meta: Any, access_grants: list | None = None) -> str:
+    visibility = _meta_value(meta, "visibility", None)
+    if visibility in VALID_VISIBILITY:
+        return visibility
+
+    return "restricted" if access_grants else "public"
+
+
+def get_catalog_dependencies(meta: Any) -> list[str]:
+    dependencies = _meta_value(meta, "dependencies", [])
+    if not isinstance(dependencies, list):
+        return []
+
+    return [
+        dependency.strip()
+        for dependency in dependencies
+        if isinstance(dependency, str) and dependency.strip()
+    ]
+
+
+def get_user_group_ids(user_id: str, db=None) -> set[str]:
+    return {group.id for group in Groups.get_groups_by_member_id(user_id, db=db)}
+
+
+def is_tool_catalog_visible(tool: Any, user: Any, user_group_ids: set[str], db=None) -> bool:
+    if getattr(user, "role", None) == "admin":
+        return True
+
+    if not is_catalog_published(getattr(tool, "meta", None)):
+        return False
+
+    visibility = get_catalog_visibility(
+        getattr(tool, "meta", None), getattr(tool, "access_grants", [])
+    )
+    if visibility == "hidden":
+        return False
+    if visibility == "public":
+        return True
+
+    return AccessGrants.has_access(
+        user_id=user.id,
+        resource_type="tool",
+        resource_id=tool.id,
+        permission="read",
+        user_group_ids=user_group_ids,
+        db=db,
+    )
+
+
+def is_skill_catalog_visible(
+    skill: Any,
+    user: Any,
+    user_group_ids: set[str],
+    db=None,
+    require_active: bool = True,
+) -> bool:
+    if getattr(user, "role", None) == "admin":
+        return True
+
+    if require_active and not getattr(skill, "is_active", False):
+        return False
+
+    if not is_catalog_published(getattr(skill, "meta", None)):
+        return False
+
+    visibility = get_catalog_visibility(
+        getattr(skill, "meta", None), getattr(skill, "access_grants", [])
+    )
+    if visibility == "hidden":
+        return False
+    if visibility == "public":
+        return True
+
+    return AccessGrants.has_access(
+        user_id=user.id,
+        resource_type="skill",
+        resource_id=skill.id,
+        permission="read",
+        user_group_ids=user_group_ids,
+        db=db,
+    )
+
+
+def filter_visible_tools(tools: Iterable[Any], user: Any, db=None) -> list[Any]:
+    user_group_ids = (
+        set() if getattr(user, "role", None) == "admin" else get_user_group_ids(user.id, db=db)
+    )
+    return [
+        tool for tool in tools if is_tool_catalog_visible(tool, user, user_group_ids, db=db)
+    ]
+
+
+def filter_visible_skills(
+    skills: Iterable[Any], user: Any, db=None, require_active: bool = True
+) -> list[Any]:
+    user_group_ids = (
+        set() if getattr(user, "role", None) == "admin" else get_user_group_ids(user.id, db=db)
+    )
+    return [
+        skill
+        for skill in skills
+        if is_skill_catalog_visible(
+            skill, user, user_group_ids, db=db, require_active=require_active
+        )
+    ]

@@ -39,6 +39,7 @@ from open_webui.models.tools import Tools
 from open_webui.models.users import UserModel
 from open_webui.models.groups import Groups
 from open_webui.models.access_grants import AccessGrants
+from open_webui.utils.catalog import get_user_group_ids, is_tool_catalog_visible
 from open_webui.utils.plugin import load_tool_module_by_id
 from open_webui.utils.access_control import has_access, has_connection_access
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
@@ -154,23 +155,12 @@ async def get_tools(
     tools_dict = {}
 
     # Get user's group memberships for access control checks
-    user_group_ids = {group.id for group in Groups.get_groups_by_member_id(user.id)}
+    user_group_ids = get_user_group_ids(user.id)
 
     for tool_id in tool_ids:
         tool = Tools.get_tool_by_id(tool_id)
         if tool:
-            # Check access control for local tools
-            if (
-                not (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                and tool.user_id != user.id
-                and not AccessGrants.has_access(
-                    user_id=user.id,
-                    resource_type="tool",
-                    resource_id=tool.id,
-                    permission="read",
-                    user_group_ids=user_group_ids,
-                )
-            ):
+            if not is_tool_catalog_visible(tool, user, user_group_ids):
                 log.warning(f"Access denied to tool {tool_id} for user {user.id}")
                 continue
 

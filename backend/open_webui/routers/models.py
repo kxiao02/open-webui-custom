@@ -18,6 +18,7 @@ from open_webui.models.models import (
     Models,
 )
 from open_webui.models.access_grants import AccessGrants
+from open_webui.models.groups import Groups
 
 from pydantic import BaseModel
 from open_webui.constants import ERROR_MESSAGES

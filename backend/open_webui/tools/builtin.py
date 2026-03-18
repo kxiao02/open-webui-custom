@@ -2069,7 +2069,7 @@ async def view_skill(
 
     try:
         from open_webui.models.skills import Skills
-        from open_webui.models.access_grants import AccessGrants
+        from open_webui.utils.catalog import get_user_group_ids, is_skill_catalog_visible
 
         user_id = __user__.get("id")
 
@@ -2079,20 +2079,14 @@ async def view_skill(
         if not skill or not skill.is_active:
             return json.dumps({"error": f"Skill '{name}' not found"})
 
-        # Check user access
         user_role = __user__.get("role", "user")
-        if user_role != "admin" and skill.user_id != user_id:
-            user_group_ids = [
-                group.id for group in Groups.get_groups_by_member_id(user_id)
-            ]
-            if not AccessGrants.has_access(
-                user_id=user_id,
-                resource_type="skill",
-                resource_id=skill.id,
-                permission="read",
-                user_group_ids=set(user_group_ids),
-            ):
-                return json.dumps({"error": "Access denied"})
+        if not is_skill_catalog_visible(
+            skill,
+            type("SkillViewer", (), {"id": user_id, "role": user_role})(),
+            get_user_group_ids(user_id),
+            require_active=True,
+        ):
+            return json.dumps({"error": "Access denied"})
 
         return json.dumps(
             {

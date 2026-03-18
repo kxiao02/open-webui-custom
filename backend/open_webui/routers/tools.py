@@ -36,6 +36,11 @@ from open_webui.utils.access_control import (
     filter_allowed_access_grants,
 )
 from open_webui.utils.tools import get_tool_servers
+from open_webui.utils.catalog import (
+    filter_visible_tools,
+    get_user_group_ids,
+    is_tool_catalog_visible,
+)
 
 from open_webui.config import CACHE_DIR, BYPASS_ADMIN_ACCESS_CONTROL
 from open_webui.constants import ERROR_MESSAGES
@@ -58,6 +63,10 @@ def _can_access_workspace_content(user, owner_user_id: str) -> bool:
     return owner_user_id == user.id or (
         user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL
     )
+
+
+def _tool_write_access(user) -> bool:
+    return user.role == "admin"
 
 
 ############################
@@ -169,37 +178,25 @@ async def get_tools(
                 )
             )
 
-    if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
-        # Admin can see all tools
+    if user.role == "admin":
         return tools
-    else:
-        user_group_ids = {
-            group.id for group in Groups.get_groups_by_member_id(user.id, db=db)
-        }
-        tools = [
-            tool
-            for tool in tools
-            if tool.user_id == user.id
-            or (
-                has_access(
-                    user.id,
-                    "read",
-                    server_access_grants.get(str(tool.id), []),
-                    user_group_ids,
-                    db=db,
-                )
-                if str(tool.id).startswith("server:")
-                else AccessGrants.has_access(
-                    user_id=user.id,
-                    resource_type="tool",
-                    resource_id=tool.id,
-                    permission="read",
-                    user_group_ids=user_group_ids,
-                    db=db,
-                )
+
+    user_group_ids = get_user_group_ids(user.id, db=db)
+    return [
+        tool
+        for tool in tools
+        if (
+            has_access(
+                user.id,
+                "read",
+                server_access_grants.get(str(tool.id), []),
+                user_group_ids,
+                db=db,
             )
-        ]
-        return tools
+            if str(tool.id).startswith("server:")
+            else is_tool_catalog_visible(tool, user, user_group_ids, db=db)
+        )
+    ]
 
 
 ############################
@@ -211,38 +208,14 @@ async def get_tools(
 async def get_tool_list(
     user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
-        tools = Tools.get_tools(defer_content=True, db=db)
-    else:
-        tools = Tools.get_tools_by_user_id(user.id, "read", defer_content=True, db=db)
-
-    user_group_ids = {
-        group.id for group in Groups.get_groups_by_member_id(user.id, db=db)
-    }
+    tools = filter_visible_tools(Tools.get_tools(defer_content=True, db=db), user, db=db)
 
     result = []
     for tool in tools:
-        has_write = (
-            (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-            or user.id == tool.user_id
-            or any(
-                g.permission == "write"
-                and (
-                    (
-                        g.principal_type == "user"
-                        and (g.principal_id == user.id or g.principal_id == "*")
-                    )
-                    or (
-                        g.principal_type == "group" and g.principal_id in user_group_ids
-                    )
-                )
-                for g in tool.access_grants
-            )
-        )
         result.append(
             ToolAccessResponse(
                 **tool.model_dump(),
-                write_access=has_write,
+                write_access=_tool_write_access(user),
             )
         )
     return result
@@ -333,24 +306,15 @@ async def load_tool_from_url(
 @router.get("/export", response_model=list[ToolModel])
 async def export_tools(
     request: Request,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: Session = Depends(get_session),
 ):
-    if user.role != "admin" and not has_permission(
-        user.id,
-        "workspace.tools_export",
-        request.app.state.config.USER_PERMISSIONS,
-        db=db,
-    ):
+    if user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
-
-    if user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL:
-        return Tools.get_tools(db=db)
-    else:
-        return Tools.get_tools_by_user_id(user.id, "read", db=db)
+    return Tools.get_tools(db=db)
 
 
 ############################
@@ -362,25 +326,14 @@ async def export_tools(
 async def create_new_tools(
     request: Request,
     form_data: ToolForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: Session = Depends(get_session),
 ):
-    if user.role != "admin" and not (
-        has_permission(
-            user.id, "workspace.tools", request.app.state.config.USER_PERMISSIONS, db=db
-        )
-        or has_permission(
-            user.id,
-            "workspace.tools_import",
-            request.app.state.config.USER_PERMISSIONS,
-            db=db,
-        )
-    ):
+    if user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
-
     if not form_data.id.isidentifier():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -439,30 +392,11 @@ async def get_tools_by_id(
     tools = Tools.get_tool_by_id(id, db=db)
 
     if tools:
-        if (
-            user.role == "admin"
-            or tools.user_id == user.id
-            or AccessGrants.has_access(
-                user_id=user.id,
-                resource_type="tool",
-                resource_id=tools.id,
-                permission="read",
-                db=db,
-            )
-        ):
+        user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+        if is_tool_catalog_visible(tools, user, user_group_ids, db=db):
             return ToolAccessResponse(
                 **tools.model_dump(),
-                write_access=(
-                    (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or user.id == tools.user_id
-                    or AccessGrants.has_access(
-                        user_id=user.id,
-                        resource_type="tool",
-                        resource_id=tools.id,
-                        permission="write",
-                        db=db,
-                    )
-                ),
+                write_access=_tool_write_access(user),
             )
         else:
             raise HTTPException(
@@ -491,31 +425,19 @@ async def update_tools_by_id(
     request: Request,
     id: str,
     form_data: ToolForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: Session = Depends(get_session),
 ):
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.UNAUTHORIZED,
+        )
     tools = Tools.get_tool_by_id(id, db=db)
     if not tools:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.NOT_FOUND,
-        )
-
-    # Is the user the original creator, in a group with write access, or an admin
-    if (
-        tools.user_id != user.id
-        and not AccessGrants.has_access(
-            user_id=user.id,
-            resource_type="tool",
-            resource_id=tools.id,
-            permission="write",
-            db=db,
-        )
-        and user.role != "admin"
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
     try:
@@ -565,30 +487,19 @@ async def update_tool_access_by_id(
     request: Request,
     id: str,
     form_data: ToolAccessGrantsForm,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: Session = Depends(get_session),
 ):
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.UNAUTHORIZED,
+        )
     tools = Tools.get_tool_by_id(id, db=db)
     if not tools:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
-        )
-
-    if (
-        tools.user_id != user.id
-        and not AccessGrants.has_access(
-            user_id=user.id,
-            resource_type="tool",
-            resource_id=tools.id,
-            permission="write",
-            db=db,
-        )
-        and user.role != "admin"
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
     form_data.access_grants = filter_allowed_access_grants(
@@ -613,30 +524,19 @@ async def update_tool_access_by_id(
 async def delete_tools_by_id(
     request: Request,
     id: str,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: Session = Depends(get_session),
 ):
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.UNAUTHORIZED,
+        )
     tools = Tools.get_tool_by_id(id, db=db)
     if not tools:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.NOT_FOUND,
-        )
-
-    if (
-        tools.user_id != user.id
-        and not AccessGrants.has_access(
-            user_id=user.id,
-            resource_type="tool",
-            resource_id=tools.id,
-            permission="write",
-            db=db,
-        )
-        and user.role != "admin"
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
     result = Tools.delete_tool_by_id(id, db=db)
@@ -659,7 +559,8 @@ async def get_tools_valves_by_id(
 ):
     tools = Tools.get_tool_by_id(id, db=db)
     if tools:
-        if not _can_access_workspace_content(user, tools.user_id):
+        user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+        if not is_tool_catalog_visible(tools, user, user_group_ids, db=db):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -693,7 +594,8 @@ async def get_tools_valves_spec_by_id(
 ):
     tools = Tools.get_tool_by_id(id, db=db)
     if tools:
-        if not _can_access_workspace_content(user, tools.user_id):
+        user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+        if not is_tool_catalog_visible(tools, user, user_group_ids, db=db):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -728,30 +630,19 @@ async def update_tools_valves_by_id(
     request: Request,
     id: str,
     form_data: dict,
-    user=Depends(get_verified_user),
+    user=Depends(get_admin_user),
     db: Session = Depends(get_session),
 ):
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.UNAUTHORIZED,
+        )
     tools = Tools.get_tool_by_id(id, db=db)
     if not tools:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=ERROR_MESSAGES.NOT_FOUND,
-        )
-
-    if (
-        tools.user_id != user.id
-        and not AccessGrants.has_access(
-            user_id=user.id,
-            resource_type="tool",
-            resource_id=tools.id,
-            permission="write",
-            db=db,
-        )
-        and user.role != "admin"
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
     if id in request.app.state.TOOLS:
@@ -792,7 +683,8 @@ async def get_tools_user_valves_by_id(
 ):
     tools = Tools.get_tool_by_id(id, db=db)
     if tools:
-        if not _can_access_workspace_content(user, tools.user_id):
+        user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+        if not is_tool_catalog_visible(tools, user, user_group_ids, db=db):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -821,7 +713,8 @@ async def get_tools_user_valves_spec_by_id(
 ):
     tools = Tools.get_tool_by_id(id, db=db)
     if tools:
-        if not _can_access_workspace_content(user, tools.user_id):
+        user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+        if not is_tool_catalog_visible(tools, user, user_group_ids, db=db):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
@@ -857,7 +750,8 @@ async def update_tools_user_valves_by_id(
     tools = Tools.get_tool_by_id(id, db=db)
 
     if tools:
-        if not _can_access_workspace_content(user, tools.user_id):
+        user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+        if not is_tool_catalog_visible(tools, user, user_group_ids, db=db):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=ERROR_MESSAGES.ACCESS_PROHIBITED,

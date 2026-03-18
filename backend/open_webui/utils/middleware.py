@@ -110,6 +110,7 @@ from open_webui.utils.filter import (
     get_sorted_filter_ids,
     process_filter_functions,
 )
+from open_webui.utils.catalog import filter_visible_skills
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.payload import apply_system_prompt_to_body
 from open_webui.utils.response import normalize_usage
@@ -2664,15 +2665,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     if all_skill_ids:
         from open_webui.models.skills import Skills as SkillsModel
 
-        accessible_skill_ids = {
-            s.id for s in SkillsModel.get_skills_by_user_id(user.id, "read")
+        indexed_skills = {
+            skill.id: skill
+            for skill in filter_visible_skills(
+                SkillsModel.get_skills(), user, require_active=True
+            )
         }
         available_skills = [
-            s
-            for sid in all_skill_ids
-            if sid in accessible_skill_ids
-            and (s := SkillsModel.get_skill_by_id(sid))
-            and s.is_active
+            indexed_skills[skill_id]
+            for skill_id in all_skill_ids
+            if skill_id in indexed_skills
         ]
 
         skill_descriptions = ""
