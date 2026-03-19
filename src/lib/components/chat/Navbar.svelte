@@ -12,7 +12,6 @@
 		showArchivedChats,
 		showControls,
 		showOverview,
-		showArtifacts,
 		showCanvas,
 		showEmbeds,
 		showCallOverlay,
@@ -360,7 +359,6 @@
 								class="flex cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
 								on:click={async () => {
 									await showOverview.set(false);
-									await showArtifacts.set(false);
 									await showCanvas.set(false);
 									await showEmbeds.set(false);
 									await showCallOverlay.set(false);

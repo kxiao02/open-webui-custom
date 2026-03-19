@@ -34,8 +34,8 @@
 		temporaryChatEnabled,
 		mobile,
 		chatTitle,
-		showArtifacts,
-		artifactContents,
+		showCanvas,
+		canvasState,
 		tools,
 		toolServers,
 		terminalServers,
@@ -838,7 +838,7 @@
 
 			if (!value) {
 				showCallOverlay.set(false);
-				showArtifacts.set(false);
+				showCanvas.set(false);
 				showEmbeds.set(false);
 				showFilePreview.set(false);
 			}
@@ -1099,7 +1099,11 @@
 				contentsRAF = null;
 			});
 		} else {
-			artifactContents.set([]);
+			// Only clear if we're in preview mode (auto-detected artifacts)
+			if ($canvasState?.mode === 'preview') {
+				canvasState.set(null);
+				showCanvas.set(false);
+			}
 		}
 	};
 
@@ -1107,7 +1111,7 @@
 
 	const getContents = () => {
 		const messages = history ? createMessagesList(history, history.currentId) : [];
-		let contents = [];
+		let contents: Array<{ type: string; content: string }> = [];
 		messages.forEach((message) => {
 			if (message?.role !== 'user' && message?.content) {
 				const {
@@ -1153,7 +1157,32 @@
 			}
 		});
 
-		artifactContents.set(contents);
+		// Update canvas state for preview mode (don't overwrite if user is in edit mode)
+		const currentState = $canvasState;
+		if (currentState?.mode === 'edit') return;
+
+		if (contents.length === 0) {
+			if (currentState?.mode === 'preview') {
+				showControls.set(false);
+				showCanvas.set(false);
+				canvasState.set(null);
+			}
+		} else {
+			const prevContents = currentState?.contents ?? [];
+			const newIdx = contents.length > prevContents.length
+				? contents.length - 1
+				: (currentState?.selectedContentIdx ?? 0);
+
+			canvasState.set({
+				code: '',
+				originalCode: '',
+				lang: '',
+				title: '',
+				mode: 'preview',
+				contents,
+				selectedContentIdx: newIdx
+			});
+		}
 	};
 
 	//////////////////////////
@@ -1283,7 +1312,7 @@
 			await showControls.set(false);
 		}
 		await showCallOverlay.set(false);
-		await showArtifacts.set(false);
+		await showCanvas.set(false);
 		await showEmbeds.set(false);
 		await showFilePreview.set(false);
 

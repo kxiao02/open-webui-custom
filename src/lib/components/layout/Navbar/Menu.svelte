@@ -11,16 +11,15 @@
 
 	import {
 		showControls,
-		showArtifacts,
 		showCanvas,
+		canvasState,
 		mobile,
 		temporaryChatEnabled,
 		theme,
 		user,
 		settings,
 		folders,
-		showEmbeds,
-		artifactContents
+		showEmbeds
 	} from '$lib/stores';
 	import { flyAndScale } from '$lib/utils/transitions';
 	import { getChatById } from '$lib/apis/chats';
@@ -318,7 +317,7 @@
 					id="chat-controls-button"
 					on:click={async () => {
 						await showControls.set(true);
-						await showArtifacts.set(false);
+						await showCanvas.set(false);
 						await showEmbeds.set(false);
 					}}
 				>
@@ -327,15 +326,14 @@
 				</DropdownMenu.Item>
 			{/if}
 
-			{#if ($artifactContents ?? []).length > 0}
+			{#if $canvasState?.mode === 'preview' && ($canvasState?.contents ?? []).length > 0}
 				<DropdownMenu.Item
 					draggable="false"
 					class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl select-none w-full"
 					id="chat-artifacts-button"
 					on:click={async () => {
 						await showControls.set(true);
-						await showArtifacts.set(true);
-						await showCanvas.set(false);
+						await showCanvas.set(true);
 						await showEmbeds.set(false);
 					}}
 				>

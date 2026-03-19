@@ -15,7 +15,6 @@
 		mobile,
 		showControls,
 		showCallOverlay,
-		showArtifacts,
 		showCanvas,
 		showEmbeds,
 		showFilePreview,
@@ -31,7 +30,6 @@
 	import Controls from './Controls/Controls.svelte';
 	import CallOverlay from './MessageInput/CallOverlay.svelte';
 	import Drawer from '../common/Drawer.svelte';
-	import Artifacts from './Artifacts.svelte';
 	import Canvas from './Canvas/Canvas.svelte';
 	import Embeds from './ChatControls/Embeds.svelte';
 	import FilePreview from './ChatControls/FilePreview.svelte';
@@ -252,7 +250,6 @@
 		if (!largeScreen) {
 			showControls.set(false);
 		}
-		showArtifacts.set(false);
 		showCanvas.set(false);
 		showEmbeds.set(false);
 		showFilePreview.set(false);
@@ -262,7 +259,7 @@
 	$: if (paneReady && !chatId) closeHandler();
 
 	// Helper: is a "special" full-screen panel active?
-	$: specialPanel = $showCallOverlay || $showArtifacts || $showEmbeds || $showCanvas;
+	$: specialPanel = $showCallOverlay || $showEmbeds || $showCanvas;
 </script>
 
 {#if !largeScreen}
@@ -295,8 +292,6 @@
 					<Embeds />
 				{:else if $showFilePreview}
 					<FilePreview {history} />
-				{:else if $showArtifacts}
-					<Artifacts {history} />
 				{:else}
 					<!-- Controls + Files tabs -->
 					<div class="flex flex-col h-full min-h-0">
@@ -445,8 +440,6 @@
 						<Embeds overlay={dragged} />
 					{:else if $showFilePreview}
 						<FilePreview {history} overlay={dragged} />
-					{:else if $showArtifacts}
-						<Artifacts {history} overlay={dragged} />
 					{:else}
 						<!-- Controls + Files tabs -->
 						<div class="flex flex-col h-full min-h-0">

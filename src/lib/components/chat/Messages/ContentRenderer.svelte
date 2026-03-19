@@ -4,12 +4,10 @@
 
 	import Markdown from './Markdown.svelte';
 	import {
-		artifactCode,
 		canvasState,
 		chatId,
 		mobile,
 		settings,
-		showArtifacts,
 		showCanvas,
 		showControls,
 		showEmbeds,
@@ -186,15 +184,14 @@
 			) {
 				await tick();
 				showFilePreview.set(false);
-				showArtifacts.set(true);
+				showCanvas.set(true);
 				showControls.set(true);
 			}
 		}}
 		onPreview={async (value) => {
-			console.log('Preview', value);
-			await artifactCode.set(value);
+			// Preview button on code blocks — show in canvas preview mode
 			await showControls.set(true);
-			await showArtifacts.set(true);
+			await showCanvas.set(true);
 			await showEmbeds.set(false);
 			await showFilePreview.set(false);
 		}}
@@ -203,10 +200,10 @@
 				code,
 				originalCode: code,
 				lang: lang || '',
-				title: lang || 'Code'
+				title: lang || 'Code',
+				mode: 'edit'
 			});
 			showCanvas.set(true);
-			showArtifacts.set(false);
 			showEmbeds.set(false);
 			showFilePreview.set(false);
 			showControls.set(true);

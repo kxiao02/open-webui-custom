@@ -41,7 +41,6 @@
 		settings,
 		showControls,
 		showOverview,
-		showArtifacts,
 		showCanvas,
 		showEmbeds,
 		showCallOverlay,
@@ -228,7 +227,7 @@
 
 	const openFilePreviewPane = () => {
 		showOverview.set(false);
-		showArtifacts.set(false);
+		showCanvas.set(false);
 		showCanvas.set(false);
 		showEmbeds.set(false);
 		showCallOverlay.set(false);

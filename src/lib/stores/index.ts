@@ -93,7 +93,6 @@ export const showChangelog = writable(false);
 export const showControls = writable(false);
 export const showEmbeds = writable(false);
 export const showOverview = writable(false);
-export const showArtifacts = writable(false);
 export const showFilePreview = writable(false);
 export const showCallOverlay = writable(false);
 export const showFileNav = writable(false);
@@ -101,15 +100,15 @@ export const showFileNavPath: Writable<string | null> = writable(null);
 export const showFileNavDir: Writable<string | null> = writable(null);
 export const selectedTerminalId: Writable<string | null> = writable(null);
 
-export const artifactCode = writable(null);
-export const artifactContents = writable(null);
-
 export const showCanvas = writable(false);
 export const canvasState: Writable<{
 	code: string;
 	originalCode: string;
 	lang: string;
 	title: string;
+	mode: 'edit' | 'preview';
+	contents?: Array<{ type: string; content: string }>;
+	selectedContentIdx?: number;
 } | null> = writable(null);
 
 export const embed = writable(null);
