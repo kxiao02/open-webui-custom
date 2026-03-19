@@ -25,7 +25,7 @@ class Pipe:
 
     class Valves(BaseModel):
         langgraph_url: str = Field(
-            default="http://agent:32000",
+            default="http://agent:2024",
             description="Direct URL of the LangGraph agent server",
         )
         graph_name: str = Field(

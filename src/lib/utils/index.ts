@@ -97,14 +97,39 @@ export const processResponseContent = (content: string) => {
 	return content.trim();
 };
 
+/**
+ * Splits content by fenced code blocks (``` ... ```) and applies the given
+ * transform only to segments that are outside code blocks.
+ */
+function processOutsideCodeBlocks(
+	content: string,
+	transform: (segment: string) => string
+): string {
+	const parts = content.split(/(```[\s\S]*?```)/g);
+	return parts
+		.map((part, i) => {
+			// Odd-indexed parts are inside code fences — leave them untouched.
+			if (i % 2 === 1) return part;
+			return transform(part);
+		})
+		.join('');
+}
+
 const RELATIVE_FILE_DOWNLOAD_PATH_RE =
 	/\/(?:api\/)?v1\/files\/[A-Za-z0-9][A-Za-z0-9._-]*\/content(?:\/[^\s)\]]*)?/g;
 
-function collectMarkdownLinkRanges(segment: string): Array<[number, number]> {
+function collectExcludedRanges(segment: string): Array<[number, number]> {
 	const ranges: Array<[number, number]> = [];
+	// Exclude markdown links
 	const markdownLinkRe = /!?\[[^\]]*?\]\((?:[^()\\]|\\.)*?\)/g;
 	let match: RegExpExecArray | null = null;
 	while ((match = markdownLinkRe.exec(segment)) !== null) {
+		ranges.push([match.index, match.index + match[0].length]);
+	}
+	// Exclude HTML tags (e.g. <details ... files="..." ...>) so file paths
+	// inside attributes are not corrupted by linkification.
+	const htmlTagRe = /<[a-zA-Z][^>]*>/g;
+	while ((match = htmlTagRe.exec(segment)) !== null) {
 		ranges.push([match.index, match.index + match[0].length]);
 	}
 	return ranges;
@@ -125,12 +150,12 @@ function linkifyRelativeFileDownloadPaths(content: string): string {
 			return segment;
 		}
 
-		const linkRanges = collectMarkdownLinkRanges(segment);
+		const excludedRanges = collectExcludedRanges(segment);
 		return segment.replace(
 			RELATIVE_FILE_DOWNLOAD_PATH_RE,
 			(match: string, ...args: Array<string | number>) => {
 				const index = Number(args[args.length - 2] ?? -1);
-				if (index < 0 || isInsideRanges(index, linkRanges)) {
+				if (index < 0 || isInsideRanges(index, excludedRanges)) {
 					return match;
 				}
 				return `[${match}](${match})`;
