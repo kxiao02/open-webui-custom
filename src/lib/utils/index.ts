@@ -49,6 +49,11 @@ export const replaceOutsideCode = (content: string, replacer: (str: string) => s
 		.join('');
 };
 
+// Keep older markdown helpers working after the shared splitter was renamed.
+const processOutsideCodeBlocks = (content: string, replacer: (str: string) => string) => {
+	return replaceOutsideCode(content, replacer);
+};
+
 export const replaceTokens = (content, char, user) => {
 	const tokens = [
 		{ regex: /{{char}}/gi, replacement: char },

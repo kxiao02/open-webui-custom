@@ -1909,6 +1909,8 @@
 
 	const submitPrompt = async (userPrompt, { _raw = false } = {}) => {
 		console.log('submitPrompt', userPrompt, $chatId);
+		// Cancel any in-flight landing-page init so it cannot wipe the first message render.
+		initNewChatRunId += 1;
 		ensureSelectedModels();
 
 		const _selectedModels = selectedModels.map((modelId) =>
