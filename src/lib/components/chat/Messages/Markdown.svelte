@@ -33,6 +33,7 @@
 
 	export let onSourceClick = () => {};
 	export let onTaskClick = () => {};
+	export let onEditInCanvas = () => {};
 
 	let tokens = [];
 	let pendingUpdate = null;
@@ -107,5 +108,6 @@
 		{onSave}
 		{onUpdate}
 		{onPreview}
+		{onEditInCanvas}
 	/>
 {/key}

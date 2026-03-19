@@ -104,6 +104,14 @@ export const selectedTerminalId: Writable<string | null> = writable(null);
 export const artifactCode = writable(null);
 export const artifactContents = writable(null);
 
+export const showCanvas = writable(false);
+export const canvasState: Writable<{
+	code: string;
+	originalCode: string;
+	lang: string;
+	title: string;
+} | null> = writable(null);
+
 export const embed = writable(null);
 
 export const temporaryChatEnabled = writable(false);

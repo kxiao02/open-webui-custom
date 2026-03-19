@@ -12,6 +12,7 @@
 	import {
 		showControls,
 		showArtifacts,
+		showCanvas,
 		mobile,
 		temporaryChatEnabled,
 		theme,
@@ -334,6 +335,7 @@
 					on:click={async () => {
 						await showControls.set(true);
 						await showArtifacts.set(true);
+						await showCanvas.set(false);
 						await showEmbeds.set(false);
 					}}
 				>

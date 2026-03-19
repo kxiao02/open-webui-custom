@@ -46,6 +46,7 @@
 
 	export let onTaskClick: Function = () => {};
 	export let onSourceClick: Function = () => {};
+	export let onEditInCanvas: Function = () => {};
 
 	const headerComponent = (depth: number) => {
 		return 'h' + depth;
@@ -134,6 +135,7 @@
 				}}
 				{onUpdate}
 				{onPreview}
+				{onEditInCanvas}
 			/>
 		{:else}
 			{token.text}

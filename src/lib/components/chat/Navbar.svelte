@@ -13,6 +13,7 @@
 		showControls,
 		showOverview,
 		showArtifacts,
+		showCanvas,
 		showEmbeds,
 		showCallOverlay,
 		showFilePreview,
@@ -360,6 +361,7 @@
 								on:click={async () => {
 									await showOverview.set(false);
 									await showArtifacts.set(false);
+									await showCanvas.set(false);
 									await showEmbeds.set(false);
 									await showCallOverlay.set(false);
 									await showFilePreview.set(true);

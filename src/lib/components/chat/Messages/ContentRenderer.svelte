@@ -5,10 +5,12 @@
 	import Markdown from './Markdown.svelte';
 	import {
 		artifactCode,
+		canvasState,
 		chatId,
 		mobile,
 		settings,
 		showArtifacts,
+		showCanvas,
 		showControls,
 		showEmbeds,
 		showOverview,
@@ -195,6 +197,19 @@
 			await showArtifacts.set(true);
 			await showEmbeds.set(false);
 			await showFilePreview.set(false);
+		}}
+		onEditInCanvas={({ code, lang }) => {
+			canvasState.set({
+				code,
+				originalCode: code,
+				lang: lang || '',
+				title: lang || 'Code'
+			});
+			showCanvas.set(true);
+			showArtifacts.set(false);
+			showEmbeds.set(false);
+			showFilePreview.set(false);
+			showControls.set(true);
 		}}
 	/>
 </div>
