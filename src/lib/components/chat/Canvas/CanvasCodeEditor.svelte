@@ -15,7 +15,7 @@
 		id="canvas-editor"
 		{lang}
 		onChange={(value) => {
-			if ($canvasState) {
+			if ($canvasState && $canvasState.code !== value) {
 				$canvasState = { ...$canvasState, code: value };
 			}
 		}}

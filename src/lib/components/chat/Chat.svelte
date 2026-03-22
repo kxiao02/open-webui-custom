@@ -1110,6 +1110,9 @@
 	$: onHistoryChange(history);
 
 	const getContents = () => {
+		// Skip expensive parsing when user is actively editing in canvas
+		if ($canvasState?.mode === 'edit') return;
+
 		const messages = history ? createMessagesList(history, history.currentId) : [];
 		let contents: Array<{ type: string; content: string }> = [];
 		messages.forEach((message) => {
@@ -1157,10 +1160,7 @@
 			}
 		});
 
-		// Update canvas state for preview mode (don't overwrite if user is in edit mode)
 		const currentState = $canvasState;
-		if (currentState?.mode === 'edit') return;
-
 		if (contents.length === 0) {
 			if (currentState?.mode === 'preview') {
 				showControls.set(false);

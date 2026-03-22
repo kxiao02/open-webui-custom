@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, getContext } from 'svelte';
+	import { getContext, onDestroy } from 'svelte';
 	import { marked } from 'marked';
 	import hljs from 'highlight.js';
 	import { canvasState, settings } from '$lib/stores';
@@ -17,12 +17,30 @@
 	$: isMarkdown = ['markdown', 'md'].includes(lang);
 	$: isPreviewable = isHtml || isSvg || isMarkdown;
 
-	$: renderedMarkdown = isMarkdown ? marked.parse(code) : '';
+	// Debounce preview rendering to avoid per-keystroke iframe rebuilds
+	let previewCode = '';
+	let previewTimer: ReturnType<typeof setTimeout>;
 
-	$: highlightedCode =
-		!isPreviewable && code
-			? hljs.highlightAuto(code, hljs.getLanguage(lang)?.aliases).value || code
-			: '';
+	$: {
+		code;
+		clearTimeout(previewTimer);
+		previewTimer = setTimeout(() => {
+			previewCode = code;
+		}, 400);
+	}
+
+	onDestroy(() => clearTimeout(previewTimer));
+
+	$: renderedMarkdown = isMarkdown ? marked.parse(previewCode) : '';
+
+	$: highlightedCode = (() => {
+		if (isPreviewable || !previewCode) return '';
+		const langObj = hljs.getLanguage(lang);
+		if (langObj) {
+			return hljs.highlight(previewCode, { language: lang }).value;
+		}
+		return hljs.highlightAuto(previewCode).value || previewCode;
+	})();
 
 	const iframeLoadHandler = () => {
 		if (!iframeElement?.contentWindow) return;
@@ -44,7 +62,7 @@
 		<iframe
 			bind:this={iframeElement}
 			title="Preview"
-			srcdoc={code}
+			srcdoc={previewCode}
 			class="w-full h-full border-0"
 			sandbox="allow-scripts allow-downloads{($settings?.iframeSandboxAllowForms ?? false)
 				? ' allow-forms'
@@ -52,12 +70,12 @@
 			on:load={iframeLoadHandler}
 		></iframe>
 	{:else if isSvg}
-		<SvgPanZoom className="w-full h-full max-h-full overflow-hidden" svg={code} />
+		<SvgPanZoom className="w-full h-full max-h-full overflow-hidden" svg={previewCode} />
 	{:else if isMarkdown}
 		<div class="prose dark:prose-invert max-w-none p-4 text-sm">
 			{@html renderedMarkdown}
 		</div>
-	{:else if code}
+	{:else if previewCode}
 		<pre
 			class="hljs p-4 overflow-x-auto h-full text-sm"><code class="language-{lang}">{@html highlightedCode}</code></pre>
 	{:else}

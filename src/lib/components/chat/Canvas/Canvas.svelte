@@ -69,11 +69,15 @@
 
 	const downloadArtifact = () => {
 		if (contents.length === 0) return;
-		const blob = new Blob([contents[selectedContentIdx].content], { type: 'text/html' });
+		const item = contents[selectedContentIdx];
+		const isSvg = item.type === 'svg';
+		const mimeType = isSvg ? 'image/svg+xml' : 'text/html';
+		const ext = isSvg ? 'svg' : 'html';
+		const blob = new Blob([item.content], { type: mimeType });
 		const url = URL.createObjectURL(blob);
 		const a = document.createElement('a');
 		a.href = url;
-		a.download = `artifact-${$chatId}-${selectedContentIdx}.html`;
+		a.download = `artifact-${$chatId}-${selectedContentIdx}.${ext}`;
 		document.body.appendChild(a);
 		a.click();
 		document.body.removeChild(a);
@@ -90,7 +94,8 @@
 
 	const iframeLoadHandler = () => {
 		if (!iframeElement?.contentWindow) return;
-		iframeElement.contentWindow.addEventListener(
+		const cw = iframeElement.contentWindow;
+		cw.addEventListener(
 			'click',
 			function (e) {
 				const target = (e.target as HTMLElement).closest('a');
@@ -98,22 +103,13 @@
 					e.preventDefault();
 					const url = new URL((target as HTMLAnchorElement).href, iframeElement.baseURI);
 					if (url.origin === window.location.origin) {
-						iframeElement.contentWindow.history.pushState(
-							null,
-							'',
-							url.pathname + url.search + url.hash
-						);
+						cw.history.pushState(null, '', url.pathname + url.search + url.hash);
 					}
 				}
 			},
 			true
 		);
-		iframeElement.contentWindow.addEventListener('mouseenter', function (e) {
-			e.preventDefault();
-			iframeElement.contentWindow.addEventListener('dragstart', (event) => {
-				event.preventDefault();
-			});
-		});
+		cw.addEventListener('dragstart', (e) => e.preventDefault(), true);
 	};
 </script>
 

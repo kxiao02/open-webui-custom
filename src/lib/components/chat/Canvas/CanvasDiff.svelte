@@ -1,12 +1,25 @@
 <script lang="ts">
-	import { getContext } from 'svelte';
+	import { getContext, onDestroy } from 'svelte';
 	import { canvasState } from '$lib/stores';
 
 	const i18n = getContext('i18n');
 
 	$: originalCode = $canvasState?.originalCode ?? '';
 	$: currentCode = $canvasState?.code ?? '';
-	$: diffLines = computeDiff(originalCode, currentCode);
+
+	let diffLines: DiffLine[] = [];
+	let debounceTimer: ReturnType<typeof setTimeout>;
+
+	$: {
+		originalCode;
+		currentCode;
+		clearTimeout(debounceTimer);
+		debounceTimer = setTimeout(() => {
+			diffLines = computeDiff(originalCode, currentCode);
+		}, 300);
+	}
+
+	onDestroy(() => clearTimeout(debounceTimer));
 
 	interface DiffLine {
 		type: 'equal' | 'add' | 'remove';

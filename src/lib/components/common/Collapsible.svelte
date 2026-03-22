@@ -228,7 +228,6 @@
 	const openFilePreviewPane = () => {
 		showOverview.set(false);
 		showCanvas.set(false);
-		showCanvas.set(false);
 		showEmbeds.set(false);
 		showCallOverlay.set(false);
 		showFilePreview.set(true);
