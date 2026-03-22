@@ -42,7 +42,7 @@
 		showControls.set(false);
 	};
 
-	const copyCode = () => {
+	const copyCode = async () => {
 		let textToCopy = '';
 		if (mode === 'preview' && contents.length > 0) {
 			textToCopy = contents[selectedContentIdx]?.content ?? '';
@@ -50,7 +50,7 @@
 			textToCopy = $canvasState?.code ?? '';
 		}
 		if (textToCopy) {
-			copyToClipboard(textToCopy);
+			await copyToClipboard(textToCopy);
 			copied = true;
 			setTimeout(() => {
 				copied = false;

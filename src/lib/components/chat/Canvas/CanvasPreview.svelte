@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { getContext, onDestroy } from 'svelte';
 	import { marked } from 'marked';
+	import DOMPurify from 'dompurify';
 	import hljs from 'highlight.js';
 	import { canvasState, settings } from '$lib/stores';
 	import SvgPanZoom from '$lib/components/common/SVGPanZoom.svelte';
@@ -31,7 +32,7 @@
 
 	onDestroy(() => clearTimeout(previewTimer));
 
-	$: renderedMarkdown = isMarkdown ? marked.parse(previewCode) : '';
+	$: renderedMarkdown = isMarkdown ? DOMPurify.sanitize(marked.parse(previewCode)) : '';
 
 	$: highlightedCode = (() => {
 		if (isPreviewable || !previewCode) return '';
