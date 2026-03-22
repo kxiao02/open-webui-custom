@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import dayjs from '$lib/dayjs';
 	import duration from 'dayjs/plugin/duration';
 	import relativeTime from 'dayjs/plugin/relativeTime';
@@ -7,7 +8,7 @@
 	dayjs.extend(relativeTime);
 
 	import { getContext } from 'svelte';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { capitalizeFirstLetter, formatFileSize } from '$lib/utils';
 

@@ -12,4 +12,7 @@ declare global {
 	}
 }
 
+declare module 'file-saver';
+declare module 'uuid';
+
 export {};

@@ -42,7 +42,7 @@ from open_webui.models.access_grants import AccessGrants
 from open_webui.utils.catalog import get_user_group_ids, is_tool_catalog_visible
 from open_webui.utils.plugin import load_tool_module_by_id
 from open_webui.utils.access_control import has_access, has_connection_access
-from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
+from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, ENABLE_KNOWLEDGE
 from open_webui.env import (
     AIOHTTP_CLIENT_TIMEOUT,
     AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER_DATA,
@@ -426,7 +426,7 @@ def get_builtin_tools(
     folder_knowledge = extra_params.get("__metadata__", {}).get("folder_knowledge")
     if folder_knowledge:
         model_knowledge = list(model_knowledge or []) + list(folder_knowledge)
-    if is_builtin_tool_enabled("knowledge"):
+    if ENABLE_KNOWLEDGE.value and is_builtin_tool_enabled("knowledge"):
         if model_knowledge:
             # Model has attached knowledge - only allow semantic search within it
             builtin_functions.append(query_knowledge_files)

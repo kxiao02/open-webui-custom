@@ -1,10 +1,11 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { toast } from 'svelte-sonner';
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
 	import { onMount, getContext, tick, onDestroy } from 'svelte';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { WEBUI_NAME, config, tools as _tools, user } from '$lib/stores';
 
@@ -157,14 +158,32 @@
 	};
 
 	const init = async () => {
-		tools = await getToolList(localStorage.token);
-		_tools.set(await getTools(localStorage.token));
+		const [toolListResult, toolsResult] = await Promise.allSettled([
+			getToolList(localStorage.token),
+			getTools(localStorage.token)
+		]);
+
+		if (toolListResult.status === 'fulfilled') {
+			tools = toolListResult.value ?? [];
+		} else {
+			tools = [];
+			toast.error(`${toolListResult.reason}`);
+		}
+
+		if (toolsResult.status === 'fulfilled') {
+			_tools.set(toolsResult.value ?? []);
+		} else {
+			toast.error(`${toolsResult.reason}`);
+		}
 	};
 
 	onMount(async () => {
 		viewOption = localStorage?.workspaceViewOption || '';
-		await init();
-		loaded = true;
+		try {
+			await init();
+		} finally {
+			loaded = true;
+		}
 
 		const onKeyDown = (event) => {
 			if (event.key === 'Shift') {

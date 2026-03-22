@@ -30,9 +30,10 @@
 	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
 	import ChevronLeft from '$lib/components/icons/ChevronLeft.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let selectedToolIds: string[] = [];
+	export let lockedToolIds: string[] = [];
 
 	export let selectedModels: string[] = [];
 	export let fileUploadCapableModels: string[] = [];
@@ -98,6 +99,8 @@
 
 		selectedToolIds = selectedToolIds.filter((id) => Object.keys(tools).includes(id));
 	};
+
+	const isToolLocked = (toolId: string) => lockedToolIds.includes(toolId);
 </script>
 
 <Dropdown
@@ -349,6 +352,10 @@
 									const authUrl = getOAuthClientAuthorizationUrl(serverId, 'mcp');
 									window.open(authUrl, '_self', 'noopener');
 								} else {
+									if (isToolLocked(toolId) && tools[toolId]?.enabled) {
+										return;
+									}
+
 									tools[toolId].enabled = !tools[toolId].enabled;
 
 									const state = tools[toolId].enabled;

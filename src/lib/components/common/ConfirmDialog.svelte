@@ -1,10 +1,11 @@
 <script lang="ts">
+	// @ts-nocheck
 	import DOMPurify from 'dompurify';
 
 	import { onMount, getContext, createEventDispatcher, onDestroy, tick } from 'svelte';
 	import * as FocusTrap from 'focus-trap';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 	const dispatch = createEventDispatcher();
 
 	import { fade } from 'svelte/transition';

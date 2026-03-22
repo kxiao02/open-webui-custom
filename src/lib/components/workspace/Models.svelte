@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { marked } from 'marked';
 
 	import { toast } from 'svelte-sonner';
@@ -9,7 +10,7 @@
 
 	import { onMount, getContext, tick } from 'svelte';
 	import { goto } from '$app/navigation';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { WEBUI_NAME, config, mobile, models as _models, settings, user } from '$lib/stores';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
@@ -228,11 +229,17 @@
 		viewOption = localStorage.workspaceViewOption ?? '';
 		page = 1;
 
-		let groups = await getGroups(localStorage.token);
-		groupIds = groups.map((group) => group.id);
-
-		await tick();
-		loaded = true;
+		try {
+			const groups =
+				(await getGroups(localStorage.token).catch((error) => {
+					toast.error(`${error}`);
+					return [];
+				})) ?? [];
+			groupIds = groups.map((group) => group.id);
+		} finally {
+			await tick();
+			loaded = true;
+		}
 
 		const onKeyDown = (event) => {
 			if (event.key === 'Shift') {

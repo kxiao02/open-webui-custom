@@ -3,7 +3,7 @@
 	import { v4 as uuidv4 } from 'uuid';
 
 	import { getContext } from 'svelte';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { slide } from 'svelte/transition';
 	import { quintOut } from 'svelte/easing';
@@ -14,6 +14,8 @@
 	import Markdown from '../chat/Messages/Markdown.svelte';
 	import WrenchSolid from '../icons/WrenchSolid.svelte';
 	import CheckCircle from '../icons/CheckCircle.svelte';
+	import ClockRotateRight from '../icons/ClockRotateRight.svelte';
+	import XMark from '../icons/XMark.svelte';
 	import Image from './Image.svelte';
 	import FullHeightIframe from './FullHeightIframe.svelte';
 	import { settings } from '$lib/stores';
@@ -28,6 +30,7 @@
 		files?: string;
 		embeds?: string;
 		done?: string;
+		status?: string;
 	} = {};
 
 	export let open = false;
@@ -35,6 +38,24 @@
 
 	const RESULT_PREVIEW_LIMIT = 10000;
 	let expandedResult = false;
+
+	const TOOL_LABELS: Record<string, string> = {
+		internet_search: '网络搜索',
+		联网搜索: '网络搜索',
+		visit_webpage: '网页读取',
+		网页读取: '网页读取',
+		current_server_time: '服务器时间',
+		服务器时间: '服务器时间',
+		math_calculator: '数学计算',
+		数学计算: '数学计算',
+		read_structured_file: '读取结构化文件',
+		读取结构化文件: '读取结构化文件',
+		write_structured_file: '写入结构化文件',
+		写入结构化文件: '写入结构化文件',
+		gotenberg_convert: 'PDF 转换',
+		'PDF转换': 'PDF 转换',
+		'PDF 转换': 'PDF 转换'
+	};
 
 	$: if (!open) expandedResult = false;
 	export let buttonClassName =
@@ -75,15 +96,41 @@
 		}
 	}
 
+	function normalizeStatus(status: string | undefined, done: string | undefined): string {
+		const normalized = (status || '').trim().toLowerCase();
+		if (['running', 'success', 'error', 'timeout'].includes(normalized)) {
+			return normalized;
+		}
+		return done === 'true' ? 'success' : 'running';
+	}
+
+	function getStatusLabel(status: string): string {
+		if (status === 'success') return '已完成';
+		if (status === 'timeout') return '已超时';
+		if (status === 'error') return '执行失败';
+		return '进行中';
+	}
+
+	function getStatusMessage(status: string, name: string): string {
+		if (status === 'success') return `查看 ${name} 的结果`;
+		if (status === 'timeout') return `${name} 已超时`;
+		if (status === 'error') return `${name} 运行失败`;
+		return `正在执行 ${name}...`;
+	}
+
 	$: args = decode(attributes?.arguments ?? '');
 	$: result = decode(attributes?.result ?? '');
 	$: files = parseJSONString(decode(attributes?.files ?? ''));
 	$: embeds = parseJSONString(decode(attributes?.embeds ?? ''));
-	$: isDone = attributes?.done === 'true';
-	$: isExecuting = attributes?.done && attributes?.done !== 'true';
-
 	$: parsedArgs = parseArguments(args);
 	$: parsedResult = parseJSONString(result);
+	$: displayName = TOOL_LABELS[attributes?.name ?? ''] ?? attributes?.name ?? '';
+	$: status = normalizeStatus(attributes?.status, attributes?.done);
+	$: isDone = status === 'success';
+	$: isTerminal = status !== 'running';
+	$: isExecuting = status === 'running';
+	$: statusLabel = getStatusLabel(status);
+	$: statusMessage = getStatusMessage(status, displayName);
 </script>
 
 <div {id} class={className}>
@@ -91,7 +138,7 @@
 		<!-- Embed Mode: Show iframes without collapsible behavior -->
 		<div class="py-1 w-full cursor-pointer">
 			<div class="w-full text-xs text-gray-500">
-				{attributes.name}
+				{displayName}
 			</div>
 			{#each embeds as embed, idx}
 				<div class="my-2" id={`${componentId}-tool-call-embed-${idx}`}>
@@ -129,6 +176,14 @@
 					<div class="text-emerald-500 dark:text-emerald-400">
 						<CheckCircle className="size-4" strokeWidth="2" />
 					</div>
+				{:else if status === 'timeout'}
+					<div class="text-amber-500 dark:text-amber-400">
+						<ClockRotateRight className="size-4" strokeWidth="2" />
+					</div>
+				{:else if status === 'error'}
+					<div class="text-rose-500 dark:text-rose-400">
+						<XMark className="size-4" strokeWidth="2.2" />
+					</div>
 				{:else}
 					<div class="text-gray-400 dark:text-gray-500">
 						<WrenchSolid className="size-3.5" />
@@ -138,24 +193,10 @@
 				<!-- Label -->
 				<div class="flex-1 line-clamp-1">
 					<!-- Short label (below md) -->
-					<span class="@md:hidden font-semibold text-black dark:text-white">{attributes.name}</span>
+					<span class="@md:hidden font-semibold text-black dark:text-white">{displayName}</span>
 					<!-- Full label (md and above) -->
 					<span class="hidden @md:inline">
-						{#if isDone}
-							<Markdown
-								id={`${componentId}-tool-call-title`}
-								content={$i18n.t('View Result from **{{NAME}}**', {
-									NAME: attributes.name
-								})}
-							/>
-						{:else}
-							<Markdown
-								id={`${componentId}-tool-call-executing`}
-								content={$i18n.t('Executing **{{NAME}}**...', {
-									NAME: attributes.name
-								})}
-							/>
-						{/if}
+						<span class="font-medium text-black dark:text-white">{statusMessage}</span>
 					</span>
 				</div>
 
@@ -207,12 +248,12 @@
 					{/if}
 
 					<!-- Output -->
-					{#if isDone && result}
+					{#if isTerminal && result}
 						<div>
 							<div
 								class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-gray-500 mb-1.5 px-1"
 							>
-								{$i18n.t('Output')}
+								{status === 'success' ? $i18n.t('Output') : '错误信息'}
 							</div>
 							<div class="w-full max-w-none!">
 								{#if typeof parsedResult === 'object' && parsedResult !== null}
@@ -249,7 +290,7 @@
 	{/if}
 
 	<!-- Files display (images etc.) when done -->
-	{#if isDone}
+	{#if isTerminal}
 		{#if typeof files === 'object'}
 			{#each files ?? [] as file, idx}
 				{#if typeof file === 'string'}

@@ -30,6 +30,7 @@
 		copyToClipboard as _copyToClipboard,
 		approximateToHumanReadable,
 		getMessageContentParts,
+		normalizeLeakedFormatting,
 		sanitizeResponseContent,
 		createMessagesList,
 		formatDate,
@@ -62,7 +63,7 @@
 	import RegenerateMenu from './ResponseMessage/RegenerateMenu.svelte';
 	import StatusHistory from './ResponseMessage/StatusHistory.svelte';
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
-	import Collapsible from '$lib/components/common/Collapsible.svelte';
+	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
 
 	interface MessageType {
 		id: string;
@@ -302,7 +303,7 @@
 		if (!content) return '';
 		return content.replace(
 			/(^|\n)(#{1,6}\s*)?Sources\s*(?=\n|$)/gim,
-			(_, prefix: string, headingPrefix: string) => `${prefix}${headingPrefix || '### '}参考来源`
+			(_, prefix: string) => `${prefix}参考来源`
 		);
 	};
 
@@ -430,47 +431,67 @@
 		if (!content) return { process: '', final: '' };
 
 		const toolCallRegex = /<details\b[^>]*\btype="tool_calls"[^>]*>[\s\S]*?<\/details>/gim;
-		let lastToolBlockEnd = -1;
+		const matches = Array.from(content.matchAll(toolCallRegex));
 
-		for (const match of content.matchAll(toolCallRegex)) {
-			const start = match.index ?? -1;
-			if (start >= 0) {
-				lastToolBlockEnd = start + match[0].length;
-			}
-		}
-
-		if (lastToolBlockEnd < 0) {
+		if (matches.length === 0) {
 			return {
 				process: '',
 				final: content.trim()
 			};
 		}
 
+		const process = matches
+			.map((match) => (match[0] || '').trim())
+			.filter(Boolean)
+			.join('\n\n')
+			.trim();
+
+		let cursor = 0;
+		let final = '';
+		for (const match of matches) {
+			const start = match.index ?? -1;
+			if (start < 0) continue;
+			final += content.slice(cursor, start);
+			cursor = start + (match[0] || '').length;
+		}
+		final += content.slice(cursor);
+
 		return {
-			process: content.slice(0, lastToolBlockEnd).trim(),
-			final: content.slice(lastToolBlockEnd).replace(/\n{3,}/g, '\n\n').trim()
+			process,
+			final: final.replace(/\n{3,}/g, '\n\n').trim()
 		};
 	};
 
 	let processContent = '';
+	let processToolCallItems: { key: string; attrs: Record<string, string> }[] = [];
 	let finalMessageContent = '';
 	let finalContentBeforeGeneratedFiles = '';
 	let finalContentAfterGeneratedFiles = '';
 	let placeInlineGeneratedFiles = false;
-	let processPanelOpen = false;
-	let processPanelAutoCollapsed = false;
-	let processPanelAutoOpened = false;
-	let lastProcessSnapshot = '';
-	let processPanelDisplayTitle = '当前执行的操作';
-	let processPanelCollapsedTitle: string | null = null;
-	let processPanelStatusDone = false;
 
 	$: {
 		const rawContent = message?.content ?? '';
 		const normalizedContent = dedupeToolCallBlocks(normalizeSourcesHeading(rawContent));
 		const { process, final } = splitToolCallSection(normalizedContent);
 		processContent = process;
-		const cleanedFinal = stripDownloadSection(final, generatedFiles.length > 0);
+		processToolCallItems = Array.from(process.matchAll(TOOL_CALL_BLOCK_REGEX))
+			.map((match, index) => {
+				const block = match[0] || '';
+				const attrs = getToolCallAttrs(block);
+				const key =
+					(attrs.call_key || '').trim() ||
+					(attrs.id || '').trim() ||
+					`${(attrs.name || '').trim()}-${index}`;
+
+				return {
+					key,
+					attrs
+				};
+			})
+			.filter((item) => Object.keys(item.attrs).length > 0);
+		const cleanedFinal = normalizeLeakedFormatting(
+			stripDownloadSection(final, generatedFiles.length > 0)
+		);
 		finalMessageContent = cleanedFinal;
 
 		if (cleanedFinal.includes(INLINE_GENERATED_FILES_MARKER)) {
@@ -484,89 +505,6 @@
 			placeInlineGeneratedFiles = false;
 		}
 	}
-
-	$: {
-		const processText = processContent.trim();
-		const finalText = finalMessageContent.trim();
-
-		if (!processText) {
-			processPanelOpen = false;
-			processPanelAutoCollapsed = false;
-			processPanelAutoOpened = false;
-			lastProcessSnapshot = '';
-		} else {
-			if (processText !== lastProcessSnapshot) {
-				lastProcessSnapshot = processText;
-			}
-
-			if (!finalText && !processPanelAutoOpened) {
-				processPanelOpen = true;
-				processPanelAutoOpened = true;
-			}
-
-			if (finalText && !processPanelAutoCollapsed) {
-				processPanelOpen = false;
-				processPanelAutoCollapsed = true;
-			}
-		}
-	}
-
-	const getProcessPanelState = (
-		process: string,
-		final: string,
-		messageDone: boolean
-	): { title: string; done: boolean } => {
-		if (!process) {
-			return { title: '当前执行的操作', done: true };
-		}
-
-		const matches = Array.from(process.matchAll(TOOL_CALL_BLOCK_REGEX));
-		let lastName = '';
-		let lastPendingName = '';
-
-		for (const match of matches) {
-			const attrs = getToolCallAttrs(match[0] || '');
-			const name = (attrs.name || '').trim();
-			const isPending = (attrs.done || '').toLowerCase() !== 'true';
-			if (name) {
-				lastName = name;
-			}
-			if (isPending && name) {
-				lastPendingName = name;
-			}
-		}
-
-		if (lastPendingName) {
-			return {
-				title: `当前执行：${lastPendingName}`,
-				done: false
-			};
-		}
-
-		if (final.trim() || messageDone) {
-			return {
-				title: '已完成',
-				done: true
-			};
-		}
-
-		return {
-			title: lastName ? `当前执行：${lastName}` : '当前执行的操作',
-			done: false
-		};
-	};
-
-	$: {
-		const panelState = getProcessPanelState(
-			processContent,
-			finalMessageContent,
-			Boolean(message?.done ?? false)
-		);
-		processPanelDisplayTitle = panelState.title;
-		processPanelStatusDone = panelState.done;
-	}
-
-	$: processPanelCollapsedTitle = processPanelOpen ? null : processPanelDisplayTitle;
 
 	const copyToClipboard = async (text) => {
 		text = removeDetails(text, ['tool_calls']);
@@ -1054,7 +992,7 @@
 			</Name>
 
 			<div>
-				<div class="chat-{message.role} w-full min-w-full markdown-prose">
+				<div class="chat-{message.role} w-full min-w-full chat-markdown-prose">
 					<div>
 						{#if model?.info?.meta?.capabilities?.status_updates ?? true}
 							<StatusHistory statusHistory={message?.statusHistory} expand={true} />
@@ -1177,35 +1115,15 @@
 								id="response-content-container"
 							>
 								{#if processContent}
-									<div class="mb-2 rounded-xl border border-gray-200/80 bg-gray-50/60 px-2 py-1.5 dark:border-gray-800 dark:bg-gray-900/50">
-										<Collapsible
-											title={processPanelCollapsedTitle}
-											attributes={{ done: processPanelStatusDone ? 'true' : 'false' }}
-											chevron={true}
-											open={processPanelOpen}
-											onChange={(isOpen) => {
-												processPanelOpen = Boolean(isOpen);
-											}}
-											className="w-full"
-											buttonClassName="w-full text-xs font-semibold text-gray-700 hover:text-gray-900 dark:text-gray-300 dark:hover:text-gray-100"
-										>
-											<div class="pt-1" slot="content">
-												<ContentRenderer
-													id={`${chatId}-${message.id}-process`}
-													messageId={message.id}
-													{history}
-													{selectedModels}
-													content={processContent}
-													floatingButtons={false}
-													save={false}
-													preview={false}
-													editCodeBlock={false}
-													topPadding={false}
-													done={true}
-													{model}
-												/>
-											</div>
-										</Collapsible>
+									<div class="mb-2 px-1 pt-1 space-y-1">
+										{#each processToolCallItems as item (item.key)}
+											<ToolCallDisplay
+												id={`${chatId}-${message.id}-process-${item.key}`}
+												attributes={item.attrs}
+												open={false}
+												className="w-full space-y-1"
+											/>
+										{/each}
 									</div>
 								{/if}
 

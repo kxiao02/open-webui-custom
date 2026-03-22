@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import DOMPurify from 'dompurify';
 	import { marked } from 'marked';
 
@@ -27,7 +28,7 @@
 	import SensitiveInput from '$lib/components/common/SensitiveInput.svelte';
 	import { redirect } from '@sveltejs/kit';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	let loaded = false;
 

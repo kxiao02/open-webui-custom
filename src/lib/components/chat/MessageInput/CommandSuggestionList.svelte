@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { config } from '$lib/stores';
 	import Prompts from './Commands/Prompts.svelte';
 	import Knowledge from './Commands/Knowledge.svelte';
 	import Models from './Commands/Models.svelte';
@@ -71,7 +72,7 @@
 					}
 				}}
 			/>
-		{:else if char === '#'}
+		{:else if char === '#' && ($config?.features?.enable_knowledge ?? true)}
 			<Knowledge
 				bind:this={suggestionElement}
 				{query}

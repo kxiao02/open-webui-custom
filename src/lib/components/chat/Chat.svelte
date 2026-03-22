@@ -5,7 +5,7 @@
 
 	import { getContext, onDestroy, onMount, tick } from 'svelte';
 	import { fade } from 'svelte/transition';
-	const i18n: Writable<i18nType> = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
@@ -37,6 +37,7 @@
 		showArtifacts,
 		artifactContents,
 		tools,
+		skills,
 		toolServers,
 		terminalServers,
 		functions,
@@ -74,6 +75,7 @@
 		getChatList,
 		getPinnedChatList,
 		getTagsById,
+		updateChatSessionCapabilities,
 		updateChatById,
 		updateChatFolderIdById
 	} from '$lib/apis/chats';
@@ -88,7 +90,8 @@
 		stopTask,
 		getTaskIdsByChatId
 	} from '$lib/apis';
-	import { getTools } from '$lib/apis/tools';
+	import { getSkills, installSkillById } from '$lib/apis/skills';
+	import { getTools, installToolById } from '$lib/apis/tools';
 	import { uploadFile } from '$lib/apis/files';
 	import { createOpenAITextStream } from '$lib/apis/streaming';
 	import { getFunctions } from '$lib/apis/functions';
@@ -99,6 +102,7 @@
 	import Messages from '$lib/components/chat/Messages.svelte';
 	import Navbar from '$lib/components/chat/Navbar.svelte';
 	import ChatControls from './ChatControls.svelte';
+	import CapabilityInstallDialog from './CapabilityInstallDialog.svelte';
 	import EventConfirmDialog from '../common/ConfirmDialog.svelte';
 	import Placeholder from './Placeholder.svelte';
 	import LandingAmbientBackground from './LandingAmbientBackground.svelte';
@@ -134,11 +138,25 @@
 	let eventConfirmationInputPlaceholder = '';
 	let eventConfirmationInputValue = '';
 	let eventConfirmationInputType = '';
-	let eventCallback = null;
+	let eventCallback: ((value?: string) => unknown) | null = null;
 
-	let selectedModels = [''];
+	type CapabilityInstallRequest = {
+		resource_type: 'tool' | 'skill';
+		resource_id: string;
+		name?: string;
+		title?: string;
+		message?: string;
+		install_label?: string;
+		session_label?: string;
+		cancel_label?: string;
+	};
+
+	let showCapabilityInstallDialog = false;
+	let capabilityInstallRequest: CapabilityInstallRequest | null = null;
+
+	let selectedModels: string[] = [''];
 	let atSelectedModel: Model | undefined;
-	let selectedModelIds = [];
+	let selectedModelIds: string[] = [];
 	$: if (atSelectedModel !== undefined) {
 		selectedModelIds = [atSelectedModel.id];
 	} else {
@@ -153,8 +171,11 @@
 		thinkingModeEnabled = false;
 	}
 
-	let selectedToolIds = [];
-	let selectedFilterIds = [];
+	let selectedToolIds: string[] = [];
+	let lockedToolIds: string[] = [];
+	let selectedFilterIds: string[] = [];
+	let sessionToolIds: string[] = [];
+	let sessionSkillIds: string[] = [];
 
 	let imageGenerationEnabled = false;
 	let webSearchEnabled = false;
@@ -164,23 +185,23 @@
 
 	let generating = false;
 	let dragged = false;
-	let generationController = null;
+	let generationController: AbortController | null = null;
 
-	let chat = null;
-	let tags = [];
+	let chat: any = null;
+	let tags: any[] = [];
 
-	let history = {
+	let history: any = {
 		messages: {},
 		currentId: null
 	};
 
-	let taskIds = null;
+	let taskIds: any[] | null = null;
 
 	// Chat Input
 	let prompt = '';
-	let chatFiles = [];
-	let files = [];
-	let params = {};
+	let chatFiles: any[] = [];
+	let files: any[] = [];
+	let params: Record<string, any> = {};
 	let messageCount = 0;
 	let hasCustomBackground = false;
 	let showLandingAmbientBackground = false;
@@ -246,6 +267,151 @@
 			.filter(Boolean);
 	};
 
+	const dedupeIds = (ids: string[] = []) =>
+		[
+			...new Set(
+				(ids ?? [])
+					.filter((id): id is string => typeof id === 'string')
+					.map((id) => id.trim())
+					.filter((id) => id !== '')
+			)
+		];
+
+	const getInstalledToolIds = () =>
+		dedupeIds(($tools ?? []).filter((tool) => tool.installed).map((tool) => tool.id));
+
+	const mergeToolIds = (...groups: string[][]) => dedupeIds(groups.flat());
+
+	const applySelectedToolIds = (toolIds: string[] = []) => {
+		selectedToolIds = mergeToolIds(getInstalledToolIds(), sessionToolIds, toolIds);
+	};
+
+	$: lockedToolIds = mergeToolIds(getInstalledToolIds(), sessionToolIds);
+
+	const getChatSessionMeta = () => ({
+		session_tool_ids: dedupeIds(sessionToolIds),
+		session_skill_ids: dedupeIds(sessionSkillIds)
+	});
+
+	const persistSessionCapabilities = async (
+		toolIds: string[] = sessionToolIds,
+		skillIds: string[] = sessionSkillIds
+	) => {
+		const nextToolIds = dedupeIds(toolIds);
+		const nextSkillIds = dedupeIds(skillIds);
+
+		sessionToolIds = nextToolIds;
+		sessionSkillIds = nextSkillIds;
+		applySelectedToolIds(selectedToolIds);
+
+		if (!$chatId || $chatId.startsWith('local:')) {
+			return null;
+		}
+
+		const updatedChat = await updateChatSessionCapabilities(localStorage.token, $chatId, {
+			tool_ids: nextToolIds,
+			skill_ids: nextSkillIds
+		});
+
+		if (updatedChat) {
+			chat = updatedChat;
+		}
+
+		return updatedChat;
+	};
+
+	const closeCapabilityInstallDialog = () => {
+		showCapabilityInstallDialog = false;
+		capabilityInstallRequest = null;
+	};
+
+	const handleCapabilityInstallDecision = async (decision: 'install' | 'session' | 'cancel') => {
+		const request = capabilityInstallRequest;
+		const callback = eventCallback;
+
+		closeCapabilityInstallDialog();
+		eventCallback = null;
+
+		if (!callback || !request) {
+			return;
+		}
+
+		if (decision === 'cancel') {
+			callback({
+				decision,
+				resource_type: request.resource_type,
+				resource_id: request.resource_id
+			});
+			return;
+		}
+
+		try {
+			if (request.resource_type === 'tool') {
+				if (decision === 'install') {
+					await installToolById(localStorage.token, request.resource_id);
+					tools.set(await getTools(localStorage.token));
+					applySelectedToolIds([...selectedToolIds, request.resource_id]);
+				} else {
+					await persistSessionCapabilities(
+						[...sessionToolIds, request.resource_id],
+						sessionSkillIds
+					);
+					applySelectedToolIds([...selectedToolIds, request.resource_id]);
+				}
+			} else if (decision === 'install') {
+				await installSkillById(localStorage.token, request.resource_id);
+				skills.set(await getSkills(localStorage.token));
+			} else {
+				await persistSessionCapabilities(sessionToolIds, [...sessionSkillIds, request.resource_id]);
+			}
+
+			callback({
+				decision,
+				resource_type: request.resource_type,
+				resource_id: request.resource_id
+			});
+		} catch (error) {
+			const errorMessage =
+				typeof error === 'string'
+					? error
+					: (error?.message ?? $i18n.t('Failed to update capability'));
+
+			toast.error(errorMessage);
+			callback({
+				decision: 'error',
+				resource_type: request.resource_type,
+				resource_id: request.resource_id,
+				error: errorMessage
+			});
+		}
+	};
+
+	const LEGACY_MODEL_ALIASES: Record<string, string> = {
+		deepagent: '中电慧语'
+	};
+
+	const normalizeModelId = (value: unknown): string => {
+		if (typeof value !== 'string') {
+			return '';
+		}
+
+		const normalized = value.trim();
+		if (!normalized) {
+			return '';
+		}
+
+		return LEGACY_MODEL_ALIASES[normalized] ?? normalized;
+	};
+
+	const normalizeModelSelection = (value: unknown): string[] => {
+		const rawValues = Array.isArray(value) ? value : value != null ? [value] : [];
+		const normalizedValues = rawValues
+			.map((modelId) => normalizeModelId(modelId))
+			.filter((modelId) => modelId !== '');
+
+		return Array.from(new Set(normalizedValues));
+	};
+
 	const sanitizeHistoryFileRefs = (historyData: any) => {
 		if (!historyData?.messages || typeof historyData.messages !== 'object') {
 			return;
@@ -254,6 +420,30 @@
 		for (const message of Object.values(historyData.messages)) {
 			if (message && typeof message === 'object' && Array.isArray((message as any).files)) {
 				(message as any).files = sanitizeFilesList((message as any).files);
+			}
+		}
+	};
+
+	const sanitizeHistoryModelRefs = (historyData: any) => {
+		if (!historyData?.messages || typeof historyData.messages !== 'object') {
+			return;
+		}
+
+		for (const message of Object.values(historyData.messages)) {
+			if (!message || typeof message !== 'object') {
+				continue;
+			}
+
+			if (typeof (message as any).model === 'string') {
+				(message as any).model = normalizeModelId((message as any).model);
+			}
+
+			if (typeof (message as any).selectedModelId === 'string') {
+				(message as any).selectedModelId = normalizeModelId((message as any).selectedModelId);
+			}
+
+			if (Array.isArray((message as any).models)) {
+				(message as any).models = normalizeModelSelection((message as any).models);
 			}
 		}
 	};
@@ -320,6 +510,8 @@
 
 		files = [];
 		messageQueue = [];
+		sessionToolIds = [];
+		sessionSkillIds = [];
 		selectedToolIds = [];
 		selectedFilterIds = [];
 		webSearchEnabled = false;
@@ -368,7 +560,7 @@
 						if (!$temporaryChatEnabled) {
 							messageInput?.setText(input.prompt);
 							files = sanitizeFilesList(input.files ?? []);
-							selectedToolIds = input.selectedToolIds;
+							applySelectedToolIds(input.selectedToolIds ?? []);
 							selectedFilterIds = input.selectedFilterIds;
 							webSearchEnabled = input.webSearchEnabled;
 							imageGenerationEnabled = input.imageGenerationEnabled;
@@ -477,15 +669,13 @@
 		if (model) {
 			// Set Default Tools
 			if (model?.info?.meta?.toolIds) {
-				selectedToolIds = [
-					...new Set(
-						[...(model?.info?.meta?.toolIds ?? [])].filter((id) => $tools.find((t) => t.id === id))
-					)
-				];
+				applySelectedToolIds(
+					(model?.info?.meta?.toolIds ?? []).filter((id) => $tools.find((t) => t.id === id))
+				);
 			} else if ($settings?.tools) {
-				selectedToolIds = $settings.tools;
+				applySelectedToolIds($settings.tools);
 			} else {
-				selectedToolIds = selectedToolIds.filter((id) => !id.startsWith('direct_server:'));
+				applySelectedToolIds(selectedToolIds.filter((id) => !id.startsWith('direct_server:')));
 			}
 
 			// Set Default Filters (Toggleable only)
@@ -685,6 +875,10 @@
 
 					eventConfirmationTitle = data.title;
 					eventConfirmationMessage = data.message;
+				} else if (type === 'capability:install:confirm') {
+					eventCallback = cb;
+					capabilityInstallRequest = data;
+					showCapabilityInstallDialog = true;
 				} else if (type === 'execute') {
 					eventCallback = cb;
 
@@ -866,6 +1060,8 @@
 				messageInput?.setText('');
 
 				files = [];
+				sessionToolIds = [];
+				sessionSkillIds = [];
 				selectedToolIds = [];
 				selectedFilterIds = [];
 				webSearchEnabled = false;
@@ -878,7 +1074,7 @@
 					if (!$temporaryChatEnabled) {
 						messageInput?.setText(input.prompt);
 						files = input.files;
-						selectedToolIds = input.selectedToolIds;
+						applySelectedToolIds(input.selectedToolIds ?? []);
 						selectedFilterIds = input.selectedFilterIds;
 						webSearchEnabled = input.webSearchEnabled;
 						imageGenerationEnabled = input.imageGenerationEnabled;
@@ -1173,6 +1369,8 @@
 
 		const runId = ++initNewChatRunId;
 		loading = true;
+		sessionToolIds = [];
+		sessionSkillIds = [];
 
 		if ($user?.role !== 'admin' && $user?.permissions?.chat?.temporary_enforced) {
 			await temporaryChatEnabled.set(true);
@@ -1202,11 +1400,13 @@
 		const defaultModels = $config?.default_models ? $config?.default_models.split(',') : [];
 
 		if ($page.url.searchParams.get('models') || $page.url.searchParams.get('model')) {
-			const urlModels = (
+			const urlModels = normalizeModelSelection(
+				(
 				$page.url.searchParams.get('models') ||
 				$page.url.searchParams.get('model') ||
 				''
-			)?.split(',');
+				)?.split(',')
+			);
 
 			if (urlModels.length === 1) {
 				if (!$models.find((m) => m.id === urlModels[0])) {
@@ -1239,19 +1439,19 @@
 		} else {
 			if ($selectedFolder?.data?.model_ids) {
 				// Set from folder model IDs
-				selectedModels = $selectedFolder?.data?.model_ids;
+				selectedModels = normalizeModelSelection($selectedFolder?.data?.model_ids);
 			} else {
 				if (sessionStorage.selectedModels) {
 					// Set from session storage (temporary selection)
-					selectedModels = JSON.parse(sessionStorage.selectedModels);
+					selectedModels = normalizeModelSelection(JSON.parse(sessionStorage.selectedModels));
 					sessionStorage.removeItem('selectedModels');
 				} else {
 					if ($settings?.models) {
 						// Set from user settings
-						selectedModels = $settings?.models;
+						selectedModels = normalizeModelSelection($settings?.models);
 					} else if (defaultModels && defaultModels.length > 0) {
 						// Set from default models
-						selectedModels = defaultModels;
+						selectedModels = normalizeModelSelection(defaultModels);
 					}
 				}
 			}
@@ -1345,6 +1545,8 @@
 				.filter((id) => id);
 		}
 
+		applySelectedToolIds(selectedToolIds ?? []);
+
 		if ($page.url.searchParams.get('call') === 'true') {
 			showFilePreview.set(false);
 			showCallOverlay.set(true);
@@ -1364,7 +1566,7 @@
 		}
 
 		selectedModels = selectedModels.map((modelId) =>
-			$models.map((m) => m.id).includes(modelId) ? modelId : ''
+			$models.map((m) => m.id).includes(normalizeModelId(modelId)) ? normalizeModelId(modelId) : ''
 		);
 
 		if (!isActiveNewChatInit(runId)) {
@@ -1398,11 +1600,14 @@
 
 			if (chatContent) {
 				console.log(chatContent);
+				sessionToolIds = dedupeIds(chat?.meta?.session_tool_ids ?? []);
+				sessionSkillIds = dedupeIds(chat?.meta?.session_skill_ids ?? []);
 
-				selectedModels =
+				selectedModels = normalizeModelSelection(
 					(chatContent?.models ?? undefined) !== undefined
 						? chatContent.models
-						: [chatContent.models ?? ''];
+						: [chatContent.models ?? '']
+				);
 
 				if (!($user?.role === 'admin' || ($user?.permissions?.chat?.multiple_models ?? true))) {
 					selectedModels = selectedModels.length > 0 ? [selectedModels[0]] : [''];
@@ -1415,11 +1620,13 @@
 							? chatContent.history
 							: convertMessagesToHistory(chatContent.messages);
 					sanitizeHistoryFileRefs(history);
+					sanitizeHistoryModelRefs(history);
 
 					chatTitle.set(chatContent.title);
 
 					params = chatContent?.params ?? {};
 					chatFiles = sanitizeFilesList(chatContent?.files ?? []);
+					applySelectedToolIds(selectedToolIds ?? []);
 
 				autoScroll = true;
 				await tick();
@@ -1459,8 +1666,8 @@
 		}
 	};
 
-	let scrollRAF = null;
-	let contentsRAF = null;
+	let scrollRAF: number | null = null;
+	let contentsRAF: number | null = null;
 	const scheduleScrollToBottom = () => {
 		if (!scrollRAF) {
 			scrollRAF = requestAnimationFrame(async () => {
@@ -1469,6 +1676,47 @@
 			});
 		}
 	};
+
+	const TOOL_CALL_BLOCK_START_REGEX = /<details\b[^>]*\btype="tool_calls"[^>]*>/i;
+	const SOURCE_SECTION_LINE_REGEX = /(^|\n)\s*(参考来源|Sources)\s*:?\s*(?:\n|$)/i;
+	const SOURCE_SECTION_INLINE_REGEX = /(参考来源|Sources)\s*:?\s*(?:\[[^\]]+\][^\n\r]*)$/i;
+
+	const normalizeAssistantResponseContent = (content: string) => {
+		if (!content) return content;
+
+		let normalized = content;
+		const toolCallStartIndex = normalized.search(TOOL_CALL_BLOCK_START_REGEX);
+		if (toolCallStartIndex > 0) {
+			const leading = normalized.slice(0, toolCallStartIndex);
+			if (!leading.includes('<details')) {
+				normalized = normalized.slice(toolCallStartIndex);
+			}
+		}
+
+		normalized = normalized.replace(
+			/(^|[^\n])\s*#{1,6}\s*(参考来源|Sources)(?=\s|$)/g,
+			(_, prefix: string, heading: string) =>
+				`${prefix}\n\n${heading === 'Sources' ? '参考来源' : heading}`
+		);
+		normalized = normalized.replace(
+			/(^|\n)#{1,6}\s*(参考来源|Sources)(?=\s|$)/g,
+			(_, prefix: string, heading: string) =>
+				`${prefix}${heading === 'Sources' ? '参考来源' : heading}`
+		);
+
+		const lineHeadingMatch = normalized.match(SOURCE_SECTION_LINE_REGEX);
+		if (lineHeadingMatch?.index !== undefined) {
+			normalized = normalized.slice(0, lineHeadingMatch.index).trimEnd();
+		} else {
+			const inlineHeadingMatch = normalized.match(SOURCE_SECTION_INLINE_REGEX);
+			if (inlineHeadingMatch?.index !== undefined) {
+				normalized = normalized.slice(0, inlineHeadingMatch.index).trimEnd();
+			}
+		}
+
+		return normalized;
+	};
+
 	const chatCompletedHandler = async (_chatId, modelId, responseMessageId, messages) => {
 		const res = await chatCompleted(localStorage.token, {
 			model: modelId,
@@ -1754,6 +2002,7 @@
 			if (choices[0]?.message?.content) {
 				// Non-stream response
 				message.content += choices[0]?.message?.content;
+				message.content = normalizeAssistantResponseContent(message.content);
 			} else {
 				// Stream response
 				let value = choices[0]?.delta?.content ?? '';
@@ -1761,6 +2010,7 @@
 					console.log('Empty response');
 				} else {
 					message.content += value;
+					message.content = normalizeAssistantResponseContent(message.content);
 
 					if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
 						navigator.vibrate(5);
@@ -1796,7 +2046,7 @@
 
 		if (content) {
 			// REALTIME_CHAT_SAVE is disabled
-			message.content = content;
+			message.content = normalizeAssistantResponseContent(content);
 
 			if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
 				navigator.vibrate(5);
@@ -2338,7 +2588,7 @@
 		const toolIds = [];
 		const toolServerIds = [];
 
-		for (const toolId of selectedToolIds) {
+		for (const toolId of mergeToolIds(selectedToolIds, sessionToolIds)) {
 			if (toolId.startsWith('direct_server:')) {
 				let serverId = toolId.replace('direct_server:', '');
 				// Check if serverId is a number
@@ -2391,6 +2641,7 @@
 
 		// Use the user-selected terminal from the dropdown
 		const activeTerminalId = $selectedTerminalId ?? null;
+		const effectiveSkillIds = dedupeIds([...sessionSkillIds, ...skillIds]);
 
 			const res = await generateOpenAIChatCompletion(
 				localStorage.token,
@@ -2417,7 +2668,7 @@
 
 					filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
 					tool_ids: toolIds.length > 0 ? toolIds : undefined,
-					skill_ids: skillIds.length > 0 ? skillIds : undefined,
+					skill_ids: effectiveSkillIds.length > 0 ? effectiveSkillIds : undefined,
 					terminal_id: activeTerminalId ?? undefined,
 					tool_servers: [
 						...($toolServers ?? []).filter(
@@ -2754,7 +3005,7 @@
 		}
 	};
 
-	const initChatHandler = async (history) => {
+	const initChatHandler = async (history: any) => {
 		let _chatId = $chatId;
 
 		if (!$temporaryChatEnabled) {
@@ -2771,7 +3022,8 @@
 					tags: [],
 					timestamp: Date.now()
 				},
-				$selectedFolder?.id
+				($selectedFolder as any)?.id ?? null,
+				getChatSessionMeta()
 			);
 
 			_chatId = chat.id;
@@ -2790,7 +3042,7 @@
 		return _chatId;
 	};
 
-	const saveChatHandler = async (_chatId, history) => {
+	const saveChatHandler = async (_chatId: string, history: any) => {
 		if ($chatId == _chatId) {
 			if (!$temporaryChatEnabled) {
 				chat = await updateChatById(localStorage.token, _chatId, {
@@ -2920,6 +3172,20 @@
 	}}
 />
 
+<CapabilityInstallDialog
+	bind:show={showCapabilityInstallDialog}
+	title={capabilityInstallRequest?.title ?? ''}
+	message={capabilityInstallRequest?.message ?? ''}
+	resourceType={capabilityInstallRequest?.resource_type ?? 'tool'}
+	resourceName={capabilityInstallRequest?.name ?? ''}
+	installLabel={capabilityInstallRequest?.install_label ?? ''}
+	sessionLabel={capabilityInstallRequest?.session_label ?? ''}
+	cancelLabel={capabilityInstallRequest?.cancel_label ?? ''}
+	on:decision={(e) => {
+		handleCapabilityInstallDecision(e.detail.decision);
+	}}
+/>
+
 <div
 	class="h-screen max-h-[100dvh] transition-width duration-200 ease-in-out {$showSidebar
 		? '  md:max-w-[calc(100%-var(--sidebar-width))]'
@@ -2999,7 +3265,8 @@
 										messages: messages,
 										timestamp: Date.now()
 									},
-									null
+									null,
+									getChatSessionMeta()
 								);
 
 								if (savedChat) {
@@ -3066,6 +3333,7 @@
 									bind:prompt
 									bind:autoScroll
 									bind:selectedToolIds
+									{lockedToolIds}
 									bind:selectedFilterIds
 									bind:imageGenerationEnabled
 									bind:codeInterpreterEnabled
@@ -3138,6 +3406,7 @@
 									bind:prompt
 									bind:autoScroll
 									bind:selectedToolIds
+									{lockedToolIds}
 									bind:selectedFilterIds
 									bind:imageGenerationEnabled
 									bind:codeInterpreterEnabled

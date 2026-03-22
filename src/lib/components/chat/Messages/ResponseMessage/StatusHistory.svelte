@@ -1,6 +1,6 @@
 <script>
 	import { getContext } from 'svelte';
-	const i18n = getContext('i18n');
+	const i18n = /** @type {import('$lib/i18n').I18nStore} */ (getContext('i18n'));
 
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
 	import StatusItem from './StatusHistory/StatusItem.svelte';
@@ -70,7 +70,7 @@
 								{/if}
 							</div>
 
-							<StatusItem {status} done={true} />
+							<StatusItem {status} done={idx < history.length - 1 || Boolean(status?.done)} />
 						</div>
 					{/each}
 				{:else}
@@ -80,7 +80,7 @@
 								<span class="relative inline-flex size-1.5 rounded-full bg-gray-500 dark:bg-gray-400"></span>
 							</span>
 						</div>
-						<StatusItem status={latestStatus} done={true} />
+						<StatusItem status={latestStatus} done={Boolean(latestStatus?.done)} />
 					</div>
 				{/if}
 			</div>

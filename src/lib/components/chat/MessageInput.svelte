@@ -103,7 +103,7 @@
 	import Expand from '../icons/Expand.svelte';
 	import QueuedMessageItem from './MessageInput/QueuedMessageItem.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let onUpload: Function = (e) => {};
 	export let onChange: Function = () => {};
@@ -128,6 +128,7 @@
 	export let files = [];
 
 	export let selectedToolIds = [];
+	export let lockedToolIds = [];
 	export let selectedFilterIds = [];
 
 	export let imageGenerationEnabled = false;
@@ -1658,6 +1659,7 @@
 											{showImageGenerationButton}
 											{showCodeInterpreterButton}
 											bind:selectedToolIds
+											{lockedToolIds}
 											bind:selectedFilterIds
 											bind:webSearchEnabled
 											bind:imageGenerationEnabled
@@ -1931,7 +1933,7 @@
 											{/if}
 										{/if}
 
-									{#if prompt === '' && files.length === 0 && ($_user?.permissions?.chat?.call ?? true)}
+									{#if prompt === '' && files.length === 0 && ($_user?.permissions?.chat?.call ?? true) && ($settings?.conversationMode ?? false)}
 											<div class=" flex items-center">
 												<!-- {$i18n.t('Call')} -->
 												<Tooltip content={$i18n.t('Voice mode')}>

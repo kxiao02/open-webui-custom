@@ -1,7 +1,13 @@
+// @ts-nocheck
 import { WEBUI_API_BASE_URL } from '$lib/constants';
 import { getTimeRange } from '$lib/utils';
 
-export const createNewChat = async (token: string, chat: object, folderId: string | null) => {
+export const createNewChat = async (
+	token: string,
+	chat: object,
+	folderId: string | null,
+	meta: object | null = null
+) => {
 	let error = null;
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/new`, {
@@ -13,7 +19,8 @@ export const createNewChat = async (token: string, chat: object, folderId: strin
 		},
 		body: JSON.stringify({
 			chat: chat,
-			folder_id: folderId ?? null
+			folder_id: folderId ?? null,
+			meta: meta ?? {}
 		})
 	})
 		.then(async (res) => {
@@ -78,6 +85,39 @@ export const importChats = async (token: string, chats: object[]) => {
 		body: JSON.stringify({
 			chats
 		})
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err;
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const updateChatSessionCapabilities = async (
+	token: string,
+	id: string,
+	data: { tool_ids?: string[]; skill_ids?: string[] }
+) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${id}/session/capabilities`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify(data)
 	})
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();

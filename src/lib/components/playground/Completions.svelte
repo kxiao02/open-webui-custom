@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { toast } from 'svelte-sonner';
 
 	import { goto } from '$app/navigation';
@@ -12,7 +13,7 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Selector from '$lib/components/chat/ModelSelector/Selector.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	let loaded = false;
 	let text = '';

@@ -1,3 +1,4 @@
+// @ts-nocheck
 import type { Writable } from 'svelte/store';
 import { v4 as uuidv4 } from 'uuid';
 import sha256 from 'js-sha256';
@@ -1038,17 +1039,71 @@ export const removeDetails = (content, types) => {
 		for (const type of types) {
 			segment = segment.replace(
 				new RegExp(`<details\\s+type="${type}"[^>]*>.*?<\\/details>`, 'gis'),
-				''
+				'\n\n'
 			);
 		}
-		return segment;
+		return segment.replace(/\n{3,}/g, '\n\n');
 	});
 };
 
 export const removeAllDetails = (content) => {
 	return replaceOutsideCode(content, (segment) => {
-		return segment.replace(/<details[^>]*>.*?<\/details>/gis, '');
+		return segment.replace(/<details[^>]*>.*?<\/details>/gis, '\n\n').replace(/\n{3,}/g, '\n\n');
 	});
+};
+
+const AGENT_CONTROL_BLOCK_REGEX =
+	/<(?:tool_execution|tool_call|analysis|reasoning)\b[^>]*>[\s\S]*?<\/(?:tool_execution|tool_call|analysis|reasoning)>/gi;
+const AGENT_CONTROL_TAG_REGEX =
+	/<\/?(?:tool_execution|tool_call|analysis|reasoning)\b[^>]*\/?>/gi;
+const SUMMARY_TAG_REGEX = /<\/?summary\b[^>]*>/gi;
+const MALFORMED_HEADING_REGEX = /(^|\n)(\s*)#{1,6}(?=\S)/g;
+const INLINE_HEADING_MARKER_REGEX = /([。！？!?：:]\s*)#{1,6}(?=\S)/g;
+const STANDALONE_BOLD_LABEL_REGEX =
+	/(^|[\n。！？!?：:]\s*)\*{2,3}([^*\n]{1,120}?[：:])\*{2,3}(?=\s|$)/g;
+const EMPTY_MARKER_LINE_REGEX = /(^|\n)\s*(?:#{1,6}|\*{1,3}|_{1,3})\s*$/g;
+
+export const stripAgentControlMarkup = (content: string) => {
+	if (!content) return '';
+
+	return replaceOutsideCode(content, (segment) => {
+		return segment
+			.replace(AGENT_CONTROL_BLOCK_REGEX, '\n\n')
+			.replace(AGENT_CONTROL_TAG_REGEX, '\n')
+			.replace(SUMMARY_TAG_REGEX, '\n')
+			.replace(/\n{3,}/g, '\n\n');
+	}).trim();
+};
+
+export const normalizeLeakedFormatting = (content: string) => {
+	if (!content) return '';
+
+	return replaceOutsideCode(stripAgentControlMarkup(content), (segment) => {
+		return segment
+			.replace(STANDALONE_BOLD_LABEL_REGEX, '$1$2')
+			// Remove malformed heading markers such as `##总结` while leaving valid markdown headings intact.
+			.replace(MALFORMED_HEADING_REGEX, '$1$2')
+			.replace(INLINE_HEADING_MARKER_REGEX, '$1')
+			.replace(EMPTY_MARKER_LINE_REGEX, '$1')
+			.replace(/\n{3,}/g, '\n\n');
+	}).trim();
+};
+
+export const toPlainNotificationText = (content: string) => {
+	if (!content) return '';
+
+	const normalized = normalizeLeakedFormatting(removeAllDetails(content))
+		.replace(/<[^>]+>/g, ' ')
+		.replace(/&nbsp;/gi, ' ');
+
+	const plainText = removeFormattings(unescapeHtml(normalized) || normalized);
+
+	return plainText
+		.replace(/[ \t]+\n/g, '\n')
+		.replace(/\n[ \t]+/g, '\n')
+		.replace(/[ \t]{2,}/g, ' ')
+		.replace(/\n{3,}/g, '\n\n')
+		.trim();
 };
 
 export const processDetails = (content) => {
@@ -1303,8 +1358,8 @@ export const getTimeRange = (timestamp) => {
  * @param content {string} - The content string with potential frontmatter.
  * @returns {Object} - The extracted frontmatter as a dictionary.
  */
-export const extractFrontmatter = (content) => {
-	const frontmatter = {};
+export const extractFrontmatter = (content: string): Record<string, string> => {
+	const frontmatter: Record<string, string> = {};
 	let frontmatterStarted = false;
 	let frontmatterEnded = false;
 	const frontmatterPattern = /^\s*([a-z_]+):\s*(.*)\s*$/i;

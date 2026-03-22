@@ -17,7 +17,7 @@
 	import { toast } from 'svelte-sonner';
 	import localizedFormat from 'dayjs/plugin/localizedFormat';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 	dayjs.extend(localizedFormat);
 
 	let loaded = false;
@@ -28,16 +28,16 @@
 
 	// let chatId = $page.params.id;
 	let showModelSelector = false;
-	let selectedModels = [''];
+	let selectedModels: string[] = [''];
 
-	let chat = null;
-	let user = null;
+	let chat: any = null;
+	let user: any = null;
 
 	let title = '';
-	let files = [];
+	let files: any[] = [];
 
-	let messages = [];
-	let history = {
+	let messages: any[] = [];
+	let history: any = {
 		messages: {},
 		currentId: null
 	};

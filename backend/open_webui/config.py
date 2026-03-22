@@ -24,6 +24,7 @@ from open_webui.env import (
     ENABLE_DB_MIGRATIONS,
     ENV,
     REDIS_URL,
+    STRICT_EXTERNAL_STATE,
     REDIS_KEY_PREFIX,
     REDIS_SENTINEL_HOSTS,
     REDIS_SENTINEL_PORT,
@@ -970,6 +971,11 @@ if CUSTOM_NAME:
 
 STORAGE_PROVIDER = os.environ.get("STORAGE_PROVIDER", "local")  # defaults to local, s3
 
+if STRICT_EXTERNAL_STATE and STORAGE_PROVIDER == "local":
+    raise ValueError(
+        "STRICT_EXTERNAL_STATE does not allow STORAGE_PROVIDER=local. Configure S3-compatible object storage."
+    )
+
 S3_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID", None)
 S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY", None)
 S3_REGION_NAME = os.environ.get("S3_REGION_NAME", None)
@@ -1710,6 +1716,14 @@ ENABLE_NOTES = PersistentConfig(
     os.environ.get("ENABLE_NOTES", "True").lower() == "true",
 )
 
+ENABLE_KNOWLEDGE = PersistentConfig(
+    "ENABLE_KNOWLEDGE",
+    "knowledge.enable",
+    os.environ.get("ENABLE_KNOWLEDGE", "True").lower() == "true",
+)
+if "ENABLE_KNOWLEDGE" in os.environ:
+    ENABLE_KNOWLEDGE.value = os.environ["ENABLE_KNOWLEDGE"].lower() == "true"
+
 ENABLE_USER_STATUS = PersistentConfig(
     "ENABLE_USER_STATUS",
     "users.enable_status",
@@ -1975,7 +1989,9 @@ Suggest 3-5 relevant follow-up questions or prompts that the user might naturall
 - Make questions concise, clear, and directly related to the discussed topic(s).
 - Only suggest follow-ups that make sense given the chat content and do not repeat what was already covered.
 - If the conversation is very short or not specific, suggest more general (but relevant) follow-ups the user might ask.
-- Use the conversation's primary language; default to English if multilingual.
+- Use the conversation's primary language.
+- If the visible chat history is primarily Chinese, every follow-up must be written fully in Simplified Chinese. Do not output English follow-ups in that case, except unavoidable proper nouns, product names, or API names.
+- If the conversation is multilingual, prefer the language used in the latest user message.
 - Response must be a JSON object with a "follow_ups" key containing an array of strings, no extra text or formatting.
 ### Output:
 JSON format: { "follow_ups": ["Question 1?", "Question 2?", "Question 3?"] }
@@ -2343,6 +2359,11 @@ CODE_INTERPRETER_PYODIDE_PROMPT = """
 ####################################
 
 VECTOR_DB = os.environ.get("VECTOR_DB", "chroma")
+
+if STRICT_EXTERNAL_STATE and VECTOR_DB == "chroma":
+    raise ValueError(
+        "STRICT_EXTERNAL_STATE does not allow VECTOR_DB=chroma. Configure pgvector or another external vector service."
+    )
 
 # Chroma
 CHROMA_DATA_PATH = f"{DATA_DIR}/vector_db"

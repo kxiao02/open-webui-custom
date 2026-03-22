@@ -4,7 +4,7 @@
 
 	import { tick, getContext, onMount } from 'svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { config, mobile, settings, socket, user } from '$lib/stores';
 	import {

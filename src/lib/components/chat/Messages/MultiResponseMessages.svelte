@@ -19,7 +19,7 @@
 	import localizedFormat from 'dayjs/plugin/localizedFormat';
 	import ProfileImage from './ProfileImage.svelte';
 	import { WEBUI_BASE_URL } from '$lib/constants';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 	dayjs.extend(localizedFormat);
 
 	export let chatId;
@@ -411,7 +411,7 @@
 									{/if}
 								</Name>
 
-								<div class="mt-1 markdown-prose w-full min-w-full">
+								<div class="mt-1 chat-markdown-prose w-full min-w-full">
 									{#if (message?.content ?? '') === ''}
 										<Skeleton />
 									{:else}

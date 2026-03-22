@@ -22,6 +22,7 @@ from open_webui.models.tools import (
     Tools,
 )
 from open_webui.models.access_grants import AccessGrants
+from open_webui.models.resource_installations import ResourceInstallations
 from open_webui.utils.plugin import (
     load_tool_module_by_id,
     replace_imports,
@@ -69,6 +70,14 @@ def _tool_write_access(user) -> bool:
     return user.role == "admin"
 
 
+def _get_installed_tool_ids(
+    user_id: str, tool_ids: Optional[list[str] | set[str] | tuple[str, ...]] = None, db=None
+) -> set[str]:
+    return ResourceInstallations.get_installed_resource_ids(
+        user_id, "tool", resource_ids=tool_ids, db=db
+    )
+
+
 ############################
 # GetTools
 ############################
@@ -81,6 +90,7 @@ async def get_tools(
     db: Session = Depends(get_session),
 ):
     tools = []
+    installed_tool_ids = _get_installed_tool_ids(user.id, db=db)
 
     # Local Tools
     for tool in Tools.get_tools(defer_content=True, db=db):
@@ -96,6 +106,7 @@ async def get_tools(
                     "has_user_valves": (
                         hasattr(tool_module, "UserValves") if tool_module else False
                     ),
+                    "installed": tool.id in installed_tool_ids,
                 }
             )
         )
@@ -209,6 +220,9 @@ async def get_tool_list(
     user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
     tools = filter_visible_tools(Tools.get_tools(defer_content=True, db=db), user, db=db)
+    installed_tool_ids = _get_installed_tool_ids(
+        user.id, [tool.id for tool in tools], db=db
+    )
 
     result = []
     for tool in tools:
@@ -216,6 +230,7 @@ async def get_tool_list(
             ToolAccessResponse(
                 **tool.model_dump(),
                 write_access=_tool_write_access(user),
+                installed=tool.id in installed_tool_ids,
             )
         )
     return result
@@ -397,6 +412,7 @@ async def get_tools_by_id(
             return ToolAccessResponse(
                 **tools.model_dump(),
                 write_access=_tool_write_access(user),
+                installed=id in _get_installed_tool_ids(user.id, [id], db=db),
             )
         else:
             raise HTTPException(
@@ -413,6 +429,41 @@ async def get_tools_by_id(
         **tools.model_dump(),
         write_access=_can_access_workspace_content(user, tools.user_id),
     )
+
+
+############################
+# InstallToolsById
+############################
+
+
+@router.post("/id/{id}/install", response_model=dict)
+async def install_tools_by_id(
+    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+):
+    tool = Tools.get_tool_by_id(id, db=db)
+    if not tool:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+    if not is_tool_catalog_visible(tool, user, user_group_ids, db=db):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    ResourceInstallations.install_resource(user.id, "tool", id, db=db)
+    return {"id": id, "installed": True}
+
+
+@router.delete("/id/{id}/install", response_model=dict)
+async def uninstall_tools_by_id(
+    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+):
+    ResourceInstallations.uninstall_resource(user.id, "tool", id, db=db)
+    return {"id": id, "installed": False}
 
 
 ############################

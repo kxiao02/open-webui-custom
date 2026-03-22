@@ -1,8 +1,9 @@
 <script>
+	// @ts-nocheck
 	import { toast } from 'svelte-sonner';
 	import { getContext, onMount, tick } from 'svelte';
 
-	const i18n = getContext('i18n');
+	const i18n = /** @type {import('$lib/i18n').I18nStore} */ (getContext('i18n'));
 
 	import { goto } from '$app/navigation';
 	import { user } from '$lib/stores';

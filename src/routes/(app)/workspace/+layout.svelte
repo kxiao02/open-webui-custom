@@ -5,6 +5,7 @@
 		showSidebar,
 		functions,
 		user,
+		config,
 		mobile,
 		models,
 		knowledge,
@@ -15,7 +16,7 @@
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Sidebar from '$lib/components/icons/Sidebar.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	let loaded = false;
 
@@ -24,14 +25,18 @@
 			return '/workspace/models';
 		}
 
-		if ($user?.role === 'user' && $user?.permissions?.workspace?.knowledge) {
+		if (
+			($config?.features?.enable_knowledge ?? true) &&
+			$user?.role === 'user' &&
+			$user?.permissions?.workspace?.knowledge
+		) {
 			return '/workspace/knowledge';
 		}
 
 		if ($user?.permissions?.workspace?.models) {
 			return '/workspace/models';
 		}
-		if ($user?.permissions?.workspace?.knowledge) {
+		if (($config?.features?.enable_knowledge ?? true) && $user?.permissions?.workspace?.knowledge) {
 			return '/workspace/knowledge';
 		}
 		if ($user?.permissions?.workspace?.prompts) {
@@ -53,7 +58,7 @@
 				goto(getWorkspaceFallbackPath());
 			} else if (
 				$page.url.pathname.includes('/knowledge') &&
-				!$user?.permissions?.workspace?.knowledge
+				(!(($config?.features?.enable_knowledge ?? true) && $user?.permissions?.workspace?.knowledge))
 			) {
 				goto(getWorkspaceFallbackPath());
 			} else if (
@@ -123,7 +128,7 @@
 							>
 						{/if}
 
-						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.knowledge}
+						{#if ($config?.features?.enable_knowledge ?? true) && ($user?.role === 'admin' || $user?.permissions?.workspace?.knowledge)}
 							<a
 								draggable="false"
 								aria-current={$page.url.pathname.includes('/workspace/knowledge') ? 'page' : null}

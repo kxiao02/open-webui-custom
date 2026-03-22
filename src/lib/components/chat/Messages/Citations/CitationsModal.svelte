@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { getContext, onMount, tick } from 'svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import Modal from '$lib/components/common/Modal.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import CitationModal from './CitationModal.svelte';
+	import ReferenceLinkItem from '../ReferenceLinkItem.svelte';
 
 	export let id = '';
 	export let show = false;
@@ -27,6 +28,42 @@
 		} catch (e) {
 			return str;
 		}
+	};
+
+	const isHttpUrl = (value: string = '') => /^https?:\/\//i.test(value);
+
+	const getDomain = (value: string = '') => {
+		try {
+			return new URL(value).hostname.replace(/^www\./, '');
+		} catch {
+			return value.replace(/^https?:\/\//i, '').split(/[/?#]/)[0];
+		}
+	};
+
+	const getCitationKind = (citation) => {
+		const sourceUrl = citation?.source?.url ?? '';
+		const sourceName = citation?.source?.name ?? '';
+		return isHttpUrl(sourceUrl) || isHttpUrl(sourceName) ? 'web' : 'knowledge';
+	};
+
+	const getCitationTitle = (citation) => {
+		const sourceTitle = citation?.source?.title ?? citation?.metadata?.[0]?.name ?? '';
+		if (sourceTitle && !isHttpUrl(sourceTitle)) {
+			return decodeString(sourceTitle);
+		}
+
+		const fallback = citation?.source?.url ?? citation?.source?.name ?? citation?.id ?? 'N/A';
+		return isHttpUrl(fallback) ? getDomain(fallback) : decodeString(fallback);
+	};
+
+	const getCitationSubtitle = (citation) => {
+		if (getCitationKind(citation) === 'web') {
+			return decodeString(citation?.source?.url ?? citation?.source?.name ?? '');
+		}
+
+		const sourceName = decodeString(citation?.source?.name ?? '');
+		const title = getCitationTitle(citation);
+		return sourceName && sourceName !== title ? sourceName : '';
 	};
 </script>
 
@@ -58,23 +95,20 @@
 				class="flex flex-col w-full dark:text-gray-200 overflow-y-scroll max-h-[22rem] scrollbar-hidden text-left text-sm gap-2"
 			>
 				{#each citations as citation, idx}
-					<button
-						id={`source-${id}-${idx + 1}`}
-						class="no-toggle outline-hidden flex dark:text-gray-300 bg-white dark:bg-gray-900 rounded-xl gap-1.5 items-center"
-						on:click={() => {
-							showCitationModal = true;
-							selectedCitation = citation;
-						}}
-					>
-						<div class=" font-medium">
-							{idx + 1}.
-						</div>
-						<div
-							class="flex-1 truncate text-black/60 hover:text-black dark:text-white/60 dark:hover:text-white transition text-left"
-						>
-							{decodeString(citation.source.name)}
-						</div>
-					</button>
+					<div id={`source-${id}-${idx + 1}`}>
+						<ReferenceLinkItem
+							kind={getCitationKind(citation)}
+							label={getCitationKind(citation) === 'web' ? $i18n.t('Web') : $i18n.t('Knowledge Base')}
+							title={getCitationTitle(citation)}
+							subtitle={getCitationSubtitle(citation)}
+							index={idx + 1}
+							titleAttr={decodeString(citation?.source?.title ?? citation?.source?.name ?? '')}
+							onClick={() => {
+								showCitationModal = true;
+								selectedCitation = citation;
+							}}
+						/>
+					</div>
 				{/each}
 			</div>
 		</div>

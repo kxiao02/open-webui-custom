@@ -126,6 +126,7 @@ class ChatFileModel(BaseModel):
 class ChatForm(BaseModel):
     chat: dict
     folder_id: Optional[str] = None
+    meta: Optional[dict] = {}
 
 
 class ChatImportForm(ChatForm):
@@ -419,6 +420,7 @@ class ChatTable:
                         else "New Chat"
                     ),
                     "chat": self._clean_null_bytes(form_data.chat),
+                    "meta": self._clean_null_bytes(form_data.meta or {}),
                     "folder_id": form_data.folder_id,
                     "created_at": int(time.time()),
                     "updated_at": int(time.time()),
@@ -568,6 +570,25 @@ class ChatTable:
                 self.delete_orphan_tags_for_user(list(removed), user.id, db=db)
 
             return ChatModel.model_validate(chat)
+
+    def update_chat_meta_by_id(
+        self, id: str, meta_updates: dict, db: Optional[Session] = None
+    ) -> Optional[ChatModel]:
+        try:
+            with get_db_context(db) as db:
+                chat = db.get(Chat, id)
+                if chat is None:
+                    return None
+
+                existing_meta = chat.meta or {}
+                chat.meta = {**existing_meta, **meta_updates}
+                chat.updated_at = int(time.time())
+                db.commit()
+                db.refresh(chat)
+
+                return ChatModel.model_validate(chat)
+        except Exception:
+            return None
 
     def get_chat_title_by_id(self, id: str) -> Optional[str]:
         with get_db_context() as db:

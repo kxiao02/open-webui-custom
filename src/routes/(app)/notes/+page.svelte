@@ -1,7 +1,7 @@
 <script>
 	import { getContext, onMount } from 'svelte';
 
-	const i18n = getContext('i18n');
+	const i18n = /** @type {import('$lib/i18n').I18nStore} */ (getContext('i18n'));
 
 	import dayjs from '$lib/dayjs';
 	import { mobile, showArchivedChats, showSidebar, user } from '$lib/stores';

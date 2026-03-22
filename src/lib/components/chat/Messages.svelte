@@ -22,28 +22,29 @@
 
 	import ChatPlaceholder from './ChatPlaceholder.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let className = 'h-full flex pt-8';
 
 	export let chatId = '';
-	export let user = $_user;
+	export let user: any = $_user;
 
-	export let prompt;
-	export let history = {};
-	export let selectedModels;
-	export let atSelectedModel;
+	export let prompt: any = null;
+	export let history: any = {};
+	export let selectedModels: any[] = [];
+	export let atSelectedModel: any = undefined;
+	export let processing = '';
 
-	let messages = [];
+	export let messages: any[] = [];
 
 	export let setInputText: Function = () => {};
 
-	export let sendMessage: Function;
-	export let continueResponse: Function;
-	export let regenerateResponse: Function;
-	export let mergeResponses: Function;
+	export let sendMessage: Function = () => {};
+	export let continueResponse: Function = () => {};
+	export let regenerateResponse: Function = () => {};
+	export let mergeResponses: Function = () => {};
 
-	export let chatActionHandler: Function;
+	export let chatActionHandler: Function = () => {};
 	export let showMessage: Function = () => {};
 	export let submitMessage: Function = () => {};
 	export let addMessages: Function = () => {};
@@ -53,9 +54,9 @@
 
 	export let topPadding = false;
 	export let bottomPadding = false;
-	export let autoScroll;
+	export let autoScroll: boolean = true;
 
-	export let onSelect = (e) => {};
+	export let onSelect = (e: any) => {};
 
 	export let messagesCount: number | null = 20;
 	let messagesLoading = false;
@@ -63,6 +64,7 @@
 	const loadMoreMessages = async () => {
 		// scroll slightly down to disable continuous loading
 		const element = document.getElementById('messages-container');
+		if (!element || messagesCount === null) return;
 		element.scrollTop = element.scrollTop + 100;
 
 		messagesLoading = true;
@@ -74,11 +76,11 @@
 		messagesLoading = false;
 	};
 
-	let pendingRebuild = null;
-	let lastCurrentId = null;
+	let pendingRebuild: number | null = null;
+	let lastCurrentId: any = null;
 
 	const buildMessages = () => {
-		let _messages = [];
+		let _messages: any[] = [];
 
 		let message = history.messages[history.currentId];
 		const visitedMessageIds = new Set();
@@ -99,7 +101,7 @@
 
 	// Throttle message list rebuilds to once per animation frame during streaming.
 	// Structural changes (currentId change) always rebuild immediately.
-	const handleHistoryChange = (currentId, _messages) => {
+	const handleHistoryChange = (currentId: any, _messages: any) => {
 		if (!currentId) {
 			messages = [];
 			return;
@@ -135,6 +137,7 @@
 
 	const scrollToBottom = () => {
 		const element = document.getElementById('messages-container');
+		if (!element) return;
 		element.scrollTop = element.scrollHeight;
 	};
 
@@ -152,7 +155,7 @@
 		}
 	};
 
-	const gotoMessage = async (message, idx) => {
+	const gotoMessage = async (message: any, idx: number) => {
 		// Determine the correct sibling list (either parent's children or root messages)
 		let siblings;
 		if (message.parentId !== null) {
@@ -193,7 +196,7 @@
 		}
 	};
 
-	const showPreviousMessage = async (message) => {
+	const showPreviousMessage = async (message: any) => {
 		if (message.parentId !== null) {
 			let messageId =
 				history.messages[message.parentId].childrenIds[

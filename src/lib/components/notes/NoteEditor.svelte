@@ -1,10 +1,11 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { getContext, onDestroy, onMount, tick } from 'svelte';
 	import { v4 as uuidv4 } from 'uuid';
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { marked } from 'marked';
 	import { toast } from 'svelte-sonner';

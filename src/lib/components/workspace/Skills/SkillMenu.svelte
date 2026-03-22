@@ -10,7 +10,7 @@
 	import Download from '$lib/components/icons/Download.svelte';
 	import { user } from '$lib/stores';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let editHandler: Function;
 	export let cloneHandler: Function;

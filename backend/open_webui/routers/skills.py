@@ -18,6 +18,7 @@ from open_webui.models.skills import (
     Skills,
 )
 from open_webui.models.access_grants import AccessGrants
+from open_webui.models.resource_installations import ResourceInstallations
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_permission, filter_allowed_access_grants
 from open_webui.utils.catalog import (
@@ -40,6 +41,16 @@ def _skill_write_access(user) -> bool:
     return user.role == "admin"
 
 
+def _get_installed_skill_ids(
+    user_id: str,
+    skill_ids: Optional[list[str] | set[str] | tuple[str, ...]] = None,
+    db=None,
+) -> set[str]:
+    return ResourceInstallations.get_installed_resource_ids(
+        user_id, "skill", resource_ids=skill_ids, db=db
+    )
+
+
 ############################
 # GetSkills
 ############################
@@ -51,7 +62,19 @@ async def get_skills(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
-    return filter_visible_skills(Skills.get_skills(db=db), user, db=db)
+    visible_skills = filter_visible_skills(Skills.get_skills(db=db), user, db=db)
+    installed_skill_ids = _get_installed_skill_ids(
+        user.id, [skill.id for skill in visible_skills], db=db
+    )
+    return [
+        SkillUserResponse(
+            **{
+                **skill.model_dump(),
+                "installed": skill.id in installed_skill_ids,
+            }
+        )
+        for skill in visible_skills
+    ]
 
 
 ############################
@@ -68,6 +91,9 @@ async def get_skill_list(
     db: Session = Depends(get_session),
 ):
     filtered_skills = filter_visible_skills(Skills.get_skills(db=db), user, db=db)
+    installed_skill_ids = _get_installed_skill_ids(
+        user.id, [skill.id for skill in filtered_skills], db=db
+    )
 
     normalized_query = (query or "").strip().lower()
     if normalized_query:
@@ -96,6 +122,7 @@ async def get_skill_list(
             SkillAccessResponse(
                 **skill.model_dump(),
                 write_access=_skill_write_access(user),
+                installed=skill.id in installed_skill_ids,
             )
             for skill in items
         ],
@@ -182,6 +209,7 @@ async def get_skill_by_id(
             return SkillAccessResponse(
                 **skill.model_dump(),
                 write_access=_skill_write_access(user),
+                installed=id in _get_installed_skill_ids(user.id, [id], db=db),
             )
         else:
             raise HTTPException(
@@ -193,6 +221,41 @@ async def get_skill_by_id(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
+
+
+############################
+# InstallSkillById
+############################
+
+
+@router.post("/id/{id}/install", response_model=dict)
+async def install_skill_by_id(
+    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+):
+    skill = Skills.get_skill_by_id(id, db=db)
+    if not skill:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+    if not is_skill_catalog_visible(skill, user, user_group_ids, db=db):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    ResourceInstallations.install_resource(user.id, "skill", id, db=db)
+    return {"id": id, "installed": True}
+
+
+@router.delete("/id/{id}/install", response_model=dict)
+async def uninstall_skill_by_id(
+    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+):
+    ResourceInstallations.uninstall_resource(user.id, "skill", id, db=db)
+    return {"id": id, "installed": False}
 
 
 ############################

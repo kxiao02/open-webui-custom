@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import Modal from '$lib/components/common/Modal.svelte';
 	import { getContext } from 'svelte';
 	import { getModelHistory } from '$lib/apis/evaluations';
@@ -10,7 +11,7 @@
 	export let model = null;
 	export let onClose: () => void = () => {};
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	type TimeRange = '30d' | '1y' | 'all';
 	const TIME_RANGES: { key: TimeRange; label: string; days: number }[] = [

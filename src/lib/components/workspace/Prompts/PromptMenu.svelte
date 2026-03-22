@@ -14,7 +14,7 @@
 	import DocumentDuplicate from '$lib/components/icons/DocumentDuplicate.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let shareHandler: Function;
 	export let cloneHandler: Function;
@@ -45,7 +45,7 @@
 			align="start"
 			transition={flyAndScale}
 		>
-			{#if $config.features.enable_community_sharing}
+			{#if $config?.features?.enable_community_sharing}
 				<DropdownMenu.Item
 					class="select-none flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800  rounded-xl"
 					on:click={() => {

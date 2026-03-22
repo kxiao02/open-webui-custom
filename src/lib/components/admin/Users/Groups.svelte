@@ -28,7 +28,7 @@
 		updateUserDefaultPermissions
 	} from '$lib/apis/users';
 
-	const i18n = getContext('i18n');
+	const i18n = /** @type {import('$lib/i18n').I18nStore} */ (getContext('i18n'));
 
 	let loaded = false;
 

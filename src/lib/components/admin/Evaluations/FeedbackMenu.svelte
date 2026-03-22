@@ -7,7 +7,7 @@
 	const { saveAs } = fileSaver;
 
 	const dispatch = createEventDispatcher();
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
 	import GarbageBin from '$lib/components/icons/GarbageBin.svelte';

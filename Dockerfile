@@ -220,6 +220,7 @@ RUN pip3 install --no-cache-dir uv && \
     fi; \
     fi; \
     pip3 install --no-cache-dir -r requirements-min.txt && \
+    pip3 install --no-cache-dir psycopg2-binary==2.9.11 pgvector==0.4.2 && \
     mkdir -p /app/backend/data && chown -R $UID:$GID /app/backend/data/ && \
     rm -rf /var/lib/apt/lists/*;
 
@@ -230,6 +231,7 @@ import importlib.util
 required_modules = {
     "fastapi": "fastapi",
     "pydantic": "pydantic",
+    "psycopg2": "psycopg2-binary",
     "uvicorn": "uvicorn",
     "typer": "typer",
 }

@@ -12,7 +12,7 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import GlobeAlt from '$lib/components/icons/GlobeAlt.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let func;
 
@@ -21,7 +21,7 @@
 	export let cloneHandler: Function;
 	export let exportHandler: Function;
 	export let deleteHandler: Function;
-	export let toggleGlobalHandler: Function;
+	export let toggleGlobalHandler: (e: CustomEvent<any>) => void = () => {};
 
 	export let onClose: Function;
 

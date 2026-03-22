@@ -18,7 +18,7 @@
 
 	import localizedFormat from 'dayjs/plugin/localizedFormat';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 	dayjs.extend(localizedFormat);
 
 	export let user;
@@ -196,7 +196,7 @@
 			</div>
 		{/if}
 
-		<div class="chat-{message.role} w-full min-w-full markdown-prose">
+		<div class="chat-{message.role} w-full min-w-full chat-markdown-prose">
 			{#if edit !== true}
 				{#if message.files}
 						<div

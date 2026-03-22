@@ -3,8 +3,10 @@
 	import { embed, showControls, showEmbeds, showFilePreview } from '$lib/stores';
 
 	import CitationModal from './Citations/CitationModal.svelte';
+	import ReferenceLinkItem from './ReferenceLinkItem.svelte';
+	import WebSourceAvatar from './WebSourceAvatar.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let id = '';
 	export let chatId = '';
@@ -132,7 +134,7 @@
 				}
 
 				if (id.startsWith('http://') || id.startsWith('https://')) {
-					_source = { ..._source, name: id, url: id };
+					_source = { ..._source, title: _source?.name ?? metadata?.name ?? id, name: id, url: id };
 				}
 
 				const existingSource = acc.find((item) => item.id === id);
@@ -167,6 +169,42 @@
 			return str;
 		}
 	};
+
+	const isHttpUrl = (value: string = '') => /^https?:\/\//i.test(value);
+
+	const getDomain = (value: string = '') => {
+		try {
+			return new URL(value).hostname.replace(/^www\./, '');
+		} catch {
+			return value.replace(/^https?:\/\//i, '').split(/[/?#]/)[0];
+		}
+	};
+
+	const getCitationKind = (citation) => {
+		const sourceUrl = citation?.source?.url ?? '';
+		const sourceName = citation?.source?.name ?? '';
+		return isHttpUrl(sourceUrl) || isHttpUrl(sourceName) ? 'web' : 'knowledge';
+	};
+
+	const getCitationTitle = (citation) => {
+		const sourceTitle = citation?.source?.title ?? citation?.metadata?.[0]?.name ?? '';
+		if (sourceTitle && !isHttpUrl(sourceTitle)) {
+			return decodeString(sourceTitle);
+		}
+
+		const fallback = citation?.source?.url ?? citation?.source?.name ?? citation?.id ?? 'N/A';
+		return isHttpUrl(fallback) ? getDomain(fallback) : decodeString(fallback);
+	};
+
+	const getCitationSubtitle = (citation) => {
+		if (getCitationKind(citation) === 'web') {
+			return decodeString(citation?.source?.url ?? citation?.source?.name ?? '');
+		}
+
+		const sourceName = decodeString(citation?.source?.name ?? '');
+		const title = getCitationTitle(citation);
+		return sourceName && sourceName !== title ? sourceName : '';
+	};
 </script>
 
 <CitationModal
@@ -190,19 +228,16 @@
 			}}
 		>
 			{#if urlCitations.length > 0}
-				<div class="flex -space-x-1 items-center">
-					{#each urlCitations.slice(0, 3) as citation, idx}
-						<img
-							src="https://www.google.com/s2/favicons?sz=32&domain={citation.source.name}"
-							alt="favicon"
-							class="size-4 rounded-full shrink-0 border border-white dark:border-gray-850 bg-white dark:bg-gray-900"
-							on:error={(e) => {
-								e.target.src = '/favicon.png';
-							}}
-						/>
-					{/each}
-				</div>
-			{/if}
+					<div class="flex -space-x-1 items-center">
+						{#each urlCitations.slice(0, 3) as citation, idx}
+							<WebSourceAvatar
+								url={citation?.source?.url ?? citation?.source?.name ?? ''}
+								title={citation?.source?.title ?? citation?.source?.name ?? ''}
+								className="size-4 rounded-full shrink-0 bg-white dark:bg-gray-900"
+							/>
+						{/each}
+					</div>
+				{/if}
 			<div>
 				{#if citations.length === 1}
 					{$i18n.t('1 Source')}
@@ -220,26 +255,20 @@
 	<div class="py-1.5">
 		<div class="text-xs gap-2 flex flex-col">
 			{#each citations as citation, idx}
-				<button
-					id={`source-${id}-${idx + 1}`}
-					aria-label={$i18n.t('View source: {{name}}', {
-						name: decodeString(citation.source.name)
-					})}
-					class="no-toggle outline-hidden flex dark:text-gray-300 bg-transparent text-gray-600 rounded-xl gap-1.5 items-center"
-					on:click={() => {
-						showCitationModal = true;
-						selectedCitation = citation;
-					}}
-				>
-					<div class=" font-medium bg-gray-50 dark:bg-gray-850 rounded-md px-1">
-						{idx + 1}
-					</div>
-					<div
-						class="flex-1 truncate hover:text-black dark:text-white/60 dark:hover:text-white transition text-left"
-					>
-						{decodeString(citation.source.name)}
-					</div>
-				</button>
+				<div id={`source-${id}-${idx + 1}`}>
+					<ReferenceLinkItem
+						kind={getCitationKind(citation)}
+						label={getCitationKind(citation) === 'web' ? $i18n.t('Web') : $i18n.t('Knowledge Base')}
+						title={getCitationTitle(citation)}
+						subtitle={getCitationSubtitle(citation)}
+						index={idx + 1}
+						titleAttr={decodeString(citation?.source?.title ?? citation?.source?.name ?? '')}
+						onClick={() => {
+							showCitationModal = true;
+							selectedCitation = citation;
+						}}
+					/>
+				</div>
 			{/each}
 		</div>
 	</div>

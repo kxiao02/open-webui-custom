@@ -2,7 +2,7 @@
 	import Sortable from 'sortablejs';
 
 	import { createEventDispatcher, getContext, onDestroy, onMount, tick } from 'svelte';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { models } from '$lib/stores';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';

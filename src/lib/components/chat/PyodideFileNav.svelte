@@ -16,7 +16,7 @@
 	import Folder from '../icons/Folder.svelte';
 	import Document from '../icons/Document.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let overlay = false;
 

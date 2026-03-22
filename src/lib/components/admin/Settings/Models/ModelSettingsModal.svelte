@@ -2,7 +2,7 @@
 	import { toast } from 'svelte-sonner';
 
 	import { createEventDispatcher, getContext, onMount } from 'svelte';
-	const i18n = getContext('i18n');
+	const i18n = /** @type {import('$lib/i18n').I18nStore} */ (getContext('i18n'));
 	const dispatch = createEventDispatcher();
 
 	import { models, config as _config } from '$lib/stores';

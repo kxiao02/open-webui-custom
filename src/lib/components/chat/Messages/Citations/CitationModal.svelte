@@ -9,7 +9,7 @@
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import Textarea from '$lib/components/common/Textarea.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	const CONTENT_PREVIEW_LIMIT = 10000;
 	let expandedDocs: Set<number> = new Set();
@@ -63,6 +63,10 @@
 		}
 	};
 
+	const getCitationHeading = (source: any) => {
+		return decodeString(source?.title ?? source?.name ?? '');
+	};
+
 	const normalizeFileRef = (value: unknown): string | null => {
 		if (typeof value !== 'string') {
 			return null;
@@ -114,7 +118,7 @@
 	<div>
 		<div class=" flex justify-between dark:text-gray-300 px-4.5 pt-3 pb-2">
 				<div class=" text-lg font-medium self-center flex items-center">
-					{#if citation?.source?.name}
+					{#if citation?.source?.name || citation?.source?.title}
 						{@const document = mergedDocuments?.[0]}
 						{@const documentFileRef = normalizeFileRef(document?.metadata?.file_id)}
 						{#if documentFileRef || document.source?.url?.includes('http')}
@@ -135,11 +139,11 @@
 											: `#`}
 								target="_blank"
 							>
-								{decodeString(citation?.source?.name)}
+								{getCitationHeading(citation?.source)}
 							</a>
 						</Tooltip>
 					{:else}
-						{decodeString(citation?.source?.name)}
+						{getCitationHeading(citation?.source)}
 					{/if}
 				{:else}
 					{$i18n.t('Citation')}

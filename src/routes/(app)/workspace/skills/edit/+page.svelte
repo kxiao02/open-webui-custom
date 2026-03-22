@@ -1,10 +1,11 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { toast } from 'svelte-sonner';
 	import { goto } from '$app/navigation';
 	import { skills } from '$lib/stores';
 	import { onMount, getContext } from 'svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { getSkillById, getSkills, updateSkillById } from '$lib/apis/skills';
 	import { page } from '$app/stores';

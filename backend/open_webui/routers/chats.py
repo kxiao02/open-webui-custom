@@ -989,11 +989,40 @@ async def update_chat_by_id(
         )
 
 
+@router.post("/{id}/session/capabilities", response_model=Optional[ChatResponse])
+async def update_chat_session_capabilities_by_id(
+    id: str,
+    form_data: ChatSessionCapabilitiesForm,
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
+):
+    chat = Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
+    if not chat:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    meta_updates = {}
+    if form_data.tool_ids is not None:
+        meta_updates["session_tool_ids"] = list(dict.fromkeys(form_data.tool_ids))
+    if form_data.skill_ids is not None:
+        meta_updates["session_skill_ids"] = list(dict.fromkeys(form_data.skill_ids))
+
+    chat = Chats.update_chat_meta_by_id(id, meta_updates, db=db)
+    return ChatResponse(**chat.model_dump())
+
+
 ############################
 # UpdateChatMessageById
 ############################
 class MessageForm(BaseModel):
     content: str
+
+
+class ChatSessionCapabilitiesForm(BaseModel):
+    tool_ids: Optional[list[str]] = None
+    skill_ids: Optional[list[str]] = None
 
 
 @router.post("/{id}/messages/{message_id}", response_model=Optional[ChatResponse])

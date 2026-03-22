@@ -159,6 +159,9 @@ VERSION = PACKAGE_DATA["version"]
 
 DEPLOYMENT_ID = os.environ.get("DEPLOYMENT_ID", "")
 INSTANCE_ID = os.environ.get("INSTANCE_ID", str(uuid4()))
+STRICT_EXTERNAL_STATE = (
+    os.environ.get("STRICT_EXTERNAL_STATE", "False").lower() == "true"
+)
 
 ENABLE_DB_MIGRATIONS = os.environ.get("ENABLE_DB_MIGRATIONS", "True").lower() == "true"
 
@@ -353,6 +356,16 @@ elif DATABASE_TYPE == "sqlite+sqlcipher" and not os.environ.get("DATABASE_URL"):
 if "postgres://" in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://")
 
+if STRICT_EXTERNAL_STATE:
+    if not os.environ.get("DATABASE_URL") and not all(DB_VARS.values()):
+        raise ValueError(
+            "STRICT_EXTERNAL_STATE requires DATABASE_URL or explicit database connection settings."
+        )
+    if "sqlite" in DATABASE_URL:
+        raise ValueError(
+            "STRICT_EXTERNAL_STATE does not allow SQLite. Configure PostgreSQL via DATABASE_URL."
+        )
+
 DATABASE_SCHEMA = os.environ.get("DATABASE_SCHEMA", None)
 
 DATABASE_POOL_SIZE = os.environ.get("DATABASE_POOL_SIZE", None)
@@ -435,6 +448,11 @@ RAG_SYSTEM_CONTEXT = os.environ.get("RAG_SYSTEM_CONTEXT", "False").lower() == "t
 ####################################
 
 REDIS_URL = os.environ.get("REDIS_URL", "")
+
+if STRICT_EXTERNAL_STATE and not REDIS_URL:
+    raise ValueError(
+        "STRICT_EXTERNAL_STATE requires REDIS_URL so sessions and runtime cache are not local."
+    )
 REDIS_CLUSTER = os.environ.get("REDIS_CLUSTER", "False").lower() == "true"
 
 REDIS_KEY_PREFIX = os.environ.get("REDIS_KEY_PREFIX", "open-webui")
@@ -954,6 +972,11 @@ try:
     MAX_BODY_LOG_SIZE = int(os.environ.get("MAX_BODY_LOG_SIZE") or 2048)
 except ValueError:
     MAX_BODY_LOG_SIZE = 2048
+
+if STRICT_EXTERNAL_STATE and ENABLE_AUDIT_LOGS_FILE:
+    raise ValueError(
+        "STRICT_EXTERNAL_STATE requires ENABLE_AUDIT_LOGS_FILE=false to avoid file-backed audit logs."
+    )
 
 # Comma separated list for urls to exclude from audit
 AUDIT_EXCLUDED_PATHS = os.getenv("AUDIT_EXCLUDED_PATHS", "/chats,/chat,/folders").split(

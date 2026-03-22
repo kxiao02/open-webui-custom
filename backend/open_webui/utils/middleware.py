@@ -1309,6 +1309,34 @@ async def terminal_event_handler(
         )
 
 
+def strip_leading_message_output_before_tool_call(output: list) -> list:
+    """
+    Remove assistant message items that appear before the first tool call.
+
+    Some tool-using models emit a short planning/progress sentence before the
+    first `tool_calls` delta (for example, "我来为您查询..."). That text is
+    part of the execution flow and should not remain in the persisted final
+    answer once the tool workflow begins.
+    """
+    first_tool_call_index = next(
+        (
+            index
+            for index, item in enumerate(output)
+            if item.get("type") == "function_call"
+        ),
+        None,
+    )
+    if first_tool_call_index is None:
+        return output
+
+    prefix = output[:first_tool_call_index]
+    if not any(item.get("type") == "message" for item in prefix):
+        return output
+
+    cleaned_prefix = [item for item in prefix if item.get("type") != "message"]
+    return cleaned_prefix + output[first_tool_call_index:]
+
+
 async def chat_completion_tools_handler(
     request: Request, body: dict, extra_params: dict, user: UserModel, models, tools
 ) -> tuple[dict, dict]:
@@ -2652,12 +2680,33 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     terminal_id = form_data.pop("terminal_id", None)
     files = form_data.pop("files", None)
 
+    from open_webui.models.resource_installations import ResourceInstallations
+
+    chat_id = metadata.get("chat_id")
+    session_tool_ids: list[str] = []
+    session_skill_ids: set[str] = set()
+    if chat_id and isinstance(chat_id, str) and not chat_id.startswith("local:"):
+        chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+        if chat:
+            chat_meta = chat.meta or {}
+            session_tool_ids = list(chat_meta.get("session_tool_ids", []) or [])
+            session_skill_ids = set(chat_meta.get("session_skill_ids", []) or [])
+
+    installed_tool_ids = list(
+        ResourceInstallations.get_installed_resource_ids(user.id, "tool")
+    )
+    tool_ids = list(
+        dict.fromkeys([*(tool_ids or []), *session_tool_ids, *installed_tool_ids])
+    )
+
     # Caller-provided OpenAI-style tools take precedence over server-side
     # tool resolution (tool_ids, MCP servers, builtin tools).
     payload_tools = form_data.get("tools", None)
 
     # Skills
     user_skill_ids = set(form_data.pop("skill_ids", None) or [])
+    user_skill_ids |= session_skill_ids
+    user_skill_ids |= ResourceInstallations.get_installed_resource_ids(user.id, "skill")
     model_skill_ids = set(model.get("info", {}).get("meta", {}).get("skillIds", []))
 
     all_skill_ids = user_skill_ids | model_skill_ids
@@ -4209,6 +4258,11 @@ async def streaming_chat_response_handler(response, ctx):
                                         if response_tool_calls:
                                             # Flush any pending text first
                                             await flush_pending_delta_data()
+                                            output = (
+                                                strip_leading_message_output_before_tool_call(
+                                                    output
+                                                )
+                                            )
 
                                             # Build pending function_call output items for display
                                             pending_fc_items = []
@@ -4228,7 +4282,11 @@ async def streaming_chat_response_handler(response, ctx):
                                                         "status": "in_progress",
                                                     }
                                                 )
-                                            pending_output = output + pending_fc_items
+                                            pending_output = (
+                                                strip_leading_message_output_before_tool_call(
+                                                    output + pending_fc_items
+                                                )
+                                            )
                                             await event_emitter(
                                                 {
                                                     "type": "chat:completion",
@@ -4611,6 +4669,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 "status": "in_progress",
                             }
                         )
+                    output = strip_leading_message_output_before_tool_call(output)
 
                     await event_emitter(
                         {
@@ -5116,6 +5175,8 @@ async def streaming_chat_response_handler(response, ctx):
                 for item in output:
                     if item.get("status") == "in_progress":
                         item["status"] = "completed"
+
+                output = strip_leading_message_output_before_tool_call(output)
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
                 data = {

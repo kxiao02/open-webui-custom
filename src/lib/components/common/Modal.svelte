@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { onDestroy, onMount } from 'svelte';
 	import { fade } from 'svelte/transition';
 

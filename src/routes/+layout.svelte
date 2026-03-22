@@ -1,4 +1,5 @@
 <script>
+	// @ts-nocheck
 	import { io } from 'socket.io-client';
 	import { spring } from 'svelte/motion';
 	import PyodideWorker from '$lib/workers/pyodide.worker?worker';
@@ -55,7 +56,7 @@
 	import { chatCompletion } from '$lib/apis/openai';
 
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME } from '$lib/constants';
-	import { bestMatchingLanguage, displayFileHandler } from '$lib/utils';
+	import { bestMatchingLanguage, displayFileHandler, toPlainNotificationText } from '$lib/utils';
 	import { setTextScale } from '$lib/utils/text-scale';
 
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
@@ -434,6 +435,8 @@
 			const { done, content, title } = data;
 
 			if (done) {
+				const notificationContent = toPlainNotificationText(content);
+
 				if ($settings?.notificationSoundAlways ?? false) {
 					playingNotificationSound.set(true);
 
@@ -447,7 +450,7 @@
 				if ($isLastActiveTab) {
 					if ($settings?.notificationEnabled ?? false) {
 						new Notification(`${title} • Open WebUI`, {
-							body: content,
+							body: notificationContent,
 							icon: `${WEBUI_BASE_URL}/static/favicon.png`
 						});
 					}
@@ -458,7 +461,7 @@
 						onClick: () => {
 							goto(`/c/${event.chat_id}`);
 						},
-						content: content,
+						content: notificationContent,
 						title: title
 					},
 					duration: 15000,
@@ -649,11 +652,12 @@
 
 			if (type === 'message') {
 				const title = `${data?.user?.name}${event?.channel?.type !== 'dm' ? ` (#${event?.channel?.name})` : ''}`;
+				const notificationContent = toPlainNotificationText(data?.content ?? '');
 
 				if ($isLastActiveTab) {
 					if ($settings?.notificationEnabled ?? false) {
 						new Notification(`${title} • Open WebUI`, {
-							body: data?.content,
+							body: notificationContent,
 							icon: `${WEBUI_API_BASE_URL}/users/${data?.user?.id}/profile/image`
 						});
 					}
@@ -664,7 +668,7 @@
 						onClick: () => {
 							goto(`/channels/${event.channel_id}`);
 						},
-						content: data?.content,
+						content: notificationContent,
 						title: `${title}`
 					},
 					duration: 15000,

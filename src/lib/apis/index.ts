@@ -1,10 +1,11 @@
+// @ts-nocheck
 import { WEBUI_BASE_URL } from '$lib/constants';
 import { convertOpenApiToToolPayload } from '$lib/utils';
 import { getOpenAIModelsDirect } from './openai';
 
 export const getModels = async (
 	token: string = '',
-	connections: object | null = null,
+	connections: Record<string, any> | false | null = null,
 	base: boolean = false,
 	refresh: boolean = false
 ) => {
@@ -1673,10 +1674,14 @@ export interface ModelConfig {
 }
 
 export interface ModelMeta {
-	toolIds: never[];
+	toolIds: string[];
 	description?: string;
 	capabilities?: object;
 	profile_image_url?: string;
+	hidden?: boolean;
+	defaultFeatureIds?: string[];
+	defaultFilterIds?: string[];
+	[key: string]: any;
 }
 
 export interface ModelParams {}

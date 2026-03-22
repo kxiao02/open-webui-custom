@@ -1,8 +1,10 @@
+import io
 import os
 import shutil
 import json
 import logging
 import re
+import tempfile
 from abc import ABC, abstractmethod
 from typing import BinaryIO, Tuple, Dict
 
@@ -53,6 +55,7 @@ except ImportError:
     ResourceNotFoundError = Exception
 
 log = logging.getLogger(__name__)
+TEMP_DOWNLOAD_PREFIX = "open-webui-s3-"
 
 
 def _require_dependency(name: str, value):
@@ -62,6 +65,25 @@ def _require_dependency(name: str, value):
             "Install the full backend requirements or the provider-specific SDK."
         )
     return value
+
+
+def is_ephemeral_storage_file(file_path: str | os.PathLike | None) -> bool:
+    if not file_path:
+        return False
+    return os.path.basename(os.fspath(file_path)).startswith(TEMP_DOWNLOAD_PREFIX)
+
+
+def cleanup_ephemeral_storage_file(file_path: str | os.PathLike | None) -> None:
+    if not is_ephemeral_storage_file(file_path):
+        return
+
+    resolved_path = os.fspath(file_path)
+    try:
+        os.remove(resolved_path)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Failed to remove ephemeral storage file %s: %s", resolved_path, e)
 
 
 class StorageProvider(ABC):
@@ -175,10 +197,14 @@ class S3StorageProvider(StorageProvider):
         self, file: BinaryIO, filename: str, tags: Dict[str, str]
     ) -> Tuple[bytes, str]:
         """Handles uploading of the file to S3 storage."""
-        _, file_path = LocalStorageProvider.upload_file(file, filename, tags)
+        contents = file.read()
+        if not contents:
+            raise ValueError(ERROR_MESSAGES.EMPTY_CONTENT)
         s3_key = os.path.join(self.key_prefix, filename)
         try:
-            self.s3_client.upload_file(file_path, self.bucket_name, s3_key)
+            self.s3_client.upload_fileobj(
+                io.BytesIO(contents), self.bucket_name, s3_key
+            )
             if S3_ENABLE_TAGGING and tags:
                 sanitized_tags = {
                     self.sanitize_tag_value(k): self.sanitize_tag_value(v)
@@ -194,10 +220,7 @@ class S3StorageProvider(StorageProvider):
                     Key=s3_key,
                     Tagging=tagging,
                 )
-            return (
-                open(file_path, "rb").read(),
-                f"s3://{self.bucket_name}/{s3_key}",
-            )
+            return (contents, f"s3://{self.bucket_name}/{s3_key}")
         except ClientError as e:
             raise RuntimeError(f"Error uploading file to S3: {e}")
 
@@ -205,7 +228,7 @@ class S3StorageProvider(StorageProvider):
         """Handles downloading of the file from S3 storage."""
         try:
             s3_key = self._extract_s3_key(file_path)
-            local_file_path = self._get_local_file_path(s3_key)
+            local_file_path = self._get_temp_file_path(s3_key)
             self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
             return local_file_path
         except ClientError as e:
@@ -218,9 +241,6 @@ class S3StorageProvider(StorageProvider):
             self.s3_client.delete_object(Bucket=self.bucket_name, Key=s3_key)
         except ClientError as e:
             raise RuntimeError(f"Error deleting file from S3: {e}")
-
-        # Always delete from local storage
-        LocalStorageProvider.delete_file(file_path)
 
     def delete_all_files(self) -> None:
         """Handles deletion of all files from S3 storage."""
@@ -238,15 +258,19 @@ class S3StorageProvider(StorageProvider):
         except ClientError as e:
             raise RuntimeError(f"Error deleting all files from S3: {e}")
 
-        # Always delete from local storage
-        LocalStorageProvider.delete_all_files()
-
     # The s3 key is the name assigned to an object. It excludes the bucket name, but includes the internal path and the file name.
     def _extract_s3_key(self, full_file_path: str) -> str:
         return "/".join(full_file_path.split("//")[1].split("/")[1:])
 
-    def _get_local_file_path(self, s3_key: str) -> str:
-        return f"{UPLOAD_DIR}/{s3_key.split('/')[-1]}"
+    def _get_temp_file_path(self, s3_key: str) -> str:
+        suffix = os.path.splitext(s3_key)[1]
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix=TEMP_DOWNLOAD_PREFIX,
+            suffix=suffix,
+            delete=False,
+        )
+        temp_file.close()
+        return temp_file.name
 
 
 class GCSStorageProvider(StorageProvider):

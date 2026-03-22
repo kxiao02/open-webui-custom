@@ -3,7 +3,7 @@
 	import { v4 as uuidv4 } from 'uuid';
 
 	import { getContext } from 'svelte';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import dayjs from '$lib/dayjs';
 	import duration from 'dayjs/plugin/duration';
@@ -60,6 +60,7 @@
 
 	export let chevron = false;
 	export let grow = false;
+	export let centerTitle = false;
 
 	export let disabled = false;
 	export let hide = false;
@@ -345,6 +346,38 @@
 		};
 	}
 
+	function normalizeToolStatus(status: string | undefined, done: string | undefined) {
+		const normalized = (status || '').trim().toLowerCase();
+		if (['running', 'success', 'error', 'timeout'].includes(normalized)) {
+			return normalized;
+		}
+		return done === 'true' ? 'success' : 'running';
+	}
+
+	function getToolStatusLabel(status: string) {
+		if (status === 'success') return '已完成';
+		if (status === 'timeout') return '已超时';
+		if (status === 'error') return '执行失败';
+		return '进行中';
+	}
+
+	function getToolStatusBadgeClass(status: string) {
+		if (status === 'success') {
+			return 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/70 dark:bg-emerald-900/30 dark:text-emerald-300';
+		}
+		if (status === 'timeout') {
+			return 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/70 dark:bg-amber-900/30 dark:text-amber-300';
+		}
+		if (status === 'error') {
+			return 'border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/70 dark:bg-rose-900/30 dark:text-rose-300';
+		}
+		return 'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900/70 dark:bg-blue-900/30 dark:text-blue-300';
+	}
+
+	function getToolResultHeading(status: string) {
+		return status === 'success' ? '工具结果' : '错误信息';
+	}
+
 	function pickFirstString(record: Record<string, any>, keys: string[]) {
 		for (const key of keys) {
 			const value = record?.[key];
@@ -425,7 +458,9 @@
 			{@const parsedArgs = parseJSONString(args)}
 			{@const parsedResult = parseJSONString(result)}
 			{@const argsRecord = asRecord(parsedArgs)}
-			{@const statusDone = attributes?.done === 'true'}
+			{@const toolStatus = normalizeToolStatus(attributes?.status, attributes?.done)}
+			{@const statusDone = toolStatus === 'success'}
+			{@const statusTerminal = toolStatus !== 'running'}
 			{@const meta = getToolCardMeta(attributes?.name, argsRecord)}
 			{@const searchItems = normalizeSearchResultItems(parsedResult)}
 			{@const mergedCount = Number(attributes?.merged_count || 1)}
@@ -471,13 +506,11 @@
 								</div>
 							{/if}
 							<div
-								class="rounded-full border px-1.5 py-0.5 text-[10px] font-medium {statusDone
-									? 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/70 dark:bg-emerald-900/30 dark:text-emerald-300'
-									: 'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900/70 dark:bg-blue-900/30 dark:text-blue-300'}"
+								class="rounded-full border px-1.5 py-0.5 text-[10px] font-medium {getToolStatusBadgeClass(toolStatus)}"
 							>
-								{statusDone ? '已完成' : '进行中'}
+								{getToolStatusLabel(toolStatus)}
 							</div>
-							{#if !statusDone}
+							{#if !statusTerminal}
 								<Spinner className="size-4" />
 							{/if}
 							<div class="flex self-center translate-y-[1px] text-gray-500">
@@ -506,10 +539,10 @@
 								</div>
 							{/if}
 
-							{#if statusDone}
+							{#if statusTerminal}
 								<div>
 									<div class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
-										工具结果
+										{getToolResultHeading(toolStatus)}
 									</div>
 									{#if visibleSearchItems.length > 0}
 										<div class="space-y-2">
@@ -587,7 +620,7 @@
 			</div>
 		{/if}
 
-		{#if attributes?.done === 'true'}
+		{#if normalizeToolStatus(attributes?.status, attributes?.done) !== 'running'}
 			{#if typeof files === 'object'}
 				{#each files ?? [] as file, idx}
 					{#if typeof file === 'string'}
@@ -622,7 +655,7 @@
 			}}
 		>
 			<div
-				class=" w-full flex items-center justify-between gap-2 {attributes?.done &&
+				class="w-full flex items-center gap-2 {centerTitle ? 'relative justify-center' : 'justify-between'} {attributes?.done &&
 				attributes?.done !== 'true'
 					? 'shimmer'
 					: ''}
@@ -634,7 +667,7 @@
 					</div>
 				{/if}
 
-				<div class="">
+				<div class={centerTitle ? 'flex-1 text-center' : ''}>
 					{#if attributes?.type === 'reasoning'}
 						{#if attributes?.done === 'true' && attributes?.duration}
 							{#if attributes.duration < 1}
@@ -663,7 +696,11 @@
 				</div>
 
 				{#if !disabled}
-					<div class="flex self-center translate-y-[1px]">
+					<div
+						class="flex self-center translate-y-[1px] {centerTitle
+							? 'absolute right-0 top-1/2 -translate-y-1/2'
+							: ''}"
+					>
 						{#if open}
 							<ChevronUp strokeWidth="3.5" className="size-3.5" />
 						{:else}
