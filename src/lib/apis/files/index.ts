@@ -75,9 +75,31 @@ export const uploadFile = async (
 								if (data?.error) {
 									console.error(data.error);
 									res.error = data.error;
+									streamDone = true;
+									break;
 								}
 
 								res.data = data;
+
+								const statusValue =
+									typeof data?.status === 'string'
+										? data.status
+										: typeof data?.state === 'string'
+											? data.state
+											: typeof data?.result?.status === 'string'
+												? data.result.status
+												: '';
+
+								const normalizedStatus = statusValue.trim().toLowerCase();
+								if (['completed', 'failed'].includes(normalizedStatus)) {
+									streamDone = true;
+									break;
+								}
+
+								if (data?.done === true || data?.completed === true || data?.failed === true) {
+									streamDone = true;
+									break;
+								}
 							}
 						}
 					}

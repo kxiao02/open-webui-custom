@@ -168,7 +168,14 @@
 	let showDeleteConfirm = false;
 
 	let model = null;
-	$: model = $models.find((m) => m.id === message.model);
+	$: {
+		const modelId = message?.model;
+		model = $models.find((m) => m.id === modelId);
+		if (!model && typeof modelId === 'string' && modelId.endsWith('-thinking')) {
+			const baseModelId = modelId.slice(0, -'-thinking'.length);
+			model = $models.find((m) => m.id === baseModelId);
+		}
+	}
 
 	let edit = false;
 	let editedContent = '';

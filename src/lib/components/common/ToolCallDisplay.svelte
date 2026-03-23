@@ -8,14 +8,8 @@
 	import { slide } from 'svelte/transition';
 	import { quintOut } from 'svelte/easing';
 
-	import ChevronUp from '../icons/ChevronUp.svelte';
 	import ChevronDown from '../icons/ChevronDown.svelte';
-	import Spinner from './Spinner.svelte';
 	import Markdown from '../chat/Messages/Markdown.svelte';
-	import WrenchSolid from '../icons/WrenchSolid.svelte';
-	import CheckCircle from '../icons/CheckCircle.svelte';
-	import ClockRotateRight from '../icons/ClockRotateRight.svelte';
-	import XMark from '../icons/XMark.svelte';
 	import Image from './Image.svelte';
 	import FullHeightIframe from './FullHeightIframe.svelte';
 	import { settings } from '$lib/stores';
@@ -58,8 +52,7 @@
 	};
 
 	$: if (!open) expandedResult = false;
-	export let buttonClassName =
-		'w-fit text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition';
+	export let buttonClassName = '';
 
 	const componentId = id || uuidv4();
 
@@ -104,13 +97,6 @@
 		return done === 'true' ? 'success' : 'running';
 	}
 
-	function getStatusLabel(status: string): string {
-		if (status === 'success') return '已完成';
-		if (status === 'timeout') return '已超时';
-		if (status === 'error') return '执行失败';
-		return '进行中';
-	}
-
 	function getStatusMessage(status: string, name: string): string {
 		if (status === 'success') return `查看 ${name} 的结果`;
 		if (status === 'timeout') return `${name} 已超时`;
@@ -126,160 +112,155 @@
 	$: parsedResult = parseJSONString(result);
 	$: displayName = TOOL_LABELS[attributes?.name ?? ''] ?? attributes?.name ?? '';
 	$: status = normalizeStatus(attributes?.status, attributes?.done);
-	$: isDone = status === 'success';
 	$: isTerminal = status !== 'running';
 	$: isExecuting = status === 'running';
-	$: statusLabel = getStatusLabel(status);
 	$: statusMessage = getStatusMessage(status, displayName);
+	$: hasEmbeds = embeds && Array.isArray(embeds) && embeds.length > 0;
+	$: hasFiles = Array.isArray(files) && files.length > 0;
+	$: canExpand = !hasEmbeds && (Boolean(args) || Boolean(result) || hasFiles);
+	$: if (!canExpand) open = false;
 </script>
 
 <div {id} class={className}>
-	{#if embeds && Array.isArray(embeds) && embeds.length > 0}
-		<!-- Embed Mode: Show iframes without collapsible behavior -->
-		<div class="py-1 w-full cursor-pointer">
-			<div class="w-full text-xs text-gray-500">
-				{displayName}
-			</div>
-			{#each embeds as embed, idx}
-				<div class="my-2" id={`${componentId}-tool-call-embed-${idx}`}>
-					<FullHeightIframe
-						src={embed}
-						{args}
-						allowScripts={true}
-						allowForms={$settings?.iframeSandboxAllowForms ?? false}
-						allowSameOrigin={$settings?.iframeSandboxAllowSameOrigin ?? false}
-						allowPopups={true}
-					/>
-				</div>
-			{/each}
-		</div>
-	{:else}
-		<!-- Tool call display -->
-		<!-- svelte-ignore a11y-no-static-element-interactions -->
-		<div
-			class="{buttonClassName} cursor-pointer"
-			on:pointerup={() => {
-				open = !open;
+	<div class="mb-2 w-full overflow-hidden rounded-xl border border-gray-200/90 bg-gray-50/80 dark:border-gray-800 dark:bg-gray-900/70">
+		<button
+			type="button"
+			class="flex w-full items-center justify-between gap-2 border-b border-gray-200/80 px-3 py-2 text-left dark:border-gray-800 {buttonClassName} {canExpand ? '' : 'cursor-default'}"
+			on:click={() => {
+				if (canExpand) {
+					open = !open;
+				}
 			}}
 		>
-			<div
-				class="w-full max-w-full font-medium flex items-center gap-1.5 {isExecuting
-					? 'shimmer'
-					: ''}"
-			>
-				<!-- Status icon -->
-				{#if isExecuting}
-					<div>
-						<Spinner className="size-4" />
-					</div>
-				{:else if isDone}
-					<div class="text-emerald-500 dark:text-emerald-400">
-						<CheckCircle className="size-4" strokeWidth="2" />
-					</div>
-				{:else if status === 'timeout'}
-					<div class="text-amber-500 dark:text-amber-400">
-						<ClockRotateRight className="size-4" strokeWidth="2" />
-					</div>
-				{:else if status === 'error'}
-					<div class="text-rose-500 dark:text-rose-400">
-						<XMark className="size-4" strokeWidth="2.2" />
-					</div>
-				{:else}
-					<div class="text-gray-400 dark:text-gray-500">
-						<WrenchSolid className="size-3.5" />
-					</div>
-				{/if}
-
-				<!-- Label -->
-				<div class="flex-1 line-clamp-1">
-					<!-- Short label (below md) -->
-					<span class="@md:hidden font-semibold text-black dark:text-white">{displayName}</span>
-					<!-- Full label (md and above) -->
-					<span class="hidden @md:inline">
-						<span class="font-medium text-black dark:text-white">{statusMessage}</span>
-					</span>
+			<div class="min-w-0">
+				<div class="text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300">
+					{$i18n.t('Process')}
 				</div>
-
-				<!-- Chevron -->
-				<div class="flex shrink-0 self-center translate-y-[1px]">
-					{#if open}
-						<ChevronUp strokeWidth="3.5" className="size-3.5" />
-					{:else}
-						<ChevronDown strokeWidth="3.5" className="size-3.5" />
-					{/if}
+				<div
+					class="mt-0.5 line-clamp-1 text-xs text-gray-500 dark:text-gray-400 {isExecuting
+						? 'shimmer'
+						: ''}"
+				>
+					{statusMessage}
 				</div>
 			</div>
-		</div>
 
-		{#if open}
+			{#if canExpand}
+				<ChevronDown
+					className={`size-3.5 shrink-0 text-gray-500 transition-transform ${open
+						? 'rotate-180'
+						: ''}`}
+				/>
+			{/if}
+		</button>
+
+		{#if (open && canExpand) || hasEmbeds}
 			<div transition:slide={{ duration: 300, easing: quintOut, axis: 'y' }}>
-				<div class="border border-gray-50 dark:border-gray-850/30 rounded-2xl my-1.5 p-3 space-y-3">
-					<!-- Input -->
-					{#if args}
-						<div>
-							<div
-								class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-gray-500 mb-1.5 px-1"
-							>
-								{$i18n.t('Input')}
+				<div class="px-2 py-2 space-y-3">
+					{#if hasEmbeds}
+						{#each embeds as embed, idx}
+							<div class="my-2" id={`${componentId}-tool-call-embed-${idx}`}>
+								<FullHeightIframe
+									src={embed}
+									{args}
+									allowScripts={true}
+									allowForms={$settings?.iframeSandboxAllowForms ?? false}
+									allowSameOrigin={$settings?.iframeSandboxAllowSameOrigin ?? false}
+									allowPopups={true}
+								/>
+							</div>
+						{/each}
+					{:else}
+						<div class="flex items-stretch gap-2">
+							<div>
+								<div class="mb-1.5 px-1 pt-3">
+									<span class="relative flex size-1.5 items-center justify-center rounded-full">
+										<span class="relative inline-flex size-1.5 rounded-full bg-gray-500 dark:bg-gray-400"></span>
+									</span>
+								</div>
 							</div>
 
-							{#if parsedArgs}
-								<div class="px-1 space-y-0.5">
-									{#each Object.entries(parsedArgs) as [key, value]}
-										<div class="flex gap-2 text-xs py-0.5">
-											<span class="font-medium text-gray-600 dark:text-gray-400 shrink-0"
-												>{key}</span
-											>
-											<span class="text-gray-800 dark:text-gray-200 break-all"
-												>{typeof value === 'object' ? JSON.stringify(value) : value}</span
-											>
-										</div>
-									{/each}
+							<div class="flex-1 space-y-3">
+								<div
+									class="{isExecuting
+										? 'shimmer'
+										: ''} text-gray-500 dark:text-gray-500 text-base line-clamp-1 text-wrap"
+								>
+									{displayName}
 								</div>
-							{:else}
-								<div class="tool-call-body w-full max-w-none!">
-									<Markdown
-										id={`${componentId}-tool-call-args`}
-										content={`\`\`\`json\n${formatJSONString(args)}\n\`\`\``}
-									/>
-								</div>
-							{/if}
-						</div>
-					{/if}
 
-					<!-- Output -->
-					{#if isTerminal && result}
-						<div>
-							<div
-								class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-gray-500 mb-1.5 px-1"
-							>
-								{status === 'success' ? $i18n.t('Output') : '错误信息'}
-							</div>
-							<div class="w-full max-w-none!">
-								{#if typeof parsedResult === 'object' && parsedResult !== null}
-									<Markdown
-										id={`${componentId}-tool-call-result`}
-										content={`\`\`\`json\n${JSON.stringify(parsedResult, null, 2)}\n\`\`\``}
-									/>
-								{:else}
-									{@const resultStr = String(parsedResult)}
-									{@const isTruncated = resultStr.length > RESULT_PREVIEW_LIMIT && !expandedResult}
-									<pre
-										class="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap break-words font-mono">{isTruncated
-											? resultStr.slice(0, RESULT_PREVIEW_LIMIT)
-											: resultStr}</pre>
-									{#if isTruncated}
-										<button
-											class="mt-1 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition"
-											on:click|stopPropagation={() => {
-												expandedResult = true;
-											}}
+								<!-- Input -->
+								{#if args}
+									<div>
+										<div
+											class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-gray-500 mb-1.5 px-1"
 										>
-											{$i18n.t('Show all ({{COUNT}} characters)', {
-												COUNT: resultStr.length.toLocaleString()
-											})}
-										</button>
-									{/if}
+											{$i18n.t('Input')}
+										</div>
+
+										{#if parsedArgs}
+											<div class="px-1 space-y-0.5">
+												{#each Object.entries(parsedArgs) as [key, value]}
+													<div class="flex gap-2 text-xs py-0.5">
+														<span class="font-medium text-gray-600 dark:text-gray-400 shrink-0"
+															>{key}</span
+														>
+														<span class="text-gray-800 dark:text-gray-200 break-all"
+															>{typeof value === 'object'
+																? JSON.stringify(value)
+																: value}</span
+														>
+													</div>
+												{/each}
+											</div>
+										{:else}
+											<div class="tool-call-body w-full max-w-none!">
+												<Markdown
+													id={`${componentId}-tool-call-args`}
+													content={`\`\`\`json\n${formatJSONString(args)}\n\`\`\``}
+												/>
+											</div>
+										{/if}
+									</div>
+								{/if}
+
+								<!-- Output -->
+								{#if isTerminal && result}
+									<div>
+										<div
+											class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-gray-500 mb-1.5 px-1"
+										>
+											{status === 'success' ? $i18n.t('Output') : '错误信息'}
+										</div>
+										<div class="w-full max-w-none!">
+											{#if typeof parsedResult === 'object' && parsedResult !== null}
+												<Markdown
+													id={`${componentId}-tool-call-result`}
+													content={`\`\`\`json\n${JSON.stringify(parsedResult, null, 2)}\n\`\`\``}
+												/>
+											{:else}
+												{@const resultStr = String(parsedResult)}
+												{@const isTruncated =
+													resultStr.length > RESULT_PREVIEW_LIMIT && !expandedResult}
+												<pre
+													class="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap break-words font-mono">{isTruncated
+														? resultStr.slice(0, RESULT_PREVIEW_LIMIT)
+														: resultStr}</pre>
+												{#if isTruncated}
+													<button
+														class="mt-1 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 transition"
+														on:click|stopPropagation={() => {
+															expandedResult = true;
+														}}
+													>
+														{$i18n.t('Show all ({{COUNT}} characters)', {
+															COUNT: resultStr.length.toLocaleString()
+														})}
+													</button>
+												{/if}
+											{/if}
+										</div>
+									</div>
 								{/if}
 							</div>
 						</div>
@@ -287,7 +268,7 @@
 				</div>
 			</div>
 		{/if}
-	{/if}
+	</div>
 
 	<!-- Files display (images etc.) when done -->
 	{#if isTerminal}
