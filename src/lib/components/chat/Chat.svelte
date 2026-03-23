@@ -3079,7 +3079,20 @@
 	};
 
 	const getEffectiveModelId = (modelId: string): string => {
-		return modelId;
+		const normalizedModelId = normalizeModelId(modelId);
+
+		if (!thinkingModeEnabled || !normalizedModelId) {
+			return normalizedModelId;
+		}
+
+		if (normalizedModelId.endsWith('-thinking')) {
+			return normalizedModelId;
+		}
+
+		const thinkingCandidate = `${normalizedModelId}-thinking`;
+		return $models.some((model) => model.id === thinkingCandidate)
+			? thinkingCandidate
+			: normalizedModelId;
 	};
 
 	const getModelById = (modelId: string): Model | undefined => {

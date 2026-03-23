@@ -1087,15 +1087,33 @@ async def generate_chat_completion(
     payload = {**form_data}
     metadata = payload.pop("metadata", None)
 
-    model_id = form_data.get("model")
-    requested_model_id = model_id
+    requested_model_id = form_data.get("model")
+    thinking_mode_enabled = bool(
+        form_data.get("thinking_mode_enabled")
+        or form_data.get("thinkingModeEnabled")
+        or form_data.get("thinking")
+    )
+    model_id = requested_model_id
+    if (
+        thinking_mode_enabled
+        and isinstance(model_id, str)
+        and model_id
+        and not model_id.endswith("-thinking")
+    ):
+        model_id = f"{model_id}-thinking"
+    payload["model"] = model_id
     reasoning_requested = False
     if isinstance(requested_model_id, str) and requested_model_id:
         reasoning_requested = is_openai_reasoning_model(
             requested_model_id
         ) or requested_model_id.endswith("-thinking")
+    if isinstance(model_id, str) and model_id.endswith("-thinking"):
+        reasoning_requested = True
     model_is_always_allowed = is_model_always_allowed(requested_model_id)
-    model_info = Models.get_model_by_id(model_id)
+    model_lookup_id = model_id
+    if isinstance(model_lookup_id, str) and model_lookup_id.endswith("-thinking"):
+        model_lookup_id = model_lookup_id[: -len("-thinking")]
+    model_info = Models.get_model_by_id(model_lookup_id)
 
     # Check model info and override the payload
     if model_info:
@@ -1105,8 +1123,17 @@ async def generate_chat_completion(
                 if hasattr(request, "base_model_id")
                 else model_info.base_model_id
             )  # Use request's base_model_id if available
-            payload["model"] = base_model_id
-            model_id = base_model_id
+            resolved_model_id = base_model_id
+            if (
+                isinstance(model_id, str)
+                and model_id.endswith("-thinking")
+                and isinstance(base_model_id, str)
+                and not base_model_id.endswith("-thinking")
+            ):
+                resolved_model_id = f"{base_model_id}-thinking"
+
+            payload["model"] = resolved_model_id
+            model_id = resolved_model_id
 
         params = model_info.params.model_dump()
 
@@ -1150,7 +1177,11 @@ async def generate_chat_completion(
 
     # Check if model is already in app state cache to avoid expensive get_all_models() call
     models = request.app.state.OPENAI_MODELS
-    if not models or model_id not in models:
+    model_lookup_candidates = {model_id}
+    if isinstance(model_id, str) and model_id.endswith("-thinking"):
+        model_lookup_candidates.add(model_id[: -len("-thinking")])
+
+    if not models or not any(candidate in models for candidate in model_lookup_candidates):
         await get_all_models(request, user=user)
         models = request.app.state.OPENAI_MODELS
     model = models.get(model_id)

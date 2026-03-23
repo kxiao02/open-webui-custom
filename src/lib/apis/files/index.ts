@@ -91,7 +91,7 @@ export const uploadFile = async (
 												: '';
 
 								const normalizedStatus = statusValue.trim().toLowerCase();
-								if (['completed', 'failed'].includes(normalizedStatus)) {
+								if (['completed', 'failed', 'not_found'].includes(normalizedStatus)) {
 									streamDone = true;
 									break;
 								}

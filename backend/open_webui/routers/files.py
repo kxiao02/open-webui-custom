@@ -546,12 +546,15 @@ async def get_file_process_status(
 
                             yield f"data: {json.dumps(event)}\n\n"
                             if status in ("completed", "failed"):
+                                yield "data: [DONE]\n\n"
                                 break
                         else:
                             # Legacy
+                            yield "data: [DONE]\n\n"
                             break
                     else:
                         yield f"data: {json.dumps({'status': 'not_found'})}\n\n"
+                        yield "data: [DONE]\n\n"
                         break
 
                     await asyncio.sleep(1)

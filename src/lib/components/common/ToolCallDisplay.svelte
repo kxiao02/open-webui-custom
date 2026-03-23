@@ -98,7 +98,7 @@
 	}
 
 	function getStatusMessage(status: string, name: string): string {
-		if (status === 'success') return `查看 ${name} 的结果`;
+		if (status === 'success') return `${name} 已完成`;
 		if (status === 'timeout') return `${name} 已超时`;
 		if (status === 'error') return `${name} 运行失败`;
 		return `正在执行 ${name}...`;
@@ -134,7 +134,7 @@
 		>
 			<div class="min-w-0">
 				<div class="text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300">
-					{$i18n.t('Process')}
+					{displayName}
 				</div>
 				<div
 					class="mt-0.5 line-clamp-1 text-xs text-gray-500 dark:text-gray-400 {isExecuting
