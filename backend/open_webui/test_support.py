@@ -1,11 +1,13 @@
 import asyncio
 import copy
+import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
 from fastapi import FastAPI
 from fastapi.responses import Response
+from sqlalchemy import inspect, text
 from starlette.background import BackgroundTasks
 from starlette.requests import Request
 
@@ -28,6 +30,7 @@ BASE_CONFIG = {
     "SHOW_ADMIN_DETAILS": True,
     "ADMIN_EMAIL": "",
     "DEFAULT_GROUP_ID": "",
+    "WEBUI_URL": "",
     "JWT_EXPIRES_IN": "0",
     "ENABLE_SIGNUP": True,
     "ENABLE_LOGIN_FORM": True,
@@ -62,24 +65,50 @@ def reset_runtime_state():
 
 
 def reset_database():
-    connection = engine.raw_connection()
-    try:
-        cursor = connection.cursor()
-        cursor.execute("PRAGMA foreign_keys = OFF")
-        cursor.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table'
-              AND name NOT LIKE 'sqlite_%'
-              AND name != 'alembic_version'
-            """
+    dialect = engine.dialect.name
+    if os.environ.get("OPEN_WEBUI_TEST_DATABASE_URL") is None and dialect != "sqlite":
+        raise RuntimeError(
+            "Refusing to reset a non-SQLite database without OPEN_WEBUI_TEST_DATABASE_URL."
         )
-        for (table_name,) in cursor.fetchall():
-            cursor.execute(f'DELETE FROM "{table_name}"')
-        connection.commit()
-    finally:
-        connection.close()
+
+    if dialect == "sqlite":
+        connection = engine.raw_connection()
+        try:
+            cursor = connection.cursor()
+            cursor.execute("PRAGMA foreign_keys = OFF")
+            cursor.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name NOT LIKE 'sqlite_%'
+                  AND name != 'alembic_version'
+                """
+            )
+            for (table_name,) in cursor.fetchall():
+                cursor.execute(f'DELETE FROM "{table_name}"')
+            connection.commit()
+        finally:
+            connection.close()
+        return
+
+    table_names = [
+        table_name
+        for table_name in inspect(engine).get_table_names()
+        if table_name != "alembic_version"
+    ]
+    if not table_names:
+        return
+
+    quoted_tables = ", ".join(f'"{table_name}"' for table_name in table_names)
+    with engine.begin() as connection:
+        if dialect == "postgresql":
+            connection.execute(
+                text(f"TRUNCATE TABLE {quoted_tables} RESTART IDENTITY CASCADE")
+            )
+        else:
+            for table_name in table_names:
+                connection.execute(text(f'DELETE FROM "{table_name}"'))
 
 
 def ensure_user(

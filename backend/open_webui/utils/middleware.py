@@ -44,8 +44,12 @@ from open_webui.routers.tasks import (
 from open_webui.routers.retrieval import (
     process_web_search,
     SearchForm,
+    ProcessFileForm,
     ensure_retrieval_runtime,
+    process_file,
 )
+from open_webui.internal.db import SessionLocal
+from open_webui.models.files import Files
 from open_webui.utils.tools import get_builtin_tools
 from open_webui.routers.images import (
     image_generations,
@@ -143,6 +147,8 @@ from open_webui.constants import TASKS
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
+
+INLINE_FILE_SOURCE_MAX_CHARS = 12000
 
 
 DEFAULT_REASONING_TAGS = [
@@ -2172,8 +2178,22 @@ async def chat_completion_files_handler(
     sources = []
 
     if files := body.get("metadata", {}).get("files", None):
+        files, inline_sources, retrieval_files = await _prepare_chat_files_for_retrieval(
+            request, files, user
+        )
+        body.setdefault("metadata", {})["files"] = files
+        if body.get("files") is not None:
+            body["files"] = files
+        if body.get("attachments") is not None:
+            body["attachments"] = files
+
+        if inline_sources:
+            sources.extend(inline_sources)
+
         # Check if all files are in full context mode
-        all_full_context = all(item.get("context") == "full" for item in files)
+        all_full_context = bool(retrieval_files) and all(
+            item.get("context") == "full" for item in retrieval_files
+        )
 
         queries = []
         if not all_full_context:
@@ -2220,36 +2240,38 @@ async def chat_completion_files_handler(
         if len(queries) == 0:
             queries = [get_last_user_message(body["messages"])]
 
-        try:
-            ensure_retrieval_runtime(request.app)
-            # Directly await async get_sources_from_items (no thread needed - fully async now)
-            sources = await get_sources_from_items(
-                request=request,
-                items=files,
-                queries=queries,
-                embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
-                    query, prefix=prefix, user=user
-                ),
-                k=request.app.state.config.TOP_K,
-                reranking_function=(
-                    (
-                        lambda query, documents: request.app.state.RERANKING_FUNCTION(
-                            query, documents, user=user
+        if retrieval_files:
+            try:
+                ensure_retrieval_runtime(request.app)
+                # Directly await async get_sources_from_items (no thread needed - fully async now)
+                retrieved_sources = await get_sources_from_items(
+                    request=request,
+                    items=retrieval_files,
+                    queries=queries,
+                    embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
+                        query, prefix=prefix, user=user
+                    ),
+                    k=request.app.state.config.TOP_K,
+                    reranking_function=(
+                        (
+                            lambda query, documents: request.app.state.RERANKING_FUNCTION(
+                                query, documents, user=user
+                            )
                         )
-                    )
-                    if request.app.state.RERANKING_FUNCTION
-                    else None
-                ),
-                k_reranker=request.app.state.config.TOP_K_RERANKER,
-                r=request.app.state.config.RELEVANCE_THRESHOLD,
-                hybrid_bm25_weight=request.app.state.config.HYBRID_BM25_WEIGHT,
-                hybrid_search=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
-                full_context=all_full_context
-                or request.app.state.config.RAG_FULL_CONTEXT,
-                user=user,
-            )
-        except Exception as e:
-            log.exception(e)
+                        if request.app.state.RERANKING_FUNCTION
+                        else None
+                    ),
+                    k_reranker=request.app.state.config.TOP_K_RERANKER,
+                    r=request.app.state.config.RELEVANCE_THRESHOLD,
+                    hybrid_bm25_weight=request.app.state.config.HYBRID_BM25_WEIGHT,
+                    hybrid_search=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
+                    full_context=all_full_context
+                    or request.app.state.config.RAG_FULL_CONTEXT,
+                    user=user,
+                )
+                sources.extend(retrieved_sources)
+            except Exception as e:
+                log.exception(e)
 
         log.debug(f"rag_contexts:sources: {sources}")
 
@@ -2285,6 +2307,146 @@ async def chat_completion_files_handler(
         )
 
     return body, {"sources": sources}
+
+
+def _should_prepare_chat_file(file_item: Any) -> bool:
+    if not isinstance(file_item, dict):
+        return False
+
+    file_type = str(file_item.get("type", "file") or "file").strip().lower()
+    if file_type in {"folder", "collection", "note", "chat"}:
+        return False
+
+    file_id = file_item.get("id")
+    if not isinstance(file_id, str) or not file_id.strip():
+        return False
+
+    content_type = str(
+        file_item.get("content_type")
+        or file_item.get("meta", {}).get("content_type")
+        or ""
+    ).strip().lower()
+    if content_type.startswith(("image/", "audio/", "video/")):
+        return False
+
+    return True
+
+
+def _prepare_chat_file_sync(
+    request: Request,
+    file_item: dict,
+    user: UserModel,
+) -> tuple[dict, Optional[dict]]:
+    prepared = dict(file_item)
+    file_id = str(prepared.get("id") or "").strip()
+    if not file_id:
+        return prepared, None
+
+    with SessionLocal() as db:
+        file = (
+            Files.get_file_by_id(file_id, db=db)
+            if user.role == "admin"
+            else Files.get_file_by_id_and_user_id(file_id, user.id, db=db)
+        )
+        if file is None:
+            return prepared, None
+
+        file_data = file.data or {}
+        file_meta = file.meta or {}
+        content = str(file_data.get("content") or "").strip()
+        status = str(file_data.get("status") or "").strip().lower()
+
+        if not content and status not in {"processing", "uploading"}:
+            try:
+                process_file(
+                    request,
+                    ProcessFileForm(file_id=file_id),
+                    user=user,
+                    db=db,
+                )
+                file = (
+                    Files.get_file_by_id(file_id, db=db)
+                    if user.role == "admin"
+                    else Files.get_file_by_id_and_user_id(file_id, user.id, db=db)
+                )
+                if file is not None:
+                    file_data = file.data or {}
+                    file_meta = file.meta or {}
+                    content = str(file_data.get("content") or "").strip()
+                    status = str(file_data.get("status") or "").strip().lower()
+            except Exception as exc:
+                log.warning("Failed to process chat attachment %s: %s", file_id, exc)
+
+        prepared.setdefault("name", file.filename)
+        if file_meta.get("content_type") and not prepared.get("content_type"):
+            prepared["content_type"] = file_meta.get("content_type")
+        if status:
+            prepared["status"] = status
+
+        inline_source = _build_inline_file_source(file, content)
+
+    return prepared, inline_source
+
+
+def _truncate_inline_file_content(content: str, max_chars: int = INLINE_FILE_SOURCE_MAX_CHARS) -> str:
+    normalized = str(content or "").strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[: max_chars - 1]}…"
+
+
+def _build_inline_file_source(file, content: str) -> Optional[dict]:
+    normalized_content = _truncate_inline_file_content(content)
+    if not normalized_content:
+        return None
+
+    filename = str(getattr(file, "filename", "") or "").strip() or "uploaded_file"
+    file_id = str(getattr(file, "id", "") or "").strip()
+    if not file_id:
+        return None
+
+    return {
+        "source": {
+            "id": file_id,
+            "name": filename,
+            "url": f"/api/v1/files/{file_id}/content",
+            "type": "file",
+        },
+        "document": [normalized_content],
+        "metadata": [
+            {
+                "source": file_id,
+                "name": filename,
+                "file_id": file_id,
+            }
+        ],
+    }
+
+
+async def _prepare_chat_files_for_retrieval(
+    request: Request,
+    files: list[dict],
+    user: UserModel,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    prepared_files = []
+    inline_sources = []
+    retrieval_files = []
+    for file_item in files:
+        if not _should_prepare_chat_file(file_item):
+            prepared_files.append(file_item)
+            retrieval_files.append(file_item)
+            continue
+
+        prepared_file, inline_source = await asyncio.to_thread(
+            _prepare_chat_file_sync, request, file_item, user
+        )
+        prepared_files.append(prepared_file)
+        if inline_source:
+            inline_sources.append(inline_source)
+        else:
+            retrieval_files.append(prepared_file)
+
+    return prepared_files, inline_sources, retrieval_files
 
 
 def apply_params_to_form_data(form_data, model):

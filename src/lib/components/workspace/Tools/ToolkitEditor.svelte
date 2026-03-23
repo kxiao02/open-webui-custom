@@ -43,6 +43,13 @@
 
 	let _content = '';
 
+	$: if ($user?.role !== 'admin' && meta?.is_default) {
+		meta = {
+			...meta,
+			is_default: false
+		};
+	}
+
 	$: if (content) {
 		updateContent();
 	}
@@ -320,7 +327,10 @@ class Tools:
 					</div>
 
 					<div class="grid gap-2 px-1 pt-2 md:grid-cols-2">
-						<Tooltip content={$i18n.t('Optional grouping shown in the catalog')} placement="top-start">
+						<Tooltip
+							content={$i18n.t('Optional grouping shown in the catalog')}
+							placement="top-start"
+						>
 							<input
 								class="w-full text-sm bg-transparent outline-hidden"
 								type="text"
@@ -367,10 +377,12 @@ class Tools:
 								<span>{$i18n.t('Published')}</span>
 							</label>
 
-							<label class="flex items-center gap-2">
-								<Switch bind:state={meta.is_default} />
-								<span>{$i18n.t('Default')}</span>
-							</label>
+							{#if $user?.role === 'admin'}
+								<label class="flex items-center gap-2">
+									<Switch bind:state={meta.is_default} />
+									<span>{$i18n.t('Default')}</span>
+								</label>
+							{/if}
 						</div>
 					</div>
 				</div>

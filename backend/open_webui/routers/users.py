@@ -16,6 +16,8 @@ from open_webui.models.oauth_sessions import OAuthSessions
 from open_webui.models.groups import Groups
 from open_webui.models.chats import Chats
 from open_webui.models.users import (
+    PRIMARY_ADMIN_INFO_KEY,
+    PRIMARY_ADMIN_SET_AT_KEY,
     UserModel,
     UserGroupIdsModel,
     UserGroupIdsListResponse,
@@ -40,10 +42,101 @@ from open_webui.utils.auth import (
     validate_password,
 )
 from open_webui.utils.access_control import get_permissions, has_permission
+from open_webui.utils.models import get_all_models
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _public_user_info(info: Optional[dict]) -> Optional[dict]:
+    if not isinstance(info, dict):
+        return info
+
+    sanitized = dict(info)
+    sanitized.pop(PRIMARY_ADMIN_INFO_KEY, None)
+    sanitized.pop(PRIMARY_ADMIN_SET_AT_KEY, None)
+    return sanitized or None
+
+
+def _normalize_model_ids(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    normalized_ids = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+
+        model_id = item.strip()
+        if model_id and model_id not in normalized_ids:
+            normalized_ids.append(model_id)
+
+    return normalized_ids
+
+
+def _string_arrays_equal(a: list[str], b: list[str]) -> bool:
+    return len(a) == len(b) and all(left == right for left, right in zip(a, b))
+
+
+async def _reconcile_user_model_settings(
+    request: Request, user: UserModel, settings_payload: Optional[dict]
+) -> tuple[dict, bool]:
+    settings_payload = settings_payload or {}
+
+    ui_settings = settings_payload.get("ui")
+    if not isinstance(ui_settings, dict):
+        ui_settings = {}
+
+    models = await get_all_models(request, user=user)
+    visible_model_ids = [
+        model["id"]
+        for model in models
+        if not ((model.get("info") or {}).get("meta") or {}).get("hidden", False)
+    ]
+
+    if len(visible_model_ids) == 0:
+        reconciled_settings = {**settings_payload, "ui": ui_settings}
+        return reconciled_settings, False
+
+    configured_default_model_ids = [
+        model_id
+        for model_id in [
+            item.strip()
+            for item in (request.app.state.config.DEFAULT_MODELS or "").split(",")
+        ]
+        if model_id and model_id in visible_model_ids
+    ]
+
+    original_models = _normalize_model_ids(ui_settings.get("models"))
+    original_pinned_models = _normalize_model_ids(ui_settings.get("pinnedModels"))
+
+    current_models = [model_id for model_id in original_models if model_id in visible_model_ids]
+    current_pinned_models = [
+        model_id for model_id in original_pinned_models if model_id in visible_model_ids
+    ]
+
+    next_models = (
+        current_models
+        or configured_default_model_ids
+        or [visible_model_ids[0]]
+    )
+
+    models_changed = not _string_arrays_equal(original_models, next_models)
+    pinned_models_changed = not _string_arrays_equal(
+        original_pinned_models, current_pinned_models
+    )
+
+    reconciled_settings = {
+        **settings_payload,
+        "ui": {
+            **ui_settings,
+            "models": next_models,
+            "pinnedModels": current_pinned_models,
+        },
+    }
+
+    return reconciled_settings, models_changed or pinned_models_changed
 
 
 ############################
@@ -288,11 +381,18 @@ async def update_default_user_permissions(
 
 @router.get("/user/settings", response_model=Optional[UserSettings])
 async def get_user_settings_by_session_user(
+    request: Request,
     user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
     user = Users.get_user_by_id(user.id, db=db)
     if user:
-        return user.settings
+        settings_payload = (
+            user.settings.model_dump() if isinstance(user.settings, UserSettings) else user.settings
+        )
+        reconciled_settings, _changed = await _reconcile_user_model_settings(
+            request, user, settings_payload
+        )
+        return UserSettings(**reconciled_settings)
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -326,6 +426,10 @@ async def update_user_settings_by_session_user(
     ):
         # If the user is not an admin and does not have permission to use tool servers, remove the key
         updated_user_settings["ui"].pop("toolServers", None)
+
+    updated_user_settings, _ = await _reconcile_user_model_settings(
+        request, user, updated_user_settings
+    )
 
     user = Users.update_user_settings_by_id(user.id, updated_user_settings, db=db)
     if user:
@@ -402,7 +506,7 @@ async def get_user_info_by_session_user(
 ):
     user = Users.get_user_by_id(user.id, db=db)
     if user:
-        return user.info
+        return _public_user_info(user.info)
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -428,7 +532,7 @@ async def update_user_info_by_session_user(
             user.id, {"info": {**user.info, **form_data}}, db=db
         )
         if user:
-            return user.info
+            return _public_user_info(user.info)
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -477,7 +581,7 @@ async def get_user_by_id(
         groups = Groups.get_groups_by_member_id(user_id, db=db)
         return UserActiveResponse(
             **{
-                **user.model_dump(),
+                **{**user.model_dump(), "info": _public_user_info(user.info)},
                 "groups": [{"id": group.id, "name": group.name} for group in groups],
                 "is_active": Users.is_user_active(user_id, db=db),
             }
@@ -498,7 +602,7 @@ async def get_user_info_by_id(
         groups = Groups.get_groups_by_member_id(user_id, db=db)
         return UserInfoResponse(
             **{
-                **user.model_dump(),
+                **{**user.model_dump(), "info": _public_user_info(user.info)},
                 "groups": [{"id": group.id, "name": group.name} for group in groups],
                 "is_active": Users.is_user_active(user_id, db=db),
             }
@@ -590,9 +694,9 @@ async def update_user_by_id(
 ):
     # Prevent modification of the primary admin user by other admins
     try:
-        first_user = Users.get_first_user(db=db)
-        if first_user:
-            if user_id == first_user.id:
+        primary_admin = Users.ensure_primary_admin(db=db)
+        if primary_admin:
+            if user_id == primary_admin.id:
                 if session_user.id != user_id:
                     # If the user trying to update is the primary admin, and they are not the primary admin themselves
                     raise HTTPException(
@@ -607,6 +711,8 @@ async def update_user_by_id(
                         detail=ERROR_MESSAGES.ACTION_PROHIBITED,
                     )
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"Error checking primary admin status: {e}")
         raise HTTPException(
@@ -617,37 +723,67 @@ async def update_user_by_id(
     user = Users.get_user_by_id(user_id, db=db)
 
     if user:
-        if form_data.email.lower() != user.email:
-            email_user = Users.get_user_by_email(form_data.email.lower(), db=db)
-            if email_user:
+        try:
+            if form_data.email.lower() != user.email:
+                email_user = Users.get_user_by_email(form_data.email.lower(), db=db)
+                if email_user:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=ERROR_MESSAGES.EMAIL_TAKEN,
+                    )
+
+            if form_data.password:
+                try:
+                    validate_password(form_data.password)
+                except Exception as e:
+                    raise HTTPException(400, detail=str(e))
+
+                hashed = get_password_hash(form_data.password)
+                if not Auths.update_user_password_by_id(
+                    user_id, hashed, db=db, commit=False
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=ERROR_MESSAGES.DEFAULT(),
+                    )
+
+            if not Auths.update_email_by_id(
+                user_id, form_data.email.lower(), db=db, commit=False
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=ERROR_MESSAGES.EMAIL_TAKEN,
+                    detail=ERROR_MESSAGES.DEFAULT(),
                 )
 
-        if form_data.password:
-            try:
-                validate_password(form_data.password)
-            except Exception as e:
-                raise HTTPException(400, detail=str(e))
+            updated_user = Users.update_user_by_id(
+                user_id,
+                {
+                    "role": form_data.role,
+                    "name": form_data.name,
+                    "profile_image_url": form_data.profile_image_url,
+                },
+                db=db,
+                commit=False,
+            )
 
-            hashed = get_password_hash(form_data.password)
-            Auths.update_user_password_by_id(user_id, hashed, db=db)
+            if not updated_user:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.DEFAULT(),
+                )
 
-        Auths.update_email_by_id(user_id, form_data.email.lower(), db=db)
-        updated_user = Users.update_user_by_id(
-            user_id,
-            {
-                "role": form_data.role,
-                "name": form_data.name,
-                "email": form_data.email.lower(),
-                "profile_image_url": form_data.profile_image_url,
-            },
-            db=db,
-        )
+            db.commit()
 
-        if updated_user:
-            return updated_user
+            return Users.get_user_by_id(user_id, db=db)
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ERROR_MESSAGES.DEFAULT(),
+            )
 
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -671,12 +807,14 @@ async def delete_user_by_id(
 ):
     # Prevent deletion of the primary admin user
     try:
-        first_user = Users.get_first_user(db=db)
-        if first_user and user_id == first_user.id:
+        primary_admin = Users.ensure_primary_admin(db=db)
+        if primary_admin and user_id == primary_admin.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=ERROR_MESSAGES.ACTION_PROHIBITED,
             )
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"Error checking primary admin status: {e}")
         raise HTTPException(
@@ -685,11 +823,13 @@ async def delete_user_by_id(
         )
 
     if user.id != user_id:
-        result = Auths.delete_auth_by_id(user_id, db=db)
+        result = Auths.delete_auth_by_id(user_id, db=db, commit=False)
 
         if result:
+            db.commit()
             return True
 
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=ERROR_MESSAGES.DELETE_USER_ERROR,

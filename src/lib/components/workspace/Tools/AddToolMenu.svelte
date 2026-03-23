@@ -4,24 +4,12 @@
 	import { getContext } from 'svelte';
 
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
-	import GarbageBin from '$lib/components/icons/GarbageBin.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
-	import Share from '$lib/components/icons/Share.svelte';
-	import DocumentDuplicate from '$lib/components/icons/DocumentDuplicate.svelte';
-	import Download from '$lib/components/icons/Download.svelte';
-	import Switch from '$lib/components/common/Switch.svelte';
-	import GlobeAlt from '$lib/components/icons/GlobeAlt.svelte';
-	import Github from '$lib/components/icons/Github.svelte';
-	import Plus from '$lib/components/icons/Plus.svelte';
 	import Pencil from '$lib/components/icons/Pencil.svelte';
-	import PencilSolid from '$lib/components/icons/PencilSolid.svelte';
-	import Link from '$lib/components/icons/Link.svelte';
 
 	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let createHandler: Function;
-	export let importFromLinkHandler: Function;
-
 	export let onClose: Function = () => {};
 
 	let show = false;
@@ -58,19 +46,6 @@
 					<Pencil />
 				</div>
 				<div class=" self-center truncate">{$i18n.t('New Tool')}</div>
-			</button>
-
-			<button
-				class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
-				on:click={async () => {
-					importFromLinkHandler();
-					show = false;
-				}}
-			>
-				<div class=" self-center mr-2">
-					<Link />
-				</div>
-				<div class=" self-center truncate">{$i18n.t('Import From Link')}</div>
 			</button>
 		</DropdownMenu.Content>
 	</div>

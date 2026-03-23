@@ -8,7 +8,7 @@ from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.env import DATABASE_USER_ACTIVE_STATUS_UPDATE_INTERVAL
 
 from open_webui.models.chats import Chats
-from open_webui.models.groups import Groups, GroupMember
+from open_webui.models.groups import Group, GroupMember
 from open_webui.models.channels import ChannelMember
 
 from open_webui.utils.misc import throttle
@@ -24,6 +24,7 @@ from sqlalchemy import (
     Boolean,
     Text,
     Date,
+    UniqueConstraint,
     exists,
     select,
     cast,
@@ -37,6 +38,9 @@ import datetime
 # User DB Schema
 ####################
 
+PRIMARY_ADMIN_INFO_KEY = "primary_admin"
+PRIMARY_ADMIN_SET_AT_KEY = "primary_admin_set_at"
+
 
 class UserSettings(BaseModel):
     ui: Optional[dict] = {}
@@ -46,15 +50,16 @@ class UserSettings(BaseModel):
 
 class User(Base):
     __tablename__ = "user"
+    __table_args__ = (UniqueConstraint("email", name="uq_user_email"),)
 
     id = Column(String, primary_key=True, unique=True)
-    email = Column(String)
+    email = Column(String, nullable=False)
     username = Column(String(50), nullable=True)
-    role = Column(String)
+    role = Column(String, nullable=False)
 
-    name = Column(String)
+    name = Column(String, nullable=False)
 
-    profile_image_url = Column(Text)
+    profile_image_url = Column(Text, nullable=False)
     profile_banner_image_url = Column(Text, nullable=True)
 
     bio = Column(Text, nullable=True)
@@ -258,6 +263,108 @@ class UserUpdateForm(BaseModel):
 
 
 class UsersTable:
+    def _normalize_user_info(self, info: Optional[dict]) -> dict:
+        return info if isinstance(info, dict) else {}
+
+    def _set_primary_admin_flag(self, user: User, value: bool) -> bool:
+        info = self._normalize_user_info(user.info)
+        changed = False
+
+        if value:
+            if info.get(PRIMARY_ADMIN_INFO_KEY) is not True:
+                info[PRIMARY_ADMIN_INFO_KEY] = True
+                info.setdefault(PRIMARY_ADMIN_SET_AT_KEY, int(time.time()))
+                changed = True
+        else:
+            if PRIMARY_ADMIN_INFO_KEY in info:
+                info.pop(PRIMARY_ADMIN_INFO_KEY, None)
+                info.pop(PRIMARY_ADMIN_SET_AT_KEY, None)
+                changed = True
+
+        if changed:
+            user.info = info if info else None
+
+        return changed
+
+    def _find_primary_admin_row(self, db: Session) -> Optional[User]:
+        admins = (
+            db.query(User).filter(User.role == "admin").order_by(User.created_at).all()
+        )
+        for admin in admins:
+            info = self._normalize_user_info(admin.info)
+            if info.get(PRIMARY_ADMIN_INFO_KEY) is True:
+                return admin
+        return None
+
+    def _clear_primary_admin_flags(
+        self, db: Session, exclude_user_id: Optional[str] = None
+    ) -> bool:
+        changed = False
+        admins = db.query(User).filter(User.role == "admin").all()
+        for admin in admins:
+            if exclude_user_id and admin.id == exclude_user_id:
+                continue
+            info = self._normalize_user_info(admin.info)
+            if info.get(PRIMARY_ADMIN_INFO_KEY) is True:
+                if self._set_primary_admin_flag(admin, False):
+                    changed = True
+        return changed
+
+    def ensure_primary_admin(
+        self,
+        user_id: Optional[str] = None,
+        db: Optional[Session] = None,
+        commit: bool = True,
+    ) -> Optional[UserModel]:
+        try:
+            with get_db_context(db) as db:
+                primary = self._find_primary_admin_row(db)
+                changed = False
+
+                if primary:
+                    changed = self._clear_primary_admin_flags(
+                        db, exclude_user_id=primary.id
+                    )
+                else:
+                    candidate = None
+                    if user_id:
+                        candidate = db.query(User).filter_by(id=user_id).first()
+                        if candidate and candidate.role != "admin":
+                            candidate = None
+                    if not candidate:
+                        candidate = (
+                            db.query(User)
+                            .filter(User.role == "admin")
+                            .order_by(User.created_at)
+                            .first()
+                        )
+                    if candidate:
+                        if self._set_primary_admin_flag(candidate, True):
+                            changed = True
+                        primary = candidate
+
+                if changed:
+                    if commit:
+                        db.commit()
+                        if primary:
+                            db.refresh(primary)
+                    else:
+                        db.flush()
+
+                return UserModel.model_validate(primary) if primary else None
+        except Exception:
+            return None
+
+    def get_primary_admin_user(
+        self, db: Optional[Session] = None
+    ) -> Optional[UserModel]:
+        try:
+            with get_db_context(db) as db:
+                primary = self._find_primary_admin_row(db)
+                return UserModel.model_validate(primary) if primary else None
+        except Exception:
+            return None
+
     def insert_new_user(
         self,
         id: str,
@@ -268,6 +375,7 @@ class UsersTable:
         username: Optional[str] = None,
         oauth: Optional[dict] = None,
         db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[UserModel]:
         with get_db_context(db) as db:
             user = UserModel(
@@ -286,8 +394,11 @@ class UsersTable:
             )
             result = User(**user.model_dump())
             db.add(result)
-            db.commit()
-            db.refresh(result)
+            if commit:
+                db.commit()
+                db.refresh(result)
+            else:
+                db.flush()
             if result:
                 return user
             else:
@@ -326,6 +437,7 @@ class UsersTable:
                 user = (
                     db.query(User)
                     .filter(func.lower(User.email) == email.lower())
+                    .order_by(User.created_at.asc(), User.id.asc())
                     .first()
                 )
                 return UserModel.model_validate(user) if user else None
@@ -555,6 +667,19 @@ class UsersTable:
         except Exception:
             return None
 
+    def get_first_admin_user(self, db: Optional[Session] = None) -> UserModel:
+        try:
+            with get_db_context(db) as db:
+                user = (
+                    db.query(User)
+                    .filter(User.role == "admin")
+                    .order_by(User.created_at)
+                    .first()
+                )
+                return UserModel.model_validate(user) if user else None
+        except Exception:
+            return None
+
     def get_user_webhook_url_by_id(
         self, id: str, db: Optional[Session] = None
     ) -> Optional[str]:
@@ -583,7 +708,11 @@ class UsersTable:
             return query.count()
 
     def update_user_role_by_id(
-        self, id: str, role: str, db: Optional[Session] = None
+        self,
+        id: str,
+        role: str,
+        db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[UserModel]:
         try:
             with get_db_context(db) as db:
@@ -591,8 +720,26 @@ class UsersTable:
                 if not user:
                     return None
                 user.role = role
-                db.commit()
-                db.refresh(user)
+                if role != "admin":
+                    self._set_primary_admin_flag(user, False)
+                    if not self._find_primary_admin_row(db):
+                        candidate = (
+                            db.query(User)
+                            .filter(User.role == "admin")
+                            .order_by(User.created_at)
+                            .first()
+                        )
+                        if candidate:
+                            self._set_primary_admin_flag(candidate, True)
+                else:
+                    if not self._find_primary_admin_row(db):
+                        self._set_primary_admin_flag(user, True)
+
+                if commit:
+                    db.commit()
+                    db.refresh(user)
+                else:
+                    db.flush()
                 return UserModel.model_validate(user)
         except Exception:
             return None
@@ -614,7 +761,11 @@ class UsersTable:
             return None
 
     def update_user_profile_image_url_by_id(
-        self, id: str, profile_image_url: str, db: Optional[Session] = None
+        self,
+        id: str,
+        profile_image_url: str,
+        db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[UserModel]:
         try:
             with get_db_context(db) as db:
@@ -622,8 +773,11 @@ class UsersTable:
                 if not user:
                     return None
                 user.profile_image_url = profile_image_url
-                db.commit()
-                db.refresh(user)
+                if commit:
+                    db.commit()
+                    db.refresh(user)
+                else:
+                    db.flush()
                 return UserModel.model_validate(user)
         except Exception:
             return None
@@ -645,7 +799,14 @@ class UsersTable:
             return None
 
     def update_user_oauth_by_id(
-        self, id: str, provider: str, sub: str, db: Optional[Session] = None
+        self,
+        id: str,
+        provider: str,
+        sub: str,
+        payload: Optional[dict] = None,
+        merge: bool = True,
+        db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[UserModel]:
         """
         Update or insert an OAuth provider/sub pair into the user's oauth JSON field.
@@ -664,12 +825,19 @@ class UsersTable:
                 # Load existing oauth JSON or create empty
                 oauth = user.oauth or {}
 
-                # Update or insert provider entry
-                oauth[provider] = {"sub": sub}
+                # Update or insert provider entry, preserving existing payload when requested
+                provider_entry = oauth.get(provider, {}) if merge else {}
+                if payload and isinstance(payload, dict):
+                    provider_entry.update(payload)
+                provider_entry["sub"] = sub
+                oauth[provider] = provider_entry
 
                 # Persist updated JSON
                 db.query(User).filter_by(id=id).update({"oauth": oauth})
-                db.commit()
+                if commit:
+                    db.commit()
+                else:
+                    db.flush()
 
                 return UserModel.model_validate(user)
 
@@ -682,6 +850,7 @@ class UsersTable:
         provider: str,
         external_id: str,
         db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[UserModel]:
         """
         Update or insert a SCIM provider/external_id pair into the user's scim JSON field.
@@ -701,7 +870,10 @@ class UsersTable:
                 scim[provider] = {"external_id": external_id}
 
                 db.query(User).filter_by(id=id).update({"scim": scim})
-                db.commit()
+                if commit:
+                    db.commit()
+                else:
+                    db.flush()
 
                 return UserModel.model_validate(user)
 
@@ -709,24 +881,52 @@ class UsersTable:
             return None
 
     def update_user_by_id(
-        self, id: str, updated: dict, db: Optional[Session] = None
+        self,
+        id: str,
+        updated: dict,
+        db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[UserModel]:
         try:
             with get_db_context(db) as db:
                 user = db.query(User).filter_by(id=id).first()
                 if not user:
                     return None
+                role_update = updated.get("role")
                 for key, value in updated.items():
                     setattr(user, key, value)
-                db.commit()
-                db.refresh(user)
+                if role_update is not None:
+                    if role_update != "admin":
+                        self._set_primary_admin_flag(user, False)
+                        if not self._find_primary_admin_row(db):
+                            candidate = (
+                                db.query(User)
+                                .filter(User.role == "admin")
+                                .order_by(User.created_at)
+                                .first()
+                            )
+                            if candidate:
+                                self._set_primary_admin_flag(candidate, True)
+                    else:
+                        if not self._find_primary_admin_row(db):
+                            self._set_primary_admin_flag(user, True)
+
+                if commit:
+                    db.commit()
+                    db.refresh(user)
+                else:
+                    db.flush()
                 return UserModel.model_validate(user)
         except Exception as e:
             print(e)
             return None
 
     def update_user_settings_by_id(
-        self, id: str, updated: dict, db: Optional[Session] = None
+        self,
+        id: str,
+        updated: dict,
+        db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[UserModel]:
         try:
             with get_db_context(db) as db:
@@ -742,29 +942,50 @@ class UsersTable:
                 user_settings.update(updated)
 
                 db.query(User).filter_by(id=id).update({"settings": user_settings})
-                db.commit()
+                if commit:
+                    db.commit()
+                else:
+                    db.flush()
 
                 user = db.query(User).filter_by(id=id).first()
                 return UserModel.model_validate(user)
         except Exception:
             return None
 
-    def delete_user_by_id(self, id: str, db: Optional[Session] = None) -> bool:
+    def delete_user_by_id(
+        self, id: str, db: Optional[Session] = None, commit: bool = True
+    ) -> bool:
         try:
-            # Remove User from Groups
-            Groups.remove_user_from_all_groups(id)
+            with get_db_context(db) as db:
+                group_ids = [
+                    group_id
+                    for (group_id,) in db.query(GroupMember.group_id)
+                    .filter(GroupMember.user_id == id)
+                    .distinct()
+                    .all()
+                ]
+                if group_ids:
+                    db.query(GroupMember).filter(
+                        GroupMember.user_id == id,
+                        GroupMember.group_id.in_(group_ids),
+                    ).delete(synchronize_session=False)
+                    db.query(Group).filter(Group.id.in_(group_ids)).update(
+                        {"updated_at": int(time.time())},
+                        synchronize_session=False,
+                    )
 
-            # Delete User Chats
-            result = Chats.delete_chats_by_user_id(id, db=db)
-            if result:
-                with get_db_context(db) as db:
-                    # Delete User
-                    db.query(User).filter_by(id=id).delete()
+                result = Chats.delete_chats_by_user_id(id, db=db, commit=False)
+                if not result:
+                    db.rollback()
+                    return False
+
+                db.query(User).filter_by(id=id).delete()
+                if commit:
                     db.commit()
+                else:
+                    db.flush()
 
                 return True
-            else:
-                return False
         except Exception:
             return False
 
@@ -779,12 +1000,15 @@ class UsersTable:
             return None
 
     def update_user_api_key_by_id(
-        self, id: str, api_key: str, db: Optional[Session] = None
+        self,
+        id: str,
+        api_key: str,
+        db: Optional[Session] = None,
+        commit: bool = True,
     ) -> bool:
         try:
             with get_db_context(db) as db:
                 db.query(ApiKey).filter_by(user_id=id).delete()
-                db.commit()
 
                 now = int(time.time())
                 new_api_key = ApiKey(
@@ -795,7 +1019,10 @@ class UsersTable:
                     updated_at=now,
                 )
                 db.add(new_api_key)
-                db.commit()
+                if commit:
+                    db.commit()
+                else:
+                    db.flush()
 
                 return True
 
@@ -819,12 +1046,7 @@ class UsersTable:
             return [user.id for user in users]
 
     def get_super_admin_user(self, db: Optional[Session] = None) -> Optional[UserModel]:
-        with get_db_context(db) as db:
-            user = db.query(User).filter_by(role="admin").first()
-            if user:
-                return UserModel.model_validate(user)
-            else:
-                return None
+        return self.ensure_primary_admin(db=db, commit=True)
 
     def get_active_user_count(self, db: Optional[Session] = None) -> int:
         with get_db_context(db) as db:

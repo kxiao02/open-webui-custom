@@ -68,7 +68,11 @@ from open_webui.socket.main import (
     get_event_emitter,
     get_models_in_use,
 )
-from open_webui.routers.retrieval import get_ef, get_rf
+from open_webui.routers.retrieval import (
+    get_ef,
+    get_rf,
+    initialize_retrieval_runtime,
+)
 from open_webui.retrieval.utils import (
     get_embedding_function,
     get_reranking_function,
@@ -406,6 +410,23 @@ from open_webui.config import (
     OAUTH_USERNAME_CLAIM,
     OAUTH_ALLOWED_ROLES,
     OAUTH_ADMIN_ROLES,
+    # Enterprise OAuth (non oauth.*)
+    ENTERPRISE_OAUTH_ENABLED,
+    ENTERPRISE_OAUTH_PROVIDER_NAME,
+    ENTERPRISE_OAUTH_CLIENT_ID,
+    ENTERPRISE_OAUTH_CLIENT_SECRET,
+    ENTERPRISE_OAUTH_AUTHORIZE_URL,
+    ENTERPRISE_OAUTH_TOKEN_URL,
+    ENTERPRISE_OAUTH_PROFILE_URL,
+    ENTERPRISE_OAUTH_CHECK_TOKEN_URL,
+    ENTERPRISE_OAUTH_LOGOUT_URL,
+    ENTERPRISE_OAUTH_REDIRECT_URI,
+    ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM,
+    ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM,
+    ENTERPRISE_OAUTH_ID_CLAIM,
+    ENTERPRISE_OAUTH_ACCOUNT_NO_PATH,
+    ENTERPRISE_OAUTH_EMAIL_CLAIM,
+    ENTERPRISE_OAUTH_EMAIL_DOMAIN,
     # WebUI (LDAP)
     ENABLE_LDAP,
     LDAP_SERVER_LABEL,
@@ -614,11 +635,19 @@ async def lifespan(app: FastAPI):
     if LICENSE_KEY:
         get_license_data(app, LICENSE_KEY)
 
-    # Create admin account from env vars if specified and no users exist
+    # Create admin account from env vars only for initial bootstrap
     if WEBUI_ADMIN_EMAIL and WEBUI_ADMIN_PASSWORD:
-        if create_admin_user(WEBUI_ADMIN_EMAIL, WEBUI_ADMIN_PASSWORD, WEBUI_ADMIN_NAME):
-            # Disable signup since we now have an admin
-            app.state.config.ENABLE_SIGNUP = False
+        user_count = Users.get_num_users()
+        if user_count == 0:
+            if create_admin_user(
+                WEBUI_ADMIN_EMAIL, WEBUI_ADMIN_PASSWORD, WEBUI_ADMIN_NAME
+            ):
+                # Disable signup since we now have an admin
+                app.state.config.ENABLE_SIGNUP = False
+        elif user_count is None:
+            log.warning(
+                "Skipping admin bootstrap: unable to determine existing user count."
+            )
 
     # This should be blocking (sync) so functions are not deactivated on first /get_models calls
     # when the first user lands on the / route.
@@ -670,6 +699,11 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning(f"Failed to pre-fetch models at startup: {e}")
 
+    try:
+        await prewarm_runtime_dependencies(app)
+    except Exception as e:
+        log.warning(f"Failed to prewarm runtime dependencies at startup: {e}")
+
     # Pre-fetch tool server specs so the first request doesn't pay the latency cost
     if len(app.state.config.TOOL_SERVER_CONNECTIONS) > 0:
         log.info("Initializing tool servers...")
@@ -703,6 +737,46 @@ async def lifespan(app: FastAPI):
 
     if hasattr(app.state, "redis_task_command_listener"):
         app.state.redis_task_command_listener.cancel()
+
+
+def _should_prewarm_retrieval(app: FastAPI) -> bool:
+    return bool(
+        app.state.config.RAG_EMBEDDING_MODEL
+        and not app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
+    )
+
+
+async def prewarm_runtime_dependencies(app: FastAPI):
+    if _should_prewarm_retrieval(app):
+        try:
+            log.info("Prewarming retrieval runtime...")
+            await asyncio.to_thread(initialize_retrieval_runtime, app)
+        except Exception as e:
+            log.warning(f"Failed to prewarm retrieval runtime: {e}")
+    else:
+        log.info("Skipping retrieval runtime prewarm.")
+
+    try:
+        import tiktoken
+
+        encoding_name = str(app.state.config.TIKTOKEN_ENCODING_NAME)
+        if encoding_name:
+            log.info(f"Prewarming tiktoken encoding: {encoding_name}")
+            await asyncio.to_thread(tiktoken.get_encoding, encoding_name)
+    except Exception as e:
+        log.warning(f"Failed to prewarm tiktoken encoding: {e}")
+
+    whisper_model = str(app.state.config.WHISPER_MODEL).strip()
+    if whisper_model and app.state.faster_whisper_model is None:
+        try:
+            log.info(f"Prewarming whisper model: {whisper_model}")
+            app.state.faster_whisper_model = await asyncio.to_thread(
+                audio.set_faster_whisper_model,
+                whisper_model,
+                WHISPER_MODEL_AUTO_UPDATE,
+            )
+        except Exception as e:
+            log.warning(f"Failed to prewarm whisper model: {e}")
 
 
 app = FastAPI(
@@ -895,6 +969,28 @@ app.state.config.ENABLE_OAUTH_ROLE_MANAGEMENT = ENABLE_OAUTH_ROLE_MANAGEMENT
 app.state.config.OAUTH_ROLES_CLAIM = OAUTH_ROLES_CLAIM
 app.state.config.OAUTH_ALLOWED_ROLES = OAUTH_ALLOWED_ROLES
 app.state.config.OAUTH_ADMIN_ROLES = OAUTH_ADMIN_ROLES
+
+# Enterprise OAuth (non oauth.* prefix)
+app.state.config.ENTERPRISE_OAUTH_ENABLED = ENTERPRISE_OAUTH_ENABLED
+app.state.config.ENTERPRISE_OAUTH_PROVIDER_NAME = ENTERPRISE_OAUTH_PROVIDER_NAME
+app.state.config.ENTERPRISE_OAUTH_CLIENT_ID = ENTERPRISE_OAUTH_CLIENT_ID
+app.state.config.ENTERPRISE_OAUTH_CLIENT_SECRET = ENTERPRISE_OAUTH_CLIENT_SECRET
+app.state.config.ENTERPRISE_OAUTH_AUTHORIZE_URL = ENTERPRISE_OAUTH_AUTHORIZE_URL
+app.state.config.ENTERPRISE_OAUTH_TOKEN_URL = ENTERPRISE_OAUTH_TOKEN_URL
+app.state.config.ENTERPRISE_OAUTH_PROFILE_URL = ENTERPRISE_OAUTH_PROFILE_URL
+app.state.config.ENTERPRISE_OAUTH_CHECK_TOKEN_URL = ENTERPRISE_OAUTH_CHECK_TOKEN_URL
+app.state.config.ENTERPRISE_OAUTH_LOGOUT_URL = ENTERPRISE_OAUTH_LOGOUT_URL
+app.state.config.ENTERPRISE_OAUTH_REDIRECT_URI = ENTERPRISE_OAUTH_REDIRECT_URI
+app.state.config.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM = (
+    ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM
+)
+app.state.config.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM = (
+    ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM
+)
+app.state.config.ENTERPRISE_OAUTH_ID_CLAIM = ENTERPRISE_OAUTH_ID_CLAIM
+app.state.config.ENTERPRISE_OAUTH_ACCOUNT_NO_PATH = ENTERPRISE_OAUTH_ACCOUNT_NO_PATH
+app.state.config.ENTERPRISE_OAUTH_EMAIL_CLAIM = ENTERPRISE_OAUTH_EMAIL_CLAIM
+app.state.config.ENTERPRISE_OAUTH_EMAIL_DOMAIN = ENTERPRISE_OAUTH_EMAIL_DOMAIN
 
 app.state.config.ENABLE_LDAP = ENABLE_LDAP
 app.state.config.LDAP_SERVER_LABEL = LDAP_SERVER_LABEL
@@ -1109,66 +1205,72 @@ app.state._retrieval_runtime_signature = None
 
 app.state.YOUTUBE_LOADER_TRANSLATION = None
 
+retrieval_bootstrap_enabled = (
+    app.state.config.ENABLE_KNOWLEDGE or app.state.config.ENABLE_WEB_SEARCH
+)
 
-try:
-    app.state.ef = get_ef(
-        app.state.config.RAG_EMBEDDING_ENGINE, app.state.config.RAG_EMBEDDING_MODEL
+if retrieval_bootstrap_enabled:
+    try:
+        app.state.ef = get_ef(
+            app.state.config.RAG_EMBEDDING_ENGINE, app.state.config.RAG_EMBEDDING_MODEL
+        )
+        if (
+            app.state.config.ENABLE_RAG_HYBRID_SEARCH
+            and not app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
+        ):
+            app.state.rf = get_rf(
+                app.state.config.RAG_RERANKING_ENGINE,
+                app.state.config.RAG_RERANKING_MODEL,
+                app.state.config.RAG_EXTERNAL_RERANKER_URL,
+                app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
+                app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
+            )
+        else:
+            app.state.rf = None
+    except Exception as e:
+        log.error(f"Error updating models: {e}")
+
+    app.state.EMBEDDING_FUNCTION = get_embedding_function(
+        app.state.config.RAG_EMBEDDING_ENGINE,
+        app.state.config.RAG_EMBEDDING_MODEL,
+        embedding_function=app.state.ef,
+        url=(
+            app.state.config.RAG_OPENAI_API_BASE_URL
+            if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else (
+                app.state.config.RAG_OLLAMA_BASE_URL
+                if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
+                else app.state.config.RAG_AZURE_OPENAI_BASE_URL
+            )
+        ),
+        key=(
+            app.state.config.RAG_OPENAI_API_KEY
+            if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else (
+                app.state.config.RAG_OLLAMA_API_KEY
+                if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
+                else app.state.config.RAG_AZURE_OPENAI_API_KEY
+            )
+        ),
+        embedding_batch_size=app.state.config.RAG_EMBEDDING_BATCH_SIZE,
+        azure_api_version=(
+            app.state.config.RAG_AZURE_OPENAI_API_VERSION
+            if app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
+            else None
+        ),
+        enable_async=app.state.config.ENABLE_ASYNC_EMBEDDING,
+        concurrent_requests=app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
     )
-    if (
-        app.state.config.ENABLE_RAG_HYBRID_SEARCH
-        and not app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
-    ):
-        app.state.rf = get_rf(
-            app.state.config.RAG_RERANKING_ENGINE,
-            app.state.config.RAG_RERANKING_MODEL,
-            app.state.config.RAG_EXTERNAL_RERANKER_URL,
-            app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
-            app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
-        )
-    else:
-        app.state.rf = None
-except Exception as e:
-    log.error(f"Error updating models: {e}")
-    pass
 
-
-app.state.EMBEDDING_FUNCTION = get_embedding_function(
-    app.state.config.RAG_EMBEDDING_ENGINE,
-    app.state.config.RAG_EMBEDDING_MODEL,
-    embedding_function=app.state.ef,
-    url=(
-        app.state.config.RAG_OPENAI_API_BASE_URL
-        if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-        else (
-            app.state.config.RAG_OLLAMA_BASE_URL
-            if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-            else app.state.config.RAG_AZURE_OPENAI_BASE_URL
-        )
-    ),
-    key=(
-        app.state.config.RAG_OPENAI_API_KEY
-        if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-        else (
-            app.state.config.RAG_OLLAMA_API_KEY
-            if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-            else app.state.config.RAG_AZURE_OPENAI_API_KEY
-        )
-    ),
-    embedding_batch_size=app.state.config.RAG_EMBEDDING_BATCH_SIZE,
-    azure_api_version=(
-        app.state.config.RAG_AZURE_OPENAI_API_VERSION
-        if app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
-        else None
-    ),
-    enable_async=app.state.config.ENABLE_ASYNC_EMBEDDING,
-    concurrent_requests=app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
-)
-
-app.state.RERANKING_FUNCTION = get_reranking_function(
-    app.state.config.RAG_RERANKING_ENGINE,
-    app.state.config.RAG_RERANKING_MODEL,
-    reranking_function=app.state.rf,
-)
+    app.state.RERANKING_FUNCTION = get_reranking_function(
+        app.state.config.RAG_RERANKING_ENGINE,
+        app.state.config.RAG_RERANKING_MODEL,
+        reranking_function=app.state.rf,
+    )
+else:
+    log.info(
+        "Skipping retrieval model bootstrap because knowledge and web search are disabled."
+    )
 ########################################
 #
 # CODE EXECUTION

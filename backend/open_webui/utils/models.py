@@ -421,7 +421,8 @@ def check_model_access(user, model, db=None):
     else:
         model_info = Models.get_model_by_id(model.get("id"), db=db)
         if not model_info:
-            raise Exception("Model not found")
+            # Base/provider models without a custom DB record are shared chat targets.
+            return
         elif not (
             user.id == model_info.user_id
             or AccessGrants.has_access(
@@ -489,6 +490,9 @@ def get_filtered_models(models, user, db=None):
                     or model["id"] in accessible_model_ids
                 ):
                     filtered_models.append(model)
+            else:
+                # Provider/base models without a custom model record remain readable.
+                filtered_models.append(model)
 
         return filtered_models
     else:

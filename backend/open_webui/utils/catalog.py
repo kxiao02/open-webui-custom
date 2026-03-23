@@ -47,6 +47,9 @@ def is_tool_catalog_visible(tool: Any, user: Any, user_group_ids: set[str], db=N
     if getattr(user, "role", None) == "admin":
         return True
 
+    if getattr(tool, "user_id", None) == getattr(user, "id", None):
+        return True
+
     if not is_catalog_published(getattr(tool, "meta", None)):
         return False
 

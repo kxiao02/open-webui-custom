@@ -14,7 +14,7 @@
 	import { getTools } from '$lib/apis/tools';
 	import { getBanners } from '$lib/apis/configs';
 	import { getTerminalServers } from '$lib/apis/terminal';
-	import { getUserSettings } from '$lib/apis/users';
+	import { getUserSettings, updateUserSettings } from '$lib/apis/users';
 
 	import { WEBUI_VERSION, WEBUI_API_BASE_URL } from '$lib/constants';
 	import {
@@ -87,21 +87,83 @@
 			return null;
 		});
 
-		if (!userSettings) {
-			try {
-				userSettings = JSON.parse(localStorage.getItem('settings') ?? '{}');
-			} catch (e: unknown) {
-				console.error('Failed to parse settings from localStorage', e);
-				userSettings = {};
-			}
-		}
-
 		if (userSettings?.ui) {
 			settings.set(userSettings.ui);
+		} else {
+			settings.set({});
 		}
 
 		if (cb) {
 			await cb();
+		}
+	};
+
+	const normalizeModelIds = (value: unknown): string[] => {
+		if (!Array.isArray(value)) {
+			return [];
+		}
+
+		return [...new Set(value.map((id) => (typeof id === 'string' ? id.trim() : '')).filter(Boolean))];
+	};
+
+	const areStringArraysEqual = (a: string[], b: string[]) => {
+		if (a.length !== b.length) {
+			return false;
+		}
+
+		return a.every((value, index) => value === b[index]);
+	};
+
+	const repairUserModelSettings = async () => {
+		const visibleModelIds = $models
+			.filter((model) => !(model?.info?.meta?.hidden ?? false))
+			.map((model) => model.id);
+
+		if (visibleModelIds.length === 0) {
+			return;
+		}
+
+		const configuredDefaultModelIds = ($config?.default_models ?? '')
+			.split(',')
+			.map((id) => id.trim())
+			.filter((id) => id && visibleModelIds.includes(id));
+
+		const currentSettings = $settings ?? {};
+		const originalModels = normalizeModelIds(currentSettings?.models);
+		const originalPinnedModels = normalizeModelIds(currentSettings?.pinnedModels);
+		const currentModels = originalModels.filter((id) =>
+			visibleModelIds.includes(id)
+		);
+		const currentPinnedModels = originalPinnedModels.filter((id) =>
+			visibleModelIds.includes(id)
+		);
+
+		const nextModels =
+			currentModels.length > 0
+				? currentModels
+				: configuredDefaultModelIds.length > 0
+					? configuredDefaultModelIds
+					: [visibleModelIds[0]];
+
+		const modelsChanged = !areStringArraysEqual(originalModels, nextModels);
+		const pinnedModelsChanged = !areStringArraysEqual(originalPinnedModels, currentPinnedModels);
+
+		if (!modelsChanged && !pinnedModelsChanged) {
+			return;
+		}
+
+		const nextSettings = {
+			...currentSettings,
+			models: nextModels,
+			pinnedModels: currentPinnedModels
+		};
+
+		settings.set(nextSettings);
+
+		try {
+			await updateUserSettings(localStorage.token, { ui: nextSettings });
+		} catch (error) {
+			console.error('Failed to repair user model settings', error);
 		}
 	};
 
@@ -112,6 +174,7 @@
 				$config?.features?.enable_direct_connections ? ($settings?.directConnections ?? null) : null
 			)
 		);
+		await repairUserModelSettings();
 	};
 
 	const setToolServers = async () => {

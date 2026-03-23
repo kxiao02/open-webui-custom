@@ -7,7 +7,7 @@ from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.models.users import User, UserModel, UserProfileImageResponse, Users
 from open_webui.utils.validate import validate_profile_image_url
 from pydantic import BaseModel, field_validator
-from sqlalchemy import Boolean, Column, String, Text
+from sqlalchemy import Boolean, Column, ForeignKey, String, Text, func
 
 log = logging.getLogger(__name__)
 
@@ -19,10 +19,15 @@ log = logging.getLogger(__name__)
 class Auth(Base):
     __tablename__ = "auth"
 
-    id = Column(String, primary_key=True, unique=True)
-    email = Column(String)
-    password = Column(Text)
-    active = Column(Boolean)
+    id = Column(
+        String,
+        ForeignKey("user.id", ondelete="CASCADE"),
+        primary_key=True,
+        unique=True,
+    )
+    email = Column(String, nullable=False)
+    password = Column(Text, nullable=False)
+    active = Column(Boolean, nullable=False)
 
 
 class AuthModel(BaseModel):
@@ -97,28 +102,75 @@ class AuthsTable:
         role: str = "pending",
         oauth: Optional[dict] = None,
         db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[UserModel]:
         with get_db_context(db) as db:
             log.info("insert_new_auth")
 
-            id = str(uuid.uuid4())
+            email = email.lower()
+            existing_user = Users.get_user_by_email(email, db=db)
+            try:
+                if existing_user:
+                    auth = db.query(Auth).filter_by(id=existing_user.id).first()
+                    if auth:
+                        auth.email = email
+                        auth.password = password
+                        auth.active = True
+                    else:
+                        db.add(
+                            Auth(
+                                id=existing_user.id,
+                                email=email,
+                                password=password,
+                                active=True,
+                            )
+                        )
 
-            auth = AuthModel(
-                **{"id": id, "email": email, "password": password, "active": True}
-            )
-            result = Auth(**auth.model_dump())
-            db.add(result)
+                    if existing_user.role == "admin" or role == "admin":
+                        Users.ensure_primary_admin(
+                            existing_user.id, db=db, commit=False
+                        )
 
-            user = Users.insert_new_user(
-                id, name, email, profile_image_url, role, oauth=oauth, db=db
-            )
+                    if commit:
+                        db.commit()
+                    else:
+                        db.flush()
+                    return Users.get_user_by_id(existing_user.id, db=db)
 
-            db.commit()
-            db.refresh(result)
+                id = str(uuid.uuid4())
 
-            if result and user:
-                return user
-            else:
+                auth = AuthModel(
+                    **{"id": id, "email": email, "password": password, "active": True}
+                )
+                result = Auth(**auth.model_dump())
+                db.add(result)
+
+                user = Users.insert_new_user(
+                    id,
+                    name,
+                    email,
+                    profile_image_url,
+                    role,
+                    oauth=oauth,
+                    db=db,
+                    commit=False,
+                )
+                if not user:
+                    db.rollback()
+                    return None
+
+                if role == "admin":
+                    Users.ensure_primary_admin(id, db=db, commit=False)
+
+                if commit:
+                    db.commit()
+                    db.refresh(result)
+                else:
+                    db.flush()
+
+                return Users.get_user_by_id(id, db=db)
+            except Exception:
+                db.rollback()
                 return None
 
     def authenticate_user(
@@ -163,11 +215,10 @@ class AuthsTable:
         log.info(f"authenticate_user_by_email: {email}")
         try:
             with get_db_context(db) as db:
-                # Single JOIN query instead of two separate queries
                 result = (
                     db.query(Auth, User)
                     .join(User, Auth.id == User.id)
-                    .filter(Auth.email == email, Auth.active == True)
+                    .filter(func.lower(User.email) == email.lower(), Auth.active == True)
                     .first()
                 )
                 if result:
@@ -178,41 +229,66 @@ class AuthsTable:
             return None
 
     def update_user_password_by_id(
-        self, id: str, new_password: str, db: Optional[Session] = None
+        self,
+        id: str,
+        new_password: str,
+        db: Optional[Session] = None,
+        commit: bool = True,
     ) -> bool:
         try:
             with get_db_context(db) as db:
                 result = (
                     db.query(Auth).filter_by(id=id).update({"password": new_password})
                 )
-                db.commit()
+                if commit:
+                    db.commit()
+                else:
+                    db.flush()
                 return True if result == 1 else False
         except Exception:
             return False
 
     def update_email_by_id(
-        self, id: str, email: str, db: Optional[Session] = None
+        self,
+        id: str,
+        email: str,
+        db: Optional[Session] = None,
+        commit: bool = True,
     ) -> bool:
         try:
             with get_db_context(db) as db:
-                result = db.query(Auth).filter_by(id=id).update({"email": email})
-                db.commit()
-                if result == 1:
-                    Users.update_user_by_id(id, {"email": email}, db=db)
-                    return True
-                return False
+                auth = db.query(Auth).filter_by(id=id).first()
+                user = db.query(User).filter_by(id=id).first()
+                if not user:
+                    return False
+
+                if auth:
+                    auth.email = email
+                user.email = email
+
+                if commit:
+                    db.commit()
+                else:
+                    db.flush()
+
+                return True
         except Exception:
             return False
 
-    def delete_auth_by_id(self, id: str, db: Optional[Session] = None) -> bool:
+    def delete_auth_by_id(
+        self, id: str, db: Optional[Session] = None, commit: bool = True
+    ) -> bool:
         try:
             with get_db_context(db) as db:
                 # Delete User
-                result = Users.delete_user_by_id(id, db=db)
+                result = Users.delete_user_by_id(id, db=db, commit=False)
 
                 if result:
                     db.query(Auth).filter_by(id=id).delete()
-                    db.commit()
+                    if commit:
+                        db.commit()
+                    else:
+                        db.flush()
 
                     return True
                 else:

@@ -16,6 +16,8 @@ export const WEBUI_VERSION: Writable<string | null> = writable(null);
 export const WEBUI_DEPLOYMENT_ID: Writable<string | null> = writable(null);
 
 export const config: Writable<Config | undefined> = writable(undefined);
+export const configStatus: Writable<'idle' | 'loading' | 'ready' | 'error'> = writable('idle');
+export const configError: Writable<string | null> = writable(null);
 export const user: Writable<SessionUser | undefined> = writable(undefined);
 
 // Electron App

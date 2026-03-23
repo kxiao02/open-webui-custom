@@ -12,6 +12,8 @@
 	import { onMount, tick, setContext, onDestroy } from 'svelte';
 	import {
 		config,
+		configStatus,
+		configError,
 		user,
 		settings,
 		theme,
@@ -692,6 +694,8 @@
 			const res = await userSignOut();
 			user.set(null);
 			localStorage.removeItem('token');
+			localStorage.removeItem('settings');
+			settings.set({});
 
 			location.href = res?.redirect_url ?? '/auth';
 		}
@@ -823,7 +827,7 @@
 				if (userSettings) {
 					settings.set(userSettings.ui);
 				} else {
-					settings.set(JSON.parse(localStorage.getItem('settings') ?? '{}'));
+					settings.set({});
 				}
 				setTextScale($settings?.textScale ?? 1);
 
@@ -835,8 +839,12 @@
 			} else {
 				$socket?.off('events', chatEventHandler);
 				$socket?.off('events:channel', channelEventHandler);
+				settings.set({});
 			}
 		});
+
+		configStatus.set('loading');
+		configError.set(null);
 
 		let backendConfig = null;
 		try {
@@ -844,6 +852,8 @@
 			console.log('Backend config:', backendConfig);
 		} catch (error) {
 			console.error('Error loading backend config:', error);
+			configError.set(error?.message ?? 'Failed to load backend config');
+			configStatus.set('error');
 		}
 		// Initialize i18n even if we didn't get a backend config,
 		// so `/error` can show something that's not `undefined`.
@@ -865,6 +875,7 @@
 			// Save Backend Status to Store
 			await config.set(backendConfig);
 			await WEBUI_NAME.set(backendConfig.name);
+			configStatus.set('ready');
 
 			if ($config) {
 				await setupSocket($config.features?.enable_websocket ?? true);
@@ -882,13 +893,19 @@
 					if (sessionUser) {
 						await user.set(sessionUser);
 						try {
+							configStatus.set('loading');
 							await config.set(await getBackendConfig());
+							configStatus.set('ready');
 						} catch (error) {
 							console.error('Error refreshing backend config:', error);
+							configError.set(error?.message ?? 'Failed to refresh backend config');
+							configStatus.set('error');
 						}
 					} else {
 						// Redirect Invalid Session User to /auth Page
 						localStorage.removeItem('token');
+						localStorage.removeItem('settings');
+						settings.set({});
 						await goto(`/auth?redirect=${encodedUrl}`);
 					}
 				} else {
@@ -901,6 +918,9 @@
 			}
 		} else {
 			// Redirect to /error when Backend Not Detected
+			if ($configStatus !== 'error') {
+				configStatus.set('error');
+			}
 			await goto(`/error`);
 		}
 

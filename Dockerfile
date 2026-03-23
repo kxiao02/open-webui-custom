@@ -28,7 +28,8 @@ ARG NPM_CONFIG_REGISTRY
 ARG GITHUB_MIRROR_PREFIX
 ARG NODE_MAX_OLD_SPACE_SIZE=4096
 ARG SKIP_PYODIDE_FETCH=false
-ARG HF_ENDPOINT
+ARG SKIP_NLTK_PRELOAD=false
+ARG HF_ENDPOINT=https://huggingface.co
 ARG PIP_INDEX_URL
 ARG UV_INDEX_URL
 ARG PIP_TRUSTED_HOST
@@ -36,6 +37,7 @@ ARG PYTORCH_INDEX_URL_CPU
 ARG PYTORCH_INDEX_URL_CUDA
 ARG APT_MIRROR
 ARG APT_SECURITY_MIRROR
+ARG SKIP_NLTK_PRELOAD
 
 ######## WebUI frontend ########
 FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS build
@@ -84,7 +86,7 @@ ARG USE_RERANKING_MODEL
 ARG USE_AUXILIARY_EMBEDDING_MODEL
 ARG UID
 ARG GID
-ARG HF_ENDPOINT
+ARG HF_ENDPOINT=https://huggingface.co
 ARG PIP_INDEX_URL
 ARG UV_INDEX_URL
 ARG PIP_TRUSTED_HOST
@@ -93,6 +95,7 @@ ARG PYTORCH_INDEX_URL_CUDA
 ARG GITHUB_MIRROR_PREFIX
 ARG APT_MIRROR
 ARG APT_SECURITY_MIRROR
+ARG SKIP_NLTK_PRELOAD
 
 # Python settings
 ENV PYTHONUNBUFFERED=1
@@ -126,6 +129,8 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST} \
     PYTORCH_INDEX_URL_CPU=${PYTORCH_INDEX_URL_CPU} \
     PYTORCH_INDEX_URL_CUDA=${PYTORCH_INDEX_URL_CUDA}
+
+ENV SKIP_NLTK_PRELOAD=${SKIP_NLTK_PRELOAD}
 
 #### Other models #########################################################
 ## whisper TTS model settings ##
@@ -195,7 +200,8 @@ RUN if [ -n "$APT_MIRROR" ] || [ -n "$APT_SECURITY_MIRROR" ]; then \
 COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
 COPY --chown=$UID:$GID ./backend/requirements-min.txt ./requirements-min.txt
 
-RUN pip3 install --no-cache-dir uv && \
+RUN set -e; \
+    pip3 install --no-cache-dir uv && \
     if [ "$USE_CUDA" = "true" ]; then \
     # If you use CUDA the whisper and embedding model will be downloaded on first use
     # fix: pin torch<=2.9.1 - torch 2.10.0 aarch64 wheels cause SIGILL on ARM devices (RPi 4 Cortex-A72) #21349
@@ -257,9 +263,15 @@ import io
 import os
 import urllib.request
 import zipfile
+import sys
 
 download_dir = os.environ.get("NLTK_DATA", "/usr/local/share/nltk_data")
 mirror_prefix = (os.environ.get("GITHUB_MIRROR_PREFIX") or "").strip().rstrip("/")
+skip_nltk_preload = (os.environ.get("SKIP_NLTK_PRELOAD") or "").lower() == "true"
+
+if skip_nltk_preload:
+    print("Skipping NLTK preload during image build")
+    sys.exit(0)
 
 resources = [
     ("taggers", "averaged_perceptron_tagger_eng"),

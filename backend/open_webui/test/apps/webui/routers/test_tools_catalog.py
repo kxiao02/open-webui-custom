@@ -9,9 +9,16 @@ from open_webui.test_support import AbstractPostgresTest, mock_webui_user
 from open_webui.utils import tools as tool_utils
 
 
-def _insert_tool(db, tool_id: str, *, meta: dict):
+VALID_TOOL_CONTENT = """
+class Tools:
+    def ping(self) -> str:
+        return "pong"
+""".strip()
+
+
+def _insert_tool(db, tool_id: str, *, meta: dict, owner_id: str = "admin-1"):
     return Tools.insert_new_tool(
-        "admin-1",
+        owner_id,
         ToolForm(
             id=tool_id,
             name=tool_id,
@@ -38,23 +45,24 @@ class TestToolCatalogRouters(AbstractPostgresTest):
         self.request.app.state.TOOLS = {}
         self.request.app.state.config.TOOL_SERVER_CONNECTIONS = []
 
-    def test_non_admin_cannot_create_or_update_tools(self):
+    def test_non_admin_can_create_own_tool_but_cannot_update_others(self):
         with mock_webui_user(id="2", role="user") as user:
-            with pytest.raises(HTTPException) as create_exc:
-                self.run_async(
-                    tools.create_new_tools(
-                        request=self.request,
-                        form_data=ToolForm(
-                            id="user_tool",
-                            name="user_tool",
-                            content="pass",
-                            meta={"description": "tool"},
-                        ),
-                        user=user,
-                        db=self.db,
-                    )
+            created = self.run_async(
+                tools.create_new_tools(
+                    request=self.request,
+                    form_data=ToolForm(
+                        id="user_tool",
+                        name="user_tool",
+                        content=VALID_TOOL_CONTENT,
+                        meta={"description": "tool"},
+                    ),
+                    user=user,
+                    db=self.db,
                 )
-            assert create_exc.value.status_code == 401
+            )
+            assert created is not None
+            assert created.user_id == "2"
+            assert created.id == "user_tool"
 
             _insert_tool(
                 self.db,
@@ -100,6 +108,80 @@ class TestToolCatalogRouters(AbstractPostgresTest):
             assert visible.id == "public_tool"
             assert visible.write_access is False
 
+    def test_owner_can_view_unpublished_hidden_custom_tool(self):
+        _insert_tool(
+            self.db,
+            "owner_draft_tool",
+            meta={"description": "owner", "published": False, "visibility": "hidden"},
+            owner_id="user-1",
+        )
+
+        with mock_webui_user(id="user-1", role="user") as owner:
+            visible = self.run_async(
+                tools.get_tools_by_id("owner_draft_tool", user=owner, db=self.db)
+            )
+            assert visible.id == "owner_draft_tool"
+            assert visible.write_access is True
+
+        with mock_webui_user(id="user-2", role="user") as other:
+            with pytest.raises(HTTPException) as exc_info:
+                self.run_async(
+                    tools.get_tools_by_id("owner_draft_tool", user=other, db=self.db)
+                )
+            assert exc_info.value.status_code == 401
+
+    def test_non_admin_cannot_update_default_tool_even_if_owner(self):
+        _insert_tool(
+            self.db,
+            "default_tool",
+            meta={
+                "description": "default",
+                "published": True,
+                "visibility": "public",
+                "is_default": True,
+            },
+            owner_id="user-1",
+        )
+
+        with mock_webui_user(id="user-1", role="user") as user:
+            with pytest.raises(HTTPException) as exc_info:
+                self.run_async(
+                    tools.update_tools_by_id(
+                        request=self.request,
+                        id="default_tool",
+                        form_data=ToolForm(
+                            id="default_tool",
+                            name="default_tool",
+                            content="pass",
+                            meta={
+                                "description": "updated",
+                                "published": True,
+                                "visibility": "public",
+                                "is_default": True,
+                            },
+                        ),
+                        user=user,
+                        db=self.db,
+                    )
+                )
+            assert exc_info.value.status_code == 401
+
+    def test_owner_write_access_for_custom_tool(self):
+        _insert_tool(
+            self.db,
+            "owner_tool",
+            meta={"description": "owner", "published": True, "visibility": "public"},
+            owner_id="user-1",
+        )
+
+        with mock_webui_user(id="user-1", role="user") as owner:
+            visible = self.run_async(tools.get_tools_by_id("owner_tool", user=owner, db=self.db))
+            assert visible.write_access is True
+
+        with mock_webui_user(id="user-2", role="user") as other:
+            visible = self.run_async(tools.get_tools_by_id("owner_tool", user=other, db=self.db))
+            assert visible.write_access is False
+
     def test_runtime_get_tools_filters_unpublished_tools(self):
         _insert_tool(
             self.db,
@@ -138,3 +220,96 @@ class TestToolCatalogRouters(AbstractPostgresTest):
             )
 
         assert sorted(resolved.keys()) == ["public_tool_call"]
+
+    def test_get_tool_list_includes_server_tools(self, monkeypatch):
+        server_id = "server-1"
+        self.request.app.state.config.TOOL_SERVER_CONNECTIONS = [
+            {
+                "config": {
+                    "access_grants": [
+                        {
+                            "principal_type": "user",
+                            "principal_id": "*",
+                            "permission": "read",
+                        }
+                    ]
+                }
+            }
+        ]
+
+        async def _fake_get_tool_servers(_request):
+            return [
+                {
+                    "id": server_id,
+                    "idx": 0,
+                    "openapi": {
+                        "info": {
+                            "title": "Server Tool",
+                            "description": "Server tool description",
+                        }
+                    },
+                    "specs": [],
+                }
+            ]
+
+        monkeypatch.setattr(tools, "get_tool_servers", _fake_get_tool_servers)
+
+        with mock_webui_user(id="2", role="user") as user:
+            result = self.run_async(
+                tools.get_tool_list(request=self.request, user=user, db=self.db)
+            )
+
+        server_tool = next((tool for tool in result if tool.id == f"server:{server_id}"), None)
+        assert server_tool is not None
+        assert server_tool.write_access is False
+
+    def test_install_uninstall_server_tool(self, monkeypatch):
+        server_id = "server-1"
+        tool_id = f"server:{server_id}"
+        self.request.app.state.config.TOOL_SERVER_CONNECTIONS = [
+            {
+                "config": {
+                    "access_grants": [
+                        {
+                            "principal_type": "user",
+                            "principal_id": "*",
+                            "permission": "read",
+                        }
+                    ]
+                }
+            }
+        ]
+
+        async def _fake_get_tool_servers(_request):
+            return [
+                {
+                    "id": server_id,
+                    "idx": 0,
+                    "openapi": {
+                        "info": {
+                            "title": "Server Tool",
+                            "description": "Server tool description",
+                        }
+                    },
+                    "specs": [],
+                }
+            ]
+
+        monkeypatch.setattr(tools, "get_tool_servers", _fake_get_tool_servers)
+
+        with mock_webui_user(id="2", role="user") as user:
+            installed = self.run_async(
+                tools.install_tools_by_id(
+                    request=self.request, id=tool_id, user=user, db=self.db
+                )
+            )
+            assert installed["id"] == tool_id
+            assert installed["installed"] is True
+
+            removed = self.run_async(
+                tools.uninstall_tools_by_id(
+                    request=self.request, id=tool_id, user=user, db=self.db
+                )
+            )
+            assert removed["id"] == tool_id
+            assert removed["installed"] is False

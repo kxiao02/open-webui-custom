@@ -67,7 +67,9 @@ def run_migrations():
         migrations_path = OPEN_WEBUI_DIR / "migrations"
         alembic_cfg.set_main_option("script_location", str(migrations_path))
 
-        command.upgrade(alembic_cfg, "head")
+        # This branch currently carries multiple alembic heads, so upgrade all
+        # branch tips instead of assuming a single linear head.
+        command.upgrade(alembic_cfg, "heads")
     except Exception as e:
         log.exception(f"Error running migrations: {e}")
 
@@ -86,6 +88,16 @@ class Config(Base):
     updated_at = Column(DateTime, nullable=True, onupdate=func.now())
 
 
+def _get_latest_config_entry(db):
+    return db.query(Config).order_by(Config.id.desc()).first()
+
+
+def _prune_stale_config_entries(db, keep_id: Optional[int]) -> None:
+    if keep_id is None:
+        return
+    db.query(Config).filter(Config.id != keep_id).delete()
+
+
 def load_json_config():
     with open(f"{DATA_DIR}/config.json", "r") as file:
         return json.load(file)
@@ -93,14 +105,17 @@ def load_json_config():
 
 def save_to_db(data):
     with get_db() as db:
-        existing_config = db.query(Config).first()
-        if not existing_config:
+        existing_config = _get_latest_config_entry(db)
+        if existing_config is None:
             new_config = Config(data=data, version=0)
             db.add(new_config)
+            db.flush()
+            _prune_stale_config_entries(db, new_config.id)
         else:
             existing_config.data = data
             existing_config.updated_at = datetime.now()
             db.add(existing_config)
+            _prune_stale_config_entries(db, existing_config.id)
         db.commit()
 
 
@@ -124,22 +139,30 @@ DEFAULT_CONFIG = {
 
 def get_config():
     with get_db() as db:
-        config_entry = db.query(Config).order_by(Config.id.desc()).first()
+        config_entry = _get_latest_config_entry(db)
         return config_entry.data if config_entry else DEFAULT_CONFIG
 
 
 CONFIG_DATA = get_config()
 
 
-def get_config_value(config_path: str):
+def _get_config_value_from_data(config_path: str, data: dict):
     path_parts = config_path.split(".")
-    cur_config = CONFIG_DATA
+    cur_config = data
     for key in path_parts:
         if key in cur_config:
             cur_config = cur_config[key]
         else:
             return None
     return cur_config
+
+
+def get_config_value(config_path: str):
+    value = _get_config_value_from_data(config_path, CONFIG_DATA)
+    if value is None and config_path.startswith("enterprise_oauth."):
+        legacy_path = f"oauth.{config_path}"
+        value = _get_config_value_from_data(legacy_path, CONFIG_DATA)
+    return value
 
 
 PERSISTENT_CONFIG_REGISTRY = []
@@ -149,16 +172,65 @@ def save_config(config):
     global CONFIG_DATA
     global PERSISTENT_CONFIG_REGISTRY
     try:
+        if (
+            is_enterprise_oauth_deployment_managed()
+            and _contains_enterprise_oauth_config(config)
+        ):
+            log.warning(
+                "Enterprise OAuth is deployment-managed; ignoring persisted enterprise OAuth config."
+            )
+            config = _strip_enterprise_oauth_config(config)
         save_to_db(config)
         CONFIG_DATA = config
 
         # Trigger updates on all registered PersistentConfig entries
         for config_item in PERSISTENT_CONFIG_REGISTRY:
             config_item.update()
+
+        # Refresh OAuth providers to keep runtime config in sync.
+        load_oauth_providers()
     except Exception as e:
         log.exception(e)
         return False
     return True
+
+
+def _should_reload_oauth_providers(config_path: str) -> bool:
+    if config_path.startswith("oauth."):
+        return True
+    if not config_path.startswith("enterprise_oauth."):
+        return False
+    try:
+        deployment_managed = is_enterprise_oauth_deployment_managed()
+        missing = _enterprise_oauth_missing_fields(deployment_managed)
+        return len(missing) == 0
+    except Exception:
+        return False
+
+
+def _contains_enterprise_oauth_config(config: dict) -> bool:
+    if not isinstance(config, dict):
+        return False
+    if "enterprise_oauth" in config:
+        return True
+    oauth = config.get("oauth")
+    if isinstance(oauth, dict) and "enterprise_oauth" in oauth:
+        return True
+    return False
+
+
+def _strip_enterprise_oauth_config(config: dict) -> dict:
+    if not isinstance(config, dict):
+        return config
+    updated = dict(config)
+    if "enterprise_oauth" in updated:
+        updated.pop("enterprise_oauth", None)
+    oauth = updated.get("oauth")
+    if isinstance(oauth, dict) and "enterprise_oauth" in oauth:
+        oauth = dict(oauth)
+        oauth.pop("enterprise_oauth", None)
+        updated["oauth"] = oauth
+    return updated
 
 
 T = TypeVar("T")
@@ -169,13 +241,23 @@ ENABLE_PERSISTENT_CONFIG = (
 
 
 class PersistentConfig(Generic[T]):
-    def __init__(self, env_name: str, config_path: str, env_value: T):
+    def __init__(
+        self,
+        env_name: str,
+        config_path: str,
+        env_value: T,
+        prefer_env: bool = False,
+    ):
         self.env_name = env_name
         self.config_path = config_path
         self.env_value = env_value
+        self.prefer_env = prefer_env
+        self.env_present = env_name in os.environ
         self.config_value = get_config_value(config_path)
 
-        if self.config_value is not None and ENABLE_PERSISTENT_CONFIG:
+        if self.prefer_env and self.env_present:
+            self.value = env_value
+        elif self.config_value is not None and ENABLE_PERSISTENT_CONFIG:
             if (
                 self.config_path.startswith("oauth.")
                 and not ENABLE_OAUTH_PERSISTENT_CONFIG
@@ -209,6 +291,9 @@ class PersistentConfig(Generic[T]):
         return super().__getattribute__(item)
 
     def update(self):
+        if self.prefer_env and self.env_present:
+            self.value = self.env_value
+            return
         new_value = get_config_value(self.config_path)
         if new_value is not None:
             self.value = new_value
@@ -225,6 +310,8 @@ class PersistentConfig(Generic[T]):
         sub_config[path_parts[-1]] = self.value
         save_to_db(CONFIG_DATA)
         self.config_value = self.value
+        if _should_reload_oauth_providers(self.config_path):
+            load_oauth_providers()
 
 
 class AppConfig:
@@ -282,6 +369,10 @@ class AppConfig:
                     if self._state[key].value != decoded_value:
                         self._state[key].value = decoded_value
                         log.info(f"Updated {key} from Redis: {decoded_value}")
+                        if _should_reload_oauth_providers(
+                            self._state[key].config_path
+                        ):
+                            load_oauth_providers()
 
                 except json.JSONDecodeError:
                     log.error(f"Invalid JSON format in Redis for {key}: {redis_value}")
@@ -679,8 +770,181 @@ OAUTH_AUDIENCE = PersistentConfig(
     os.environ.get("OAUTH_AUDIENCE", ""),
 )
 
+# Enterprise OAuth uses a dedicated config path (non oauth.*) and prefers
+# deployment-provided env vars when present.
+ENTERPRISE_OAUTH_ENABLED = PersistentConfig(
+    "ENTERPRISE_OAUTH_ENABLED",
+    "enterprise_oauth.enabled",
+    os.environ.get("ENTERPRISE_OAUTH_ENABLED", "False").lower() == "true",
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_PROVIDER_NAME = PersistentConfig(
+    "ENTERPRISE_OAUTH_PROVIDER_NAME",
+    "enterprise_oauth.provider_name",
+    os.environ.get("ENTERPRISE_OAUTH_PROVIDER_NAME", "Enterprise SSO"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_CLIENT_ID = PersistentConfig(
+    "ENTERPRISE_OAUTH_CLIENT_ID",
+    "enterprise_oauth.client_id",
+    os.environ.get("ENTERPRISE_OAUTH_CLIENT_ID", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_CLIENT_SECRET = PersistentConfig(
+    "ENTERPRISE_OAUTH_CLIENT_SECRET",
+    "enterprise_oauth.client_secret",
+    os.environ.get("ENTERPRISE_OAUTH_CLIENT_SECRET", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_AUTHORIZE_URL = PersistentConfig(
+    "ENTERPRISE_OAUTH_AUTHORIZE_URL",
+    "enterprise_oauth.authorize_url",
+    os.environ.get("ENTERPRISE_OAUTH_AUTHORIZE_URL", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_TOKEN_URL = PersistentConfig(
+    "ENTERPRISE_OAUTH_TOKEN_URL",
+    "enterprise_oauth.token_url",
+    os.environ.get("ENTERPRISE_OAUTH_TOKEN_URL", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_PROFILE_URL = PersistentConfig(
+    "ENTERPRISE_OAUTH_PROFILE_URL",
+    "enterprise_oauth.profile_url",
+    os.environ.get("ENTERPRISE_OAUTH_PROFILE_URL", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_CHECK_TOKEN_URL = PersistentConfig(
+    "ENTERPRISE_OAUTH_CHECK_TOKEN_URL",
+    "enterprise_oauth.check_token_url",
+    os.environ.get("ENTERPRISE_OAUTH_CHECK_TOKEN_URL", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_LOGOUT_URL = PersistentConfig(
+    "ENTERPRISE_OAUTH_LOGOUT_URL",
+    "enterprise_oauth.logout_url",
+    os.environ.get("ENTERPRISE_OAUTH_LOGOUT_URL", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_REDIRECT_URI = PersistentConfig(
+    "ENTERPRISE_OAUTH_REDIRECT_URI",
+    "enterprise_oauth.redirect_uri",
+    os.environ.get("ENTERPRISE_OAUTH_REDIRECT_URI", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM = PersistentConfig(
+    "ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM",
+    "enterprise_oauth.authorize_redirect_param",
+    os.environ.get("ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM", "redirect_url"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM = PersistentConfig(
+    "ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM",
+    "enterprise_oauth.token_redirect_param",
+    os.environ.get("ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM", "redirect.uri"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_ID_CLAIM = PersistentConfig(
+    "ENTERPRISE_OAUTH_ID_CLAIM",
+    "enterprise_oauth.id_claim",
+    os.environ.get("ENTERPRISE_OAUTH_ID_CLAIM", "id"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_ACCOUNT_NO_PATH = PersistentConfig(
+    "ENTERPRISE_OAUTH_ACCOUNT_NO_PATH",
+    "enterprise_oauth.account_no_path",
+    os.environ.get("ENTERPRISE_OAUTH_ACCOUNT_NO_PATH", "attributes.account_no"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_EMAIL_CLAIM = PersistentConfig(
+    "ENTERPRISE_OAUTH_EMAIL_CLAIM",
+    "enterprise_oauth.email_claim",
+    os.environ.get("ENTERPRISE_OAUTH_EMAIL_CLAIM", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_EMAIL_DOMAIN = PersistentConfig(
+    "ENTERPRISE_OAUTH_EMAIL_DOMAIN",
+    "enterprise_oauth.email_domain",
+    os.environ.get("ENTERPRISE_OAUTH_EMAIL_DOMAIN", "local"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_REQUIRED_FIELDS = (
+    ("ENTERPRISE_OAUTH_CLIENT_ID", ENTERPRISE_OAUTH_CLIENT_ID),
+    ("ENTERPRISE_OAUTH_CLIENT_SECRET", ENTERPRISE_OAUTH_CLIENT_SECRET),
+    ("ENTERPRISE_OAUTH_AUTHORIZE_URL", ENTERPRISE_OAUTH_AUTHORIZE_URL),
+    ("ENTERPRISE_OAUTH_TOKEN_URL", ENTERPRISE_OAUTH_TOKEN_URL),
+    ("ENTERPRISE_OAUTH_PROFILE_URL", ENTERPRISE_OAUTH_PROFILE_URL),
+    ("ENTERPRISE_OAUTH_REDIRECT_URI", ENTERPRISE_OAUTH_REDIRECT_URI),
+)
+
+ENTERPRISE_OAUTH_ENV_FIELDS = (
+    ENTERPRISE_OAUTH_ENABLED,
+    ENTERPRISE_OAUTH_PROVIDER_NAME,
+    ENTERPRISE_OAUTH_CLIENT_ID,
+    ENTERPRISE_OAUTH_CLIENT_SECRET,
+    ENTERPRISE_OAUTH_AUTHORIZE_URL,
+    ENTERPRISE_OAUTH_TOKEN_URL,
+    ENTERPRISE_OAUTH_PROFILE_URL,
+    ENTERPRISE_OAUTH_CHECK_TOKEN_URL,
+    ENTERPRISE_OAUTH_LOGOUT_URL,
+    ENTERPRISE_OAUTH_REDIRECT_URI,
+    ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM,
+    ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM,
+    ENTERPRISE_OAUTH_ID_CLAIM,
+    ENTERPRISE_OAUTH_ACCOUNT_NO_PATH,
+    ENTERPRISE_OAUTH_EMAIL_CLAIM,
+    ENTERPRISE_OAUTH_EMAIL_DOMAIN,
+)
+
+
+def is_enterprise_oauth_deployment_managed() -> bool:
+    return any(cfg.env_present for cfg in ENTERPRISE_OAUTH_ENV_FIELDS)
+
+
+def _enterprise_oauth_missing_fields(require_env: bool) -> list[str]:
+    missing: list[str] = []
+    for env_name, cfg in ENTERPRISE_OAUTH_REQUIRED_FIELDS:
+        if require_env:
+            if not cfg.env_present or not str(cfg.env_value).strip():
+                missing.append(env_name)
+        else:
+            if not str(cfg.value).strip():
+                missing.append(env_name)
+    return missing
+
 
 def load_oauth_providers():
+    if ENTERPRISE_OAUTH_ENABLED.value:
+        deployment_managed = is_enterprise_oauth_deployment_managed()
+        missing = _enterprise_oauth_missing_fields(deployment_managed)
+        if missing:
+            missing_list = ", ".join(missing)
+            if deployment_managed:
+                raise RuntimeError(
+                    "ENTERPRISE_OAUTH_ENABLED is true but required deployment environment "
+                    f"variables are missing or empty: {missing_list}"
+                )
+            raise RuntimeError(
+                "ENTERPRISE_OAUTH_ENABLED is true but required configuration values are missing: "
+                f"{missing_list}"
+            )
+
     OAUTH_PROVIDERS.clear()
     if GOOGLE_CLIENT_ID.value and GOOGLE_CLIENT_SECRET.value:
 
@@ -840,6 +1104,51 @@ def load_oauth_providers():
         OAUTH_PROVIDERS["feishu"] = {
             "register": feishu_oauth_register,
             "sub_claim": "user_id",
+        }
+
+    if (
+        ENTERPRISE_OAUTH_ENABLED.value
+        and ENTERPRISE_OAUTH_CLIENT_ID.value
+        and ENTERPRISE_OAUTH_CLIENT_SECRET.value
+        and ENTERPRISE_OAUTH_AUTHORIZE_URL.value
+        and ENTERPRISE_OAUTH_TOKEN_URL.value
+        and ENTERPRISE_OAUTH_PROFILE_URL.value
+        and ENTERPRISE_OAUTH_REDIRECT_URI.value
+    ):
+
+        def enterprise_oauth_register(oauth: OAuth):
+            client = oauth.register(
+                name="enterprise",
+                client_id=ENTERPRISE_OAUTH_CLIENT_ID.value,
+                client_secret=ENTERPRISE_OAUTH_CLIENT_SECRET.value,
+                authorize_url=ENTERPRISE_OAUTH_AUTHORIZE_URL.value,
+                access_token_url=ENTERPRISE_OAUTH_TOKEN_URL.value,
+                userinfo_endpoint=ENTERPRISE_OAUTH_PROFILE_URL.value,
+                redirect_uri=ENTERPRISE_OAUTH_REDIRECT_URI.value,
+            )
+            return client
+
+        OAUTH_PROVIDERS["enterprise"] = {
+            "name": ENTERPRISE_OAUTH_PROVIDER_NAME.value,
+            "redirect_uri": ENTERPRISE_OAUTH_REDIRECT_URI.value,
+            "register": enterprise_oauth_register,
+            "type": "enterprise",
+            "enterprise": {
+                "client_id": ENTERPRISE_OAUTH_CLIENT_ID.value,
+                "client_secret": ENTERPRISE_OAUTH_CLIENT_SECRET.value,
+                "authorize_url": ENTERPRISE_OAUTH_AUTHORIZE_URL.value,
+                "token_url": ENTERPRISE_OAUTH_TOKEN_URL.value,
+                "profile_url": ENTERPRISE_OAUTH_PROFILE_URL.value,
+                "check_token_url": ENTERPRISE_OAUTH_CHECK_TOKEN_URL.value,
+                "logout_url": ENTERPRISE_OAUTH_LOGOUT_URL.value,
+                "redirect_uri": ENTERPRISE_OAUTH_REDIRECT_URI.value,
+                "authorize_redirect_param": ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM.value,
+                "token_redirect_param": ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM.value,
+                "id_claim": ENTERPRISE_OAUTH_ID_CLAIM.value,
+                "account_no_path": ENTERPRISE_OAUTH_ACCOUNT_NO_PATH.value,
+                "email_claim": ENTERPRISE_OAUTH_EMAIL_CLAIM.value,
+                "email_domain": ENTERPRISE_OAUTH_EMAIL_DOMAIN.value,
+            },
         }
 
     configured_providers = []

@@ -1363,12 +1363,8 @@ async def generate_chat_completion(
                     status_code=403,
                     detail="Model not found",
                 )
-    elif not bypass_filter:
-        if user.role != "admin" and not model_is_always_allowed:
-            raise HTTPException(
-                status_code=403,
-                detail="Model not found",
-            )
+    # Base/provider models without a custom DB record are validated against the
+    # live Ollama registry below, so verified users may still use them.
 
     url, url_idx = await get_ollama_url(request, payload["model"], url_idx)
     api_config = request.app.state.config.OLLAMA_API_CONFIGS.get(
@@ -1478,12 +1474,8 @@ async def generate_openai_completion(
                     status_code=403,
                     detail="Model not found",
                 )
-    else:
-        if user.role != "admin" and not model_is_always_allowed:
-            raise HTTPException(
-                status_code=403,
-                detail="Model not found",
-            )
+    # Base/provider models without a custom DB record are validated against the
+    # live Ollama registry below, so verified users may still use them.
 
     url, url_idx = await get_ollama_url(request, payload["model"], url_idx)
     api_config = request.app.state.config.OLLAMA_API_CONFIGS.get(
@@ -1570,12 +1562,8 @@ async def generate_openai_chat_completion(
                     status_code=403,
                     detail="Model not found",
                 )
-    else:
-        if user.role != "admin" and not model_is_always_allowed:
-            raise HTTPException(
-                status_code=403,
-                detail="Model not found",
-            )
+    # Base/provider models without a custom DB record are validated against the
+    # live Ollama registry below, so verified users may still use them.
 
     url, url_idx = await get_ollama_url(request, payload["model"], url_idx)
     api_config = request.app.state.config.OLLAMA_API_CONFIGS.get(

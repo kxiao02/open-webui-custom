@@ -9,7 +9,15 @@
 	import { getUsage } from '$lib/apis';
 	import { getSessionUser, userSignOut } from '$lib/apis/auths';
 
-	import { showSettings, mobile, showSidebar, showShortcuts, user, config } from '$lib/stores';
+	import {
+		showSettings,
+		mobile,
+		showSidebar,
+		showShortcuts,
+		user,
+		config,
+		settings
+	} from '$lib/stores';
 
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
@@ -352,6 +360,8 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 					const res = await userSignOut();
 					user.set(null);
 					localStorage.removeItem('token');
+					localStorage.removeItem('settings');
+					settings.set({});
 
 					location.href = res?.redirect_url ?? '/auth';
 					show = false;

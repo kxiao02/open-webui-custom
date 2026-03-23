@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("ENABLE_DB_MIGRATIONS", "False")
+
 import pytest
 from fastapi import HTTPException
 
@@ -10,8 +14,10 @@ from open_webui.models.auths import (
     UpdatePasswordForm,
 )
 from open_webui.models.users import UpdateProfileForm, Users
+from open_webui.models.groups import Groups, GroupMember, GroupForm
 from open_webui.routers import auths
 from open_webui.utils.auth import (
+    create_admin_user,
     get_current_user,
     get_http_authorization_cred,
     get_password_hash,
@@ -97,7 +103,7 @@ class TestAuths(AbstractPostgresTest):
             auths.update_profile(
                 form_data=UpdateProfileForm(
                     name="Updated User",
-                    profile_image_url="/updated.png",
+                    profile_image_url="/user.png",
                     bio="bio",
                     gender="other",
                 ),
@@ -106,7 +112,7 @@ class TestAuths(AbstractPostgresTest):
             )
         )
         assert updated.name == "Updated User"
-        assert updated.profile_image_url == "/updated.png"
+        assert updated.profile_image_url == "/user.png"
 
         changed = self.run_async(
             auths.update_password(
@@ -177,3 +183,64 @@ class TestAuths(AbstractPostgresTest):
             )
         )
         assert details == {"name": "Root User", "email": "root@example.com"}
+
+    def test_signup_assigns_default_group(self):
+        group = Groups.insert_new_group(
+            "admin-1",
+            form_data=GroupForm(
+                name="Default",
+                description="Default group",
+            ),
+            db=self.db,
+        )
+        assert group is not None
+
+        signup_request = self.make_request(self.create_url("/signup"), method="POST")
+        signup_request.app.state.config.DEFAULT_GROUP_ID = group.id
+        signup_response = self.make_response()
+
+        signed_up = self.run_async(
+            auths.signup(
+                request=signup_request,
+                response=signup_response,
+                form_data=SignupForm(
+                    name="Group User",
+                    email="group-user@example.com",
+                    password="StrongPass123!",
+                ),
+                db=self.db,
+            )
+        )
+
+        membership = (
+            self.db.query(GroupMember)
+            .filter_by(group_id=group.id, user_id=signed_up["id"])
+            .first()
+        )
+        assert membership is not None
+
+    def test_create_admin_user_repairs_existing_user_without_auth(self):
+        Users.insert_new_user(
+            id="u1",
+            name="Legacy User",
+            email="admin@example.com",
+            role="user",
+            db=self.db,
+        )
+
+        repaired = create_admin_user(
+            "admin@example.com",
+            "StrongPass123!",
+            "Admin User",
+        )
+
+        assert repaired is not None
+        assert repaired.email == "admin@example.com"
+        assert repaired.role == "admin"
+
+        authenticated = Auths.authenticate_user(
+            "admin@example.com",
+            lambda pw: verify_password("StrongPass123!", pw),
+            db=self.db,
+        )
+        assert authenticated is not None

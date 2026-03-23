@@ -33,8 +33,18 @@ with suppress(ImportError):
     import playhouse.postgres_ext as pw_pext
 
 
+def _has_column(database: pw.Database, table_name: str, column_name: str) -> bool:
+    try:
+        return any(column.name == column_name for column in database.get_columns(table_name))
+    except Exception:
+        return False
+
+
 def migrate(migrator: Migrator, database: pw.Database, *, fake=False):
     """Write your migrations here."""
+
+    if _has_column(database, "chat", "share_id"):
+        return
 
     migrator.add_fields(
         "chat", share_id=pw.CharField(max_length=255, null=True, unique=True)
@@ -44,4 +54,5 @@ def migrate(migrator: Migrator, database: pw.Database, *, fake=False):
 def rollback(migrator: Migrator, database: pw.Database, *, fake=False):
     """Write your rollback migrations here."""
 
-    migrator.remove_fields("chat", "share_id")
+    if _has_column(database, "chat", "share_id"):
+        migrator.remove_fields("chat", "share_id")

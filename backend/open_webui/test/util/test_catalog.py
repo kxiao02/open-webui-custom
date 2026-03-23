@@ -1,13 +1,24 @@
+import os
+
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.skills import SkillForm, Skills
 from open_webui.models.tools import ToolForm, Tools
+from open_webui.internal.db import engine
+from open_webui import test as test_env
 from open_webui.test_support import AbstractPostgresTest, mock_webui_user
 from open_webui.utils.catalog import filter_visible_skills, filter_visible_tools
 
 
-def _insert_tool(db, tool_id: str, *, meta: dict, access_grants: list[dict] | None = None):
+def _insert_tool(
+    db,
+    tool_id: str,
+    *,
+    meta: dict,
+    access_grants: list[dict] | None = None,
+    owner_id: str = "admin-1",
+):
     return Tools.insert_new_tool(
-        "admin-1",
+        owner_id,
         ToolForm(
             id=tool_id,
             name=tool_id,
@@ -49,6 +60,13 @@ def _insert_skill(
 
 
 class TestCatalogHelpers(AbstractPostgresTest):
+    def test_test_database_is_isolated(self):
+        expected_url = os.environ.get("OPEN_WEBUI_TEST_DATABASE_URL") or f"sqlite:///{test_env.TEST_DB}"
+        assert os.environ["DATABASE_URL"] == expected_url
+        if "sqlite" in expected_url:
+            assert engine.dialect.name == "sqlite"
+            assert str(test_env.TEST_DB) in expected_url
+
     def test_filter_visible_tools_respects_publish_and_visibility(self):
         _insert_tool(
             self.db,
@@ -85,6 +103,21 @@ class TestCatalogHelpers(AbstractPostgresTest):
             visible = filter_visible_tools(Tools.get_tools(defer_content=True, db=self.db), user, db=self.db)
 
         assert {tool.id for tool in visible} == {"restricted_tool", "public_tool"}
+
+    def test_filter_visible_tools_includes_owner_unpublished_hidden(self):
+        _insert_tool(
+            self.db,
+            "owner_hidden_tool",
+            meta={"description": "owner", "published": False, "visibility": "hidden"},
+            owner_id="user-1",
+        )
+
+        with mock_webui_user(id="user-1", role="user") as owner:
+            visible = filter_visible_tools(
+                Tools.get_tools(defer_content=True, db=self.db), owner, db=self.db
+            )
+
+        assert {tool.id for tool in visible} == {"owner_hidden_tool"}
 
     def test_filter_visible_skills_requires_published_and_active(self):
         _insert_skill(

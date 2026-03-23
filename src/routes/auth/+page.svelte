@@ -19,7 +19,7 @@
 	} from '$lib/apis/auths';
 
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
-	import { WEBUI_NAME, config, user, socket } from '$lib/stores';
+	import { WEBUI_NAME, config, configStatus, user, socket } from '$lib/stores';
 
 	import { generateInitialsImage, canvasPixelTest, getUserTimezone } from '$lib/utils';
 
@@ -32,7 +32,14 @@
 
 	let loaded = false;
 
-	let mode = $config?.features.enable_ldap ? 'ldap' : 'signin';
+	let mode = 'signin';
+	let modeInitialized = false;
+	let onboardingInitialized = false;
+	let autoSignInAttempted = false;
+	let configReady = false;
+	let loginFormEnabled = false;
+	let providersEnabled = false;
+	let trustedHeaderAuth = false;
 
 	let form = null;
 
@@ -47,6 +54,8 @@
 		if (sessionUser) {
 			console.log(sessionUser);
 			toast.success($i18n.t(`You're now logged in.`));
+			localStorage.removeItem('settings');
+			sessionStorage.removeItem('selectedModels');
 			if (sessionUser.token) {
 				localStorage.token = sessionUser.token;
 			}
@@ -143,6 +152,34 @@
 
 	let onboarding = false;
 
+	const coerceFormMode = (value) => {
+		if (value === 'signup' || value === 'signin' || value === 'ldap') {
+			return value;
+		}
+		return null;
+	};
+
+	const resolveInitialMode = () => {
+		const requested = coerceFormMode(form);
+		if (requested) {
+			return requested;
+		}
+		if ($config?.features?.enable_ldap) {
+			return 'ldap';
+		}
+		return 'signin';
+	};
+
+	const maybeAutoSignIn = async () => {
+		if (autoSignInAttempted || !configReady) {
+			return;
+		}
+		if (trustedHeaderAuth) {
+			autoSignInAttempted = true;
+			await signInHandler();
+		}
+	};
+
 	async function setLogoImage() {
 		await tick();
 		const logo = document.getElementById('logo');
@@ -182,17 +219,35 @@
 		}
 
 		await oauthCallbackHandler();
-		form = $page.url.searchParams.get('form');
+	});
 
+	$: form = $page.url.searchParams.get('form');
+	$: configReady = $configStatus === 'ready' && !!$config;
+	$: loginFormEnabled =
+		configReady && ($config?.features.enable_login_form || $config?.features.enable_ldap || form);
+	$: providersEnabled =
+		configReady && Object.keys($config?.oauth?.providers ?? {}).length > 0;
+	$: trustedHeaderAuth =
+		configReady && (($config?.features.auth_trusted_header ?? false) || $config?.features.auth === false);
+
+	$: if (configReady && !modeInitialized) {
+		mode = resolveInitialMode();
+		modeInitialized = true;
+	}
+
+	$: if (configReady && !onboardingInitialized) {
+		onboarding = $config?.onboarding ?? false;
+		onboardingInitialized = true;
+	}
+
+	$: if (configReady && !loaded) {
 		loaded = true;
 		setLogoImage();
+	}
 
-		if (($config?.features.auth_trusted_header ?? false) || $config?.features.auth === false) {
-			await signInHandler();
-		} else {
-			onboarding = $config?.onboarding ?? false;
-		}
-	});
+	$: if (configReady) {
+		maybeAutoSignIn();
+	}
 </script>
 
 <svelte:head>
@@ -215,13 +270,22 @@
 
 	<div class="w-full absolute top-0 left-0 right-0 h-8 drag-region" />
 
+	{#if !loaded}
+		<div class="fixed inset-0 flex items-center justify-center font-primary z-50 text-black dark:text-white">
+			<div class="flex items-center gap-3 text-base font-medium">
+				<Spinner className="size-5" />
+				<span>{$i18n.t('Loading configuration...')}</span>
+			</div>
+		</div>
+	{/if}
+
 	{#if loaded}
 		<div
 			class="fixed bg-transparent min-h-screen w-full flex justify-center font-primary z-50 text-black dark:text-white"
 			id="auth-container"
 		>
 			<div class="w-full px-10 min-h-screen flex flex-col text-center">
-				{#if ($config?.features.auth_trusted_header ?? false) || $config?.features.auth === false}
+				{#if trustedHeaderAuth}
 					<div class=" my-auto pb-10 w-full sm:max-w-md">
 						<div
 							class="flex items-center justify-center gap-3 text-xl sm:text-2xl text-center font-medium dark:text-gray-200"
@@ -258,7 +322,7 @@
 							>
 								<div class="mb-1">
 									<div class=" text-2xl font-medium">
-										{#if $config?.onboarding ?? false}
+										{#if onboarding}
 											{$i18n.t(`Get started with {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
 										{:else if mode === 'ldap'}
 											{$i18n.t(`Sign in to {{WEBUI_NAME}} with LDAP`, { WEBUI_NAME: $WEBUI_NAME })}
@@ -269,7 +333,7 @@
 										{/if}
 									</div>
 
-									{#if $config?.onboarding ?? false}
+									{#if onboarding}
 										<div class="mt-1 text-xs font-medium text-gray-600 dark:text-gray-500">
 											ⓘ {$WEBUI_NAME}
 											{$i18n.t(
@@ -279,7 +343,7 @@
 									{/if}
 								</div>
 
-								{#if $config?.features.enable_login_form || $config?.features.enable_ldap || form}
+								{#if loginFormEnabled}
 									<div class="flex flex-col mt-4">
 										{#if mode === 'signup'}
 											<div class="mb-2">
@@ -372,7 +436,7 @@
 									</div>
 								{/if}
 								<div class="mt-5">
-									{#if $config?.features.enable_login_form || $config?.features.enable_ldap || form}
+									{#if loginFormEnabled}
 										{#if mode === 'ldap'}
 											<button
 												class="bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
@@ -387,12 +451,12 @@
 											>
 												{mode === 'signin'
 													? $i18n.t('Sign in')
-													: ($config?.onboarding ?? false)
+													: onboarding
 														? $i18n.t('Create Admin Account')
 														: $i18n.t('Create Account')}
 											</button>
 
-											{#if $config?.features.enable_signup && !($config?.onboarding ?? false)}
+											{#if $config?.features.enable_signup && !onboarding}
 												<div class=" mt-4 text-sm text-center">
 													{mode === 'signin'
 														? $i18n.t("Don't have an account?")
@@ -418,10 +482,10 @@
 								</div>
 							</form>
 
-							{#if Object.keys($config?.oauth?.providers ?? {}).length > 0}
+							{#if providersEnabled}
 								<div class="inline-flex items-center justify-center w-full">
 									<hr class="w-32 h-px my-4 border-0 dark:bg-gray-100/10 bg-gray-700/10" />
-									{#if $config?.features.enable_login_form || $config?.features.enable_ldap || form}
+									{#if loginFormEnabled}
 										<span
 											class="px-3 text-sm font-medium text-gray-900 dark:text-white bg-transparent"
 											>{$i18n.t('or')}</span
@@ -553,17 +617,30 @@
 											<span>{$i18n.t('Continue with {{provider}}', { provider: 'Feishu' })}</span>
 										</button>
 									{/if}
+									{#if $config?.oauth?.providers?.enterprise}
+										<button
+											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+											on:click={() => {
+												window.location.href = `${WEBUI_BASE_URL}/oauth/enterprise/login`;
+											}}
+										>
+											<span
+												>{$i18n.t('Continue with {{provider}}', {
+													provider: $config?.oauth?.providers?.enterprise ?? 'SSO'
+												})}</span
+											>
+										</button>
+									{/if}
 								</div>
 							{/if}
 
-							{#if $config?.features.enable_ldap && $config?.features.enable_login_form}
+							{#if configReady && $config?.features.enable_ldap && $config?.features.enable_login_form}
 								<div class="mt-2">
 									<button
 										class="flex justify-center items-center text-xs w-full text-center underline"
 										type="button"
 										on:click={() => {
-											if (mode === 'ldap')
-												mode = ($config?.onboarding ?? false) ? 'signup' : 'signin';
+											if (mode === 'ldap') mode = onboarding ? 'signup' : 'signin';
 											else mode = 'ldap';
 										}}
 									>
