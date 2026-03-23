@@ -118,7 +118,13 @@ def process_uploaded_file(
     db: Optional[Session] = None,
 ):
     def _process_handler(db_session):
+        completed = False
         try:
+            Files.update_file_data_by_id(
+                file_item.id,
+                {"status": "processing", "error": None},
+                db=db_session,
+            )
             content_type = file.content_type
 
             # Detect mis-labeled text files (e.g. .ts → video/mp2t)
@@ -172,6 +178,7 @@ def process_uploaded_file(
                     db=db_session,
                 )
 
+            completed = True
         except Exception as e:
             log.error(f"Error processing file: {file_item.id}")
             Files.update_file_data_by_id(
@@ -182,6 +189,24 @@ def process_uploaded_file(
                 },
                 db=db_session,
             )
+        finally:
+            if completed:
+                file_status = None
+                try:
+                    file_snapshot = Files.get_file_by_id(file_item.id, db=db_session)
+                    file_status = (
+                        (file_snapshot.data or {}).get("status")
+                        if file_snapshot
+                        else None
+                    )
+                except Exception:
+                    file_status = None
+                if file_status not in ("completed", "failed"):
+                    Files.update_file_data_by_id(
+                        file_item.id,
+                        {"status": "completed"},
+                        db=db_session,
+                    )
 
     if db:
         _process_handler(db)

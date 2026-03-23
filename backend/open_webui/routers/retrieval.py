@@ -1697,6 +1697,11 @@ def process_file(
 
     if file:
         try:
+            Files.update_file_data_by_id(
+                file.id,
+                {"status": "processing", "error": None},
+                db=db,
+            )
 
             collection_name = form_data.collection_name
 
@@ -1906,10 +1911,11 @@ def process_file(
         except Exception as e:
             log.exception(e)
             # Fresh session for error status update.
+            error_detail = str(e.detail) if hasattr(e, "detail") else str(e)
             with get_db() as session:
                 Files.update_file_data_by_id(
                     file.id,
-                    {"status": "failed"},
+                    {"status": "failed", "error": error_detail},
                     db=session,
                 )
                 # Clear the hash so the file can be re-uploaded after fixing the issue

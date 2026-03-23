@@ -223,7 +223,9 @@ async def _read_proxy_response_data(response: aiohttp.ClientResponse):
     return "bytes", raw
 
 
-def openai_reasoning_model_handler(payload):
+def openai_reasoning_model_handler(
+    payload: dict, model_id_override: Optional[str] = None
+):
     """
     Handle reasoning model specific parameters
     """
@@ -233,8 +235,8 @@ def openai_reasoning_model_handler(payload):
         del payload["max_tokens"]
 
     # Handle system role conversion based on model type
-    if payload["messages"][0]["role"] == "system":
-        model_lower = payload["model"].lower()
+    if payload.get("messages") and payload["messages"][0].get("role") == "system":
+        model_lower = str(model_id_override or payload.get("model", "")).lower()
         # Legacy models use "user" role instead of "system"
         if model_lower.startswith("o1-mini") or model_lower.startswith("o1-preview"):
             payload["messages"][0]["role"] = "user"
@@ -1087,6 +1089,11 @@ async def generate_chat_completion(
 
     model_id = form_data.get("model")
     requested_model_id = model_id
+    reasoning_requested = False
+    if isinstance(requested_model_id, str) and requested_model_id:
+        reasoning_requested = is_openai_reasoning_model(
+            requested_model_id
+        ) or requested_model_id.endswith("-thinking")
     model_is_always_allowed = is_model_always_allowed(requested_model_id)
     model_info = Models.get_model_by_id(model_id)
 
@@ -1110,6 +1117,12 @@ async def generate_chat_completion(
             if not bypass_system_prompt:
                 payload = apply_system_prompt_to_body(system, payload, metadata, user)
 
+            if not reasoning_requested:
+                if payload.get("reasoning") is not None or payload.get(
+                    "reasoning_effort"
+                ) is not None:
+                    reasoning_requested = True
+
         # Check if user has access to the model
         if not bypass_filter and user.role == "user" and not model_is_always_allowed:
             user_group_ids = {
@@ -1129,12 +1142,11 @@ async def generate_chat_completion(
                     status_code=403,
                     detail="Model not found",
                 )
-    elif not bypass_filter:
-        if user.role != "admin" and not model_is_always_allowed:
-            raise HTTPException(
-                status_code=403,
-                detail="Model not found",
-            )
+    # Base/provider models without a custom DB record are validated later against
+    # the live provider model registry, so they stay readable for verified users.
+    if not reasoning_requested:
+        if payload.get("reasoning") is not None or payload.get("reasoning_effort") is not None:
+            reasoning_requested = True
 
     # Check if model is already in app state cache to avoid expensive get_all_models() call
     models = request.app.state.OPENAI_MODELS
@@ -1178,9 +1190,14 @@ async def generate_chat_completion(
     url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
     key = request.app.state.config.OPENAI_API_KEYS[idx]
 
+    if is_openai_reasoning_model(payload.get("model", "")):
+        reasoning_requested = True
+
     # Check if model is a reasoning model that needs special handling
-    if is_openai_reasoning_model(payload["model"]):
-        payload = openai_reasoning_model_handler(payload)
+    if reasoning_requested:
+        payload = openai_reasoning_model_handler(
+            payload, model_id_override=requested_model_id
+        )
     elif "api.openai.com" not in url:
         # Remove "max_completion_tokens" from the payload for backward compatibility
         if "max_completion_tokens" in payload:
