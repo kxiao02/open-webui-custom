@@ -6,7 +6,7 @@ import re
 import aiohttp
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT
 from open_webui.models.groups import Groups
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 from open_webui.internal.db import get_session
@@ -29,7 +29,7 @@ from open_webui.utils.plugin import (
     get_tool_module_from_cache,
     resolve_valves_schema_options,
 )
-from open_webui.utils.tools import get_tool_specs
+from open_webui.utils.tools import get_builtin_tool_catalog, get_tool_specs
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import (
     has_permission,
@@ -50,6 +50,24 @@ log = logging.getLogger(__name__)
 
 
 router = APIRouter()
+
+
+class BuiltinToolCatalogMeta(BaseModel):
+    description: str = ""
+    category: str = "builtin"
+    origin: str = "builtin"
+    mutability: str = "locked"
+    default_enabled: bool = True
+    available: bool = True
+    capability_requirements: list[str] = Field(default_factory=list)
+    feature_requirements: list[str] = Field(default_factory=list)
+    config_requirements: list[str] = Field(default_factory=list)
+
+
+class BuiltinToolCatalogResponse(BaseModel):
+    id: str
+    name: str
+    meta: BuiltinToolCatalogMeta
 
 
 def get_tool_module(request, tool_id, load_from_db=True):
@@ -410,6 +428,15 @@ async def get_tool_list(
         )
 
     return result
+
+
+@router.get("/builtin/list", response_model=list[BuiltinToolCatalogResponse])
+async def get_builtin_tool_list(
+    request: Request,
+    user=Depends(get_verified_user),
+):
+    del user
+    return get_builtin_tool_catalog(request)
 
 
 ############################

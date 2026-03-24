@@ -90,6 +90,127 @@ import copy
 log = logging.getLogger(__name__)
 
 
+BUILTIN_TOOL_CATALOG: tuple[dict[str, Any], ...] = (
+    {
+        "id": "time",
+        "name": "Time & Calculation",
+        "description": "Get current time and perform date/time calculations",
+        "capability_requirements": [],
+        "feature_requirements": [],
+        "config_requirements": [],
+    },
+    {
+        "id": "memory",
+        "name": "Memory",
+        "description": "Search and manage user memories",
+        "capability_requirements": [],
+        "feature_requirements": ["memory"],
+        "config_requirements": [],
+    },
+    {
+        "id": "chats",
+        "name": "Chat History",
+        "description": "Search and view user chat history",
+        "capability_requirements": [],
+        "feature_requirements": [],
+        "config_requirements": [],
+    },
+    {
+        "id": "notes",
+        "name": "Notes",
+        "description": "Search, view, and manage user notes",
+        "capability_requirements": [],
+        "feature_requirements": [],
+        "config_requirements": ["ENABLE_NOTES"],
+    },
+    {
+        "id": "knowledge",
+        "name": "Knowledge Base",
+        "description": "Browse and query knowledge bases",
+        "capability_requirements": [],
+        "feature_requirements": [],
+        "config_requirements": ["ENABLE_KNOWLEDGE"],
+    },
+    {
+        "id": "channels",
+        "name": "Channels",
+        "description": "Search channels and channel messages",
+        "capability_requirements": [],
+        "feature_requirements": [],
+        "config_requirements": ["ENABLE_CHANNELS"],
+    },
+    {
+        "id": "web_search",
+        "name": "Web Search",
+        "description": "Search the web and fetch URLs",
+        "capability_requirements": ["web_search"],
+        "feature_requirements": ["web_search"],
+        "config_requirements": ["ENABLE_WEB_SEARCH"],
+    },
+    {
+        "id": "image_generation",
+        "name": "Image Generation",
+        "description": "Generate and edit images",
+        "capability_requirements": ["image_generation"],
+        "feature_requirements": ["image_generation"],
+        "config_requirements": ["ENABLE_IMAGE_GENERATION_OR_EDIT"],
+    },
+    {
+        "id": "code_interpreter",
+        "name": "Code Interpreter",
+        "description": "Execute code",
+        "capability_requirements": ["code_interpreter"],
+        "feature_requirements": ["code_interpreter"],
+        "config_requirements": ["ENABLE_CODE_INTERPRETER"],
+    },
+)
+
+
+def get_builtin_tool_catalog(request: Request) -> list[dict[str, Any]]:
+    config = request.app.state.config
+    catalog: list[dict[str, Any]] = []
+
+    for item in BUILTIN_TOOL_CATALOG:
+        tool_id = item["id"]
+        available = True
+
+        if tool_id == "knowledge":
+            available = ENABLE_KNOWLEDGE.value
+        elif tool_id == "notes":
+            available = bool(getattr(config, "ENABLE_NOTES", False))
+        elif tool_id == "channels":
+            available = bool(getattr(config, "ENABLE_CHANNELS", False))
+        elif tool_id == "web_search":
+            available = bool(getattr(config, "ENABLE_WEB_SEARCH", False))
+        elif tool_id == "image_generation":
+            available = bool(
+                getattr(config, "ENABLE_IMAGE_GENERATION", False)
+                or getattr(config, "ENABLE_IMAGE_EDIT", False)
+            )
+        elif tool_id == "code_interpreter":
+            available = bool(getattr(config, "ENABLE_CODE_INTERPRETER", True))
+
+        catalog.append(
+            {
+                "id": tool_id,
+                "name": item["name"],
+                "meta": {
+                    "description": item["description"],
+                    "category": "builtin",
+                    "origin": "builtin",
+                    "mutability": "locked",
+                    "default_enabled": True,
+                    "available": available,
+                    "capability_requirements": item["capability_requirements"],
+                    "feature_requirements": item["feature_requirements"],
+                    "config_requirements": item["config_requirements"],
+                },
+            }
+        )
+
+    return catalog
+
+
 def get_async_tool_function_and_apply_extra_params(
     function: Callable, extra_params: dict
 ) -> Callable[..., Awaitable]:

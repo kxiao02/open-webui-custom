@@ -1056,6 +1056,10 @@ const AGENT_CONTROL_BLOCK_REGEX =
 	/<(?:tool_execution|tool_call|analysis|reasoning)\b[^>]*>[\s\S]*?<\/(?:tool_execution|tool_call|analysis|reasoning)>/gi;
 const AGENT_CONTROL_TAG_REGEX =
 	/<\/?(?:tool_execution|tool_call|analysis|reasoning)\b[^>]*\/?>/gi;
+const LEAKED_TOOL_ATTR_LINE_REGEX =
+	/(^|\n)\s*(?:type="tool_calls"|name="[^"\n]*"|arguments="[^"\n]*"|result="[^"\n]*"|done="(?:true|false)"\s+status="[^"\n]*")[^\n]*(?=\n|$)/gi;
+const LEAKED_TOOL_ATTR_TAIL_REGEX =
+	/\s+(?:name|arguments|result|done|status)="[^"\n>]*"(?:\s+(?:name|arguments|result|done|status)="[^"\n>]*")*\s*>/gi;
 const SUMMARY_TAG_REGEX = /<\/?summary\b[^>]*>/gi;
 const MALFORMED_HEADING_REGEX = /(^|\n)(\s*)#{1,6}(?=\S)/g;
 const INLINE_HEADING_MARKER_REGEX = /([。！？!?：:]\s*)#{1,6}(?=\S)/g;
@@ -1093,6 +1097,8 @@ export const toPlainNotificationText = (content: string) => {
 	if (!content) return '';
 
 	const normalized = normalizeLeakedFormatting(removeAllDetails(content))
+		.replace(LEAKED_TOOL_ATTR_LINE_REGEX, '$1')
+		.replace(LEAKED_TOOL_ATTR_TAIL_REGEX, '')
 		.replace(/<[^>]+>/g, ' ')
 		.replace(/&nbsp;/gi, ' ');
 

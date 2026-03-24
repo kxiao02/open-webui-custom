@@ -1,8 +1,14 @@
+<script context="module" lang="ts">
+	const MIN_VISIBLE_RUNNING_MS = 900;
+	type ToolVisualTiming = { firstSeenAt: number };
+	const toolVisualTimingByKey = new Map<string, ToolVisualTiming>();
+</script>
+
 <script lang="ts">
 	import { decode } from 'html-entities';
 	import { v4 as uuidv4 } from 'uuid';
 
-	import { getContext } from 'svelte';
+	import { getContext, onDestroy } from 'svelte';
 	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { slide } from 'svelte/transition';
@@ -18,6 +24,7 @@
 	export let attributes: {
 		type?: string;
 		id?: string;
+		call_key?: string;
 		name?: string;
 		arguments?: string;
 		result?: string;
@@ -29,9 +36,12 @@
 
 	export let open = false;
 	export let className = '';
+	export let embedded = false;
 
 	const RESULT_PREVIEW_LIMIT = 10000;
 	let expandedResult = false;
+	let visualStatusTick = 0;
+	let visualStatusTimer: ReturnType<typeof setTimeout> | null = null;
 
 	const TOOL_LABELS: Record<string, string> = {
 		internet_search: '网络搜索',
@@ -42,12 +52,14 @@
 		服务器时间: '服务器时间',
 		math_calculator: '数学计算',
 		数学计算: '数学计算',
+		tool_self_check: '工具自检',
+		工具自检: '工具自检',
 		read_structured_file: '读取结构化文件',
 		读取结构化文件: '读取结构化文件',
 		write_structured_file: '写入结构化文件',
 		写入结构化文件: '写入结构化文件',
 		gotenberg_convert: 'PDF 转换',
-		'PDF转换': 'PDF 转换',
+		PDF转换: 'PDF 转换',
 		'PDF 转换': 'PDF 转换'
 	};
 
@@ -89,6 +101,36 @@
 		}
 	}
 
+	function inferToolLabel(
+		name: string | undefined,
+		parsedArgs: Record<string, unknown> | null
+	): string {
+		const normalizedName = TOOL_LABELS[name ?? ''] ?? (name ?? '').trim();
+		if (normalizedName) return normalizedName;
+
+		const keys = new Set(Object.keys(parsedArgs ?? {}));
+		if (keys.has('query') || keys.has('max_results') || keys.has('keywords')) {
+			return '网络搜索';
+		}
+		if (keys.has('url') || keys.has('urls') || keys.has('link')) {
+			return '网页读取';
+		}
+		if (keys.has('expression') || keys.has('formula')) {
+			return '数学计算';
+		}
+		if (
+			keys.has('content') &&
+			(keys.has('path') || keys.has('file_path') || keys.has('filename'))
+		) {
+			return '写入结构化文件';
+		}
+		if (keys.has('path') || keys.has('file_path') || keys.has('filename')) {
+			return '读取结构化文件';
+		}
+
+		return '工具调用';
+	}
+
 	function normalizeStatus(status: string | undefined, done: string | undefined): string {
 		const normalized = (status || '').trim().toLowerCase();
 		if (['running', 'success', 'error', 'timeout'].includes(normalized)) {
@@ -104,14 +146,72 @@
 		return `正在执行 ${name}...`;
 	}
 
+	function clearVisualStatusTimer() {
+		if (visualStatusTimer) {
+			clearTimeout(visualStatusTimer);
+			visualStatusTimer = null;
+		}
+	}
+
+	function scheduleVisualStatusRefresh(delayMs: number) {
+		if (delayMs <= 0 || visualStatusTimer) return;
+		visualStatusTimer = setTimeout(() => {
+			visualStatusTimer = null;
+			visualStatusTick += 1;
+		}, delayMs);
+	}
+
+	function getToolVisualKey(): string {
+		const callKey = (attributes?.call_key || '').trim();
+		if (callKey) return `call_key:${callKey}`;
+		const toolCallId = (attributes?.id || '').trim();
+		if (toolCallId) return `id:${toolCallId}`;
+		const name = (attributes?.name || '').trim();
+		const args = (attributes?.arguments || '').trim();
+		if (name || args) return `name_args:${name}|${args}`;
+		return id || componentId;
+	}
+
+	function getEffectiveStatus(rawStatus: string, visualKey: string): string {
+		if (!visualKey) return rawStatus;
+
+		const now = Date.now();
+		let timing = toolVisualTimingByKey.get(visualKey);
+		if (!timing) {
+			timing = { firstSeenAt: now };
+			toolVisualTimingByKey.set(visualKey, timing);
+		}
+
+		if (rawStatus === 'running') {
+			clearVisualStatusTimer();
+			return rawStatus;
+		}
+
+		const elapsedMs = now - timing.firstSeenAt;
+		if (elapsedMs < MIN_VISIBLE_RUNNING_MS) {
+			scheduleVisualStatusRefresh(MIN_VISIBLE_RUNNING_MS - elapsedMs);
+			return 'running';
+		}
+
+		clearVisualStatusTimer();
+		return rawStatus;
+	}
+
+	onDestroy(() => {
+		clearVisualStatusTimer();
+	});
+
 	$: args = decode(attributes?.arguments ?? '');
 	$: result = decode(attributes?.result ?? '');
 	$: files = parseJSONString(decode(attributes?.files ?? ''));
 	$: embeds = parseJSONString(decode(attributes?.embeds ?? ''));
 	$: parsedArgs = parseArguments(args);
 	$: parsedResult = parseJSONString(result);
-	$: displayName = TOOL_LABELS[attributes?.name ?? ''] ?? attributes?.name ?? '';
-	$: status = normalizeStatus(attributes?.status, attributes?.done);
+	$: displayName = inferToolLabel(attributes?.name, parsedArgs);
+	$: rawStatus = normalizeStatus(attributes?.status, attributes?.done);
+	$: toolVisualKey = getToolVisualKey();
+	$: visualStatusTick;
+	$: status = getEffectiveStatus(rawStatus, toolVisualKey);
 	$: isTerminal = status !== 'running';
 	$: isExecuting = status === 'running';
 	$: statusMessage = getStatusMessage(status, displayName);
@@ -122,10 +222,18 @@
 </script>
 
 <div {id} class={className}>
-	<div class="mb-2 w-full overflow-hidden rounded-xl border border-gray-200/90 bg-gray-50/80 dark:border-gray-800 dark:bg-gray-900/70">
+	<div
+		class={`w-full overflow-hidden border border-gray-200/90 dark:border-gray-800 ${
+			embedded
+				? 'rounded-lg bg-white/80 dark:bg-gray-950/30'
+				: 'rounded-xl bg-gray-50/80 dark:bg-gray-900/70'
+		}`}
+	>
 		<button
 			type="button"
-			class="flex w-full items-center justify-between gap-2 border-b border-gray-200/80 px-3 py-2 text-left dark:border-gray-800 {buttonClassName} {canExpand ? '' : 'cursor-default'}"
+			class={`flex w-full items-center justify-between gap-2 border-b border-gray-200/80 px-3 py-2 text-left dark:border-gray-800 ${buttonClassName} ${
+				canExpand ? '' : 'cursor-default'
+			} ${embedded ? 'bg-white/60 dark:bg-transparent' : ''}`}
 			on:click={() => {
 				if (canExpand) {
 					open = !open;
@@ -133,7 +241,9 @@
 			}}
 		>
 			<div class="min-w-0">
-				<div class="text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300">
+				<div
+					class="text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300"
+				>
 					{displayName}
 				</div>
 				<div
@@ -147,16 +257,16 @@
 
 			{#if canExpand}
 				<ChevronDown
-					className={`size-3.5 shrink-0 text-gray-500 transition-transform ${open
-						? 'rotate-180'
-						: ''}`}
+					className={`size-3.5 shrink-0 text-gray-500 transition-transform ${
+						open ? 'rotate-180' : ''
+					}`}
 				/>
 			{/if}
 		</button>
 
 		{#if (open && canExpand) || hasEmbeds}
 			<div transition:slide={{ duration: 300, easing: quintOut, axis: 'y' }}>
-				<div class="px-2 py-2 space-y-3">
+				<div class={`space-y-3 ${embedded ? 'px-3 py-2' : 'px-2 py-2'}`}>
 					{#if hasEmbeds}
 						{#each embeds as embed, idx}
 							<div class="my-2" id={`${componentId}-tool-call-embed-${idx}`}>
@@ -173,9 +283,11 @@
 					{:else}
 						<div class="flex items-stretch gap-2">
 							<div>
-								<div class="mb-1.5 px-1 pt-3">
+								<div class={`mb-1.5 px-1 ${embedded ? 'pt-2.5' : 'pt-3'}`}>
 									<span class="relative flex size-1.5 items-center justify-center rounded-full">
-										<span class="relative inline-flex size-1.5 rounded-full bg-gray-500 dark:bg-gray-400"></span>
+										<span
+											class="relative inline-flex size-1.5 rounded-full bg-gray-500 dark:bg-gray-400"
+										></span>
 									</span>
 								</div>
 							</div>
@@ -206,9 +318,7 @@
 															>{key}</span
 														>
 														<span class="text-gray-800 dark:text-gray-200 break-all"
-															>{typeof value === 'object'
-																? JSON.stringify(value)
-																: value}</span
+															>{typeof value === 'object' ? JSON.stringify(value) : value}</span
 														>
 													</div>
 												{/each}

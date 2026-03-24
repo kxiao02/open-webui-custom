@@ -1678,6 +1678,8 @@
 	};
 
 	const TOOL_CALL_BLOCK_START_REGEX = /<details\b[^>]*\btype="tool_calls"[^>]*>/i;
+	const LEAKED_TOOL_ATTR_LINE_REGEX =
+		/(^|\n)\s*(?:type="tool_calls"|name="[^"\n]*"|arguments="[^"\n]*"|result="[^"\n]*"|done="(?:true|false)"\s+status="[^"\n]*")[^\n]*(?=\n|$)/gi;
 	const SOURCE_SECTION_LINE_REGEX = /(^|\n)\s*(参考来源|Sources)\s*:?\s*(?:\n|$)/i;
 	const SOURCE_SECTION_INLINE_REGEX = /(参考来源|Sources)\s*:?\s*(?:\[[^\]]+\][^\n\r]*)$/i;
 
@@ -1692,6 +1694,10 @@
 				normalized = normalized.slice(toolCallStartIndex);
 			}
 		}
+
+		normalized = normalized
+			.replace(LEAKED_TOOL_ATTR_LINE_REGEX, '$1')
+			.replace(/\n{3,}/g, '\n\n');
 
 		normalized = normalized.replace(
 			/(^|[^\n])\s*#{1,6}\s*(参考来源|Sources)(?=\s|$)/g,

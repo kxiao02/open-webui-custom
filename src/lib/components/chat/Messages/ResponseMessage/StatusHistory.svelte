@@ -38,7 +38,7 @@
 		>
 			<div class="min-w-0">
 				<div class="text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300">
-					{$i18n.t('Process')}
+					执行过程
 				</div>
 				{#if latestStatus}
 					<div class="mt-0.5 line-clamp-1 text-xs text-gray-500 dark:text-gray-400">

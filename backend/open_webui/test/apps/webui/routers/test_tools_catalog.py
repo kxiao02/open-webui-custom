@@ -263,6 +263,25 @@ class TestToolCatalogRouters(AbstractPostgresTest):
         assert server_tool is not None
         assert server_tool.write_access is False
 
+    def test_get_builtin_tool_list_returns_catalog(self):
+        with mock_webui_user(id="2", role="user") as user:
+            result = self.run_async(
+                tools.get_builtin_tool_list(request=self.request, user=user)
+            )
+
+        tool_ids = {tool["id"] if isinstance(tool, dict) else tool.id for tool in result}
+        assert {
+            "time",
+            "memory",
+            "chats",
+            "notes",
+            "knowledge",
+            "channels",
+            "web_search",
+            "image_generation",
+            "code_interpreter",
+        }.issubset(tool_ids)
+
     def test_install_uninstall_server_tool(self, monkeypatch):
         server_id = "server-1"
         tool_id = f"server:{server_id}"

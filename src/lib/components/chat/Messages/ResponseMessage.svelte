@@ -64,6 +64,7 @@
 	import StatusHistory from './ResponseMessage/StatusHistory.svelte';
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
+	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
 
 	interface MessageType {
 		id: string;
@@ -317,6 +318,45 @@
 	const TOOL_CALL_BLOCK_REGEX = /<details\b[^>]*\btype="tool_calls"[^>]*>[\s\S]*?<\/details>/gim;
 	const TOOL_CALL_OPEN_TAG_REGEX = /^<details\b([^>]*)>/i;
 	const TOOL_CALL_ATTR_REGEX = /(\w+)="([^"]*)"/g;
+	const PROCESS_TOOL_LABELS: Record<string, string> = {
+		internet_search: '网络搜索',
+		联网搜索: '网络搜索',
+		visit_webpage: '网页读取',
+		网页读取: '网页读取',
+		current_server_time: '服务器时间',
+		服务器时间: '服务器时间',
+		math_calculator: '数学计算',
+		数学计算: '数学计算',
+		tool_self_check: '工具自检',
+		工具自检: '工具自检',
+		read_structured_file: '读取结构化文件',
+		读取结构化文件: '读取结构化文件',
+		write_structured_file: '写入结构化文件',
+		写入结构化文件: '写入结构化文件',
+		gotenberg_convert: 'PDF 转换',
+		PDF转换: 'PDF 转换',
+		'PDF 转换': 'PDF 转换'
+	};
+
+	type ProcessToolCallItem = { key: string; attrs: Record<string, string> };
+	type ProcessToolCallGroup = {
+		key: string;
+		label: string;
+		count: number;
+		items: ProcessToolCallItem[];
+	};
+	type ProcessToolVisualTiming = { firstSeenAt: number };
+
+	const MIN_PROCESS_RUNNING_MS = 900;
+	const processToolVisualTimingByKey = new Map<string, ProcessToolVisualTiming>();
+
+	const normalizeProcessToolStatus = (attrs: Record<string, string>): string => {
+		const normalized = (attrs.status || '').trim().toLowerCase();
+		if (['running', 'success', 'error', 'timeout'].includes(normalized)) {
+			return normalized;
+		}
+		return (attrs.done || '').trim().toLowerCase() === 'true' ? 'success' : 'running';
+	};
 
 	const getToolCallAttrs = (block: string): Record<string, string> => {
 		const openTag = block.match(TOOL_CALL_OPEN_TAG_REGEX)?.[1] ?? '';
@@ -388,7 +428,8 @@
 			const fallbackKey = getToolCallFallbackKey(attrs);
 			const shouldDrop =
 				isPending &&
-				((key && completedKeys.has(key)) || (fallbackKey && completedFallbackKeys.has(fallbackKey)));
+				((key && completedKeys.has(key)) ||
+					(fallbackKey && completedFallbackKeys.has(fallbackKey)));
 
 			if (!shouldDrop) {
 				out += block;
@@ -397,6 +438,78 @@
 
 		out += content.slice(cursor);
 		return out.replace(/\n{3,}/g, '\n\n').trim();
+	};
+
+	const getProcessToolLabel = (attrs: Record<string, string>): string => {
+		const rawName = (attrs.name || '').trim();
+		if (rawName) {
+			return PROCESS_TOOL_LABELS[rawName] ?? rawName;
+		}
+
+		const rawArgs = attrs.arguments || '';
+		if (rawArgs) {
+			try {
+				const parsed = JSON.parse(rawArgs);
+				if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+					const keys = new Set(Object.keys(parsed as Record<string, unknown>));
+					if (keys.has('query') || keys.has('max_results') || keys.has('keywords')) {
+						return '网络搜索';
+					}
+					if (keys.has('url') || keys.has('urls') || keys.has('link')) {
+						return '网页读取';
+					}
+					if (keys.has('expression') || keys.has('formula')) {
+						return '数学计算';
+					}
+					if (
+						keys.has('content') &&
+						(keys.has('path') || keys.has('file_path') || keys.has('filename'))
+					) {
+						return '写入结构化文件';
+					}
+					if (keys.has('path') || keys.has('file_path') || keys.has('filename')) {
+						return '读取结构化文件';
+					}
+				}
+			} catch {
+				// Ignore malformed tool args and fall through to generic label.
+			}
+		}
+
+		return '工具调用';
+	};
+
+	const groupProcessToolCallItems = (items: ProcessToolCallItem[]): ProcessToolCallGroup[] => {
+		const groups: ProcessToolCallGroup[] = [];
+
+		for (const item of items) {
+			const label = getProcessToolLabel(item.attrs);
+			const lastGroup = groups.at(-1);
+
+			if (lastGroup && lastGroup.label === label) {
+				lastGroup.items = [...lastGroup.items, item];
+				lastGroup.count = lastGroup.items.length;
+				continue;
+			}
+
+			groups.push({
+				key: item.key,
+				label,
+				count: 1,
+				items: [item]
+			});
+		}
+
+		return groups;
+	};
+
+	const getProcessToolStatusMessage = (attrs: Record<string, string>): string => {
+		const label = getProcessToolLabel(attrs);
+		const status = normalizeProcessToolStatus(attrs);
+		if (status === 'success') return `${label} 已完成`;
+		if (status === 'timeout') return `${label} 已超时`;
+		if (status === 'error') return `${label} 运行失败`;
+		return `正在执行 ${label}...`;
 	};
 
 	const stripDownloadSection = (content: string, allowInlineFiles: boolean): string => {
@@ -416,9 +529,8 @@
 					linkTarget.includes('/v1/files/') ||
 					linkTarget.includes('sandbox:/mnt/data/'));
 
-			const hasDownloadLabel = /(文件下载|下载链接|下载地址|生成文件（可下载）|生成文件\(可下载\))/i.test(
-				trimmed
-			);
+			const hasDownloadLabel =
+				/(文件下载|下载链接|下载地址|生成文件（可下载）|生成文件\(可下载\))/i.test(trimmed);
 
 			if (hasDownloadLabel || hasGeneratedFileLink) {
 				if (allowInlineFiles && !markerInserted) {
@@ -431,7 +543,10 @@
 			output.push(line);
 		}
 
-		return output.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+		return output
+			.join('\n')
+			.replace(/\n{3,}/g, '\n\n')
+			.trim();
 	};
 
 	const splitToolCallSection = (content: string): { process: string; final: string } => {
@@ -470,11 +585,63 @@
 	};
 
 	let processContent = '';
-	let processToolCallItems: { key: string; attrs: Record<string, string> }[] = [];
+	let processToolCallItems: ProcessToolCallItem[] = [];
+	let processToolCallGroups: ProcessToolCallGroup[] = [];
+	let processSummary = '';
+	let showProcessToolHistory = true;
+	let processStatusTick = 0;
+	let processStatusTimer: ReturnType<typeof setTimeout> | null = null;
 	let finalMessageContent = '';
 	let finalContentBeforeGeneratedFiles = '';
 	let finalContentAfterGeneratedFiles = '';
 	let placeInlineGeneratedFiles = false;
+
+	const clearProcessStatusTimer = () => {
+		if (processStatusTimer) {
+			clearTimeout(processStatusTimer);
+			processStatusTimer = null;
+		}
+	};
+
+	const scheduleProcessStatusRefresh = (delayMs: number) => {
+		if (delayMs <= 0 || processStatusTimer) return;
+		processStatusTimer = setTimeout(() => {
+			processStatusTimer = null;
+			processStatusTick += 1;
+		}, delayMs);
+	};
+
+	const getEffectiveProcessSummaryAttrs = (
+		item: ProcessToolCallItem | undefined
+	): Record<string, string> | null => {
+		if (!item) return null;
+
+		const rawStatus = normalizeProcessToolStatus(item.attrs);
+		const now = Date.now();
+		let timing = processToolVisualTimingByKey.get(item.key);
+		if (!timing) {
+			timing = { firstSeenAt: now };
+			processToolVisualTimingByKey.set(item.key, timing);
+		}
+
+		if (rawStatus === 'running') {
+			clearProcessStatusTimer();
+			return item.attrs;
+		}
+
+		const elapsedMs = now - timing.firstSeenAt;
+		if (elapsedMs < MIN_PROCESS_RUNNING_MS) {
+			scheduleProcessStatusRefresh(MIN_PROCESS_RUNNING_MS - elapsedMs);
+			return {
+				...item.attrs,
+				status: 'running',
+				done: 'false'
+			};
+		}
+
+		clearProcessStatusTimer();
+		return item.attrs;
+	};
 
 	$: {
 		const rawContent = message?.content ?? '';
@@ -496,6 +663,19 @@
 				};
 			})
 			.filter((item) => Object.keys(item.attrs).length > 0);
+		const activeProcessKeys = new Set(processToolCallItems.map((item) => item.key));
+		for (const key of Array.from(processToolVisualTimingByKey.keys())) {
+			if (!activeProcessKeys.has(key)) {
+				processToolVisualTimingByKey.delete(key);
+			}
+		}
+		processToolCallGroups = groupProcessToolCallItems(processToolCallItems);
+		processStatusTick;
+		const summaryAttrs = getEffectiveProcessSummaryAttrs(processToolCallItems.at(-1));
+		processSummary =
+			summaryAttrs && processToolCallItems.length > 0
+				? getProcessToolStatusMessage(summaryAttrs)
+				: '';
 		const cleanedFinal = normalizeLeakedFormatting(
 			stripDownloadSection(final, generatedFiles.length > 0)
 		);
@@ -939,6 +1119,8 @@
 	});
 
 	onDestroy(() => {
+		clearProcessStatusTimer();
+
 		if (buttonsContainerElement) {
 			buttonsContainerElement.removeEventListener('wheel', buttonsWheelHandler);
 		}
@@ -1116,80 +1298,125 @@
 							</div>
 						{/if}
 
-							<div
-								bind:this={contentContainerElement}
-								class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
-								id="response-content-container"
-							>
-								{#if processContent}
-									<div class="mb-2 px-1 pt-1 space-y-1">
-										{#each processToolCallItems as item (item.key)}
-											<ToolCallDisplay
-												id={`${chatId}-${message.id}-process-${item.key}`}
-												attributes={item.attrs}
-												open={false}
-												className="w-full space-y-1"
-											/>
-										{/each}
-									</div>
-								{/if}
+						<div
+							bind:this={contentContainerElement}
+							class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
+							id="response-content-container"
+						>
+							{#if processContent}
+								<div
+									class="mb-2 w-full overflow-hidden rounded-xl border border-gray-200/90 bg-gray-50/80 dark:border-gray-800 dark:bg-gray-900/70"
+								>
+									<button
+										type="button"
+										class="flex w-full items-center justify-between gap-2 border-b border-gray-200/80 px-3 py-2 text-left dark:border-gray-800"
+										on:click={() => {
+											showProcessToolHistory = !showProcessToolHistory;
+										}}
+									>
+										<div class="min-w-0">
+											<div
+												class="text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300"
+											>
+												执行过程
+											</div>
+											{#if processSummary}
+												<div class="mt-0.5 line-clamp-1 text-xs text-gray-500 dark:text-gray-400">
+													{processSummary}
+												</div>
+											{/if}
+										</div>
 
-								{#if finalMessageContent === '' && !processContent && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
-									<Skeleton />
-								{:else if finalMessageContent && message.error !== true}
-									<!-- always show message contents even if there's an error -->
-									<!-- unless message.error === true which is legacy error handling, where the error message is stored in message.content -->
-									{#if placeInlineGeneratedFiles}
-										{#if finalContentBeforeGeneratedFiles}
-											<ContentRenderer
-												id={`${chatId}-${message.id}-before-generated-files`}
-												messageId={message.id}
-												{history}
-												{selectedModels}
-												content={finalContentBeforeGeneratedFiles}
-												sources={message.sources}
-												floatingButtons={false}
-												save={!readOnly}
-												preview={!readOnly}
-												{editCodeBlock}
-												{topPadding}
-												done={($settings?.chatFadeStreamingText ?? true)
-													? (message?.done ?? false)
-													: true}
-												{model}
-												onTaskClick={async (e) => {
-													console.log(e);
-												}}
-												onSourceClick={async (id) => {
-													console.log(id);
+										<ChevronDown
+											className={`size-3.5 shrink-0 text-gray-500 transition-transform ${
+												showProcessToolHistory ? 'rotate-180' : ''
+											}`}
+										/>
+									</button>
 
-													if (citationsElement) {
-														citationsElement?.showSourceModal(id);
-													}
-												}}
-												onAddMessages={({ modelId, parentId, messages }) => {
-													addMessages({ modelId, parentId, messages });
-												}}
-												onSave={({ raw, oldContent, newContent }) => {
-													history.messages[message.id].content = history.messages[
-														message.id
-													].content.replace(raw, raw.replace(oldContent, newContent));
+									{#if showProcessToolHistory}
+										<div class="px-2 py-2">
+											{#each processToolCallGroups as group, idx (group.key)}
+												<div class="mb-1 flex items-stretch gap-2">
+													<div>
+														<div class="mb-1.5 px-1 pt-3">
+															<span
+																class="relative flex size-1.5 items-center justify-center rounded-full"
+															>
+																<span
+																	class="relative inline-flex size-1.5 rounded-full bg-gray-500 dark:bg-gray-400"
+																></span>
+															</span>
+														</div>
+														{#if idx !== processToolCallGroups.length - 1}
+															<div
+																class="ml-[6.5px] h-[calc(100%-14px)] w-[0.5px] bg-gray-300 dark:bg-gray-700"
+															/>
+														{/if}
+													</div>
 
-													updateChat();
-												}}
-											/>
-										{/if}
-									{:else}
+													<div class="min-w-0 flex-1">
+														{#if group.count > 1}
+															<div
+																class="rounded-lg border border-gray-200/80 bg-white/70 p-2 dark:border-gray-800 dark:bg-gray-950/20"
+															>
+																<div class="mb-2 flex items-center justify-between px-1">
+																	<div
+																		class="text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300"
+																	>
+																		{group.label}
+																	</div>
+																	<div class="text-[11px] text-gray-400 dark:text-gray-500">
+																		连续 {group.count} 次
+																	</div>
+																</div>
+
+																<div class="space-y-1.5">
+																	{#each group.items as item (item.key)}
+																		<ToolCallDisplay
+																			id={`${chatId}-${message.id}-process-${item.key}`}
+																			attributes={item.attrs}
+																			open={false}
+																			embedded={true}
+																			className="w-full"
+																		/>
+																	{/each}
+																</div>
+															</div>
+														{:else}
+															{#each group.items as item (item.key)}
+																<ToolCallDisplay
+																	id={`${chatId}-${message.id}-process-${item.key}`}
+																	attributes={item.attrs}
+																	open={false}
+																	embedded={true}
+																	className="w-full"
+																/>
+															{/each}
+														{/if}
+													</div>
+												</div>
+											{/each}
+										</div>
+									{/if}
+								</div>
+							{/if}
+
+							{#if finalMessageContent === '' && !processContent && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
+								<Skeleton />
+							{:else if finalMessageContent && message.error !== true}
+								<!-- always show message contents even if there's an error -->
+								<!-- unless message.error === true which is legacy error handling, where the error message is stored in message.content -->
+								{#if placeInlineGeneratedFiles}
+									{#if finalContentBeforeGeneratedFiles}
 										<ContentRenderer
-											id={`${chatId}-${message.id}`}
+											id={`${chatId}-${message.id}-before-generated-files`}
 											messageId={message.id}
 											{history}
 											{selectedModels}
-											content={finalMessageContent}
+											content={finalContentBeforeGeneratedFiles}
 											sources={message.sources}
-											floatingButtons={message?.done &&
-												!readOnly &&
-											($settings?.showFloatingActionButtons ?? true)}
+											floatingButtons={false}
 											save={!readOnly}
 											preview={!readOnly}
 											{editCodeBlock}
@@ -1220,144 +1447,193 @@
 											}}
 										/>
 									{/if}
+								{:else}
+									<ContentRenderer
+										id={`${chatId}-${message.id}`}
+										messageId={message.id}
+										{history}
+										{selectedModels}
+										content={finalMessageContent}
+										sources={message.sources}
+										floatingButtons={message?.done &&
+											!readOnly &&
+											($settings?.showFloatingActionButtons ?? true)}
+										save={!readOnly}
+										preview={!readOnly}
+										{editCodeBlock}
+										{topPadding}
+										done={($settings?.chatFadeStreamingText ?? true)
+											? (message?.done ?? false)
+											: true}
+										{model}
+										onTaskClick={async (e) => {
+											console.log(e);
+										}}
+										onSourceClick={async (id) => {
+											console.log(id);
+
+											if (citationsElement) {
+												citationsElement?.showSourceModal(id);
+											}
+										}}
+										onAddMessages={({ modelId, parentId, messages }) => {
+											addMessages({ modelId, parentId, messages });
+										}}
+										onSave={({ raw, oldContent, newContent }) => {
+											history.messages[message.id].content = history.messages[
+												message.id
+											].content.replace(raw, raw.replace(oldContent, newContent));
+
+											updateChat();
+										}}
+									/>
 								{/if}
+							{/if}
 
-									{#if message?.error}
-										<Error content={message?.error?.content ?? message.content} />
-									{/if}
+							{#if message?.error}
+								<Error content={message?.error?.content ?? message.content} />
+							{/if}
 
-									{#if generatedFiles.length > 0 && placeInlineGeneratedFiles}
-										<div class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900/70">
+							{#if generatedFiles.length > 0 && placeInlineGeneratedFiles}
+								<div
+									class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900/70"
+								>
+									<div
+										class="border-b border-gray-200 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:border-gray-800 dark:text-gray-300"
+									>
+										生成文件
+									</div>
+									<div class="space-y-1.5 p-2">
+										{#each generatedFiles as file}
 											<div
-												class="border-b border-gray-200 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:border-gray-800 dark:text-gray-300"
+												class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850"
 											>
-												生成文件
-											</div>
-											<div class="space-y-1.5 p-2">
-												{#each generatedFiles as file}
-													<div class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850">
-														<div class="min-w-0 flex items-center gap-2">
-															{#if file.isImage}
-																<img
-																	src={file.url}
-																	alt={file.name}
-																	class="size-8 rounded-md border border-gray-200 object-cover dark:border-gray-700"
-																/>
-															{/if}
-															<div class="min-w-0">
-																<a
-																	href={file.url}
-																	target="_blank"
-																	rel="noreferrer"
-																	class="line-clamp-1 text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
-																>
-																	{file.name}
-																</a>
-															</div>
-														</div>
+												<div class="min-w-0 flex items-center gap-2">
+													{#if file.isImage}
+														<img
+															src={file.url}
+															alt={file.name}
+															class="size-8 rounded-md border border-gray-200 object-cover dark:border-gray-700"
+														/>
+													{/if}
+													<div class="min-w-0">
 														<a
 															href={file.url}
 															target="_blank"
 															rel="noreferrer"
-															class="shrink-0 inline-flex size-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
-															title={$i18n.t('Download')}
+															class="line-clamp-1 text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
 														>
-															<Download className="size-3.5" />
+															{file.name}
 														</a>
 													</div>
-												{/each}
-											</div>
-										</div>
-
-										{#if finalContentAfterGeneratedFiles}
-											<ContentRenderer
-												id={`${chatId}-${message.id}-after-generated-files`}
-												messageId={message.id}
-												{history}
-												{selectedModels}
-												content={finalContentAfterGeneratedFiles}
-												sources={message.sources}
-												floatingButtons={message?.done &&
-													!readOnly &&
-												($settings?.showFloatingActionButtons ?? true)}
-												save={!readOnly}
-												preview={!readOnly}
-												{editCodeBlock}
-												{topPadding}
-												done={($settings?.chatFadeStreamingText ?? true)
-													? (message?.done ?? false)
-													: true}
-												{model}
-												onTaskClick={async (e) => {
-													console.log(e);
-												}}
-												onSourceClick={async (id) => {
-													console.log(id);
-
-													if (citationsElement) {
-														citationsElement?.showSourceModal(id);
-													}
-												}}
-												onAddMessages={({ modelId, parentId, messages }) => {
-													addMessages({ modelId, parentId, messages });
-												}}
-												onSave={({ raw, oldContent, newContent }) => {
-													history.messages[message.id].content = history.messages[
-														message.id
-													].content.replace(raw, raw.replace(oldContent, newContent));
-
-													updateChat();
-												}}
-											/>
-										{/if}
-									{/if}
-
-									{#if generatedFiles.length > 0 && !placeInlineGeneratedFiles}
-										<div class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900/70">
-											<div
-												class="border-b border-gray-200 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:border-gray-800 dark:text-gray-300"
-										>
-											生成文件
-										</div>
-										<div class="space-y-1.5 p-2">
-											{#each generatedFiles as file}
-												<div class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850">
-													<div class="min-w-0 flex items-center gap-2">
-														{#if file.isImage}
-															<img
-																src={file.url}
-																alt={file.name}
-																class="size-8 rounded-md border border-gray-200 object-cover dark:border-gray-700"
-															/>
-														{/if}
-														<div class="min-w-0">
-															<a
-																href={file.url}
-																target="_blank"
-																rel="noreferrer"
-																class="line-clamp-1 text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
-															>
-																{file.name}
-															</a>
-														</div>
-													</div>
-													<a
-														href={file.url}
-														target="_blank"
-														rel="noreferrer"
-														class="shrink-0 inline-flex size-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
-														title={$i18n.t('Download')}
-													>
-														<Download className="size-3.5" />
-													</a>
 												</div>
-											{/each}
-										</div>
+												<a
+													href={file.url}
+													target="_blank"
+													rel="noreferrer"
+													class="shrink-0 inline-flex size-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
+													title={$i18n.t('Download')}
+												>
+													<Download className="size-3.5" />
+												</a>
+											</div>
+										{/each}
 									</div>
-								{/if}
+								</div>
 
-								{#if (message?.sources || message?.citations) && (model?.info?.meta?.capabilities?.citations ?? true)}
-									<Citations
+								{#if finalContentAfterGeneratedFiles}
+									<ContentRenderer
+										id={`${chatId}-${message.id}-after-generated-files`}
+										messageId={message.id}
+										{history}
+										{selectedModels}
+										content={finalContentAfterGeneratedFiles}
+										sources={message.sources}
+										floatingButtons={message?.done &&
+											!readOnly &&
+											($settings?.showFloatingActionButtons ?? true)}
+										save={!readOnly}
+										preview={!readOnly}
+										{editCodeBlock}
+										{topPadding}
+										done={($settings?.chatFadeStreamingText ?? true)
+											? (message?.done ?? false)
+											: true}
+										{model}
+										onTaskClick={async (e) => {
+											console.log(e);
+										}}
+										onSourceClick={async (id) => {
+											console.log(id);
+
+											if (citationsElement) {
+												citationsElement?.showSourceModal(id);
+											}
+										}}
+										onAddMessages={({ modelId, parentId, messages }) => {
+											addMessages({ modelId, parentId, messages });
+										}}
+										onSave={({ raw, oldContent, newContent }) => {
+											history.messages[message.id].content = history.messages[
+												message.id
+											].content.replace(raw, raw.replace(oldContent, newContent));
+
+											updateChat();
+										}}
+									/>
+								{/if}
+							{/if}
+
+							{#if generatedFiles.length > 0 && !placeInlineGeneratedFiles}
+								<div
+									class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900/70"
+								>
+									<div
+										class="border-b border-gray-200 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:border-gray-800 dark:text-gray-300"
+									>
+										生成文件
+									</div>
+									<div class="space-y-1.5 p-2">
+										{#each generatedFiles as file}
+											<div
+												class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850"
+											>
+												<div class="min-w-0 flex items-center gap-2">
+													{#if file.isImage}
+														<img
+															src={file.url}
+															alt={file.name}
+															class="size-8 rounded-md border border-gray-200 object-cover dark:border-gray-700"
+														/>
+													{/if}
+													<div class="min-w-0">
+														<a
+															href={file.url}
+															target="_blank"
+															rel="noreferrer"
+															class="line-clamp-1 text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
+														>
+															{file.name}
+														</a>
+													</div>
+												</div>
+												<a
+													href={file.url}
+													target="_blank"
+													rel="noreferrer"
+													class="shrink-0 inline-flex size-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
+													title={$i18n.t('Download')}
+												>
+													<Download className="size-3.5" />
+												</a>
+											</div>
+										{/each}
+									</div>
+								</div>
+							{/if}
+
+							{#if (message?.sources || message?.citations) && (model?.info?.meta?.capabilities?.citations ?? true)}
+								<Citations
 									bind:this={citationsElement}
 									id={message?.id}
 									{chatId}
