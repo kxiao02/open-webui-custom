@@ -18,7 +18,21 @@
 	import Markdown from '../chat/Messages/Markdown.svelte';
 	import Image from './Image.svelte';
 	import FullHeightIframe from './FullHeightIframe.svelte';
-	import { settings } from '$lib/stores';
+	import { downloadFileBlob } from '$lib/apis/terminal';
+	import {
+		selectedGeneratedFilePreviewId,
+		settings,
+		showArtifacts,
+		showCallOverlay,
+		showControls,
+		showEmbeds,
+		showFilePreview,
+		showOverview,
+		selectedTerminalId,
+		terminalServers
+	} from '$lib/stores';
+	import { openGeneratedFilePreview } from '$lib/utils/generated-file-preview';
+	import { normalizeToolId, resolveToolDisplay } from '$lib/utils/tool-display';
 
 	export let id: string = '';
 	export let attributes: {
@@ -26,6 +40,8 @@
 		id?: string;
 		call_key?: string;
 		name?: string;
+		tool_id?: string;
+		tool_name?: string;
 		arguments?: string;
 		result?: string;
 		files?: string;
@@ -42,26 +58,6 @@
 	let expandedResult = false;
 	let visualStatusTick = 0;
 	let visualStatusTimer: ReturnType<typeof setTimeout> | null = null;
-
-	const TOOL_LABELS: Record<string, string> = {
-		internet_search: '网络搜索',
-		联网搜索: '网络搜索',
-		visit_webpage: '网页读取',
-		网页读取: '网页读取',
-		current_server_time: '服务器时间',
-		服务器时间: '服务器时间',
-		math_calculator: '数学计算',
-		数学计算: '数学计算',
-		tool_self_check: '工具自检',
-		工具自检: '工具自检',
-		read_structured_file: '读取结构化文件',
-		读取结构化文件: '读取结构化文件',
-		write_structured_file: '写入结构化文件',
-		写入结构化文件: '写入结构化文件',
-		gotenberg_convert: 'PDF 转换',
-		PDF转换: 'PDF 转换',
-		'PDF 转换': 'PDF 转换'
-	};
 
 	$: if (!open) expandedResult = false;
 	export let buttonClassName = '';
@@ -101,36 +97,6 @@
 		}
 	}
 
-	function inferToolLabel(
-		name: string | undefined,
-		parsedArgs: Record<string, unknown> | null
-	): string {
-		const normalizedName = TOOL_LABELS[name ?? ''] ?? (name ?? '').trim();
-		if (normalizedName) return normalizedName;
-
-		const keys = new Set(Object.keys(parsedArgs ?? {}));
-		if (keys.has('query') || keys.has('max_results') || keys.has('keywords')) {
-			return '网络搜索';
-		}
-		if (keys.has('url') || keys.has('urls') || keys.has('link')) {
-			return '网页读取';
-		}
-		if (keys.has('expression') || keys.has('formula')) {
-			return '数学计算';
-		}
-		if (
-			keys.has('content') &&
-			(keys.has('path') || keys.has('file_path') || keys.has('filename'))
-		) {
-			return '写入结构化文件';
-		}
-		if (keys.has('path') || keys.has('file_path') || keys.has('filename')) {
-			return '读取结构化文件';
-		}
-
-		return '工具调用';
-	}
-
 	function normalizeStatus(status: string | undefined, done: string | undefined): string {
 		const normalized = (status || '').trim().toLowerCase();
 		if (['running', 'success', 'error', 'timeout'].includes(normalized)) {
@@ -139,11 +105,100 @@
 		return done === 'true' ? 'success' : 'running';
 	}
 
-	function getStatusMessage(status: string, name: string): string {
-		if (status === 'success') return `${name} 已完成`;
-		if (status === 'timeout') return `${name} 已超时`;
-		if (status === 'error') return `${name} 运行失败`;
-		return `正在执行 ${name}...`;
+	function getStatusMessage(status: string): string {
+		if (status === 'success') return '已完成';
+		if (status === 'timeout') return '已超时';
+		if (status === 'error') return '运行失败';
+		return '执行中';
+	}
+
+	type GeneratedTerminalFile = {
+		name: string;
+		path: string;
+	};
+
+	function getStringField(record: Record<string, unknown> | null, keys: string[]): string {
+		for (const key of keys) {
+			const value = record?.[key];
+			if (typeof value === 'string' && value.trim()) {
+				return value.trim();
+			}
+		}
+		return '';
+	}
+
+	function getGeneratedTerminalFile(
+		toolName: string | undefined,
+		parsedResult: unknown
+	): GeneratedTerminalFile | null {
+		if (!parsedResult || typeof parsedResult !== 'object' || Array.isArray(parsedResult)) {
+			return null;
+		}
+
+		const normalizedToolId = normalizeToolId(toolName);
+		if (
+			!['write_file', 'replace_file_content', 'display_file', 'edit_file'].includes(
+				normalizedToolId
+			)
+		) {
+			return null;
+		}
+
+		const record = parsedResult as Record<string, unknown>;
+		if (record.success === false) return null;
+
+		const path = getStringField(record, ['path', 'output_path', 'target_path', 'file_path']);
+		if (!path) return null;
+
+		const name =
+			getStringField(record, ['filename', 'fileName', 'name']) ||
+			path.split('/').pop()?.split('\\').pop()?.trim() ||
+			'generated-file';
+
+		return { name, path };
+	}
+
+	type ActiveTerminal = { url: string; key: string } | null;
+
+	$: systemTerminal = $selectedTerminalId
+		? (($terminalServers ?? []).find((terminal: any) => terminal.id === $selectedTerminalId) ??
+			null)
+		: (($terminalServers ?? [])[0] ?? null);
+	$: directTerminal =
+		($settings?.terminalServers ?? []).find(
+			(server: any) => server.url === $selectedTerminalId && server.enabled
+		) ?? null;
+	$: activeTerminal = (
+		directTerminal
+			? { url: directTerminal.url, key: directTerminal.api_key }
+			: systemTerminal
+				? { url: systemTerminal.url, key: systemTerminal.key }
+				: null
+	) as ActiveTerminal;
+
+	async function downloadResultFile(file: GeneratedTerminalFile) {
+		if (!activeTerminal) return;
+		const result = await downloadFileBlob(activeTerminal.url, activeTerminal.key, file.path);
+		if (!result) return;
+
+		const url = URL.createObjectURL(result.blob);
+		const link = document.createElement('a');
+		link.href = url;
+		link.download = result.filename || file.name;
+		link.click();
+		URL.revokeObjectURL(url);
+	}
+
+	function openResultFile(file: GeneratedTerminalFile) {
+		openGeneratedFilePreview(`tool:${file.path}:${file.name}`, {
+			showControls,
+			showFilePreview,
+			selectedGeneratedFilePreviewId,
+			showOverview,
+			showArtifacts,
+			showEmbeds,
+			showCallOverlay
+		});
 	}
 
 	function clearVisualStatusTimer() {
@@ -166,7 +221,7 @@
 		if (callKey) return `call_key:${callKey}`;
 		const toolCallId = (attributes?.id || '').trim();
 		if (toolCallId) return `id:${toolCallId}`;
-		const name = (attributes?.name || '').trim();
+		const name = (attributes?.tool_id || attributes?.name || '').trim();
 		const args = (attributes?.arguments || '').trim();
 		if (name || args) return `name_args:${name}|${args}`;
 		return id || componentId;
@@ -207,16 +262,24 @@
 	$: embeds = parseJSONString(decode(attributes?.embeds ?? ''));
 	$: parsedArgs = parseArguments(args);
 	$: parsedResult = parseJSONString(result);
-	$: displayName = inferToolLabel(attributes?.name, parsedArgs);
+	$: toolDisplay = resolveToolDisplay({
+		toolId: attributes?.tool_id,
+		toolName: attributes?.tool_name,
+		legacyName: attributes?.name,
+		parsedArgs
+	});
+	$: displayName = toolDisplay.toolName;
+	$: normalizedToolId = toolDisplay.toolId || normalizeToolId(attributes?.name);
 	$: rawStatus = normalizeStatus(attributes?.status, attributes?.done);
 	$: toolVisualKey = getToolVisualKey();
 	$: visualStatusTick;
 	$: status = getEffectiveStatus(rawStatus, toolVisualKey);
 	$: isTerminal = status !== 'running';
 	$: isExecuting = status === 'running';
-	$: statusMessage = getStatusMessage(status, displayName);
+	$: statusMessage = getStatusMessage(status);
 	$: hasEmbeds = embeds && Array.isArray(embeds) && embeds.length > 0;
 	$: hasFiles = Array.isArray(files) && files.length > 0;
+	$: terminalResultFile = getGeneratedTerminalFile(normalizedToolId, parsedResult);
 	$: canExpand = !hasEmbeds && (Boolean(args) || Boolean(result) || hasFiles);
 	$: if (!canExpand) open = false;
 </script>
@@ -263,6 +326,35 @@
 				/>
 			{/if}
 		</button>
+
+		{#if terminalResultFile}
+			<div
+				class={`flex flex-wrap items-center gap-1.5 px-3 pb-2 text-[11px] ${
+					canExpand ? '' : 'pt-0'
+				}`}
+			>
+				<button
+					type="button"
+					class="rounded-md border border-gray-200 bg-white px-2 py-0.5 text-gray-600 transition hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
+					on:click={() => {
+						openResultFile(terminalResultFile);
+					}}
+				>
+					查看文件
+				</button>
+				{#if activeTerminal}
+					<button
+						type="button"
+						class="rounded-md border border-gray-200 bg-white px-2 py-0.5 text-gray-600 transition hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
+						on:click={async () => {
+							await downloadResultFile(terminalResultFile);
+						}}
+					>
+						下载文件
+					</button>
+				{/if}
+			</div>
+		{/if}
 
 		{#if (open && canExpand) || hasEmbeds}
 			<div transition:slide={{ duration: 300, easing: quintOut, axis: 'y' }}>

@@ -2,7 +2,26 @@
 	import { getContext } from 'svelte';
 	import type { Writable } from 'svelte/store';
 	import type { i18n as i18nType } from 'i18next';
+	import { downloadFileBlob } from '$lib/apis/terminal';
+	import {
+		selectedGeneratedFilePreviewId,
+		selectedTerminalId,
+		settings,
+		showArtifacts,
+		showCallOverlay,
+		showControls,
+		showEmbeds,
+		showFilePreview,
+		showOverview,
+		terminalServers
+	} from '$lib/stores';
 	import { unescapeHtml } from '$lib/utils';
+	import {
+		type GeneratedFileItem,
+		collectGeneratedFilesFromValue,
+		parseNestedJSON
+	} from '$lib/utils/generated-files';
+	import { openGeneratedFilePreview } from '$lib/utils/generated-file-preview';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
 	import Wrench from '$lib/components/icons/Wrench.svelte';
@@ -10,17 +29,14 @@
 	import Document from '$lib/components/icons/Document.svelte';
 	import CommandLine from '$lib/components/icons/CommandLine.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
+	import { resolveToolDisplay } from '$lib/utils/tool-display';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 
 	export let token: any;
 
-	type ToolFileItem = {
-		id: string;
-		name: string;
-		url: string;
-		isImage: boolean;
-	};
+	type ToolFileItem = GeneratedFileItem;
+	type ActiveTerminal = { url: string; key: string } | null;
 
 	const parseAttr = (value: unknown): unknown => {
 		if (typeof value !== 'string') return value;
@@ -64,124 +80,85 @@
 		return !!value;
 	};
 
-	const normalizeFileUrl = (value: string): string => {
-		if (!value) return value;
-		if (value.startsWith('http') || value.startsWith('/') || value.startsWith('data:')) return value;
-		return `/api/v1/files/${value}/content`;
-	};
-
-	const inferName = (value: string, fallback = 'generated-file') => {
-		const sanitized = (value || '').split('?')[0];
-		const pathPart = sanitized.split('/').pop() || sanitized;
-		const windowsPathPart = pathPart.split('\\').pop() || pathPart;
-		return windowsPathPart.trim() || fallback;
-	};
-
-	const isImageName = (name: string, type?: string, contentType?: string) => {
-		if ((contentType || '').startsWith('image/')) return true;
-		if ((type || '').toLowerCase() === 'image') return true;
-		const ext = (name.split('.').pop() || '').toLowerCase();
-		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext);
-	};
-
 	const normalizeFiles = (rawFiles: unknown): ToolFileItem[] => {
-		if (!Array.isArray(rawFiles)) return [];
-		const items: ToolFileItem[] = [];
-
-		for (const raw of rawFiles) {
-			if (typeof raw === 'string') {
-				const id = raw.trim();
-				if (!id) continue;
-				const name = inferName(id);
-				items.push({
-					id: `file:${id}`,
-					name,
-					url: normalizeFileUrl(id),
-					isImage: isImageName(name)
-				});
-				continue;
-			}
-
-			if (!raw || typeof raw !== 'object') continue;
-			const file = raw as Record<string, unknown>;
-			const fileRef =
-				(typeof file.url === 'string' && file.url) ||
-				(typeof file.download_url === 'string' && file.download_url) ||
-				(typeof file.downloadUrl === 'string' && file.downloadUrl) ||
-				(typeof file.id === 'string' && file.id) ||
-				(typeof file.file_id === 'string' && file.file_id) ||
-				(typeof file.fileId === 'string' && file.fileId) ||
-				'';
-			if (!fileRef) continue;
-
-			const name =
-				(typeof file.name === 'string' && file.name.trim()) ||
-				(typeof file.filename === 'string' && file.filename.trim()) ||
-				(typeof file.fileName === 'string' && file.fileName.trim()) ||
-				inferName(fileRef);
-
-			items.push({
-				id: `file:${fileRef}:${name}`,
-				name,
-				url: normalizeFileUrl(fileRef),
-				isImage: isImageName(
-					name,
-					typeof file.type === 'string' ? file.type : undefined,
-					typeof file.content_type === 'string' ? file.content_type : undefined
-				)
-			});
-		}
-
-		const dedup = new Map<string, ToolFileItem>();
-		for (const item of items) {
-			dedup.set(`${item.url}|${item.name}`, item);
-		}
-		return Array.from(dedup.values());
+		return collectGeneratedFilesFromValue(rawFiles, 'tool');
 	};
 
-	const getToolMeta = (name: string) => {
-		const normalized = (name || '').toLowerCase();
-		if (normalized.includes('search') || normalized.includes('web')) {
+	const getToolMeta = (
+		toolId: string | undefined,
+		toolName: string | undefined,
+		legacyName: string | undefined,
+		args: Record<string, unknown> | null = null
+	) => {
+		const resolved = resolveToolDisplay({
+			toolId,
+			toolName,
+			legacyName,
+			parsedArgs: args
+		});
+		const category = resolved.category;
+		const displayName = resolved.toolName;
+		if (category === 'web') {
 			return {
 				icon: Search,
-				label: 'Web Search',
+				label: displayName,
 				iconClass: 'text-blue-600 dark:text-blue-400',
 				bgClass: 'bg-blue-100 dark:bg-blue-950/60'
 			};
 		}
-		if (normalized.includes('file') || normalized.includes('write') || normalized.includes('read')) {
+		if (category === 'file') {
 			return {
 				icon: Document,
-				label: 'File Tool',
+				label: displayName,
 				iconClass: 'text-emerald-600 dark:text-emerald-400',
 				bgClass: 'bg-emerald-100 dark:bg-emerald-950/60'
 			};
 		}
-		if (normalized.includes('code') || normalized.includes('python') || normalized.includes('execute')) {
+		if (category === 'code') {
 			return {
 				icon: CommandLine,
-				label: 'Code Tool',
+				label: displayName,
 				iconClass: 'text-purple-600 dark:text-purple-400',
 				bgClass: 'bg-purple-100 dark:bg-purple-950/60'
 			};
 		}
 		return {
 			icon: Wrench,
-			label: name || 'Tool Call',
+			label: displayName,
 			iconClass: 'text-gray-600 dark:text-gray-300',
 			bgClass: 'bg-gray-100 dark:bg-gray-800'
 		};
 	};
 
 	let open = false;
+	let systemTerminal: any = null;
+	let directTerminal: any = null;
+	let activeTerminal: ActiveTerminal = null;
 	$: done = toBool(token?.attributes?.done);
-	$: toolName = token?.attributes?.name || '';
-	$: summary = token?.summary || (done ? 'Tool Executed' : 'Executing...');
+	$: summary = token?.summary || (done ? '已完成' : '执行中');
 
 	$: argumentsParsed = parseAttr(token?.attributes?.arguments);
-	$: resultParsed = parseAttr(token?.attributes?.result);
-	$: filesParsed = normalizeFiles(parseAttr(token?.attributes?.files));
+	$: resultParsed = parseNestedJSON(parseAttr(token?.attributes?.result));
+	$: filesParsed = normalizeFiles([
+		...normalizeFiles(parseNestedJSON(parseAttr(token?.attributes?.files))),
+		...collectGeneratedFilesFromValue(resultParsed, 'tool')
+	]);
 	$: embedsParsed = parseAttr(token?.attributes?.embeds);
+	$: systemTerminal = $selectedTerminalId
+		? (($terminalServers ?? []).find((terminal: any) => terminal.id === $selectedTerminalId) ??
+			null)
+		: (($terminalServers ?? [])[0] ?? null);
+	$: directTerminal =
+		($settings?.terminalServers ?? []).find(
+			(server: any) => server.url === $selectedTerminalId && server.enabled
+		) ?? null;
+	$: activeTerminal = (
+		directTerminal
+			? { url: directTerminal.url, key: directTerminal.api_key }
+			: systemTerminal
+				? { url: systemTerminal.url, key: systemTerminal.key }
+				: null
+	) as ActiveTerminal;
 
 	$: argumentsText = prettyValue(argumentsParsed);
 	$: resultText = prettyValue(resultParsed);
@@ -192,7 +169,47 @@
 		open = false;
 	}
 
-	$: meta = getToolMeta(toolName);
+	$: argsRecord =
+		argumentsParsed && typeof argumentsParsed === 'object' && !Array.isArray(argumentsParsed)
+			? (argumentsParsed as Record<string, unknown>)
+			: null;
+	$: meta = getToolMeta(
+		token?.attributes?.tool_id,
+		token?.attributes?.tool_name,
+		token?.attributes?.name,
+		argsRecord
+	);
+
+	const openFile = (file: ToolFileItem) => {
+		openGeneratedFilePreview(file.id, {
+			showControls,
+			showFilePreview,
+			selectedGeneratedFilePreviewId,
+			showOverview,
+			showArtifacts,
+			showEmbeds,
+			showCallOverlay
+		});
+	};
+
+	const downloadFile = async (file: ToolFileItem) => {
+		if (file.downloadMode === 'terminal' && file.path && activeTerminal) {
+			const result = await downloadFileBlob(activeTerminal.url, activeTerminal.key, file.path);
+			if (!result) return;
+
+			const objectUrl = URL.createObjectURL(result.blob);
+			const link = document.createElement('a');
+			link.href = objectUrl;
+			link.download = result.filename || file.name;
+			link.click();
+			URL.revokeObjectURL(objectUrl);
+			return;
+		}
+
+		if (file.url) {
+			window.open(file.url, '_blank', 'noopener,noreferrer');
+		}
+	};
 </script>
 
 <div
@@ -215,30 +232,34 @@
 				{/if}
 			</div>
 			<span
-				class={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-white dark:border-gray-900 ${done
-					? 'bg-emerald-500'
-					: 'bg-blue-500'}`}
+				class={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-white dark:border-gray-900 ${
+					done ? 'bg-emerald-500' : 'bg-blue-500'
+				}`}
 			></span>
 		</div>
 
 		<div class="min-w-0 flex-1">
 			<div class="line-clamp-1 text-[13px] font-medium text-gray-900 dark:text-gray-100">
-				{toolName || meta.label}
+				{meta.label}
 			</div>
 			<div class="line-clamp-1 text-xs text-gray-500 dark:text-gray-400">{summary}</div>
 		</div>
 
 		<div class="flex items-center gap-2">
 			<span
-				class={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${done
-					? 'border-emerald-200 bg-emerald-100 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-300'
-					: 'border-blue-200 bg-blue-100 text-blue-700 dark:border-blue-900 dark:bg-blue-950/60 dark:text-blue-300'}`}
+				class={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${
+					done
+						? 'border-emerald-200 bg-emerald-100 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-300'
+						: 'border-blue-200 bg-blue-100 text-blue-700 dark:border-blue-900 dark:bg-blue-950/60 dark:text-blue-300'
+				}`}
 			>
 				{done ? $i18n.t('Completed') : $i18n.t('Running')}
 			</span>
 
 			{#if hasBody}
-				<ChevronDown className={`size-3.5 text-gray-500 transition-transform ${open ? 'rotate-180' : ''}`} />
+				<ChevronDown
+					className={`size-3.5 text-gray-500 transition-transform ${open ? 'rotate-180' : ''}`}
+				/>
 			{/if}
 		</div>
 	</button>
@@ -249,57 +270,75 @@
 			class="space-y-2 border-t border-gray-200/80 px-3 pb-3 pt-2 dark:border-gray-800"
 		>
 			{#if argumentsText}
-				<div class="rounded-lg border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-950/70">
-					<div class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+				<div
+					class="rounded-lg border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-950/70"
+				>
+					<div
+						class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400"
+					>
 						Input
 					</div>
-					<pre class="max-h-56 overflow-auto whitespace-pre-wrap break-words text-xs text-gray-800 dark:text-gray-200">{argumentsText}</pre>
+					<pre
+						class="max-h-56 overflow-auto whitespace-pre-wrap break-words text-xs text-gray-800 dark:text-gray-200">{argumentsText}</pre>
 				</div>
 			{/if}
 
 			{#if resultText}
-				<div class="rounded-lg border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-950/70">
-					<div class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+				<div
+					class="rounded-lg border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-950/70"
+				>
+					<div
+						class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400"
+					>
 						Result
 					</div>
-					<pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words text-xs text-gray-800 dark:text-gray-200">{resultText}</pre>
+					<pre
+						class="max-h-64 overflow-auto whitespace-pre-wrap break-words text-xs text-gray-800 dark:text-gray-200">{resultText}</pre>
 				</div>
 			{/if}
 
 			{#if filesParsed.length > 0}
-				<div class="rounded-lg border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-950/70">
-					<div class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+				<div
+					class="rounded-lg border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-950/70"
+				>
+					<div
+						class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400"
+					>
 						Files
 					</div>
 					<div class="space-y-1.5">
 						{#each filesParsed as file}
-							<div class="flex items-center justify-between gap-2 rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 dark:border-gray-700 dark:bg-gray-900/70">
+							<div
+								class="flex items-center justify-between gap-2 rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 dark:border-gray-700 dark:bg-gray-900/70"
+							>
 								<div class="min-w-0 flex items-center gap-2">
-									{#if file.isImage}
+									{#if file.isImage && file.url}
 										<img
 											src={file.url}
 											alt={file.name}
 											class="size-7 rounded-md border border-gray-200 object-cover dark:border-gray-700"
 										/>
 									{/if}
-									<a
-										href={file.url}
-										target="_blank"
-										rel="noreferrer"
+									<button
+										type="button"
 										class="line-clamp-1 text-xs font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
+										on:click={() => {
+											openFile(file);
+										}}
 									>
 										{file.name}
-									</a>
+									</button>
 								</div>
-								<a
-									href={file.url}
-									target="_blank"
-									rel="noreferrer"
+								<button
+									type="button"
 									class="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
 									title={$i18n.t('Download')}
+									on:click={async () => {
+										await downloadFile(file);
+									}}
 								>
 									<Download className="size-3.5" />
-								</a>
+								</button>
 							</div>
 						{/each}
 					</div>

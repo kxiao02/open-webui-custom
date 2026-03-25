@@ -33,6 +33,9 @@ from sqlalchemy.sql.expression import bindparam
 
 log = logging.getLogger(__name__)
 
+DEFAULT_CHAT_TAIL_MESSAGES = 50
+MAX_CHAT_TAIL_MESSAGES = 200
+
 
 class Chat(Base):
     __tablename__ = "chat"
@@ -404,6 +407,174 @@ class ChatTable:
                 changed = True
 
         return changed
+
+    def _resolve_history_current_id(self, history: dict) -> Optional[str]:
+        messages = history.get("messages") if isinstance(history, dict) else None
+        if not isinstance(messages, dict) or len(messages) == 0:
+            return None
+
+        current_id = history.get("currentId")
+        if isinstance(current_id, str) and current_id in messages:
+            return current_id
+
+        candidates = []
+        for message_id, message in messages.items():
+            if not isinstance(message_id, str) or not isinstance(message, dict):
+                continue
+
+            child_ids = message.get("childrenIds")
+            has_child_in_history = (
+                isinstance(child_ids, list)
+                and any(
+                    isinstance(child_id, str) and child_id in messages
+                    for child_id in child_ids
+                )
+            )
+            if not has_child_in_history:
+                candidates.append((message_id, message))
+
+        if not candidates:
+            candidates = [
+                (message_id, message)
+                for message_id, message in messages.items()
+                if isinstance(message_id, str) and isinstance(message, dict)
+            ]
+
+        if not candidates:
+            return None
+
+        return max(
+            candidates,
+            key=lambda item: (
+                item[1].get("timestamp", 0)
+                if isinstance(item[1].get("timestamp"), (int, float))
+                else 0,
+                item[0],
+            ),
+        )[0]
+
+    def _get_history_branch_ids(self, history: dict) -> tuple[list[str], Optional[str], dict]:
+        messages = history.get("messages") if isinstance(history, dict) else None
+        if not isinstance(messages, dict) or len(messages) == 0:
+            return [], None, {}
+
+        current_id = self._resolve_history_current_id(history)
+        if current_id is None:
+            return [], None, messages
+
+        branch_ids: list[str] = []
+        visited: set[str] = set()
+        cursor: Optional[str] = current_id
+
+        while isinstance(cursor, str) and cursor in messages and cursor not in visited:
+            visited.add(cursor)
+            branch_ids.append(cursor)
+
+            parent_id = messages[cursor].get("parentId")
+            cursor = parent_id if isinstance(parent_id, str) else None
+
+        branch_ids.reverse()
+        return branch_ids, current_id, messages
+
+    def _build_history_tail_window(
+        self, history: dict, tail: Optional[int]
+    ) -> tuple[dict, dict]:
+        """
+        Build a truncated history map along the current branch.
+        Returns (new_history, meta) without mutating the input.
+        """
+        if not isinstance(history, dict):
+            return history, {
+                "truncated": False,
+                "can_load_more": False,
+                "tail": 0,
+                "total": 0,
+            }
+
+        messages = history.get("messages")
+        if not isinstance(messages, dict) or not messages:
+            total = len(messages) if isinstance(messages, dict) else 0
+            return history, {
+                "truncated": False,
+                "can_load_more": False,
+                "tail": 0,
+                "total": total,
+            }
+
+        branch_ids, current_id, messages = self._get_history_branch_ids(history)
+        total = len(messages)
+        if not branch_ids or current_id is None:
+            return history, {
+                "truncated": False,
+                "can_load_more": False,
+                "tail": total,
+                "total": total,
+            }
+
+        effective_tail: Optional[int] = None
+        if tail is not None:
+            try:
+                tail_value = int(tail)
+            except (TypeError, ValueError):
+                tail_value = None
+            if tail_value is not None and tail_value > 0:
+                effective_tail = min(tail_value, MAX_CHAT_TAIL_MESSAGES)
+
+        effective_branch_ids = (
+            branch_ids[-effective_tail:] if effective_tail is not None else branch_ids
+        )
+        truncated = len(effective_branch_ids) < len(branch_ids)
+
+        effective_message_ids = set(effective_branch_ids)
+        history_messages: dict = {}
+        for message_id in effective_branch_ids:
+            message = messages.get(message_id)
+            if not isinstance(message, dict):
+                continue
+            child_ids = message.get("childrenIds")
+            if isinstance(child_ids, list):
+                filtered_child_ids = [
+                    child_id
+                    for child_id in child_ids
+                    if isinstance(child_id, str) and child_id in effective_message_ids
+                ]
+                if filtered_child_ids != child_ids:
+                    message = {**message, "childrenIds": filtered_child_ids}
+            history_messages[message_id] = message
+
+        new_history = {
+            **history,
+            "messages": history_messages,
+            "currentId": current_id,
+        }
+        meta = {
+            "truncated": truncated,
+            "can_load_more": truncated,
+            "tail": len(effective_branch_ids),
+            "tail_start_id": effective_branch_ids[0] if effective_branch_ids else None,
+            "total": total,
+        }
+        return new_history, meta
+
+    def _apply_history_tail_window(self, chat: ChatModel, tail: Optional[int]) -> ChatModel:
+        chat_data = chat.model_dump()
+        chat_payload = chat_data.get("chat") or {}
+        history = chat_payload.get("history")
+
+        new_history, history_meta = self._build_history_tail_window(history, tail)
+
+        if new_history is not history:
+            chat_payload = {**chat_payload, "history": new_history}
+            chat_data["chat"] = chat_payload
+
+        meta = dict(chat_data.get("meta") or {})
+        meta["history"] = history_meta
+        chat_data["meta"] = meta
+
+        return ChatModel(**chat_data)
+
+    def build_history_tail(self, history: dict, tail: int) -> tuple[dict, dict]:
+        return self._build_history_tail_window(history, tail)
 
     def insert_new_chat(
         self, user_id: str, form_data: ChatForm, db: Optional[Session] = None
@@ -1082,7 +1253,10 @@ class ChatTable:
             return [ChatModel.model_validate(chat) for chat in all_chats]
 
     def get_chat_by_id(
-        self, id: str, db: Optional[Session] = None
+        self,
+        id: str,
+        history_tail: Optional[int] = None,
+        db: Optional[Session] = None,
     ) -> Optional[ChatModel]:
         try:
             with get_db_context(db) as db:
@@ -1094,7 +1268,10 @@ class ChatTable:
                     db.commit()
                     db.refresh(chat_item)
 
-                return ChatModel.model_validate(chat_item)
+                chat = ChatModel.model_validate(chat_item)
+                if history_tail is not None:
+                    return self._apply_history_tail_window(chat, history_tail)
+                return chat
         except Exception:
             return None
 
@@ -1115,7 +1292,11 @@ class ChatTable:
             return None
 
     def get_chat_by_id_and_user_id(
-        self, id: str, user_id: str, db: Optional[Session] = None
+        self,
+        id: str,
+        user_id: str,
+        history_tail: Optional[int] = None,
+        db: Optional[Session] = None,
     ) -> Optional[ChatModel]:
         try:
             with get_db_context(db) as db:
@@ -1127,7 +1308,10 @@ class ChatTable:
                     db.commit()
                     db.refresh(chat)
 
-                return ChatModel.model_validate(chat)
+                chat_model = ChatModel.model_validate(chat)
+                if history_tail is not None:
+                    return self._apply_history_tail_window(chat_model, history_tail)
+                return chat_model
         except Exception:
             return None
 

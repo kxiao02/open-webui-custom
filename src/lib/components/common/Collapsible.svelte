@@ -47,6 +47,7 @@
 		showFilePreview
 	} from '$lib/stores';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
+	import { resolveToolDisplay } from '$lib/utils/tool-display';
 
 	export let open = false;
 
@@ -241,28 +242,20 @@
 		snippet?: string;
 	};
 
-	const TOOL_LABELS: Record<string, string> = {
-		internet_search: '网络搜索',
-		联网搜索: '网络搜索',
-		visit_webpage: '网页读取',
-		网页读取: '网页读取',
-		current_server_time: '服务器时间',
-		服务器时间: '服务器时间',
-		math_calculator: '数学计算',
-		数学计算: '数学计算',
-		read_structured_file: '读取结构化文件',
-		读取结构化文件: '读取结构化文件',
-		write_structured_file: '写入结构化文件',
-		写入结构化文件: '写入结构化文件',
-		gotenberg_convert: 'PDF 转换',
-		'PDF转换': 'PDF 转换'
-	};
-
 	const TOOL_ICONS: Record<string, string> = {
 		网络搜索: '🔎',
 		网页读取: '🌐',
 		服务器时间: '🕒',
 		数学计算: '🧮',
+		读取文件: '📄',
+		查看文件: '📄',
+		写入文件: '✍️',
+		替换文件内容: '✍️',
+		编辑文件: '✍️',
+		列出目录: '📁',
+		文件匹配: '📁',
+		文本搜索: '🔍',
+		执行命令: '⌨️',
 		读取结构化文件: '📄',
 		写入结构化文件: '✍️',
 		'PDF 转换': '📘'
@@ -285,8 +278,18 @@
 		return '';
 	}
 
-	function getToolCardMeta(rawName: string, args: Record<string, any>) {
-		const name = TOOL_LABELS[rawName] || rawName || '工具调用';
+	function getToolCardMeta(
+		rawToolId: string | undefined,
+		rawToolName: string | undefined,
+		legacyName: string | undefined,
+		args: Record<string, any>
+	) {
+		const name = resolveToolDisplay({
+			toolId: rawToolId,
+			toolName: rawToolName,
+			legacyName,
+			parsedArgs: args
+		}).toolName;
 		const icon = TOOL_ICONS[name] || '🧩';
 
 		if (name === '网络搜索') {
@@ -437,23 +440,27 @@
 			<div class="py-1 w-full cursor-pointer">
 				<div class=" w-full text-xs text-gray-500">
 					<div class="">
-						{attributes.name}
+						{resolveToolDisplay({
+							toolId: attributes?.tool_id,
+							toolName: attributes?.tool_name,
+							legacyName: attributes?.name
+						}).toolName}
 					</div>
 
-				{#each embeds as embed, idx}
-					<div class="my-2" id={`${collapsibleId}-tool-calls-${attributes?.id}-embed-${idx}`}>
-						<FullHeightIframe
-							src={embed}
-							{args}
-							allowScripts={true}
-							allowForms={true}
-							allowSameOrigin={true}
-							allowPopups={true}
-						/>
-					</div>
-				{/each}
+					{#each embeds as embed, idx}
+						<div class="my-2" id={`${collapsibleId}-tool-calls-${attributes?.id}-embed-${idx}`}>
+							<FullHeightIframe
+								src={embed}
+								{args}
+								allowScripts={true}
+								allowForms={true}
+								allowSameOrigin={true}
+								allowPopups={true}
+							/>
+						</div>
+					{/each}
+				</div>
 			</div>
-		</div>
 		{:else}
 			{@const parsedArgs = parseJSONString(args)}
 			{@const parsedResult = parseJSONString(result)}
@@ -461,12 +468,19 @@
 			{@const toolStatus = normalizeToolStatus(attributes?.status, attributes?.done)}
 			{@const statusDone = toolStatus === 'success'}
 			{@const statusTerminal = toolStatus !== 'running'}
-			{@const meta = getToolCardMeta(attributes?.name, argsRecord)}
+			{@const meta = getToolCardMeta(
+				attributes?.tool_id,
+				attributes?.tool_name,
+				attributes?.name,
+				argsRecord
+			)}
 			{@const searchItems = normalizeSearchResultItems(parsedResult)}
 			{@const mergedCount = Number(attributes?.merged_count || 1)}
 			{@const mergedResultsRaw = parseJSONString(decode(attributes?.merged_results ?? '[]'))}
 			{@const mergedResults = Array.isArray(mergedResultsRaw) ? mergedResultsRaw : []}
-			{@const mergedSearchItems = mergedResults.flatMap((entry) => normalizeSearchResultItems(entry))}
+			{@const mergedSearchItems = mergedResults.flatMap((entry) =>
+				normalizeSearchResultItems(entry)
+			)}
 			{@const visibleSearchItems = mergedSearchItems.length > 0 ? mergedSearchItems : searchItems}
 			{@const toolFiles = dedupeToolFiles([
 				...normalizeToolFiles(files),
@@ -486,7 +500,9 @@
 				>
 					<div class="flex items-start justify-between gap-2">
 						<div class="min-w-0 flex items-start gap-2.5">
-							<div class="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-gray-100 text-xs dark:bg-gray-800">
+							<div
+								class="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-gray-100 text-xs dark:bg-gray-800"
+							>
 								{meta.icon}
 							</div>
 							<div class="min-w-0">
@@ -501,12 +517,16 @@
 
 						<div class="flex shrink-0 items-center gap-1.5">
 							{#if mergedCount > 1}
-								<div class="rounded-full border border-violet-200 bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 dark:border-violet-900/70 dark:bg-violet-900/30 dark:text-violet-300">
+								<div
+									class="rounded-full border border-violet-200 bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 dark:border-violet-900/70 dark:bg-violet-900/30 dark:text-violet-300"
+								>
 									x{mergedCount}
 								</div>
 							{/if}
 							<div
-								class="rounded-full border px-1.5 py-0.5 text-[10px] font-medium {getToolStatusBadgeClass(toolStatus)}"
+								class="rounded-full border px-1.5 py-0.5 text-[10px] font-medium {getToolStatusBadgeClass(
+									toolStatus
+								)}"
 							>
 								{getToolStatusLabel(toolStatus)}
 							</div>
@@ -532,16 +552,23 @@
 						>
 							{#if Object.keys(argsRecord).length > 0}
 								<div class="mb-2">
-									<div class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+									<div
+										class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400"
+									>
 										输入参数
 									</div>
-									<pre class="m-0 overflow-x-auto whitespace-pre-wrap break-all rounded-md border border-gray-200 bg-gray-50 p-2 text-xs text-gray-700 dark:border-gray-700 dark:bg-gray-850 dark:text-gray-300">{formatJSONString(args)}</pre>
+									<pre
+										class="m-0 overflow-x-auto whitespace-pre-wrap break-all rounded-md border border-gray-200 bg-gray-50 p-2 text-xs text-gray-700 dark:border-gray-700 dark:bg-gray-850 dark:text-gray-300">{formatJSONString(
+											args
+										)}</pre>
 								</div>
 							{/if}
 
 							{#if statusTerminal}
 								<div>
-									<div class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+									<div
+										class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400"
+									>
 										{getToolResultHeading(toolStatus)}
 									</div>
 									{#if visibleSearchItems.length > 0}
@@ -557,12 +584,16 @@
 														{item.title || item.url || `结果 ${idx + 1}`}
 													</div>
 													{#if item.url}
-														<div class="mt-0.5 line-clamp-1 text-[11px] text-blue-600 dark:text-blue-400">
+														<div
+															class="mt-0.5 line-clamp-1 text-[11px] text-blue-600 dark:text-blue-400"
+														>
 															{item.url}
 														</div>
 													{/if}
 													{#if item.snippet}
-														<div class="mt-1 line-clamp-2 text-[11px] text-gray-600 dark:text-gray-300">
+														<div
+															class="mt-1 line-clamp-2 text-[11px] text-gray-600 dark:text-gray-300"
+														>
 															{item.snippet}
 														</div>
 													{/if}
@@ -570,21 +601,31 @@
 											{/each}
 										</div>
 									{:else if mergedResults.length > 1}
-										<pre class="m-0 overflow-x-auto whitespace-pre-wrap break-all rounded-md border border-gray-200 bg-gray-50 p-2 text-xs text-gray-700 dark:border-gray-700 dark:bg-gray-850 dark:text-gray-300">{formatJSONString(mergedResults)}</pre>
+										<pre
+											class="m-0 overflow-x-auto whitespace-pre-wrap break-all rounded-md border border-gray-200 bg-gray-50 p-2 text-xs text-gray-700 dark:border-gray-700 dark:bg-gray-850 dark:text-gray-300">{formatJSONString(
+												mergedResults
+											)}</pre>
 									{:else}
-										<pre class="m-0 overflow-x-auto whitespace-pre-wrap break-all rounded-md border border-gray-200 bg-gray-50 p-2 text-xs text-gray-700 dark:border-gray-700 dark:bg-gray-850 dark:text-gray-300">{formatJSONString(result)}</pre>
+										<pre
+											class="m-0 overflow-x-auto whitespace-pre-wrap break-all rounded-md border border-gray-200 bg-gray-50 p-2 text-xs text-gray-700 dark:border-gray-700 dark:bg-gray-850 dark:text-gray-300">{formatJSONString(
+												result
+											)}</pre>
 									{/if}
 								</div>
 							{/if}
 
 							{#if toolFiles.length > 0}
 								<div class="mt-2">
-									<div class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+									<div
+										class="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400"
+									>
 										生成文件
 									</div>
 									<div class="space-y-1.5">
 										{#each toolFiles as toolFile}
-											<div class="flex items-center justify-between gap-2 rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-xs dark:border-gray-700 dark:bg-gray-850">
+											<div
+												class="flex items-center justify-between gap-2 rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-xs dark:border-gray-700 dark:bg-gray-850"
+											>
 												<a
 													href={toolFile.url}
 													target="_blank"
@@ -655,10 +696,9 @@
 			}}
 		>
 			<div
-				class="w-full flex items-center gap-2 {centerTitle ? 'relative justify-center' : 'justify-between'} {attributes?.done &&
-				attributes?.done !== 'true'
-					? 'shimmer'
-					: ''}
+				class="w-full flex items-center gap-2 {centerTitle
+					? 'relative justify-center'
+					: 'justify-between'} {attributes?.done && attributes?.done !== 'true' ? 'shimmer' : ''}
 			"
 			>
 				{#if attributes?.done && attributes?.done !== 'true'}

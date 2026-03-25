@@ -103,6 +103,7 @@ export const showCallOverlay = writable(false);
 export const showFileNav = writable(false);
 export const showFileNavPath: Writable<string | null> = writable(null);
 export const showFileNavDir: Writable<string | null> = writable(null);
+export const selectedGeneratedFilePreviewId: Writable<string | null> = writable(null);
 export const selectedTerminalId: Writable<string | null> = writable(null);
 
 export const artifactCode: Writable<any> = writable(null);

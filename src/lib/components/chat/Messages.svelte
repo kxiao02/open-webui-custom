@@ -31,6 +31,7 @@
 
 	export let prompt: any = null;
 	export let history: any = {};
+	export let historyMeta: any = null;
 	export let selectedModels: any[] = [];
 	export let atSelectedModel: any = undefined;
 	export let processing = '';
@@ -59,7 +60,18 @@
 	export let onSelect = (e: any) => {};
 
 	export let messagesCount: number | null = 20;
+	export let loadMoreHistory: Function | null = null;
+	export let ensureHistoryLoaded: Function = async () => true;
 	let messagesLoading = false;
+
+	const canLoadMoreHistory = () =>
+		Boolean(
+			historyMeta?.canLoadMore ??
+				historyMeta?.can_load_more ??
+				historyMeta?.truncated ??
+				historyMeta?.is_truncated ??
+				false
+		);
 
 	const loadMoreMessages = async () => {
 		// scroll slightly down to disable continuous loading
@@ -68,6 +80,9 @@
 		element.scrollTop = element.scrollTop + 100;
 
 		messagesLoading = true;
+		if (canLoadMoreHistory() && typeof loadMoreHistory === 'function') {
+			await loadMoreHistory();
+		}
 		messagesCount += 20;
 		buildMessages();
 
@@ -141,8 +156,19 @@
 		element.scrollTop = element.scrollHeight;
 	};
 
+	const hasMoreLocalHistory = () => {
+		const first = messages.at(0);
+		if (!first) return false;
+		const parentId = first.parentId;
+		if (parentId === null || parentId === undefined) return false;
+		return Boolean(history?.messages?.[parentId]);
+	};
+
+	const shouldShowHistoryLoader = () => hasMoreLocalHistory() || canLoadMoreHistory();
+
 	const updateChat = async () => {
 		if (!$temporaryChatEnabled) {
+			await ensureHistoryLoaded();
 			history = history;
 			await tick();
 			await updateChatById(localStorage.token, chatId, {
@@ -452,10 +478,9 @@
 			{#key chatId}
 				<section class="w-full" aria-labelledby="chat-conversation">
 					<h2 class="sr-only" id="chat-conversation">{$i18n.t('Chat Conversation')}</h2>
-					{#if messages.at(0)?.parentId !== null}
+					{#if shouldShowHistoryLoader()}
 						<Loader
 							on:visible={(e) => {
-								console.log('visible');
 								if (!messagesLoading) {
 									loadMoreMessages();
 								}

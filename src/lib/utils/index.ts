@@ -160,9 +160,7 @@ function looksLikeBareMathBody(body: string): boolean {
 	if (
 		/[<>]/.test(trimmed) ||
 		/&(?:lt|gt|quot|amp);/i.test(trimmed) ||
-		/\b(?:details|summary|reasoning|tool_calls|code_interpreter|duration|done)\b/i.test(
-			trimmed
-		)
+		/\b(?:details|summary|reasoning|tool_calls|code_interpreter|duration|done)\b/i.test(trimmed)
 	) {
 		return false;
 	}
@@ -173,8 +171,7 @@ function looksLikeBareMathBody(body: string): boolean {
 	const assignmentMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(\S+)$/);
 	if (assignmentMatch) {
 		const [, lhs, rhs] = assignmentMatch;
-		const looksLikeConfigKey =
-			lhs === lhs.toUpperCase() || lhs.includes('_') || lhs.includes('.');
+		const looksLikeConfigKey = lhs === lhs.toUpperCase() || lhs.includes('_') || lhs.includes('.');
 		const looksLikePathValue =
 			rhs.startsWith('/') || rhs.startsWith('~/') || rhs.includes('\\') || rhs.includes(':/');
 		if (looksLikeConfigKey && looksLikePathValue) {
@@ -239,16 +236,12 @@ function processBareMathContent(content: string): string {
 
 function normalizeDetailsTags(content: string): string {
 	return processOutsideCodeBlocks(content, (segment) => {
-		return segment
-			// Normalize compact/malformed opening tags from streamed chunks.
-			.replace(
-				/<details(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)/gi,
-				'<details '
-			)
-			.replace(
-				/<summary(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)/gi,
-				'<summary '
-			);
+		return (
+			segment
+				// Normalize compact/malformed opening tags from streamed chunks.
+				.replace(/<details(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)/gi, '<details ')
+				.replace(/<summary(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)/gi, '<summary ')
+		);
 	});
 }
 
@@ -1054,12 +1047,11 @@ export const removeAllDetails = (content) => {
 
 const AGENT_CONTROL_BLOCK_REGEX =
 	/<(?:tool_execution|tool_call|analysis|reasoning)\b[^>]*>[\s\S]*?<\/(?:tool_execution|tool_call|analysis|reasoning)>/gi;
-const AGENT_CONTROL_TAG_REGEX =
-	/<\/?(?:tool_execution|tool_call|analysis|reasoning)\b[^>]*\/?>/gi;
+const AGENT_CONTROL_TAG_REGEX = /<\/?(?:tool_execution|tool_call|analysis|reasoning)\b[^>]*\/?>/gi;
 const LEAKED_TOOL_ATTR_LINE_REGEX =
-	/(^|\n)\s*(?:type="tool_calls"|name="[^"\n]*"|arguments="[^"\n]*"|result="[^"\n]*"|done="(?:true|false)"\s+status="[^"\n]*")[^\n]*(?=\n|$)/gi;
+	/(^|\n)\s*(?:type="tool_calls"|name="[^"\n]*"|tool_id="[^"\n]*"|tool_name="[^"\n]*"|arguments="[^"\n]*"|result="[^"\n]*"|done="(?:true|false)"\s+status="[^"\n]*")[^\n]*(?=\n|$)/gi;
 const LEAKED_TOOL_ATTR_TAIL_REGEX =
-	/\s+(?:name|arguments|result|done|status)="[^"\n>]*"(?:\s+(?:name|arguments|result|done|status)="[^"\n>]*")*\s*>/gi;
+	/\s+(?:name|tool_id|tool_name|arguments|result|done|status)="[^"\n>]*"(?:\s+(?:name|tool_id|tool_name|arguments|result|done|status)="[^"\n>]*")*\s*>/gi;
 const SUMMARY_TAG_REGEX = /<\/?summary\b[^>]*>/gi;
 const MALFORMED_HEADING_REGEX = /(^|\n)(\s*)#{1,6}(?=\S)/g;
 const INLINE_HEADING_MARKER_REGEX = /([。！？!?：:]\s*)#{1,6}(?=\S)/g;
@@ -1083,13 +1075,15 @@ export const normalizeLeakedFormatting = (content: string) => {
 	if (!content) return '';
 
 	return replaceOutsideCode(stripAgentControlMarkup(content), (segment) => {
-		return segment
-			.replace(STANDALONE_BOLD_LABEL_REGEX, '$1$2')
-			// Remove malformed heading markers such as `##总结` while leaving valid markdown headings intact.
-			.replace(MALFORMED_HEADING_REGEX, '$1$2')
-			.replace(INLINE_HEADING_MARKER_REGEX, '$1')
-			.replace(EMPTY_MARKER_LINE_REGEX, '$1')
-			.replace(/\n{3,}/g, '\n\n');
+		return (
+			segment
+				.replace(STANDALONE_BOLD_LABEL_REGEX, '$1$2')
+				// Remove malformed heading markers such as `##总结` while leaving valid markdown headings intact.
+				.replace(MALFORMED_HEADING_REGEX, '$1$2')
+				.replace(INLINE_HEADING_MARKER_REGEX, '$1')
+				.replace(EMPTY_MARKER_LINE_REGEX, '$1')
+				.replace(/\n{3,}/g, '\n\n')
+		);
 	}).trim();
 };
 

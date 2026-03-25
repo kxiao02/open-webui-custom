@@ -14,12 +14,22 @@
 	import { createNewFeedback, getFeedbackById, updateFeedbackById } from '$lib/apis/evaluations';
 	import { getChatById } from '$lib/apis/chats';
 	import { generateTags } from '$lib/apis';
+	import { downloadFileBlob } from '$lib/apis/terminal';
 
 	import {
 		audioQueue,
 		config,
 		models,
+		selectedGeneratedFilePreviewId,
 		settings,
+		showArtifacts,
+		showCallOverlay,
+		showControls,
+		showEmbeds,
+		showFilePreview,
+		showOverview,
+		selectedTerminalId,
+		terminalServers,
 		temporaryChatEnabled,
 		TTSWorker,
 		user
@@ -38,6 +48,12 @@
 		removeAllDetails
 	} from '$lib/utils';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
+	import {
+		type GeneratedFileItem,
+		collectGeneratedFilesFromMessage
+	} from '$lib/utils/generated-files';
+	import { openGeneratedFilePreview } from '$lib/utils/generated-file-preview';
+	import { resolveToolDisplay } from '$lib/utils/tool-display';
 
 	import Name from './Name.svelte';
 	import ProfileImage from './ProfileImage.svelte';
@@ -122,16 +138,61 @@
 	export let messageId;
 	export let selectedModels = [];
 
+	const getErrorKey = (value: unknown): string => {
+		if (!value) return '';
+		if (typeof value === 'string') return value;
+		if (typeof value === 'object') {
+			const content = (value as any).content;
+			if (typeof content === 'string') return content;
+			const message = (value as any).message;
+			if (typeof message === 'string') return message;
+		}
+		return 'error';
+	};
+
+	const buildMessageMetaKey = (source: MessageType): string => {
+		if (!source) return '';
+		const info = source.info ?? {};
+		const status = source.status ?? {};
+		const annotation = source.annotation ?? {};
+		const filesLength = Array.isArray((source as any).files) ? (source as any).files.length : 0;
+		const sourcesLength = Array.isArray((source as any).sources) ? (source as any).sources.length : 0;
+		const statusHistoryLength = Array.isArray((source as any).statusHistory)
+			? (source as any).statusHistory.length
+			: 0;
+		const codeExecutionsLength = Array.isArray((source as any).code_executions)
+			? (source as any).code_executions.length
+			: 0;
+		const embedsLength = Array.isArray((source as any).embeds) ? (source as any).embeds.length : 0;
+
+		return [
+			source.done ? '1' : '0',
+			getErrorKey(source.error),
+			`${status?.action ?? ''}:${status?.done ?? ''}`,
+			statusHistoryLength,
+			filesLength,
+			sourcesLength,
+			codeExecutionsLength,
+			embedsLength,
+			`${annotation?.type ?? ''}:${annotation?.rating ?? ''}`,
+			`${info?.prompt_tokens ?? ''}:${info?.completion_tokens ?? ''}:${info?.total_tokens ?? ''}`,
+			`${info?.eval_count ?? ''}:${info?.eval_duration ?? ''}:${info?.total_duration ?? ''}:${info?.load_duration ?? ''}`
+		].join('|');
+	};
+
 	let message: MessageType = structuredClone(history.messages[messageId]);
+	let lastMessageMetaKey = buildMessageMetaKey(message);
 	$: if (history.messages) {
 		const source = history.messages[messageId];
 		if (source) {
+			const metaKey = buildMessageMetaKey(source);
 			// Fast path: O(1) check on the fields that change most often (content during streaming, done at end)
-			// Avoids 2x O(n) JSON.stringify calls that are always true during streaming anyway
-			if (message.content !== source.content || message.done !== source.done) {
-				message = structuredClone(source);
-			} else if (JSON.stringify(message) !== JSON.stringify(source)) {
-				// Slow path: full comparison for infrequent changes (sources, annotations, status, etc.)
+			if (
+				message.content !== source.content ||
+				message.done !== source.done ||
+				metaKey !== lastMessageMetaKey
+			) {
+				lastMessageMetaKey = metaKey;
 				message = structuredClone(source);
 			}
 		}
@@ -190,121 +251,94 @@
 	let loadingSpeech = false;
 
 	let showRateComment = false;
-	type GeneratedFileItem = {
-		id: string;
-		name: string;
-		url: string;
-		source: string;
-		size?: number;
-		isImage?: boolean;
-	};
-
 	let generatedFiles: GeneratedFileItem[] = [];
+	let generatedFilesKey = '';
+	let generatedFilesListKey = '';
+	let parsedContentKey = '';
+	let parsedGeneratedFilesKey = '';
 
-	const normalizeFileRef = (value: unknown): string | null => {
-		if (typeof value !== 'string') return null;
-		const normalized = value.trim();
-		if (!normalized) return null;
-		const lowered = normalized.toLowerCase();
-		if (lowered === 'null' || lowered === 'undefined') return null;
-		return normalized;
+	const buildFilesKey = (messageData: MessageType): string => {
+		if (!messageData) return '';
+		const rawContent = messageData.content ?? '';
+		const hasToolCalls = rawContent.includes('type="tool_calls"');
+		const contentKey = hasToolCalls ? rawContent : '';
+		const files = Array.isArray((messageData as any)?.files) ? (messageData as any).files : [];
+		const filesKey = files
+			.map((file: any) =>
+				[
+					file?.id ?? '',
+					file?.url ?? '',
+					file?.path ?? '',
+					file?.name ?? '',
+					file?.filename ?? '',
+					file?.fileName ?? '',
+					file?.size ?? ''
+				].join(':')
+			)
+			.join('|');
+		return `${hasToolCalls ? '1' : '0'}::${contentKey}::${filesKey}`;
 	};
 
-	const inferFileName = (value: string, fallback = 'generated-file') => {
-		const sanitized = (value || '').split('?')[0];
-		const pathPart = sanitized.split('/').pop() || sanitized;
-		const windowsPathPart = pathPart.split('\\').pop() || pathPart;
-		return windowsPathPart.trim() || fallback;
+	const buildGeneratedFilesListKey = (files: GeneratedFileItem[]): string =>
+		files.map((file) => file.id).join('|');
+
+	$: {
+		const nextKey = buildFilesKey(message);
+		if (nextKey !== generatedFilesKey) {
+			generatedFilesKey = nextKey;
+			generatedFiles = collectGeneratedFilesFromMessage(message);
+			generatedFilesListKey = buildGeneratedFilesListKey(generatedFiles);
+		}
+	}
+
+	type ActiveTerminal = { url: string; key: string } | null;
+
+	$: systemTerminal = $selectedTerminalId
+		? (($terminalServers ?? []).find((terminal: any) => terminal.id === $selectedTerminalId) ??
+			null)
+		: (($terminalServers ?? [])[0] ?? null);
+	$: directTerminal =
+		($settings?.terminalServers ?? []).find(
+			(server: any) => server.url === $selectedTerminalId && server.enabled
+		) ?? null;
+	$: activeTerminal = (
+		directTerminal
+			? { url: directTerminal.url, key: directTerminal.api_key }
+			: systemTerminal
+				? { url: systemTerminal.url, key: systemTerminal.key }
+				: null
+	) as ActiveTerminal;
+
+	const openGeneratedFile = (file: GeneratedFileItem) => {
+		openGeneratedFilePreview(file.id, {
+			showControls,
+			showFilePreview,
+			selectedGeneratedFilePreviewId,
+			showOverview,
+			showArtifacts,
+			showEmbeds,
+			showCallOverlay
+		});
 	};
 
-	const normalizeOpenWebUiFileUrl = (value: string): string => {
-		if (!value) return value;
+	const downloadGeneratedFile = async (file: GeneratedFileItem) => {
+		if (file.downloadMode === 'terminal' && file.path && activeTerminal) {
+			const result = await downloadFileBlob(activeTerminal.url, activeTerminal.key, file.path);
+			if (!result) return;
 
-		let output = value;
-		if (output.includes('/v1/files/') && !output.includes('/openai/v1/files/')) {
-			output = output.replace(/(^|[^/])\/v1\/files\//g, '$1/openai/v1/files/');
+			const objectUrl = URL.createObjectURL(result.blob);
+			const link = document.createElement('a');
+			link.href = objectUrl;
+			link.download = result.filename || file.name;
+			link.click();
+			URL.revokeObjectURL(objectUrl);
+			return;
 		}
 
-		if (output.startsWith('http') || output.startsWith('data:') || output.startsWith('/')) {
-			return output;
-		}
-
-		return `${WEBUI_API_BASE_URL}/files/${output}/content`;
+		if (!file.url) return;
+		window.open(file.url, '_blank', 'noopener,noreferrer');
 	};
 
-	const isImageRef = (name: string, type?: string, contentType?: string): boolean => {
-		const ext = (name.split('.').pop() || '').toLowerCase();
-		if ((contentType || '').startsWith('image/')) return true;
-		if ((type || '').toLowerCase() === 'image') return true;
-		return ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext);
-	};
-
-	const toGeneratedFile = (item: any, source: string): GeneratedFileItem | null => {
-		if (typeof item === 'string') {
-			const ref = normalizeFileRef(item);
-			if (!ref) return null;
-			const name = inferFileName(ref);
-			return {
-				id: `${source}:${ref}`,
-				name,
-				url: normalizeOpenWebUiFileUrl(ref),
-				source,
-				isImage: isImageRef(name)
-			};
-		}
-
-		if (!item || typeof item !== 'object') return null;
-
-		const ref =
-			normalizeFileRef(item.url) ??
-			normalizeFileRef(item.download_url) ??
-			normalizeFileRef(item.downloadUrl) ??
-			normalizeFileRef(item.ossUrl) ??
-			normalizeFileRef(item.domainUrl) ??
-			normalizeFileRef(item.id) ??
-			normalizeFileRef(item.file_id) ??
-			normalizeFileRef(item.fileId);
-
-		if (!ref) return null;
-
-		const name =
-			(typeof item.name === 'string' && item.name.trim()) ||
-			(typeof item.filename === 'string' && item.filename.trim()) ||
-			(typeof item.fileName === 'string' && item.fileName.trim()) ||
-			inferFileName(ref);
-
-		const type = typeof item.type === 'string' ? item.type : undefined;
-		const contentType = typeof item.content_type === 'string' ? item.content_type : undefined;
-
-		return {
-			id: `${source}:${ref}:${name}`,
-			name,
-			url: normalizeOpenWebUiFileUrl(ref),
-			source,
-			size: typeof item.size === 'number' ? item.size : undefined,
-			isImage: isImageRef(name, type, contentType)
-		};
-	};
-
-	const collectGeneratedFiles = (messageData: MessageType): GeneratedFileItem[] => {
-		const files: GeneratedFileItem[] = [];
-
-		if (Array.isArray((messageData as any)?.files)) {
-			for (const item of (messageData as any).files) {
-				const normalized = toGeneratedFile(item, 'assistant');
-				if (normalized) files.push(normalized);
-			}
-		}
-
-		const deduped = new Map<string, GeneratedFileItem>();
-		for (const file of files) {
-			deduped.set(`${file.url}|${file.name}`, file);
-		}
-
-		return Array.from(deduped.values());
-	};
-
-	$: generatedFiles = collectGeneratedFiles(message);
 	const INLINE_GENERATED_FILES_MARKER = '<!--__GENERATED_FILES__-->';
 
 	const normalizeSourcesHeading = (content: string): string => {
@@ -318,25 +352,6 @@
 	const TOOL_CALL_BLOCK_REGEX = /<details\b[^>]*\btype="tool_calls"[^>]*>[\s\S]*?<\/details>/gim;
 	const TOOL_CALL_OPEN_TAG_REGEX = /^<details\b([^>]*)>/i;
 	const TOOL_CALL_ATTR_REGEX = /(\w+)="([^"]*)"/g;
-	const PROCESS_TOOL_LABELS: Record<string, string> = {
-		internet_search: '网络搜索',
-		联网搜索: '网络搜索',
-		visit_webpage: '网页读取',
-		网页读取: '网页读取',
-		current_server_time: '服务器时间',
-		服务器时间: '服务器时间',
-		math_calculator: '数学计算',
-		数学计算: '数学计算',
-		tool_self_check: '工具自检',
-		工具自检: '工具自检',
-		read_structured_file: '读取结构化文件',
-		读取结构化文件: '读取结构化文件',
-		write_structured_file: '写入结构化文件',
-		写入结构化文件: '写入结构化文件',
-		gotenberg_convert: 'PDF 转换',
-		PDF转换: 'PDF 转换',
-		'PDF 转换': 'PDF 转换'
-	};
 
 	type ProcessToolCallItem = { key: string; attrs: Record<string, string> };
 	type ProcessToolCallGroup = {
@@ -348,7 +363,10 @@
 	type ProcessToolVisualTiming = { firstSeenAt: number };
 
 	const MIN_PROCESS_RUNNING_MS = 900;
-	const processToolVisualTimingByKey = new Map<string, ProcessToolVisualTiming>();
+	const processToolVisualTimingByKeyByMessageId = new Map<
+		string,
+		Map<string, ProcessToolVisualTiming>
+	>();
 
 	const normalizeProcessToolStatus = (attrs: Record<string, string>): string => {
 		const normalized = (attrs.status || '').trim().toLowerCase();
@@ -372,14 +390,14 @@
 		if (callKey) return `call_key:${callKey}`;
 		const id = (attrs.id || '').trim();
 		if (id) return `id:${id}`;
-		const name = (attrs.name || '').trim();
+		const name = (attrs.tool_id || attrs.name || '').trim();
 		const args = (attrs.arguments || '').trim();
 		if (!name && !args) return '';
 		return `name_args:${name}|${args}`;
 	};
 
 	const getToolCallFallbackKey = (attrs: Record<string, string>): string => {
-		const name = (attrs.name || '').trim();
+		const name = (attrs.tool_id || attrs.name || '').trim();
 		const args = (attrs.arguments || '').trim();
 		if (!name && !args) return '';
 		return `name_args:${name}|${args}`;
@@ -394,7 +412,7 @@
 			const block = match[0] || '';
 			const attrs = getToolCallAttrs(block);
 			const isPending = (attrs.done || '').toLowerCase() !== 'true';
-			const name = (attrs.name || '').trim();
+			const name = (attrs.tool_id || attrs.name || '').trim();
 			return {
 				index: match.index ?? -1,
 				block,
@@ -441,42 +459,25 @@
 	};
 
 	const getProcessToolLabel = (attrs: Record<string, string>): string => {
-		const rawName = (attrs.name || '').trim();
-		if (rawName) {
-			return PROCESS_TOOL_LABELS[rawName] ?? rawName;
-		}
-
 		const rawArgs = attrs.arguments || '';
+		let parsedArgs: Record<string, unknown> | null = null;
 		if (rawArgs) {
 			try {
 				const parsed = JSON.parse(rawArgs);
 				if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-					const keys = new Set(Object.keys(parsed as Record<string, unknown>));
-					if (keys.has('query') || keys.has('max_results') || keys.has('keywords')) {
-						return '网络搜索';
-					}
-					if (keys.has('url') || keys.has('urls') || keys.has('link')) {
-						return '网页读取';
-					}
-					if (keys.has('expression') || keys.has('formula')) {
-						return '数学计算';
-					}
-					if (
-						keys.has('content') &&
-						(keys.has('path') || keys.has('file_path') || keys.has('filename'))
-					) {
-						return '写入结构化文件';
-					}
-					if (keys.has('path') || keys.has('file_path') || keys.has('filename')) {
-						return '读取结构化文件';
-					}
+					parsedArgs = parsed as Record<string, unknown>;
 				}
 			} catch {
-				// Ignore malformed tool args and fall through to generic label.
+				parsedArgs = null;
 			}
 		}
 
-		return '工具调用';
+		return resolveToolDisplay({
+			toolId: attrs.tool_id,
+			toolName: attrs.tool_name,
+			legacyName: attrs.name,
+			parsedArgs
+		}).toolName;
 	};
 
 	const groupProcessToolCallItems = (items: ProcessToolCallItem[]): ProcessToolCallGroup[] => {
@@ -506,10 +507,10 @@
 	const getProcessToolStatusMessage = (attrs: Record<string, string>): string => {
 		const label = getProcessToolLabel(attrs);
 		const status = normalizeProcessToolStatus(attrs);
-		if (status === 'success') return `${label} 已完成`;
-		if (status === 'timeout') return `${label} 已超时`;
-		if (status === 'error') return `${label} 运行失败`;
-		return `正在执行 ${label}...`;
+		if (status === 'success') return `最近一步：${label} · 已完成`;
+		if (status === 'timeout') return `最近一步：${label} · 已超时`;
+		if (status === 'error') return `最近一步：${label} · 运行失败`;
+		return `最近一步：${label} · 执行中`;
 	};
 
 	const stripDownloadSection = (content: string, allowInlineFiles: boolean): string => {
@@ -530,6 +531,7 @@
 					linkTarget.includes('sandbox:/mnt/data/'));
 
 			const hasDownloadLabel =
+				allowInlineFiles &&
 				/(文件下载|下载链接|下载地址|生成文件（可下载）|生成文件\(可下载\))/i.test(trimmed);
 
 			if (hasDownloadLabel || hasGeneratedFileLink) {
@@ -588,7 +590,7 @@
 	let processToolCallItems: ProcessToolCallItem[] = [];
 	let processToolCallGroups: ProcessToolCallGroup[] = [];
 	let processSummary = '';
-	let showProcessToolHistory = true;
+	let showProcessToolHistory = !message?.done;
 	let processStatusTick = 0;
 	let processStatusTimer: ReturnType<typeof setTimeout> | null = null;
 	let finalMessageContent = '';
@@ -611,6 +613,16 @@
 		}, delayMs);
 	};
 
+	const getProcessTimingMapForMessage = (id: string): Map<string, ProcessToolVisualTiming> => {
+		if (!id) return new Map();
+		let timingMap = processToolVisualTimingByKeyByMessageId.get(id);
+		if (!timingMap) {
+			timingMap = new Map<string, ProcessToolVisualTiming>();
+			processToolVisualTimingByKeyByMessageId.set(id, timingMap);
+		}
+		return timingMap;
+	};
+
 	const getEffectiveProcessSummaryAttrs = (
 		item: ProcessToolCallItem | undefined
 	): Record<string, string> | null => {
@@ -618,10 +630,11 @@
 
 		const rawStatus = normalizeProcessToolStatus(item.attrs);
 		const now = Date.now();
-		let timing = processToolVisualTimingByKey.get(item.key);
+		const timingMap = getProcessTimingMapForMessage(message?.id);
+		let timing = timingMap.get(item.key);
 		if (!timing) {
 			timing = { firstSeenAt: now };
-			processToolVisualTimingByKey.set(item.key, timing);
+			timingMap.set(item.key, timing);
 		}
 
 		if (rawStatus === 'running') {
@@ -643,8 +656,7 @@
 		return item.attrs;
 	};
 
-	$: {
-		const rawContent = message?.content ?? '';
+	const computeParsedContent = (rawContent: string) => {
 		const normalizedContent = dedupeToolCallBlocks(normalizeSourcesHeading(rawContent));
 		const { process, final } = splitToolCallSection(normalizedContent);
 		processContent = process;
@@ -655,7 +667,7 @@
 				const key =
 					(attrs.call_key || '').trim() ||
 					(attrs.id || '').trim() ||
-					`${(attrs.name || '').trim()}-${index}`;
+					`${(attrs.tool_id || attrs.name || '').trim()}-${index}`;
 
 				return {
 					key,
@@ -663,19 +675,17 @@
 				};
 			})
 			.filter((item) => Object.keys(item.attrs).length > 0);
+
+		const timingMap = getProcessTimingMapForMessage(message?.id);
 		const activeProcessKeys = new Set(processToolCallItems.map((item) => item.key));
-		for (const key of Array.from(processToolVisualTimingByKey.keys())) {
+		for (const key of Array.from(timingMap.keys())) {
 			if (!activeProcessKeys.has(key)) {
-				processToolVisualTimingByKey.delete(key);
+				timingMap.delete(key);
 			}
 		}
+
 		processToolCallGroups = groupProcessToolCallItems(processToolCallItems);
-		processStatusTick;
-		const summaryAttrs = getEffectiveProcessSummaryAttrs(processToolCallItems.at(-1));
-		processSummary =
-			summaryAttrs && processToolCallItems.length > 0
-				? getProcessToolStatusMessage(summaryAttrs)
-				: '';
+
 		const cleanedFinal = normalizeLeakedFormatting(
 			stripDownloadSection(final, generatedFiles.length > 0)
 		);
@@ -691,6 +701,24 @@
 			finalContentAfterGeneratedFiles = '';
 			placeInlineGeneratedFiles = false;
 		}
+	};
+
+	$: {
+		const rawContent = message?.content ?? '';
+		if (rawContent !== parsedContentKey || generatedFilesListKey !== parsedGeneratedFilesKey) {
+			parsedContentKey = rawContent;
+			parsedGeneratedFilesKey = generatedFilesListKey;
+			computeParsedContent(rawContent);
+		}
+	}
+
+	$: {
+		processStatusTick;
+		const summaryAttrs = getEffectiveProcessSummaryAttrs(processToolCallItems.at(-1));
+		processSummary =
+			summaryAttrs && processToolCallItems.length > 0
+				? getProcessToolStatusMessage(summaryAttrs)
+				: '';
 	}
 
 	const copyToClipboard = async (text) => {
@@ -1120,6 +1148,9 @@
 
 	onDestroy(() => {
 		clearProcessStatusTimer();
+		if (message?.id) {
+			processToolVisualTimingByKeyByMessageId.delete(message.id);
+		}
 
 		if (buttonsContainerElement) {
 			buttonsContainerElement.removeEventListener('wheel', buttonsWheelHandler);
@@ -1187,7 +1218,7 @@
 							<StatusHistory statusHistory={message?.statusHistory} expand={true} />
 						{/if}
 
-						{#if message?.files && message.files?.filter((f) => f.type === 'image').length > 0}
+						{#if message?.files && message.files.length > 0}
 							<div
 								class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap"
 								dir={$settings?.chatDirection ?? 'auto'}
@@ -1509,7 +1540,7 @@
 												class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850"
 											>
 												<div class="min-w-0 flex items-center gap-2">
-													{#if file.isImage}
+													{#if file.isImage && file.url}
 														<img
 															src={file.url}
 															alt={file.name}
@@ -1517,25 +1548,27 @@
 														/>
 													{/if}
 													<div class="min-w-0">
-														<a
-															href={file.url}
-															target="_blank"
-															rel="noreferrer"
-															class="line-clamp-1 text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
+														<button
+															type="button"
+															class="line-clamp-1 text-left text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
+															on:click={() => {
+																openGeneratedFile(file);
+															}}
 														>
 															{file.name}
-														</a>
+														</button>
 													</div>
 												</div>
-												<a
-													href={file.url}
-													target="_blank"
-													rel="noreferrer"
+												<button
+													type="button"
 													class="shrink-0 inline-flex size-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
 													title={$i18n.t('Download')}
+													on:click={async () => {
+														await downloadGeneratedFile(file);
+													}}
 												>
 													<Download className="size-3.5" />
-												</a>
+												</button>
 											</div>
 										{/each}
 									</div>
@@ -1599,7 +1632,7 @@
 												class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850"
 											>
 												<div class="min-w-0 flex items-center gap-2">
-													{#if file.isImage}
+													{#if file.isImage && file.url}
 														<img
 															src={file.url}
 															alt={file.name}
@@ -1607,25 +1640,27 @@
 														/>
 													{/if}
 													<div class="min-w-0">
-														<a
-															href={file.url}
-															target="_blank"
-															rel="noreferrer"
-															class="line-clamp-1 text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
+														<button
+															type="button"
+															class="line-clamp-1 text-left text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
+															on:click={() => {
+																openGeneratedFile(file);
+															}}
 														>
 															{file.name}
-														</a>
+														</button>
 													</div>
 												</div>
-												<a
-													href={file.url}
-													target="_blank"
-													rel="noreferrer"
+												<button
+													type="button"
 													class="shrink-0 inline-flex size-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
 													title={$i18n.t('Download')}
+													on:click={async () => {
+														await downloadGeneratedFile(file);
+													}}
 												>
 													<Download className="size-3.5" />
-												</a>
+												</button>
 											</div>
 										{/each}
 									</div>

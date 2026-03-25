@@ -69,6 +69,17 @@ from open_webui.utils.anthropic import is_anthropic_url, get_anthropic_models
 log = logging.getLogger(__name__)
 
 OPENWEBUI_FILE_LINK_RE = re.compile(r"(?<!/openai)/v1/files/")
+THINKING_MODEL_SUFFIX = "-thinking"
+DEEPSEEK_REASONING_TAGS = (
+    ("<think>", "</think>"),
+    ("<thinking>", "</thinking>"),
+    ("<reason>", "</reason>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<thought>", "</thought>"),
+    ("<Thought>", "</Thought>"),
+    ("<|begin_of_thought|>", "<|end_of_thought|>"),
+    ("◁think▷", "◁/think▷"),
+)
 
 
 ##########################################
@@ -76,6 +87,124 @@ OPENWEBUI_FILE_LINK_RE = re.compile(r"(?<!/openai)/v1/files/")
 # Utility functions
 #
 ##########################################
+
+
+def _coerce_booleanish(value) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"false", "0", "no", "off", "disabled"}:
+            return False
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return None
+
+
+def _is_deepseek_model_name(model_id: Optional[str]) -> bool:
+    if not isinstance(model_id, str):
+        return False
+
+    normalized = model_id.strip().lower()
+    return normalized.startswith("deepseek-")
+
+
+def _is_deepseek_provider(url: Optional[str], model_id: Optional[str]) -> bool:
+    if _is_deepseek_model_name(model_id):
+        return True
+    if not isinstance(url, str) or not url:
+        return False
+
+    try:
+        hostname = urlparse(url).hostname or ""
+    except Exception:
+        hostname = ""
+
+    return hostname.endswith("deepseek.com")
+
+
+def _extract_reasoning_content_from_text(content: str) -> tuple[str, str]:
+    if not isinstance(content, str) or not content:
+        return "", content
+
+    reasoning_parts: list[str] = []
+    remaining = content
+
+    for start_tag, end_tag in DEEPSEEK_REASONING_TAGS:
+        pattern = re.compile(
+            rf"{re.escape(start_tag)}(.*?){re.escape(end_tag)}",
+            flags=re.DOTALL,
+        )
+
+        while True:
+            match = pattern.search(remaining)
+            if not match:
+                break
+
+            reasoning_text = match.group(1).strip()
+            if reasoning_text:
+                reasoning_parts.append(reasoning_text)
+
+            remaining = f"{remaining[: match.start()]}{remaining[match.end() :]}"
+
+    remaining = re.sub(r"\n{3,}", "\n\n", remaining).strip()
+    return "\n\n".join(reasoning_parts).strip(), remaining
+
+
+def _adapt_messages_for_deepseek(messages: list[dict]) -> list[dict]:
+    if not isinstance(messages, list):
+        return messages
+
+    last_user_index = -1
+    for index, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_user_index = index
+
+    normalized_messages = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            normalized_messages.append(message)
+            continue
+
+        normalized_message = {**message}
+        if normalized_message.get("role") != "assistant":
+            normalized_message.pop("reasoning_content", None)
+            normalized_messages.append(normalized_message)
+            continue
+
+        content = normalized_message.get("content")
+        if isinstance(content, str) and content:
+            reasoning_content, stripped_content = _extract_reasoning_content_from_text(
+                content
+            )
+            normalized_message["content"] = stripped_content
+            if reasoning_content and index > last_user_index:
+                normalized_message["reasoning_content"] = reasoning_content
+            else:
+                normalized_message.pop("reasoning_content", None)
+        else:
+            normalized_message.pop("reasoning_content", None)
+
+        normalized_messages.append(normalized_message)
+
+    return normalized_messages
+
+
+def _apply_deepseek_thinking_config(payload: dict, thinking_mode_enabled: bool) -> dict:
+    existing_thinking = payload.get("thinking")
+    if isinstance(existing_thinking, dict):
+        return payload
+
+    model_name = str(payload.get("model", "") or "").strip().lower()
+    if thinking_mode_enabled and model_name and model_name != "deepseek-reasoner":
+        payload["thinking"] = {"type": "enabled"}
+
+    return payload
 
 
 async def send_get_request(url, key=None, user: UserModel = None):
@@ -1086,34 +1215,79 @@ async def generate_chat_completion(
 
     payload = {**form_data}
     metadata = payload.pop("metadata", None)
+    payload.pop("thinking_mode_enabled", None)
+    payload.pop("thinkingModeEnabled", None)
 
-    requested_model_id = form_data.get("model")
-    thinking_mode_enabled = bool(
-        form_data.get("thinking_mode_enabled")
-        or form_data.get("thinkingModeEnabled")
-        or form_data.get("thinking")
+    raw_requested_model_id = form_data.get("model")
+    base_requested_model_id = raw_requested_model_id
+    requested_model_info = None
+    legacy_thinking_suffix_requested = (
+        isinstance(raw_requested_model_id, str)
+        and raw_requested_model_id.endswith(THINKING_MODEL_SUFFIX)
     )
+    if isinstance(raw_requested_model_id, str):
+        requested_model_info = Models.get_model_by_id(raw_requested_model_id)
+        if legacy_thinking_suffix_requested:
+            base_requested_model_id = raw_requested_model_id[: -len(THINKING_MODEL_SUFFIX)]
+            if not requested_model_info:
+                requested_model_info = Models.get_model_by_id(base_requested_model_id)
+
+    requested_base_model_id = (
+        request.base_model_id
+        if hasattr(request, "base_model_id")
+        else (
+            requested_model_info.base_model_id
+            if requested_model_info and requested_model_info.base_model_id
+            else base_requested_model_id
+        )
+    )
+    deepseek_requested_model = _is_deepseek_model_name(requested_base_model_id)
+    requested_model_id = (
+        base_requested_model_id
+        if deepseek_requested_model and legacy_thinking_suffix_requested
+        else raw_requested_model_id
+    )
+
+    explicit_thinking_mode = _coerce_booleanish(form_data.get("thinking_mode_enabled"))
+    if explicit_thinking_mode is None:
+        explicit_thinking_mode = _coerce_booleanish(form_data.get("thinkingModeEnabled"))
+
+    explicit_thinking_payload = form_data.get("thinking")
+    if isinstance(explicit_thinking_payload, dict):
+        thinking_type = str(explicit_thinking_payload.get("type", "") or "").strip().lower()
+        if thinking_type == "enabled":
+            explicit_thinking_mode = True
+        elif thinking_type == "disabled":
+            explicit_thinking_mode = False
+
+    thinking_mode_enabled = (
+        explicit_thinking_mode
+        if explicit_thinking_mode is not None
+        else bool(deepseek_requested_model and legacy_thinking_suffix_requested)
+    )
+
     model_id = requested_model_id
     if (
         thinking_mode_enabled
         and isinstance(model_id, str)
         and model_id
-        and not model_id.endswith("-thinking")
+        and not model_id.endswith(THINKING_MODEL_SUFFIX)
+        and not deepseek_requested_model
     ):
-        model_id = f"{model_id}-thinking"
+        model_id = f"{model_id}{THINKING_MODEL_SUFFIX}"
     payload["model"] = model_id
     reasoning_requested = False
     if isinstance(requested_model_id, str) and requested_model_id:
         reasoning_requested = is_openai_reasoning_model(
             requested_model_id
-        ) or requested_model_id.endswith("-thinking")
-    if isinstance(model_id, str) and model_id.endswith("-thinking"):
+        ) or requested_model_id.endswith(THINKING_MODEL_SUFFIX)
+    if isinstance(model_id, str) and model_id.endswith(THINKING_MODEL_SUFFIX):
         reasoning_requested = True
     model_is_always_allowed = is_model_always_allowed(requested_model_id)
     model_lookup_id = model_id
-    if isinstance(model_lookup_id, str) and model_lookup_id.endswith("-thinking"):
-        model_lookup_id = model_lookup_id[: -len("-thinking")]
-    model_info = Models.get_model_by_id(model_lookup_id)
+    if isinstance(model_lookup_id, str) and model_lookup_id.endswith(THINKING_MODEL_SUFFIX):
+        model_lookup_id = model_lookup_id[: -len(THINKING_MODEL_SUFFIX)]
+    model_info = requested_model_info or Models.get_model_by_id(model_lookup_id)
 
     # Check model info and override the payload
     if model_info:
@@ -1126,11 +1300,12 @@ async def generate_chat_completion(
             resolved_model_id = base_model_id
             if (
                 isinstance(model_id, str)
-                and model_id.endswith("-thinking")
+                and model_id.endswith(THINKING_MODEL_SUFFIX)
                 and isinstance(base_model_id, str)
-                and not base_model_id.endswith("-thinking")
+                and not base_model_id.endswith(THINKING_MODEL_SUFFIX)
+                and not _is_deepseek_model_name(base_model_id)
             ):
-                resolved_model_id = f"{base_model_id}-thinking"
+                resolved_model_id = f"{base_model_id}{THINKING_MODEL_SUFFIX}"
 
             payload["model"] = resolved_model_id
             model_id = resolved_model_id
@@ -1178,15 +1353,15 @@ async def generate_chat_completion(
     # Check if model is already in app state cache to avoid expensive get_all_models() call
     models = request.app.state.OPENAI_MODELS
     model_lookup_candidates = {model_id}
-    if isinstance(model_id, str) and model_id.endswith("-thinking"):
-        model_lookup_candidates.add(model_id[: -len("-thinking")])
+    if isinstance(model_id, str) and model_id.endswith(THINKING_MODEL_SUFFIX):
+        model_lookup_candidates.add(model_id[: -len(THINKING_MODEL_SUFFIX)])
 
     if not models or not any(candidate in models for candidate in model_lookup_candidates):
         await get_all_models(request, user=user)
         models = request.app.state.OPENAI_MODELS
     model = models.get(model_id)
-    if not model and isinstance(model_id, str) and model_id.endswith("-thinking"):
-        base_model_id = model_id[: -len("-thinking")]
+    if not model and isinstance(model_id, str) and model_id.endswith(THINKING_MODEL_SUFFIX):
+        base_model_id = model_id[: -len(THINKING_MODEL_SUFFIX)]
         model = models.get(base_model_id)
 
     if model:
@@ -1220,6 +1395,10 @@ async def generate_chat_completion(
 
     url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
     key = request.app.state.config.OPENAI_API_KEYS[idx]
+
+    if _is_deepseek_provider(url, payload.get("model")):
+        payload = _apply_deepseek_thinking_config(payload, thinking_mode_enabled)
+        payload["messages"] = _adapt_messages_for_deepseek(payload.get("messages", []))
 
     if is_openai_reasoning_model(payload.get("model", "")):
         reasoning_requested = True

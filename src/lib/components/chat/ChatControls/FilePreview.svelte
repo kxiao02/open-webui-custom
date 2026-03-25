@@ -1,7 +1,19 @@
 <script lang="ts">
-	import { getContext } from 'svelte';
-	import { WEBUI_API_BASE_URL } from '$lib/constants';
-	import { showControls, showFilePreview } from '$lib/stores';
+	import { getContext, onDestroy } from 'svelte';
+	import DOMPurify from 'dompurify';
+	import { downloadFileBlob, readFile } from '$lib/apis/terminal';
+	import {
+		selectedGeneratedFilePreviewId,
+		selectedTerminalId,
+		settings,
+		showControls,
+		showFilePreview,
+		terminalServers
+	} from '$lib/stores';
+	import {
+		type GeneratedFileItem,
+		collectGeneratedFilesFromHistory
+	} from '$lib/utils/generated-files';
 
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
@@ -12,102 +24,29 @@
 	export let history;
 	export let overlay = false;
 
-	type PreviewFile = {
-		id: string;
-		name: string;
-		url: string;
-		size?: number;
-		type?: string;
-		contentType?: string;
-		source: string;
-		timestamp?: number;
-	};
+	type PreviewFile = GeneratedFileItem;
 
 	let files: PreviewFile[] = [];
 	let selectedFileId = '';
 	let selectedFile: PreviewFile | null = null;
 
 	let previewText = '';
+	let previewDocxHtml = '';
 	let previewLoading = false;
 	let previewError = '';
+	let previewObjectUrl = '';
 
-	const normalizeFileRef = (value: unknown): string | null => {
-		if (typeof value !== 'string') return null;
-		const normalized = value.trim();
-		if (!normalized) return null;
-		const lowered = normalized.toLowerCase();
-		if (lowered === 'null' || lowered === 'undefined') return null;
-		return normalized;
-	};
-
-	const inferFileName = (value: string, fallback = 'generated-file') => {
-		const sanitized = (value || '').split('?')[0];
-		const pathPart = sanitized.split('/').pop() || sanitized;
-		const windowsPathPart = pathPart.split('\\').pop() || pathPart;
-		return windowsPathPart.trim() || fallback;
-	};
-
-	const normalizeOpenWebUiFileUrl = (value: string): string => {
-		if (!value) return value;
-
-		let output = value;
-		if (output.includes('/v1/files/') && !output.includes('/openai/v1/files/')) {
-			output = output.replace(/(^|[^/])\/v1\/files\//g, '$1/openai/v1/files/');
-		}
-
-		if (output.startsWith('http') || output.startsWith('data:') || output.startsWith('/')) {
-			return output;
-		}
-
-		return `${WEBUI_API_BASE_URL}/files/${output}/content`;
-	};
-
-	const collectHistoryFiles = () => {
-		const result: PreviewFile[] = [];
-		const messages = Object.values(history?.messages ?? {}) as Array<Record<string, any>>;
-
-		for (const message of messages) {
-			const source = message?.role === 'assistant' ? 'assistant' : message?.role || 'message';
-			const timestamp = message?.timestamp;
-
-			if (Array.isArray(message?.files)) {
-				for (const file of message.files) {
-					const ref = normalizeFileRef(file?.url) ?? normalizeFileRef(file?.id);
-					if (!ref) continue;
-
-					result.push({
-						id: `${source}:${ref}:${file?.name || ''}`,
-						name:
-							(typeof file?.name === 'string' && file.name) ||
-							inferFileName(ref, 'attachment'),
-						url: normalizeOpenWebUiFileUrl(ref),
-						size: typeof file?.size === 'number' ? file.size : undefined,
-						type: typeof file?.type === 'string' ? file.type : undefined,
-						contentType:
-							typeof file?.content_type === 'string' ? file.content_type : undefined,
-						source,
-						timestamp
-					});
-				}
-			}
-
-		}
-
-		const deduped = new Map<string, PreviewFile>();
-		for (const file of result) {
-			const key = `${file.url}|${file.name}`;
-			const existing = deduped.get(key);
-			deduped.set(key, { ...existing, ...file });
-		}
-
-		return Array.from(deduped.values()).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
-	};
+	type ActiveTerminal = { url: string; key: string } | null;
+	let systemTerminal: any = null;
+	let directTerminal: any = null;
+	let activeTerminal: ActiveTerminal = null;
 
 	const isImageFile = (file: PreviewFile | null): boolean => {
 		if (!file) return false;
 		const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
 		return (
-			file.url.startsWith('data:image/') ||
+			(file.url ?? '').startsWith('data:image/') ||
+			file.isImage === true ||
 			(file.contentType ?? '').startsWith('image/') ||
 			['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)
 		);
@@ -147,6 +86,15 @@
 		].includes(ext);
 	};
 
+	const isDocxFile = (file: PreviewFile | null): boolean => {
+		if (!file) return false;
+		const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+		return (
+			(file.contentType ?? '') ===
+				'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || ext === 'docx'
+		);
+	};
+
 	const decodeDataUriText = (value: string): string => {
 		try {
 			const [meta, body] = value.split(',', 2);
@@ -160,47 +108,188 @@
 		}
 	};
 
-	const loadPreviewText = async () => {
-		if (!selectedFile || !isTextLikeFile(selectedFile)) {
-			previewText = '';
-			previewError = '';
-			previewLoading = false;
+	const revokePreviewObjectUrl = () => {
+		if (previewObjectUrl) {
+			URL.revokeObjectURL(previewObjectUrl);
+			previewObjectUrl = '';
+		}
+	};
+
+	const setPreviewObjectUrl = (blob: Blob) => {
+		revokePreviewObjectUrl();
+		previewObjectUrl = URL.createObjectURL(blob);
+	};
+
+	const getSelectedFileUrl = () => previewObjectUrl || selectedFile?.url || '';
+
+	const downloadSelectedFile = async () => {
+		if (!selectedFile) return;
+
+		if (selectedFile.downloadMode === 'terminal' && selectedFile.path && activeTerminal) {
+			const result = await downloadFileBlob(activeTerminal.url, activeTerminal.key, selectedFile.path);
+			if (!result) {
+				previewError = 'Failed to download file.';
+				return;
+			}
+
+			const objectUrl = URL.createObjectURL(result.blob);
+			const link = document.createElement('a');
+			link.href = objectUrl;
+			link.download = result.filename || selectedFile.name;
+			link.click();
+			URL.revokeObjectURL(objectUrl);
 			return;
 		}
 
-		if (selectedFile.url.startsWith('data:')) {
-			previewText = decodeDataUriText(selectedFile.url);
+		if (!selectedFile.url) return;
+		window.open(selectedFile.url, '_blank', 'noopener,noreferrer');
+	};
+
+	const loadPreviewContent = async () => {
+		previewText = '';
+		previewDocxHtml = '';
+		previewError = '';
+		previewLoading = false;
+		revokePreviewObjectUrl();
+
+		if (!selectedFile) {
+			return;
+		}
+
+		if (selectedFile.downloadMode === 'terminal' && selectedFile.path) {
+			if (!activeTerminal) {
+				previewError = 'Terminal connection is unavailable.';
+				return;
+			}
+
+			previewLoading = true;
+
+			try {
+				if (isTextLikeFile(selectedFile)) {
+					const text = await readFile(activeTerminal.url, activeTerminal.key, selectedFile.path);
+					if (text === null) {
+						throw new Error('Failed to read terminal file');
+					}
+					previewText = text;
+				} else {
+					const result = await downloadFileBlob(
+						activeTerminal.url,
+						activeTerminal.key,
+						selectedFile.path
+					);
+					if (!result) {
+						throw new Error('Failed to download terminal file');
+					}
+
+					if (isDocxFile(selectedFile)) {
+						const [{ default: mammoth }, arrayBuffer] = await Promise.all([
+							import('mammoth'),
+							result.blob.arrayBuffer()
+						]);
+						const html = await mammoth.convertToHtml({ arrayBuffer });
+						previewDocxHtml = DOMPurify.sanitize(html.value);
+					} else {
+						setPreviewObjectUrl(result.blob);
+					}
+				}
+			} catch (error) {
+				console.error(error);
+				previewError = isDocxFile(selectedFile)
+					? 'Failed to load DOCX preview.'
+					: 'Failed to load file preview.';
+			} finally {
+				previewLoading = false;
+			}
+
+			return;
+		}
+
+		if (isTextLikeFile(selectedFile) && (selectedFile.url ?? '').startsWith('data:')) {
+			previewText = decodeDataUriText(selectedFile.url ?? '');
 			previewError = previewText ? '' : 'Failed to decode inline content.';
-			previewLoading = false;
+			return;
+		}
+
+		if (
+			!isTextLikeFile(selectedFile) &&
+			!isDocxFile(selectedFile) &&
+			!isImageFile(selectedFile) &&
+			!isPdfFile(selectedFile) &&
+			!isHtmlFile(selectedFile)
+		) {
+			return;
+		}
+
+		if (
+			isImageFile(selectedFile) ||
+			isPdfFile(selectedFile) ||
+			isHtmlFile(selectedFile)
+		) {
 			return;
 		}
 
 		previewLoading = true;
-		previewError = '';
-		previewText = '';
-
 		try {
-			const response = await fetch(selectedFile.url);
+			const response = await fetch(selectedFile.url ?? '');
 			if (!response.ok) {
 				throw new Error(`HTTP ${response.status}`);
 			}
-			previewText = await response.text();
+
+			if (isDocxFile(selectedFile)) {
+				const [{ default: mammoth }, arrayBuffer] = await Promise.all([
+					import('mammoth'),
+					response.arrayBuffer()
+				]);
+				const result = await mammoth.convertToHtml({ arrayBuffer });
+				previewDocxHtml = DOMPurify.sanitize(result.value);
+			} else {
+				previewText = await response.text();
+			}
 		} catch (error) {
 			console.error(error);
-			previewError = 'Failed to load file preview.';
+			previewError = isDocxFile(selectedFile)
+				? 'Failed to load DOCX preview.'
+				: 'Failed to load file preview.';
 		} finally {
 			previewLoading = false;
 		}
 	};
 
-	$: files = collectHistoryFiles();
+	$: systemTerminal = $selectedTerminalId
+		? (($terminalServers ?? []).find((terminal: any) => terminal.id === $selectedTerminalId) ??
+			null)
+		: (($terminalServers ?? [])[0] ?? null);
+	$: directTerminal =
+		($settings?.terminalServers ?? []).find(
+			(server: any) => server.url === $selectedTerminalId && server.enabled
+		) ?? null;
+	$: activeTerminal = (
+		directTerminal
+			? { url: directTerminal.url, key: directTerminal.api_key }
+			: systemTerminal
+				? { url: systemTerminal.url, key: systemTerminal.key }
+				: null
+	) as ActiveTerminal;
+
+	$: files = collectGeneratedFilesFromHistory(history);
+	$: if (
+		$selectedGeneratedFilePreviewId &&
+		files.some((file) => file.id === $selectedGeneratedFilePreviewId) &&
+		selectedFileId !== $selectedGeneratedFilePreviewId
+	) {
+		selectedFileId = $selectedGeneratedFilePreviewId;
+	}
 	$: if (files.length > 0 && !files.some((file) => file.id === selectedFileId)) {
 		selectedFileId = files[0].id;
 	}
 	$: selectedFile = files.find((file) => file.id === selectedFileId) ?? null;
 	$: if (selectedFile) {
-		loadPreviewText();
+		loadPreviewContent();
 	}
+
+	onDestroy(() => {
+		revokePreviewObjectUrl();
+	});
 </script>
 
 <div class="h-full w-full flex flex-col bg-white dark:bg-gray-850">
@@ -269,29 +358,28 @@
 									</div>
 								</div>
 								<div class="flex items-center gap-1">
-									<a
-										href={selectedFile.url}
-										target="_blank"
-										rel="noreferrer"
+									<button
+										type="button"
 										class="inline-flex items-center gap-1 rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800"
+										on:click={downloadSelectedFile}
 									>
 										<Download className="size-3.5" />
 										{$i18n.t('Download')}
-									</a>
+									</button>
 								</div>
 							</div>
 
 							<div class="min-h-0 flex-1 overflow-auto p-2">
 								{#if isImageFile(selectedFile)}
 									<img
-										src={selectedFile.url}
+										src={getSelectedFileUrl()}
 										alt={selectedFile.name}
 										class="h-full max-h-full w-full object-contain rounded-lg"
 									/>
 								{:else if isPdfFile(selectedFile) || isHtmlFile(selectedFile)}
 									<iframe
 										title={selectedFile.name}
-										src={selectedFile.url}
+										src={getSelectedFileUrl()}
 										class="h-full min-h-[320px] w-full rounded-lg border-0"
 									/>
 								{:else if isTextLikeFile(selectedFile)}
@@ -304,6 +392,25 @@
 										<div class="text-xs text-rose-600 dark:text-rose-400">{previewError}</div>
 									{:else}
 										<pre class="m-0 whitespace-pre-wrap break-all rounded-lg bg-gray-50 p-3 text-xs text-gray-700 dark:bg-gray-850 dark:text-gray-200">{previewText}</pre>
+									{/if}
+								{:else if isDocxFile(selectedFile)}
+									{#if previewLoading}
+										<div class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400">
+											<Spinner className="size-4 mr-2" />
+											<span class="text-xs">{$i18n.t('Loading...')}</span>
+										</div>
+									{:else if previewError}
+										<div class="text-xs text-rose-600 dark:text-rose-400">{previewError}</div>
+									{:else if previewDocxHtml}
+										<div
+											class="office-preview max-h-full overflow-auto rounded-lg bg-gray-50 p-3 prose text-sm text-gray-700 dark:bg-gray-850 dark:text-gray-200 dark:prose-invert max-w-full"
+										>
+											{@html previewDocxHtml}
+										</div>
+									{:else}
+										<div class="h-full flex items-center justify-center text-xs text-gray-500 dark:text-gray-400">
+											{$i18n.t('Preview is not available for this file type.')}
+										</div>
 									{/if}
 								{:else}
 									<div class="h-full flex items-center justify-center text-xs text-gray-500 dark:text-gray-400">

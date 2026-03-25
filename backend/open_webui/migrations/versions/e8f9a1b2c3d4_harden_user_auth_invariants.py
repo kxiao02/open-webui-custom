@@ -1,7 +1,7 @@
 """Harden user/auth invariants
 
 Revision ID: e8f9a1b2c3d4
-Revises: b2c3d4e5f6a7, c0fbf31ca0db, d4e5f6a7b8c9
+Revises: b2c3d4e5f6a7, d4e5f6a7b8c9
 Create Date: 2026-03-23 16:20:00.000000
 
 """
@@ -18,9 +18,10 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "e8f9a1b2c3d4"
+# This migration merges the two branch tips created after a1b2c3d4e5f6.
+# c0fbf31ca0db is an ancestor of both tips, not an additional head.
 down_revision: Union[str, Sequence[str], None] = (
     "b2c3d4e5f6a7",
-    "c0fbf31ca0db",
     "d4e5f6a7b8c9",
 )
 branch_labels: Union[str, Sequence[str], None] = None

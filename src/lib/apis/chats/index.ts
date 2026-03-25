@@ -643,10 +643,34 @@ export const getChatListByTagName = async (token: string = '', tagName: string) 
 	}));
 };
 
-export const getChatById = async (token: string, id: string) => {
+export const getChatById = async (
+	token: string,
+	id: string,
+	options: Record<string, any> = {}
+) => {
 	let error = null;
+	const searchParams = new URLSearchParams();
 
-	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${id}`, {
+	if (options && typeof options === 'object') {
+		for (const [key, value] of Object.entries(options)) {
+			if (value === undefined || value === null) continue;
+			if (Array.isArray(value)) {
+				for (const item of value) {
+					if (item === undefined || item === null) continue;
+					searchParams.append(key, `${item}`);
+				}
+			} else {
+				searchParams.append(key, `${value}`);
+			}
+		}
+	}
+
+	const query = searchParams.toString();
+	const url = query
+		? `${WEBUI_API_BASE_URL}/chats/${id}?${query}`
+		: `${WEBUI_API_BASE_URL}/chats/${id}`;
+
+	const res = await fetch(url, {
 		method: 'GET',
 		headers: {
 			Accept: 'application/json',

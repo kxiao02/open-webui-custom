@@ -590,16 +590,42 @@ log = logging.getLogger(__name__)
 
 
 class SPAStaticFiles(StaticFiles):
+    IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+    HTML_CACHE_CONTROL = "no-cache"
+    DEFAULT_ASSET_CACHE_CONTROL = "public, max-age=3600"
+
+    def _apply_cache_headers(self, path: str, response):
+        normalized_path = (path or "").lstrip("/")
+
+        if normalized_path in {"", ".", "index.html"}:
+            response.headers["Cache-Control"] = self.HTML_CACHE_CONTROL
+            return response
+
+        if normalized_path == "_app/version.json":
+            response.headers["Cache-Control"] = self.HTML_CACHE_CONTROL
+            return response
+
+        if normalized_path.startswith("_app/immutable/"):
+            response.headers["Cache-Control"] = self.IMMUTABLE_CACHE_CONTROL
+            return response
+
+        if "." in normalized_path.rsplit("/", 1)[-1]:
+            response.headers["Cache-Control"] = self.DEFAULT_ASSET_CACHE_CONTROL
+
+        return response
+
     async def get_response(self, path: str, scope):
         try:
-            return await super().get_response(path, scope)
+            response = await super().get_response(path, scope)
+            return self._apply_cache_headers(path, response)
         except (HTTPException, StarletteHTTPException) as ex:
             if ex.status_code == 404:
                 if path.endswith(".js"):
                     # Return 404 for javascript files
                     raise ex
                 else:
-                    return await super().get_response("index.html", scope)
+                    response = await super().get_response("index.html", scope)
+                    return self._apply_cache_headers("index.html", response)
             else:
                 raise ex
 
@@ -1886,6 +1912,7 @@ async def chat_completion(
             "tool_servers": form_data.pop("tool_servers", None),
             "files": form_data.get("files", None),
             "features": form_data.get("features", {}),
+            "client_capabilities": form_data.pop("client_capabilities", {}),
             "variables": form_data.get("variables", {}),
             "model": model,
             "direct": model_item.get("direct", False),

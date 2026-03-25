@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
+import datetime
 from typing import Optional
+from email.utils import formatdate, parsedate_to_datetime
 from sqlalchemy.orm import Session
 import asyncio
 from fastapi.responses import StreamingResponse
@@ -31,7 +34,7 @@ from open_webui.internal.db import get_session
 
 from open_webui.config import ENABLE_ADMIN_CHAT_ACCESS, ENABLE_ADMIN_EXPORT
 from open_webui.constants import ERROR_MESSAGES
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 
 
@@ -42,6 +45,127 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+DEFAULT_CHAT_TAIL_MESSAGES = 50
+
+
+def _normalize_etag(tag: str) -> str:
+    tag = (tag or "").strip()
+    if tag.startswith("W/"):
+        tag = tag[2:].strip()
+    return tag
+
+
+def _if_none_match_matches(request: Request, etag: str) -> bool:
+    inm = request.headers.get("if-none-match")
+    if not inm:
+        return False
+    inm = inm.strip()
+    if inm == "*":
+        return True
+    normalized_target = _normalize_etag(etag)
+    for candidate in inm.split(","):
+        if _normalize_etag(candidate) == normalized_target:
+            return True
+    return False
+
+
+def _is_not_modified(
+    request: Request, etag: Optional[str], last_modified_ts: Optional[int]
+) -> bool:
+    if etag and request.headers.get("if-none-match"):
+        return _if_none_match_matches(request, etag)
+    return _if_modified_since_matches(request, last_modified_ts)
+
+
+def _if_modified_since_matches(request: Request, last_modified_ts: Optional[int]) -> bool:
+    if not last_modified_ts:
+        return False
+    ims = request.headers.get("if-modified-since")
+    if not ims:
+        return False
+    try:
+        ims_dt = parsedate_to_datetime(ims)
+    except (TypeError, ValueError):
+        return False
+    if ims_dt.tzinfo is None:
+        ims_dt = ims_dt.replace(tzinfo=datetime.timezone.utc)
+    last_dt = datetime.datetime.fromtimestamp(
+        last_modified_ts, tz=datetime.timezone.utc
+    )
+    return last_dt <= ims_dt
+
+
+def _apply_private_cache_headers(
+    response: Response,
+    etag: Optional[str],
+    last_modified_ts: Optional[int],
+) -> None:
+    response.headers["Cache-Control"] = "private, must-revalidate"
+    existing_vary = response.headers.get("Vary")
+    if existing_vary:
+        if "Authorization" not in existing_vary:
+            response.headers["Vary"] = f"{existing_vary}, Authorization"
+    else:
+        response.headers["Vary"] = "Authorization"
+    if etag:
+        response.headers["ETag"] = etag
+    if last_modified_ts:
+        response.headers["Last-Modified"] = formatdate(
+            last_modified_ts, usegmt=True
+        )
+
+
+def _build_chat_list_etag(
+    user_id: str,
+    page: Optional[int],
+    include_pinned: bool,
+    include_folders: bool,
+    items: list,
+) -> str:
+    normalized_items = []
+    for item in items:
+        if isinstance(item, dict):
+            normalized_items.append(
+                {
+                    "id": item.get("id"),
+                    "updated_at": item.get("updated_at"),
+                    "title": item.get("title"),
+                }
+            )
+        else:
+            normalized_items.append(
+                {
+                    "id": getattr(item, "id", None),
+                    "updated_at": getattr(item, "updated_at", None),
+                    "title": getattr(item, "title", None),
+                }
+            )
+    payload = {
+        "user_id": user_id,
+        "page": page,
+        "include_pinned": include_pinned,
+        "include_folders": include_folders,
+        "items": normalized_items,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f'W/"{digest}"'
+
+
+def _max_updated_at(items: list) -> Optional[int]:
+    max_ts: Optional[int] = None
+    for item in items:
+        if isinstance(item, dict):
+            ts = item.get("updated_at")
+        else:
+            ts = getattr(item, "updated_at", None)
+        if isinstance(ts, (int, float)):
+            ts_int = int(ts)
+            if max_ts is None or ts_int > max_ts:
+                max_ts = ts_int
+    return max_ts
+
 ############################
 # GetChatList
 ############################
@@ -50,6 +174,8 @@ router = APIRouter()
 @router.get("/", response_model=list[ChatTitleIdResponse])
 @router.get("/list", response_model=list[ChatTitleIdResponse])
 def get_session_user_chat_list(
+    request: Request,
+    response: Response,
     user=Depends(get_verified_user),
     page: Optional[int] = None,
     include_pinned: Optional[bool] = False,
@@ -61,7 +187,7 @@ def get_session_user_chat_list(
             limit = 60
             skip = (page - 1) * limit
 
-            return Chats.get_chat_title_id_list_by_user_id(
+            chats = Chats.get_chat_title_id_list_by_user_id(
                 user.id,
                 include_folders=include_folders,
                 include_pinned=include_pinned,
@@ -70,12 +196,29 @@ def get_session_user_chat_list(
                 db=db,
             )
         else:
-            return Chats.get_chat_title_id_list_by_user_id(
+            chats = Chats.get_chat_title_id_list_by_user_id(
                 user.id,
                 include_folders=include_folders,
                 include_pinned=include_pinned,
                 db=db,
             )
+
+        etag = _build_chat_list_etag(
+            user_id=str(user.id),
+            page=page,
+            include_pinned=bool(include_pinned),
+            include_folders=bool(include_folders),
+            items=chats,
+        )
+        last_modified = _max_updated_at(chats)
+
+        if _is_not_modified(request, etag, last_modified):
+            response_304 = Response(status_code=status.HTTP_304_NOT_MODIFIED)
+            _apply_private_cache_headers(response_304, etag, last_modified)
+            return response_304
+
+        _apply_private_cache_headers(response, etag, last_modified)
+        return chats
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -954,17 +1097,74 @@ async def get_user_chat_list_by_tag_name(
 
 @router.get("/{id}", response_model=Optional[ChatResponse])
 async def get_chat_by_id(
-    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+    request: Request,
+    response: Response,
+    id: str,
+    recent_only: bool = False,
+    tail: Optional[int] = None,
+    include_full_history: bool = True,
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
 ):
-    chat = Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
+    include_history_meta = recent_only or tail is not None or not include_full_history
+
+    effective_tail: Optional[int] = None
+    if tail is not None and tail > 0:
+        effective_tail = tail
+    elif recent_only or not include_full_history:
+        effective_tail = DEFAULT_CHAT_TAIL_MESSAGES
+
+    if effective_tail is not None:
+        chat = Chats.get_chat_by_id_and_user_id(
+            id, user.id, history_tail=effective_tail, db=db
+        )
+    else:
+        chat = Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
 
     if chat:
-        return ChatResponse(**chat.model_dump())
+        last_modified = chat.updated_at if isinstance(chat.updated_at, int) else None
+        etag_payload = {
+            "user_id": str(user.id),
+            "chat_id": str(chat.id),
+            "updated_at": chat.updated_at,
+            "recent_only": bool(recent_only),
+            "include_full_history": bool(include_full_history),
+            "tail": effective_tail,
+            "include_history_meta": bool(include_history_meta),
+        }
+        etag = f'W/"{hashlib.sha256(json.dumps(etag_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()}"'
 
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND
-        )
+        if _is_not_modified(request, etag, last_modified):
+            response_304 = Response(status_code=status.HTTP_304_NOT_MODIFIED)
+            _apply_private_cache_headers(response_304, etag, last_modified)
+            return response_304
+
+        payload = chat.model_dump()
+
+        if include_history_meta and effective_tail is None:
+            history_meta: dict = {}
+            chat_payload = payload.get("chat")
+            if isinstance(chat_payload, dict):
+                history = chat_payload.get("history")
+                if isinstance(history, dict):
+                    messages = history.get("messages")
+                    total_messages = len(messages) if isinstance(messages, dict) else 0
+                    history_meta = {
+                        "total": total_messages,
+                        "truncated": False,
+                        "can_load_more": False,
+                    }
+
+            if history_meta:
+                payload_meta = payload.get("meta") or {}
+                payload["meta"] = {**payload_meta, "history": history_meta}
+
+        _apply_private_cache_headers(response, etag, last_modified)
+        return ChatResponse(**payload)
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND
+    )
 
 
 ############################

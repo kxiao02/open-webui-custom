@@ -5,6 +5,8 @@ import sys
 import os
 import base64
 import textwrap
+import io
+import mimetypes
 
 import asyncio
 from aiocache import cached
@@ -19,8 +21,9 @@ import ast
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 
+import requests
 
-from fastapi import Request, HTTPException
+from fastapi import Request, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from starlette.responses import Response, StreamingResponse, JSONResponse
 
@@ -70,6 +73,7 @@ from open_webui.utils.files import (
     get_image_base64_from_url,
     get_image_url_from_base64,
 )
+from open_webui.routers.files import upload_file_handler
 
 
 from open_webui.models.users import UserModel
@@ -108,7 +112,7 @@ from open_webui.utils.tools import (
     get_updated_tool_function,
     get_terminal_tools,
 )
-from open_webui.utils.access_control import has_connection_access
+from open_webui.utils.access_control import get_permissions, has_connection_access
 from open_webui.utils.plugin import load_function_module_by_id
 from open_webui.utils.filter import (
     get_sorted_filter_ids,
@@ -1103,6 +1107,404 @@ def apply_source_context_to_messages(
         )
 
 
+TERMINAL_GENERATED_FILE_TOOLS = {
+    "write_file",
+    "replace_file_content",
+    "write_structured_file",
+    "gotenberg_convert",
+}
+BRIDGE_GENERATED_FILE_TOOLS = {
+    "write_file",
+    "replace_file_content",
+    "write_structured_file",
+}
+TERMINAL_GENERATED_FILE_PATH_KEYS = (
+    "path",
+    "output_path",
+    "target_path",
+    "file_path",
+    "pdf_path",
+)
+TOOL_RESULT_FILE_REF_PREFIXES = (
+    "http://",
+    "https://",
+    "data:",
+    "/api/v1/files/",
+    "/openai/v1/files/",
+    "/v1/files/",
+)
+BRIDGE_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<details\b(?P<attrs>[^>]*)>(?P<body>[\s\S]*?)</details>",
+    re.IGNORECASE,
+)
+BRIDGE_TOOL_CALL_ATTR_RE = re.compile(r'([A-Za-z_:][\w:.-]*)="([^"]*)"')
+BRIDGE_TEXTUAL_CONTENT_KEYS = ("content", "text", "body")
+BRIDGE_FILE_PATH_KEYS = ("path", "file_path", "file", "output_path", "target_path")
+BRIDGE_TEXTUAL_MIME_TYPES = {
+    "application/json",
+    "application/ld+json",
+    "application/rtf",
+    "application/sql",
+    "application/xml",
+    "application/x-sh",
+    "application/x-yaml",
+    "application/yaml",
+}
+CLIENT_CAPABILITIES_SCHEMA_VERSION = 1
+CLIENT_CAPABILITIES_PREVIEW_TYPES = (
+    "image",
+    "pdf",
+    "docx",
+    "text",
+    "markdown",
+    "code",
+)
+
+
+def _tool_result_explicitly_failed(tool_result: Any) -> bool:
+    if not isinstance(tool_result, dict):
+        return False
+
+    if tool_result.get("success") is False:
+        return True
+
+    status = str(tool_result.get("status", "") or "").strip().lower()
+    if status in {"error", "failed", "timeout"}:
+        return True
+
+    return False
+
+
+def _normalize_terminal_file_path(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip()
+    if not normalized or normalized.lower() in {"null", "undefined"}:
+        return None
+
+    if normalized.startswith(TOOL_RESULT_FILE_REF_PREFIXES):
+        return None
+
+    return normalized
+
+
+def _extract_terminal_generated_file_candidates(
+    tool_function_name: str, tool_result: Any
+) -> list[dict]:
+    if tool_function_name not in TERMINAL_GENERATED_FILE_TOOLS:
+        return []
+
+    candidates: list[dict] = []
+    seen_paths: set[str] = set()
+
+    def extract_path_from_text(text: str) -> Optional[str]:
+        if not isinstance(text, str):
+            return None
+
+        candidate = text.strip()
+        if not candidate or candidate.lower() in {"null", "undefined"}:
+            return None
+
+        if candidate.startswith(("/", "./", "../", "~/")):
+            return candidate
+
+        match = re.search(r"(/[^\\s\"']+)", candidate)
+        if match:
+            return match.group(1)
+
+        return None
+
+    def append_candidate(path_value: Any, payload: dict) -> None:
+        path = _normalize_terminal_file_path(path_value)
+        if not path or path in seen_paths:
+            return
+
+        seen_paths.add(path)
+
+        filename = next(
+            (
+                str(payload.get(key)).strip()
+                for key in ("filename", "fileName", "name")
+                if isinstance(payload.get(key), str) and str(payload.get(key)).strip()
+            ),
+            os.path.basename(path.rstrip("/")) or "generated-file",
+        )
+        content_type = next(
+            (
+                str(payload.get(key)).strip()
+                for key in ("content_type", "contentType", "mime_type", "mimeType")
+                if isinstance(payload.get(key), str) and str(payload.get(key)).strip()
+            ),
+            None,
+        )
+        size_value = payload.get("size")
+        size = int(size_value) if isinstance(size_value, (int, float)) else None
+
+        candidates.append(
+            {
+                "path": path,
+                "name": filename,
+                "content_type": content_type,
+                "size": size,
+            }
+        )
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if _tool_result_explicitly_failed(node):
+                return
+
+            for key in TERMINAL_GENERATED_FILE_PATH_KEYS:
+                if key in node:
+                    append_candidate(node.get(key), node)
+
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, str):
+            extracted = extract_path_from_text(node)
+            if extracted:
+                append_candidate(extracted, {"path": extracted})
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(tool_result)
+    return candidates
+
+
+def _extract_filename_from_content_disposition(content_disposition: str) -> Optional[str]:
+    if not content_disposition:
+        return None
+
+    utf8_match = re.search(
+        r"filename\*\s*=\s*UTF-8''(?P<value>[^;]+)",
+        content_disposition,
+        flags=re.IGNORECASE,
+    )
+    if utf8_match:
+        value = utf8_match.group("value").strip().strip('"')
+        return requests.utils.unquote(value)
+
+    quoted_match = re.search(
+        r'filename\s*=\s*"(?P<value>[^"]+)"',
+        content_disposition,
+        flags=re.IGNORECASE,
+    )
+    if quoted_match:
+        return quoted_match.group("value").strip()
+
+    plain_match = re.search(
+        r"filename\s*=\s*(?P<value>[^;]+)",
+        content_disposition,
+        flags=re.IGNORECASE,
+    )
+    if plain_match:
+        return plain_match.group("value").strip().strip('"')
+
+    return None
+
+
+def _get_terminal_connection(request: Request, terminal_id: str, user: UserModel) -> Optional[dict]:
+    connections = request.app.state.config.TERMINAL_SERVER_CONNECTIONS or []
+    connection = next(
+        (
+            item
+            for item in connections
+            if item.get("id") == terminal_id and item.get("enabled", True)
+        ),
+        None,
+    )
+    if connection is None:
+        return None
+
+    if not has_connection_access(user, connection):
+        return None
+
+    return connection
+
+
+def _download_terminal_file(
+    request: Request,
+    terminal_id: str,
+    path: str,
+    user: UserModel,
+) -> Optional[dict]:
+    connection = _get_terminal_connection(request, terminal_id, user)
+    if connection is None:
+        return None
+
+    base_url = str(connection.get("url", "") or "").rstrip("/")
+    if not base_url:
+        return None
+
+    target_url = f"{base_url}/files/view"
+    headers = {"X-User-Id": user.id}
+    cookies = {}
+
+    auth_type = connection.get("auth_type", "bearer")
+    if auth_type == "bearer":
+        headers["Authorization"] = f"Bearer {connection.get('key', '')}"
+    elif auth_type == "session":
+        token = getattr(getattr(request.state, "token", None), "credentials", "")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        cookies = request.cookies
+    elif auth_type == "system_oauth":
+        oauth_token = request.headers.get("x-oauth-access-token", "")
+        if oauth_token:
+            headers["Authorization"] = f"Bearer {oauth_token}"
+        cookies = request.cookies
+
+    try:
+        response = requests.get(
+            target_url,
+            params={"path": path},
+            headers=headers,
+            cookies=cookies,
+            timeout=(10, 300),
+            allow_redirects=False,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        log.warning("Failed to download terminal file %s from %s: %s", path, terminal_id, exc)
+        return None
+
+    filename = _extract_filename_from_content_disposition(
+        response.headers.get("Content-Disposition", "")
+    ) or os.path.basename(path.rstrip("/"))
+    if not filename:
+        filename = "generated-file"
+
+    content_type = (
+        response.headers.get("Content-Type")
+        or mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    )
+
+    return {
+        "content": response.content,
+        "filename": filename,
+        "content_type": content_type,
+    }
+
+
+def _upload_terminal_generated_file(
+    request: Request,
+    tool_function_name: str,
+    candidate: dict,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> Optional[dict]:
+    if user is None or not isinstance(metadata, dict):
+        return None
+
+    terminal_id = str(metadata.get("terminal_id") or "").strip()
+    if not terminal_id:
+        return None
+
+    path = str(candidate.get("path") or "").strip()
+    if not path:
+        return None
+
+    download = _download_terminal_file(request, terminal_id, path, user)
+    if not download or not isinstance(download.get("content"), (bytes, bytearray)):
+        return None
+
+    filename = str(download.get("filename") or candidate.get("name") or "").strip()
+    if not filename:
+        filename = os.path.basename(path.rstrip("/")) or "generated-file"
+
+    content_type = str(
+        download.get("content_type")
+        or candidate.get("content_type")
+        or mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    ).strip()
+
+    file = UploadFile(
+        file=io.BytesIO(download["content"]),
+        filename=filename,
+        headers={"content-type": content_type},
+    )
+
+    file_metadata = {
+        "source": "terminal_tool_result",
+        "tool_name": tool_function_name,
+        "terminal_id": terminal_id,
+        "terminal_path": path,
+        "chat_id": metadata.get("chat_id"),
+        "message_id": metadata.get("message_id"),
+        "session_id": metadata.get("session_id"),
+    }
+    file_metadata = {
+        key: value for key, value in file_metadata.items() if value not in (None, "")
+    }
+
+    try:
+        file_item = upload_file_handler(
+            request,
+            file=file,
+            metadata=file_metadata,
+            process=False,
+            user=user,
+        )
+    except Exception as exc:
+        log.warning("Failed to upload terminal file %s into storage: %s", path, exc)
+        return None
+
+    if not file_item:
+        return None
+
+    file_meta = getattr(file_item, "meta", {}) or {}
+    file_id = str(getattr(file_item, "id", "") or "").strip()
+    if not file_id:
+        return None
+
+    content_path = request.app.url_path_for("get_file_content_by_id", id=file_id)
+    normalized_content_type = (
+        str(file_meta.get("content_type") or content_type).strip()
+        or "application/octet-stream"
+    )
+
+    return {
+        "id": file_id,
+        "url": str(content_path),
+        "name": str(file_meta.get("name") or getattr(file_item, "filename", filename)),
+        "filename": str(getattr(file_item, "filename", filename)),
+        "type": "image" if normalized_content_type.startswith("image/") else "file",
+        "content_type": normalized_content_type,
+        "size": file_meta.get("size"),
+    }
+
+
+def _collect_terminal_generated_files(
+    request: Request,
+    tool_function_name: str,
+    tool_result: Any,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> list[dict]:
+    if user is None:
+        return []
+
+    files: list[dict] = []
+    for candidate in _extract_terminal_generated_file_candidates(
+        tool_function_name, tool_result
+    ):
+        uploaded = _upload_terminal_generated_file(
+            request,
+            tool_function_name,
+            candidate,
+            metadata,
+            user,
+        )
+        if uploaded:
+            files.append(uploaded)
+
+    return files
+
+
 def process_tool_result(
     request,
     tool_function_name,
@@ -1237,6 +1639,26 @@ def process_tool_result(
                         }
                     )
                     tool_result.remove(item)
+
+    terminal_generated_files = _collect_terminal_generated_files(
+        request,
+        tool_function_name,
+        tool_result,
+        metadata,
+        user,
+    )
+    if terminal_generated_files:
+        existing_keys = {
+            json.dumps(file_item, sort_keys=True, ensure_ascii=False)
+            for file_item in tool_result_files
+            if isinstance(file_item, dict)
+        }
+        for file_item in terminal_generated_files:
+            dedupe_key = json.dumps(file_item, sort_keys=True, ensure_ascii=False)
+            if dedupe_key in existing_keys:
+                continue
+            existing_keys.add(dedupe_key)
+            tool_result_files.append(file_item)
 
     if isinstance(tool_result, list):
         tool_result = {"results": tool_result}
@@ -1926,6 +2348,345 @@ def _extract_generated_files_from_choices(choices: Any) -> list[dict]:
                     generated_files.append(normalized)
 
     return generated_files
+
+
+def _default_client_capabilities(
+    request: Request,
+    user: Optional[UserModel],
+    metadata: Optional[dict],
+) -> dict:
+    share_enabled = False
+    chat_id = ""
+    if isinstance(metadata, dict):
+        chat_id = str(metadata.get("chat_id") or "").strip()
+
+    if user is not None and chat_id and not chat_id.startswith("local:"):
+        permissions = get_permissions(
+            user.id,
+            request.app.state.config.USER_PERMISSIONS,
+        )
+        share_enabled = bool(
+            user.role == "admin" or (permissions.get("chat", {}) or {}).get("share", True)
+        )
+
+    return {
+        "schema_version": CLIENT_CAPABILITIES_SCHEMA_VERSION,
+        "generated_file_download": {
+            "enabled": True,
+            "delivery": "openwebui_file",
+            "storage": "object_storage",
+        },
+        "chat_share": {
+            "enabled": share_enabled,
+            "mode": "share_link",
+        },
+        "file_preview": {
+            "enabled": True,
+            "mode": "inline_or_modal",
+            "types": list(CLIENT_CAPABILITIES_PREVIEW_TYPES),
+        },
+    }
+
+
+def _resolve_client_capabilities(
+    request: Request,
+    user: Optional[UserModel],
+    metadata: Optional[dict],
+) -> dict:
+    defaults = _default_client_capabilities(request, user, metadata)
+
+    incoming = {}
+    if isinstance(metadata, dict) and isinstance(metadata.get("client_capabilities"), dict):
+        incoming = metadata.get("client_capabilities") or {}
+
+    resolved = deep_update(copy.deepcopy(defaults), incoming)
+    resolved["schema_version"] = CLIENT_CAPABILITIES_SCHEMA_VERSION
+
+    for key in ("generated_file_download", "chat_share", "file_preview"):
+        default_enabled = bool((defaults.get(key) or {}).get("enabled"))
+        requested_enabled = bool((resolved.get(key) or {}).get("enabled"))
+        resolved.setdefault(key, {})
+        resolved[key]["enabled"] = default_enabled and requested_enabled
+
+    if not isinstance((resolved.get("file_preview") or {}).get("types"), list):
+        resolved["file_preview"]["types"] = list(CLIENT_CAPABILITIES_PREVIEW_TYPES)
+    else:
+        sanitized_types = []
+        for item in resolved["file_preview"]["types"]:
+            if isinstance(item, str) and item.strip():
+                sanitized_types.append(item.strip())
+        resolved["file_preview"]["types"] = (
+            sanitized_types[:12] if sanitized_types else list(CLIENT_CAPABILITIES_PREVIEW_TYPES)
+        )
+
+    if isinstance(metadata, dict):
+        metadata["client_capabilities"] = resolved
+
+    return resolved
+
+
+def _build_client_capabilities_system_prompt(client_capabilities: Optional[dict]) -> str:
+    if not isinstance(client_capabilities, dict):
+        return ""
+
+    generated_file_download = client_capabilities.get("generated_file_download") or {}
+    chat_share = client_capabilities.get("chat_share") or {}
+    file_preview = client_capabilities.get("file_preview") or {}
+
+    download_enabled = bool(generated_file_download.get("enabled"))
+    share_enabled = bool(chat_share.get("enabled"))
+    preview_enabled = bool(file_preview.get("enabled"))
+    preview_types = ", ".join(file_preview.get("types") or [])
+
+    lines = [
+        "以下是当前中电慧语聊天前端的能力边界，请将其视为准确的产品事实。",
+        f"- generated_file_download.enabled={'true' if download_enabled else 'false'}：当 assistant 消息已附带标准文件引用时，界面会显示可下载文件链接。",
+        f"- chat_share.enabled={'true' if share_enabled else 'false'}：{'当前会话可通过界面分享链接共享' if share_enabled else '当前会话不应向用户承诺可直接分享'}。",
+        f"- file_preview.enabled={'true' if preview_enabled else 'false'}：{'界面可预览这些类型：' + preview_types if preview_enabled and preview_types else '不要承诺界面预览能力'}。",
+        "回答规则：",
+        "1. 不要在 generated_file_download.enabled=true 的情况下说“不能下载”或“只能保存到本地”。",
+        "2. 只有在对应 capability enabled=true 时，才能告诉用户界面支持该操作。",
+        "3. 不要编造下载地址、分享链接或前端按钮状态；若链接由界面生成，只说明“可在界面直接下载/分享”。",
+        "4. 若文件尚未生成或尚未作为标准文件引用返回，应明确说明需要先完成生成或上传步骤。",
+    ]
+
+    return "\n".join(lines)
+
+
+def _parse_nested_json_value(value: Any) -> Any:
+    parsed = value
+    for _ in range(3):
+        if not isinstance(parsed, str):
+            break
+        candidate = parsed.strip()
+        if not candidate:
+            return ""
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            return parsed
+    return parsed
+
+
+def _parse_tool_call_attrs(attrs_text: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    if not isinstance(attrs_text, str) or not attrs_text:
+        return attrs
+
+    for key, value in BRIDGE_TOOL_CALL_ATTR_RE.findall(attrs_text):
+        attrs[key] = html.unescape(value)
+
+    return attrs
+
+
+def _normalize_tool_call_tool_id(attrs: dict[str, str]) -> str:
+    for key in ("tool_id", "name"):
+        value = attrs.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return ""
+
+
+def _tool_call_block_succeeded(attrs: dict[str, str], parsed_result: Any) -> bool:
+    done = str(attrs.get("done", "") or "").strip().lower() == "true"
+    status = str(attrs.get("status", "") or "").strip().lower()
+
+    if status in {"error", "failed", "timeout"}:
+        return False
+    if not done and status not in {"success", "completed"}:
+        return False
+
+    if isinstance(parsed_result, dict):
+        if parsed_result.get("success") is False:
+            return False
+        result_status = str(parsed_result.get("status", "") or "").strip().lower()
+        if result_status in {"error", "failed", "timeout"}:
+            return False
+
+    return True
+
+
+def _extract_bridge_file_path(parsed_args: dict[str, Any]) -> str:
+    for key in BRIDGE_FILE_PATH_KEYS:
+        value = parsed_args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _extract_bridge_text_content(parsed_args: dict[str, Any]) -> Optional[str]:
+    for key in BRIDGE_TEXTUAL_CONTENT_KEYS:
+        value = parsed_args.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _guess_bridge_generated_file_content_type(filename: str) -> str:
+    guessed = mimetypes.guess_type(filename)[0]
+    if guessed:
+        if guessed.startswith("text/") or guessed in BRIDGE_TEXTUAL_MIME_TYPES:
+            return guessed
+        return "application/octet-stream"
+    return "text/plain"
+
+
+def _upload_bridge_generated_file(
+    request: Request,
+    tool_id: str,
+    file_path: str,
+    file_content: str,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> Optional[dict]:
+    if user is None or not isinstance(metadata, dict):
+        return None
+
+    filename = os.path.basename(file_path.rstrip("/")) or "generated-file"
+    content_bytes = file_content.encode("utf-8")
+    content_type = _guess_bridge_generated_file_content_type(filename)
+
+    file = UploadFile(
+        file=io.BytesIO(content_bytes),
+        filename=filename,
+        headers={"content-type": content_type},
+    )
+
+    file_metadata = {
+        "source": "bridge_tool_call",
+        "tool_name": tool_id,
+        "bridge_file_path": file_path,
+        "chat_id": metadata.get("chat_id"),
+        "message_id": metadata.get("message_id"),
+        "session_id": metadata.get("session_id"),
+    }
+    file_metadata = {
+        key: value for key, value in file_metadata.items() if value not in (None, "")
+    }
+
+    try:
+        file_item = upload_file_handler(
+            request,
+            file=file,
+            metadata=file_metadata,
+            process=False,
+            user=user,
+        )
+    except Exception as exc:
+        log.warning(
+            "Failed to upload bridge generated file %s into storage: %s",
+            file_path,
+            exc,
+        )
+        return None
+
+    if not file_item:
+        return None
+
+    file_meta = getattr(file_item, "meta", {}) or {}
+    file_id = str(getattr(file_item, "id", "") or "").strip()
+    if not file_id:
+        return None
+
+    content_path = request.app.url_path_for("get_file_content_by_id", id=file_id)
+    normalized_content_type = (
+        str(file_meta.get("content_type") or content_type).strip()
+        or "application/octet-stream"
+    )
+
+    return {
+        "id": file_id,
+        "url": str(content_path),
+        "name": str(file_meta.get("name") or getattr(file_item, "filename", filename)),
+        "filename": str(getattr(file_item, "filename", filename)),
+        "type": "image" if normalized_content_type.startswith("image/") else "file",
+        "content_type": normalized_content_type,
+        "size": file_meta.get("size"),
+    }
+
+
+def _set_tool_call_block_files_attr(block: str, files: list[dict]) -> str:
+    if not block or not files:
+        return block
+
+    escaped_files = html.escape(json.dumps(files, ensure_ascii=False), quote=True)
+    if re.search(r'\sfiles="[^"]*"', block, flags=re.IGNORECASE):
+        return re.sub(
+            r'\sfiles="[^"]*"',
+            f' files="{escaped_files}"',
+            block,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    return re.sub(
+        r"(<details\b[^>]*)(>)",
+        rf'\1 files="{escaped_files}"\2',
+        block,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+
+def _collect_bridge_generated_files_from_content(
+    request: Request,
+    content: str,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> tuple[str, list[dict]]:
+    if (
+        not isinstance(content, str)
+        or 'type="tool_calls"' not in content
+        or user is None
+        or not isinstance(metadata, dict)
+    ):
+        return content, []
+
+    generated_files: list[dict] = []
+
+    def replace_block(match: re.Match[str]) -> str:
+        block = match.group(0)
+        attrs = _parse_tool_call_attrs(match.group("attrs") or "")
+        if attrs.get("type") != "tool_calls":
+            return block
+
+        existing_files = _parse_nested_json_value(attrs.get("files", ""))
+        if isinstance(existing_files, list) and existing_files:
+            return block
+
+        tool_id = _normalize_tool_call_tool_id(attrs)
+        if tool_id not in BRIDGE_GENERATED_FILE_TOOLS:
+            return block
+
+        parsed_result = _parse_nested_json_value(attrs.get("result", ""))
+        if not _tool_call_block_succeeded(attrs, parsed_result):
+            return block
+
+        parsed_args = _parse_nested_json_value(attrs.get("arguments", ""))
+        if not isinstance(parsed_args, dict):
+            return block
+
+        file_path = _extract_bridge_file_path(parsed_args)
+        file_content = _extract_bridge_text_content(parsed_args)
+        if not file_path or file_content is None:
+            return block
+
+        uploaded = _upload_bridge_generated_file(
+            request,
+            tool_id,
+            file_path,
+            file_content,
+            metadata,
+            user,
+        )
+        if not uploaded:
+            return block
+
+        generated_files.append(uploaded)
+        return _set_tool_call_block_files_attr(block, [uploaded])
+
+    updated_content = BRIDGE_TOOL_CALL_BLOCK_RE.sub(replace_block, content)
+    return updated_content, generated_files
 
 
 def add_file_context(messages: list, chat_id: str, user) -> list:
@@ -2656,6 +3417,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         "__chat_id__": metadata.get("chat_id"),
         "__message_id__": metadata.get("message_id"),
     }
+    client_capabilities = _resolve_client_capabilities(request, user, metadata)
+    extra_params["__client_capabilities__"] = client_capabilities
     # Initialize events to store additional event to be sent to the client
     # Initialize contexts and citation
     if getattr(request.state, "direct", False) and hasattr(request.state, "model"):
@@ -2786,57 +3549,67 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     form_data["messages"],
                 )
 
-        if "memory" in features and features["memory"]:
-            # Skip forced memory injection when native FC is enabled - model can use memory tools
-            if metadata.get("params", {}).get("function_calling") != "native":
-                form_data = await chat_memory_handler(
-                    request, form_data, extra_params, user
-                )
+    client_capabilities_prompt = _build_client_capabilities_system_prompt(
+        client_capabilities
+    )
+    if client_capabilities_prompt:
+        form_data["messages"] = add_or_update_system_message(
+            client_capabilities_prompt,
+            form_data["messages"],
+            append=True,
+        )
 
-        if "web_search" in features and features["web_search"]:
-            # Skip forced RAG web search when native FC is enabled - model can use web_search tool
-            if metadata.get("params", {}).get("function_calling") != "native":
-                form_data = await chat_web_search_handler(
-                    request, form_data, extra_params, user
-                )
-
-        if "image_generation" in features and features["image_generation"]:
-            # Skip forced image generation when native FC is enabled - model can use generate_image tool
-            if metadata.get("params", {}).get("function_calling") != "native":
-                form_data = await chat_image_generation_handler(
-                    request, form_data, extra_params, user
-                )
-
-        if "code_interpreter" in features and features["code_interpreter"]:
-            engine = getattr(
-                request.app.state.config, "CODE_INTERPRETER_ENGINE", "pyodide"
+    if "memory" in features and features["memory"]:
+        # Skip forced memory injection when native FC is enabled - model can use memory tools
+        if metadata.get("params", {}).get("function_calling") != "native":
+            form_data = await chat_memory_handler(
+                request, form_data, extra_params, user
             )
 
-            # Skip XML-tag prompt injection when native FC is enabled —
-            # execute_code will be injected as a builtin tool instead
-            if metadata.get("params", {}).get("function_calling") != "native":
-                prompt = (
-                    request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE
-                    if request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE != ""
-                    else DEFAULT_CODE_INTERPRETER_PROMPT
-                )
+    if "web_search" in features and features["web_search"]:
+        # Skip forced RAG web search when native FC is enabled - model can use web_search tool
+        if metadata.get("params", {}).get("function_calling") != "native":
+            form_data = await chat_web_search_handler(
+                request, form_data, extra_params, user
+            )
 
-                # Append filesystem awareness only for pyodide engine
-                if engine != "jupyter":
-                    prompt += CODE_INTERPRETER_PYODIDE_PROMPT
+    if "image_generation" in features and features["image_generation"]:
+        # Skip forced image generation when native FC is enabled - model can use generate_image tool
+        if metadata.get("params", {}).get("function_calling") != "native":
+            form_data = await chat_image_generation_handler(
+                request, form_data, extra_params, user
+            )
 
+    if "code_interpreter" in features and features["code_interpreter"]:
+        engine = getattr(
+            request.app.state.config, "CODE_INTERPRETER_ENGINE", "pyodide"
+        )
+
+        # Skip XML-tag prompt injection when native FC is enabled —
+        # execute_code will be injected as a builtin tool instead
+        if metadata.get("params", {}).get("function_calling") != "native":
+            prompt = (
+                request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE
+                if request.app.state.config.CODE_INTERPRETER_PROMPT_TEMPLATE != ""
+                else DEFAULT_CODE_INTERPRETER_PROMPT
+            )
+
+            # Append filesystem awareness only for pyodide engine
+            if engine != "jupyter":
+                prompt += CODE_INTERPRETER_PYODIDE_PROMPT
+
+            form_data["messages"] = add_or_update_user_message(
+                prompt,
+                form_data["messages"],
+            )
+        else:
+            # Native FC: tool docstring can't be dynamic, so inject
+            # filesystem context into messages for pyodide engine
+            if engine != "jupyter":
                 form_data["messages"] = add_or_update_user_message(
-                    prompt,
+                    CODE_INTERPRETER_PYODIDE_PROMPT,
                     form_data["messages"],
                 )
-            else:
-                # Native FC: tool docstring can't be dynamic, so inject
-                # filesystem context into messages for pyodide engine
-                if engine != "jupyter":
-                    form_data["messages"] = add_or_update_user_message(
-                        CODE_INTERPRETER_PYODIDE_PROMPT,
-                        form_data["messages"],
-                    )
 
     tool_ids = form_data.pop("tool_ids", None)
     terminal_id = form_data.pop("terminal_id", None)
@@ -3680,6 +4453,35 @@ async def non_streaming_chat_response_handler(response, ctx):
                 content = response_data["choices"][0]["message"]["content"]
 
                 if content:
+                    content, bridge_generated_files = (
+                        _collect_bridge_generated_files_from_content(
+                            request,
+                            content,
+                            metadata,
+                            user,
+                        )
+                    )
+                    response_data["choices"][0]["message"]["content"] = content
+
+                    if bridge_generated_files:
+                        message_files = Chats.add_message_files_by_id_and_message_id(
+                            metadata["chat_id"],
+                            metadata["message_id"],
+                            bridge_generated_files,
+                        )
+                        await event_emitter(
+                            {
+                                "type": "files",
+                                "data": {
+                                    "files": (
+                                        message_files
+                                        if isinstance(message_files, list)
+                                        else bridge_generated_files
+                                    )
+                                },
+                            }
+                        )
+
                     await event_emitter(
                         {
                             "type": "chat:completion",
@@ -5341,9 +6143,38 @@ async def streaming_chat_response_handler(response, ctx):
                 output = strip_leading_message_output_before_tool_call(output)
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
+                serialized_content = serialize_output(output)
+                serialized_content, bridge_generated_files = (
+                    _collect_bridge_generated_files_from_content(
+                        request,
+                        serialized_content,
+                        metadata,
+                        user,
+                    )
+                )
+
+                if bridge_generated_files:
+                    message_files = Chats.add_message_files_by_id_and_message_id(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        bridge_generated_files,
+                    )
+                    await event_emitter(
+                        {
+                            "type": "files",
+                            "data": {
+                                "files": (
+                                    message_files
+                                    if isinstance(message_files, list)
+                                    else bridge_generated_files
+                                )
+                            },
+                        }
+                    )
+
                 data = {
                     "done": True,
-                    "content": serialize_output(output),
+                    "content": serialized_content,
                     "output": output,
                     "title": title,
                 }
@@ -5354,7 +6185,7 @@ async def streaming_chat_response_handler(response, ctx):
                         metadata["chat_id"],
                         metadata["message_id"],
                         {
-                            "content": serialize_output(output),
+                            "content": serialized_content,
                             "output": output,
                             **({"usage": usage} if usage else {}),
                         },

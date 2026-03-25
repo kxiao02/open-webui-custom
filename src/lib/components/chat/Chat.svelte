@@ -65,6 +65,7 @@
 		isYoutubeUrl,
 		displayFileHandler
 	} from '$lib/utils';
+	import { getClientCapabilities } from '$lib/utils/client-capabilities';
 	import { AudioQueue } from '$lib/utils/audio';
 
 	import {
@@ -118,6 +119,16 @@
 
 	let loading = true;
 	let initNewChatRunId = 0;
+
+	type HistoryMeta = {
+		truncated: boolean;
+		totalMessages: number | null;
+		canLoadMore: boolean;
+		windowSize: number | null;
+	};
+
+	const HISTORY_TAIL_DEFAULT = 120;
+	const HISTORY_TAIL_STEP = 120;
 
 	const eventTarget = new EventTarget();
 	let controlPane: Pane | undefined;
@@ -194,6 +205,16 @@
 		messages: {},
 		currentId: null
 	};
+	let historyMeta: HistoryMeta = {
+		truncated: false,
+		totalMessages: null,
+		canLoadMore: false,
+		windowSize: null
+	};
+	let historyFullLoadPromise: Promise<boolean> | null = null;
+	let loadingHistoryMore = false;
+	let pendingArtifactRefresh = false;
+	let lastTaskRefreshAt = 0;
 
 	let taskIds: any[] | null = null;
 
@@ -203,10 +224,27 @@
 	let files: any[] = [];
 	let params: Record<string, any> = {};
 	let messageCount = 0;
+	let lastMessageCountId: string | null = null;
 	let hasCustomBackground = false;
 	let showLandingAmbientBackground = false;
 
-	$: messageCount = createMessagesList(history, history.currentId).length;
+	const updateMessageCount = (currentId: string | null) => {
+		if (!currentId) {
+			lastMessageCountId = null;
+			const messages = history?.messages;
+			messageCount = messages && typeof messages === 'object' ? Object.keys(messages).length : 0;
+			return;
+		}
+
+		if (currentId === lastMessageCountId) {
+			return;
+		}
+
+		lastMessageCountId = currentId;
+		messageCount = createMessagesList(history, currentId).length;
+	};
+
+	$: updateMessageCount(history?.currentId ?? null);
 	$: hasCustomBackground = Boolean(
 		$selectedFolder?.meta?.background_image_url ||
 			($settings?.backgroundImageUrl ?? $config?.license_metadata?.background_image_url ?? null)
@@ -267,15 +305,14 @@
 			.filter(Boolean);
 	};
 
-	const dedupeIds = (ids: string[] = []) =>
-		[
-			...new Set(
-				(ids ?? [])
-					.filter((id): id is string => typeof id === 'string')
-					.map((id) => id.trim())
-					.filter((id) => id !== '')
-			)
-		];
+	const dedupeIds = (ids: string[] = []) => [
+		...new Set(
+			(ids ?? [])
+				.filter((id): id is string => typeof id === 'string')
+				.map((id) => id.trim())
+				.filter((id) => id !== '')
+		)
+	];
 
 	const getInstalledToolIds = () =>
 		dedupeIds(($tools ?? []).filter((tool) => tool.installed).map((tool) => tool.id));
@@ -490,14 +527,285 @@
 		return merged;
 	};
 
+	const normalizeTaskIds = (ids: unknown): string[] =>
+		(Array.isArray(ids) ? ids : [])
+			.map((id) => (typeof id === 'string' ? id.trim() : ''))
+			.filter((id) => id !== '' && id !== 'null' && id !== 'undefined');
+
+	const resolveHistoryCurrentId = (historyData: any): string | null => {
+		const messages = historyData?.messages;
+		if (!messages || typeof messages !== 'object') {
+			return null;
+		}
+
+		const existingCurrentId =
+			typeof historyData?.currentId === 'string' ? historyData.currentId.trim() : '';
+		if (existingCurrentId && messages[existingCurrentId]) {
+			return existingCurrentId;
+		}
+
+		const entries = Object.entries(messages).filter(
+			([id, message]) => typeof id === 'string' && message && typeof message === 'object'
+		) as Array<[string, Record<string, any>]>;
+
+		if (entries.length === 0) {
+			return null;
+		}
+
+		const leaves = entries.filter(([, message]) => {
+			const childIds = Array.isArray(message.childrenIds) ? message.childrenIds : [];
+			return childIds.filter((childId) => typeof childId === 'string' && messages[childId]).length === 0;
+		});
+
+		const candidates = leaves.length > 0 ? leaves : entries;
+		candidates.sort((a, b) => {
+			const tsA = typeof a[1]?.timestamp === 'number' ? a[1].timestamp : 0;
+			const tsB = typeof b[1]?.timestamp === 'number' ? b[1].timestamp : 0;
+			if (tsA !== tsB) {
+				return tsB - tsA;
+			}
+			return a[0] < b[0] ? 1 : -1;
+		});
+
+		return candidates[0]?.[0] ?? null;
+	};
+
+	const markHistoryForRecoveredActiveTasks = (historyData: any) => {
+		const currentMessageId = resolveHistoryCurrentId(historyData);
+		if (!currentMessageId || !historyData?.messages?.[currentMessageId]) {
+			return;
+		}
+
+		historyData.currentId = currentMessageId;
+
+		const branchMessages = createMessagesList(historyData, currentMessageId);
+		const lastAssistantMessage = [...branchMessages]
+			.reverse()
+			.find((message) => message?.role === 'assistant');
+
+		if (lastAssistantMessage) {
+			lastAssistantMessage.done = false;
+			historyData.messages[lastAssistantMessage.id] = lastAssistantMessage;
+		}
+	};
+
+	const normalizeHistoryMeta = (meta: any): HistoryMeta | null => {
+		if (!meta || typeof meta !== 'object') return null;
+
+		const truncated =
+			meta.truncated ??
+			meta.history_truncated ??
+			meta.is_truncated ??
+			(meta.history ? meta.history.truncated : undefined);
+		const totalMessages =
+			typeof meta.total_messages === 'number'
+				? meta.total_messages
+				: typeof meta.total === 'number'
+					? meta.total
+					: meta.history && typeof meta.history.total === 'number'
+						? meta.history.total
+					: meta.history && typeof meta.history.total_messages === 'number'
+						? meta.history.total_messages
+						: null;
+		const canLoadMore =
+			meta.can_load_more ??
+			meta.has_more ??
+			(meta.history ? meta.history.can_load_more ?? meta.history.has_more : undefined);
+		const windowSize =
+			typeof meta.window_size === 'number'
+				? meta.window_size
+				: typeof meta.tail === 'number'
+					? meta.tail
+				: meta.history && typeof meta.history.window_size === 'number'
+					? meta.history.window_size
+					: meta.history && typeof meta.history.tail === 'number'
+						? meta.history.tail
+					: null;
+
+		return {
+			truncated: Boolean(truncated),
+			totalMessages,
+			canLoadMore: Boolean(canLoadMore),
+			windowSize
+		};
+	};
+
+	const inferHistoryTruncation = (historyData: any): boolean => {
+		if (!historyData?.messages || typeof historyData.messages !== 'object') return false;
+		for (const message of Object.values(historyData.messages)) {
+			if (!message || typeof message !== 'object') continue;
+			const parentId = (message as any).parentId;
+			if (parentId && !historyData.messages[parentId]) {
+				return true;
+			}
+		}
+		return false;
+	};
+
+	const resolveHistoryFromChatContent = (chatContent: any) => {
+		if (!chatContent) {
+			return { messages: {}, currentId: null };
+		}
+		const baseHistory =
+			(chatContent?.history ?? undefined) !== undefined
+				? chatContent.history
+				: convertMessagesToHistory(chatContent.messages);
+		return baseHistory ?? { messages: {}, currentId: null };
+	};
+
+	const prepareHistory = (historyData: any) => {
+		const normalized = historyData ?? { messages: {}, currentId: null };
+		sanitizeHistoryFileRefs(normalized);
+		sanitizeHistoryModelRefs(normalized);
+		normalized.currentId = resolveHistoryCurrentId(normalized);
+		return normalized;
+	};
+
+	const mergeHistoryData = (target: any, incoming: any): number => {
+		if (!target?.messages || !incoming?.messages) return 0;
+		let added = 0;
+		for (const [id, msg] of Object.entries(incoming.messages)) {
+			if (!target.messages[id]) {
+				target.messages[id] = msg;
+				added += 1;
+			}
+		}
+		for (const [id, msg] of Object.entries(incoming.messages)) {
+			if (!target.messages[id] || !msg || typeof msg !== 'object') continue;
+			const incomingChildren = Array.isArray((msg as any).childrenIds)
+				? (msg as any).childrenIds
+				: [];
+			if (incomingChildren.length === 0) continue;
+			const existingChildren = Array.isArray((target.messages[id] as any).childrenIds)
+				? (target.messages[id] as any).childrenIds
+				: [];
+			const mergedChildren = Array.from(new Set([...existingChildren, ...incomingChildren]));
+			(target.messages[id] as any).childrenIds = mergedChildren;
+		}
+		if (!target.currentId && incoming.currentId) {
+			target.currentId = incoming.currentId;
+		}
+		return added;
+	};
+
+	const buildHistoryRequestParams = (tailSize: number) => ({
+		recent_only: true,
+		include_full_history: false,
+		tail: tailSize
+	});
+
+	const ensureHistoryLoaded = async (): Promise<boolean> => {
+		if (!$chatId || !(historyMeta?.canLoadMore || historyMeta?.truncated)) {
+			return true;
+		}
+
+		if (historyFullLoadPromise) {
+			return historyFullLoadPromise;
+		}
+
+		historyFullLoadPromise = (async () => {
+			const chatRes = await getChatById(localStorage.token, $chatId).catch(() => null);
+
+			if (!chatRes?.chat) {
+				return false;
+			}
+
+			history = prepareHistory(resolveHistoryFromChatContent(chatRes.chat));
+			const nextMeta = normalizeHistoryMeta(chatRes.meta);
+			historyMeta = nextMeta ?? {
+				truncated: false,
+				totalMessages: Object.keys(history?.messages ?? {}).length,
+				canLoadMore: false,
+				windowSize: Object.keys(history?.messages ?? {}).length
+			};
+			return true;
+		})().finally(() => {
+			historyFullLoadPromise = null;
+		});
+
+		return historyFullLoadPromise;
+	};
+
+	const refreshActiveTasks = async () => {
+		if (!$chatId || !$page.url.pathname.startsWith('/c/')) return;
+		const now = Date.now();
+		if (now - lastTaskRefreshAt < 1500) return;
+		lastTaskRefreshAt = now;
+
+		const taskRes = await getTaskIdsByChatId(localStorage.token, $chatId).catch(() => null);
+		if (!taskRes) return;
+		const nextTaskIds = normalizeTaskIds(taskRes?.task_ids);
+		taskIds = nextTaskIds;
+
+		if ((nextTaskIds?.length ?? 0) > 0) {
+			markHistoryForRecoveredActiveTasks(history);
+		} else if (history?.currentId) {
+			for (const message of Object.values(history.messages)) {
+				if (message && message.role === 'assistant') {
+					message.done = true;
+				}
+			}
+		}
+	};
+
+	const loadMoreHistory = async () => {
+		if (loadingHistoryMore || !$chatId) return;
+		const canLoadMore = historyMeta?.canLoadMore ?? historyMeta?.truncated;
+		if (!canLoadMore) return;
+
+		loadingHistoryMore = true;
+		try {
+			const branchMessages = history?.currentId
+				? createMessagesList(history, history.currentId)
+				: [];
+			const requestedTail = Math.max(branchMessages.length + HISTORY_TAIL_STEP, HISTORY_TAIL_STEP);
+			const chatRes = await getChatById(
+				localStorage.token,
+				$chatId,
+				buildHistoryRequestParams(requestedTail)
+			).catch(() => null);
+			if (!chatRes?.chat) {
+				historyMeta = {
+					...historyMeta,
+					canLoadMore: false
+				};
+				return;
+			}
+
+			const incomingHistory = prepareHistory(resolveHistoryFromChatContent(chatRes.chat));
+			const added = mergeHistoryData(history, incomingHistory);
+			if (added > 0) {
+				history = history;
+			}
+
+			const nextMeta = normalizeHistoryMeta(chatRes.meta);
+			if (nextMeta) {
+				historyMeta = nextMeta;
+			} else if (added === 0) {
+				historyMeta = {
+					...historyMeta,
+					canLoadMore: false
+				};
+			}
+		} finally {
+			loadingHistoryMore = false;
+		}
+	};
+
 	// Message queue for storing messages while generating
 	let messageQueue: { id: string; prompt: string; files: any[] }[] = [];
+	let navigateRunId = 0;
 
 	$: if (chatIdProp) {
 		navigateHandler();
 	}
 
+	const isActiveChatNavigation = (runId: number, targetChatId: string | null | undefined) =>
+		runId === navigateRunId && chatIdProp === targetChatId;
+
 	const navigateHandler = async () => {
+		const runId = ++navigateRunId;
+		const targetChatId = chatIdProp;
 		loading = true;
 
 		// Save current queue to sessionStorage before navigating away
@@ -512,6 +820,12 @@
 		messageQueue = [];
 		sessionToolIds = [];
 		sessionSkillIds = [];
+		historyMeta = {
+			truncated: false,
+			totalMessages: null,
+			canLoadMore: false,
+			windowSize: null
+		};
 		selectedToolIds = [];
 		selectedFilterIds = [];
 		webSearchEnabled = false;
@@ -519,43 +833,47 @@
 		thinkingModeEnabled = false;
 
 		const storageChatInput = sessionStorage.getItem(
-			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
+			`chat-input${targetChatId ? `-${targetChatId}` : ''}`
 		);
 
-		if (chatIdProp && (await loadChat())) {
-			await tick();
-			loading = false;
-			window.setTimeout(() => scrollToBottom(), 0);
+		try {
+			if (targetChatId && (await loadChat())) {
+				if (!isActiveChatNavigation(runId, targetChatId)) {
+					return;
+				}
 
-			await tick();
+				await tick();
+				window.setTimeout(() => scrollToBottom(), 0);
 
-			// Restore queue from sessionStorage
-			const storedQueueData = sessionStorage.getItem(`chat-queue-${chatIdProp}`);
-			if (storedQueueData) {
-				try {
-					const restoredQueue = JSON.parse(storedQueueData);
+				await tick();
 
-					if (restoredQueue.length > 0) {
-						sessionStorage.removeItem(`chat-queue-${chatIdProp}`);
-						// Check if there are pending tasks (still generating)
-						const hasPendingTask = taskIds !== null && taskIds.length > 0;
-						if (!hasPendingTask) {
-							// No pending tasks - process the queue
-							files = restoredQueue.flatMap((m) => m.files);
-							await tick();
-							const combinedPrompt = restoredQueue.map((m) => m.prompt).join('\n\n');
-							await submitPrompt(combinedPrompt);
-						} else {
-							// Has pending tasks - show as queued (chatCompletedHandler will process)
-							messageQueue = restoredQueue;
+				// Restore queue from sessionStorage
+				const storedQueueData = sessionStorage.getItem(`chat-queue-${targetChatId}`);
+				if (storedQueueData) {
+					try {
+						const restoredQueue = JSON.parse(storedQueueData);
+
+						if (restoredQueue.length > 0) {
+							sessionStorage.removeItem(`chat-queue-${targetChatId}`);
+							// Check if there are pending tasks (still generating)
+							const hasPendingTask = taskIds !== null && taskIds.length > 0;
+							if (!hasPendingTask) {
+								// No pending tasks - process the queue
+								files = restoredQueue.flatMap((m) => m.files);
+								await tick();
+								const combinedPrompt = restoredQueue.map((m) => m.prompt).join('\n\n');
+								await submitPrompt(combinedPrompt);
+							} else {
+								// Has pending tasks - show as queued (chatCompletedHandler will process)
+								messageQueue = restoredQueue;
+							}
 						}
-					}
-				} catch (e) {}
-			}
+					} catch (e) {}
+				}
 
-			if (storageChatInput) {
-				try {
-					const input = JSON.parse(storageChatInput);
+				if (storageChatInput) {
+					try {
+						const input = JSON.parse(storageChatInput);
 
 						if (!$temporaryChatEnabled) {
 							messageInput?.setText(input.prompt);
@@ -564,18 +882,30 @@
 							selectedFilterIds = input.selectedFilterIds;
 							webSearchEnabled = input.webSearchEnabled;
 							imageGenerationEnabled = input.imageGenerationEnabled;
-						codeInterpreterEnabled = input.codeInterpreterEnabled;
-						thinkingModeEnabled = input.thinkingModeEnabled ?? false;
-					}
-				} catch (e) {}
-			} else {
-				await setDefaults();
-			}
+							codeInterpreterEnabled = input.codeInterpreterEnabled;
+							thinkingModeEnabled = input.thinkingModeEnabled ?? false;
+						}
+					} catch (e) {}
+				} else {
+					await setDefaults();
+				}
 
-			const chatInput = document.getElementById('chat-input');
-			chatInput?.focus();
-		} else {
-			await goto('/');
+				const chatInput = document.getElementById('chat-input');
+				chatInput?.focus();
+			} else if (targetChatId && isActiveChatNavigation(runId, targetChatId)) {
+				await goto('/');
+			}
+		} catch (error) {
+			console.error('Failed to load chat view:', error);
+			toast.error($i18n.t('Failed to load conversation'));
+		} finally {
+			if (
+				targetChatId &&
+				isActiveChatNavigation(runId, targetChatId) &&
+				$page.url.pathname === `/c/${targetChatId}`
+			) {
+				loading = false;
+			}
 		}
 	};
 
@@ -911,9 +1241,9 @@
 				}
 
 				history.messages[event.message_id] = message;
-				}
 			}
-		};
+		}
+	};
 
 	const onMessageHandler = async (event: {
 		origin: string;
@@ -981,9 +1311,15 @@
 
 	onMount(() => {
 		loading = true;
-		console.log('mounted');
 		window.addEventListener('message', onMessageHandler);
 		$socket?.on('events', chatEventHandler);
+		const handleVisibility = () => {
+			if (document.visibilityState === 'visible') {
+				refreshActiveTasks();
+			}
+		};
+		document.addEventListener('visibilitychange', handleVisibility);
+		window.addEventListener('focus', handleVisibility);
 
 		$audioQueue?.destroy();
 
@@ -1094,6 +1430,8 @@
 				showControlsSubscribe();
 				selectedFolderSubscribe();
 				window.removeEventListener('message', onMessageHandler);
+				document.removeEventListener('visibilitychange', handleVisibility);
+				window.removeEventListener('focus', handleVisibility);
 				$socket?.off('events', chatEventHandler);
 				audioQueueInstance?.destroy();
 				audioQueue.set(null);
@@ -1287,19 +1625,32 @@
 		}
 	};
 
-	const onHistoryChange = (history) => {
-		if (history) {
-			cancelAnimationFrame(contentsRAF);
-			contentsRAF = requestAnimationFrame(() => {
-				getContents();
-				contentsRAF = null;
-			});
-		} else {
-			artifactContents.set([]);
-		}
+	const scheduleArtifactContents = () => {
+		cancelAnimationFrame(contentsRAF);
+		contentsRAF = requestAnimationFrame(() => {
+			getContents();
+			contentsRAF = null;
+		});
 	};
 
-	$: onHistoryChange(history);
+	const onHistoryChange = (historyData, artifactsVisible: boolean) => {
+		if (!historyData) {
+			pendingArtifactRefresh = false;
+			artifactContents.set([]);
+			return;
+		}
+		if (!artifactsVisible) {
+			pendingArtifactRefresh = true;
+			return;
+		}
+		scheduleArtifactContents();
+	};
+
+	$: onHistoryChange(history, $showArtifacts);
+	$: if ($showArtifacts && pendingArtifactRefresh && history) {
+		pendingArtifactRefresh = false;
+		scheduleArtifactContents();
+	}
 
 	const getContents = () => {
 		const messages = history ? createMessagesList(history, history.currentId) : [];
@@ -1361,7 +1712,6 @@
 	};
 
 	const initNewChat = async () => {
-		console.log('initNewChat');
 		if ($page.url.pathname !== '/') {
 			await goto('/', { replaceState: true, noScroll: true, keepFocus: true });
 			return;
@@ -1401,11 +1751,9 @@
 
 		if ($page.url.searchParams.get('models') || $page.url.searchParams.get('model')) {
 			const urlModels = normalizeModelSelection(
-				(
-				$page.url.searchParams.get('models') ||
-				$page.url.searchParams.get('model') ||
-				''
-				)?.split(',')
+				($page.url.searchParams.get('models') || $page.url.searchParams.get('model') || '')?.split(
+					','
+				)
 			);
 
 			if (urlModels.length === 1) {
@@ -1586,7 +1934,11 @@
 			temporaryChatEnabled.set(false);
 		}
 
-		chat = await getChatById(localStorage.token, $chatId).catch(async (error) => {
+		chat = await getChatById(
+			localStorage.token,
+			$chatId,
+			buildHistoryRequestParams(HISTORY_TAIL_DEFAULT)
+		).catch(async (error) => {
 			await goto('/');
 			return null;
 		});
@@ -1599,7 +1951,6 @@
 			const chatContent = chat.chat;
 
 			if (chatContent) {
-				console.log(chatContent);
 				sessionToolIds = dedupeIds(chat?.meta?.session_tool_ids ?? []);
 				sessionSkillIds = dedupeIds(chat?.meta?.session_skill_ids ?? []);
 
@@ -1615,36 +1966,42 @@
 
 				oldSelectedModelIds = structuredClone(selectedModels);
 
-					history =
-						(chatContent?.history ?? undefined) !== undefined
-							? chatContent.history
-							: convertMessagesToHistory(chatContent.messages);
-					sanitizeHistoryFileRefs(history);
-					sanitizeHistoryModelRefs(history);
+				history = prepareHistory(resolveHistoryFromChatContent(chatContent));
+				const metaFromResponse = normalizeHistoryMeta(chat?.meta);
+				if (metaFromResponse) {
+					historyMeta = metaFromResponse;
+				} else {
+					const inferredTruncated = inferHistoryTruncation(history);
+					historyMeta = {
+						truncated: inferredTruncated,
+						totalMessages: null,
+						canLoadMore: inferredTruncated,
+						windowSize: null
+					};
+				}
 
-					chatTitle.set(chatContent.title);
+				chatTitle.set(chatContent.title);
 
-					params = chatContent?.params ?? {};
-					chatFiles = sanitizeFilesList(chatContent?.files ?? []);
-					applySelectedToolIds(selectedToolIds ?? []);
+				params = chatContent?.params ?? {};
+				chatFiles = sanitizeFilesList(chatContent?.files ?? []);
+				applySelectedToolIds(selectedToolIds ?? []);
+
+				const taskRes = await getTaskIdsByChatId(localStorage.token, $chatId).catch((error) => {
+					return null;
+				});
+				taskIds = normalizeTaskIds(taskRes?.task_ids);
 
 				autoScroll = true;
 				await tick();
 
-				if (history.currentId) {
+				if ((taskIds?.length ?? 0) === 0 && history.currentId) {
 					for (const message of Object.values(history.messages)) {
 						if (message && message.role === 'assistant') {
 							message.done = true;
 						}
 					}
-				}
-
-				const taskRes = await getTaskIdsByChatId(localStorage.token, $chatId).catch((error) => {
-					return null;
-				});
-
-				if (taskRes) {
-					taskIds = taskRes.task_ids;
+				} else if ((taskIds?.length ?? 0) > 0) {
+					markHistoryForRecoveredActiveTasks(history);
 				}
 
 				await tick();
@@ -1679,7 +2036,7 @@
 
 	const TOOL_CALL_BLOCK_START_REGEX = /<details\b[^>]*\btype="tool_calls"[^>]*>/i;
 	const LEAKED_TOOL_ATTR_LINE_REGEX =
-		/(^|\n)\s*(?:type="tool_calls"|name="[^"\n]*"|arguments="[^"\n]*"|result="[^"\n]*"|done="(?:true|false)"\s+status="[^"\n]*")[^\n]*(?=\n|$)/gi;
+		/(^|\n)\s*(?:type="tool_calls"|name="[^"\n]*"|tool_id="[^"\n]*"|tool_name="[^"\n]*"|arguments="[^"\n]*"|result="[^"\n]*"|done="(?:true|false)"\s+status="[^"\n]*")[^\n]*(?=\n|$)/gi;
 	const SOURCE_SECTION_LINE_REGEX = /(^|\n)\s*(参考来源|Sources)\s*:?\s*(?:\n|$)/i;
 	const SOURCE_SECTION_INLINE_REGEX = /(参考来源|Sources)\s*:?\s*(?:\[[^\]]+\][^\n\r]*)$/i;
 
@@ -1695,9 +2052,7 @@
 			}
 		}
 
-		normalized = normalized
-			.replace(LEAKED_TOOL_ATTR_LINE_REGEX, '$1')
-			.replace(/\n{3,}/g, '\n\n');
+		normalized = normalized.replace(LEAKED_TOOL_ATTR_LINE_REGEX, '$1').replace(/\n{3,}/g, '\n\n');
 
 		normalized = normalized.replace(
 			/(^|[^\n])\s*#{1,6}\s*(参考来源|Sources)(?=\s|$)/g,
@@ -1893,13 +2248,13 @@
 				childrenIds: [],
 				role: 'assistant',
 				content: `[RESPONSE] ${responseMessageId}`,
-					done: true,
+				done: true,
 
-					model: modelId,
-					modelName: model?.name ?? modelId,
-					modelIdx: 0,
-					timestamp: Math.floor(Date.now() / 1000)
-				};
+				model: modelId,
+				modelName: model?.name ?? modelId,
+				modelIdx: 0,
+				timestamp: Math.floor(Date.now() / 1000)
+			};
 
 			if (parentMessage) {
 				parentMessage.childrenIds.push(userMessageId);
@@ -2316,6 +2671,11 @@
 			newChat?: boolean;
 		} = {}
 	) => {
+		if (!newChat) {
+			await ensureHistoryLoaded();
+			_history = structuredClone(history);
+		}
+
 		if (autoScroll) {
 			scrollToBottom();
 		}
@@ -2326,13 +2686,13 @@
 
 		const responseMessageIds: Record<PropertyKey, string> = {};
 		// If modelId is provided, use it, else use selected model
-				let selectedModelIds = modelId
-					? [modelId]
-					: atSelectedModel !== undefined
-						? [atSelectedModel.id]
-						: selectedModels;
+		let selectedModelIds = modelId
+			? [modelId]
+			: atSelectedModel !== undefined
+				? [atSelectedModel.id]
+				: selectedModels;
 
-				selectedModelIds = selectedModelIds.map(getEffectiveModelId);
+		selectedModelIds = selectedModelIds.map(getEffectiveModelId);
 
 		// Create response messages for each selected model
 		for (const [_modelIdx, modelId] of selectedModelIds.entries()) {
@@ -2459,8 +2819,7 @@
 						? codeInterpreterEnabled
 						: false,
 				web_search:
-					$config?.features?.enable_web_search &&
-					($user?.permissions?.features?.web_search ?? true)
+					$config?.features?.enable_web_search && ($user?.permissions?.features?.web_search ?? true)
 						? webSearchEnabled
 						: false
 			};
@@ -2648,109 +3007,112 @@
 		// Use the user-selected terminal from the dropdown
 		const activeTerminalId = $selectedTerminalId ?? null;
 		const effectiveSkillIds = dedupeIds([...sessionSkillIds, ...skillIds]);
+		const clientCapabilities = getClientCapabilities({
+			chatId: $chatId,
+			temporaryChatEnabled: $temporaryChatEnabled,
+			canShareChat: $user?.role === 'admin' || ($user?.permissions?.chat?.share ?? true)
+		});
 
-			const res = await generateOpenAIChatCompletion(
-				localStorage.token,
-				{
-					stream: stream,
-					model: effectiveModelId,
-					thinking_mode_enabled: thinkingModeEnabled,
-					messages: messages,
-					params: {
-						...$settings?.params,
-						...params,
-						stop:
-							(params?.stop ?? $settings?.params?.stop ?? undefined)
-								? (params?.stop.split(',').map((token) => token.trim()) ?? $settings.params.stop).map(
-										(str) =>
-											decodeURIComponent(
-												JSON.parse('"' + str.replace(/\"/g, '\\"') + '"')
-											)
-									)
-								: undefined
-					},
-
-					files: (files?.length ?? 0) > 0 ? files : undefined,
-
-					filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
-					tool_ids: toolIds.length > 0 ? toolIds : undefined,
-					skill_ids: effectiveSkillIds.length > 0 ? effectiveSkillIds : undefined,
-					terminal_id: activeTerminalId ?? undefined,
-					tool_servers: [
-						...($toolServers ?? []).filter(
-							(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
-						),
-						// Direct terminal servers — always included when enabled (not routed through selectedToolIds)
-						...($terminalServers ?? []).filter((t) => !t.id)
-					],
-					features: getFeatures(),
-					variables: {
-						...getPromptVariables(
-							$user?.name,
-							$settings?.userLocation ? userLocation : undefined,
-							$user?.email
-						)
-					},
-					model_item: getModelById(effectiveModelId),
-
-					session_id: $socket?.id,
-					chat_id: $chatId,
-
-					id: responseMessageId,
-					parent_id: userMessage?.id ?? null,
-					parent_message: userMessage,
-
-					background_tasks: {
-						...(!$temporaryChatEnabled &&
-						(messages.length == 1 ||
-							(messages.length == 2 &&
-								messages.at(0)?.role === 'system' &&
-								messages.at(1)?.role === 'user')) &&
-						(getEffectiveModelId(selectedModels[0]) === effectiveModelId ||
-							atSelectedModel !== undefined)
-							? {
-									title_generation: $settings?.title?.auto ?? true,
-									tags_generation: $settings?.autoTags ?? true
-								}
-							: {}),
-						follow_up_generation: $settings?.autoFollowUps ?? true
-					},
-
-					...(stream && (model.info?.meta?.capabilities?.usage ?? false)
-						? {
-								stream_options: {
-									include_usage: true
-								}
-							}
-						: {})
+		const res = await generateOpenAIChatCompletion(
+			localStorage.token,
+			{
+				stream: stream,
+				model: effectiveModelId,
+				thinking_mode_enabled: thinkingModeEnabled,
+				messages: messages,
+				params: {
+					...$settings?.params,
+					...params,
+					stop:
+						(params?.stop ?? $settings?.params?.stop ?? undefined)
+							? (params?.stop.split(',').map((token) => token.trim()) ?? $settings.params.stop).map(
+									(str) => decodeURIComponent(JSON.parse('"' + str.replace(/\"/g, '\\"') + '"'))
+								)
+							: undefined
 				},
-				`${WEBUI_BASE_URL}/api`
-			).catch(async (error) => {
-				console.log(error);
 
-				let errorMessage = error;
-				if (error?.error?.message) {
-					errorMessage = error.error.message;
-				} else if (error?.message) {
-					errorMessage = error.message;
-				}
+				files: (files?.length ?? 0) > 0 ? files : undefined,
 
-				if (typeof errorMessage === 'object') {
-					errorMessage = $i18n.t(`Uh-oh! There was an issue with the response.`);
-				}
+				filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
+				tool_ids: toolIds.length > 0 ? toolIds : undefined,
+				skill_ids: effectiveSkillIds.length > 0 ? effectiveSkillIds : undefined,
+				terminal_id: activeTerminalId ?? undefined,
+				tool_servers: [
+					...($toolServers ?? []).filter(
+						(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
+					),
+					// Direct terminal servers — always included when enabled (not routed through selectedToolIds)
+					...($terminalServers ?? []).filter((t) => !t.id)
+				],
+				features: getFeatures(),
+				variables: {
+					...getPromptVariables(
+						$user?.name,
+						$settings?.userLocation ? userLocation : undefined,
+						$user?.email
+					)
+				},
+				model_item: getModelById(effectiveModelId),
+				client_capabilities: clientCapabilities,
 
-				toast.error(`${errorMessage}`);
-				responseMessage.error = {
-					content: error
-				};
+				session_id: $socket?.id,
+				chat_id: $chatId,
 
-				responseMessage.done = true;
+				id: responseMessageId,
+				parent_id: userMessage?.id ?? null,
+				parent_message: userMessage,
 
-				history.messages[responseMessageId] = responseMessage;
-				history.currentId = responseMessageId;
+				background_tasks: {
+					...(!$temporaryChatEnabled &&
+					(messages.length == 1 ||
+						(messages.length == 2 &&
+							messages.at(0)?.role === 'system' &&
+							messages.at(1)?.role === 'user')) &&
+					(getEffectiveModelId(selectedModels[0]) === effectiveModelId ||
+						atSelectedModel !== undefined)
+						? {
+								title_generation: $settings?.title?.auto ?? true,
+								tags_generation: $settings?.autoTags ?? true
+							}
+						: {}),
+					follow_up_generation: $settings?.autoFollowUps ?? true
+				},
 
-				return null;
-			});
+				...(stream && (model.info?.meta?.capabilities?.usage ?? false)
+					? {
+							stream_options: {
+								include_usage: true
+							}
+						}
+					: {})
+			},
+			`${WEBUI_BASE_URL}/api`
+		).catch(async (error) => {
+			console.log(error);
+
+			let errorMessage = error;
+			if (error?.error?.message) {
+				errorMessage = error.error.message;
+			} else if (error?.message) {
+				errorMessage = error.message;
+			}
+
+			if (typeof errorMessage === 'object') {
+				errorMessage = $i18n.t(`Uh-oh! There was an issue with the response.`);
+			}
+
+			toast.error(`${errorMessage}`);
+			responseMessage.error = {
+				content: error
+			};
+
+			responseMessage.done = true;
+
+			history.messages[responseMessageId] = responseMessage;
+			history.currentId = responseMessageId;
+
+			return null;
+		});
 
 		if (res) {
 			if (res.error) {
@@ -2815,11 +3177,6 @@
 	};
 
 	const stopResponse = async () => {
-		const normalizeTaskIds = (ids: unknown): string[] =>
-			(Array.isArray(ids) ? ids : [])
-				.map((id) => (typeof id === 'string' ? id.trim() : ''))
-				.filter((id) => id !== '' && id !== 'null' && id !== 'undefined');
-
 		let activeTaskIds = normalizeTaskIds(taskIds);
 
 		// Fallback: recover task IDs from backend if local state missed them.
@@ -2900,6 +3257,8 @@
 		console.log('regenerateResponse');
 
 		if (history.currentId) {
+			await ensureHistoryLoaded();
+			message = history.messages[message.id] ?? message;
 			let userMessage = history.messages[message.parentId];
 
 			if (!userMessage) {
@@ -2935,8 +3294,8 @@
 	};
 
 	const continueResponse = async () => {
-		console.log('continueResponse');
 		const _chatId = JSON.parse(JSON.stringify($chatId));
+		await ensureHistoryLoaded();
 
 		if (history.currentId && history.messages[history.currentId].done == true) {
 			const responseMessage = history.messages[history.currentId];
@@ -3048,13 +3407,15 @@
 		return _chatId;
 	};
 
-	const saveChatHandler = async (_chatId: string, history: any) => {
+	const saveChatHandler = async (_chatId: string, historyData: any) => {
 		if ($chatId == _chatId) {
 			if (!$temporaryChatEnabled) {
+				await ensureHistoryLoaded();
+				const historyToPersist = structuredClone(history);
 				chat = await updateChatById(localStorage.token, _chatId, {
 					models: selectedModels,
-					history: history,
-					messages: createMessagesList(history, history.currentId),
+					history: historyToPersist,
+					messages: createMessagesList(historyToPersist, historyToPersist.currentId),
 					params: params,
 					files: chatFiles
 				});
@@ -3321,6 +3682,9 @@
 										bind:history
 										bind:autoScroll
 										bind:prompt
+										{historyMeta}
+										loadMoreHistory={loadMoreHistory}
+										ensureHistoryLoaded={ensureHistoryLoaded}
 										setInputText={(text) => {
 											messageInput?.setText(text);
 										}}
@@ -3496,8 +3860,12 @@
 	:global(#chat-container.landing-ambient-mode #message-input-container) {
 		backdrop-filter: none !important;
 		-webkit-backdrop-filter: none !important;
-		background:
-			linear-gradient(160deg, rgba(255, 255, 255, 0.92) 0%, rgba(255, 255, 255, 0.8) 48%, rgba(255, 255, 255, 0.86) 100%),
+		background: linear-gradient(
+				160deg,
+				rgba(255, 255, 255, 0.92) 0%,
+				rgba(255, 255, 255, 0.8) 48%,
+				rgba(255, 255, 255, 0.86) 100%
+			),
 			radial-gradient(circle at 12% -12%, rgba(90, 152, 255, 0.09), rgba(90, 152, 255, 0) 52%),
 			radial-gradient(circle at 88% 122%, rgba(239, 91, 109, 0.07), rgba(239, 91, 109, 0) 58%);
 		border-color: rgba(255, 255, 255, 0.6) !important;
@@ -3508,8 +3876,12 @@
 	}
 
 	:global(.dark #chat-container.landing-ambient-mode #message-input-container) {
-		background:
-			linear-gradient(165deg, rgba(14, 18, 28, 0.9) 0%, rgba(10, 13, 20, 0.78) 52%, rgba(14, 18, 28, 0.88) 100%),
+		background: linear-gradient(
+				165deg,
+				rgba(14, 18, 28, 0.9) 0%,
+				rgba(10, 13, 20, 0.78) 52%,
+				rgba(14, 18, 28, 0.88) 100%
+			),
 			radial-gradient(circle at 12% -12%, rgba(90, 152, 255, 0.12), rgba(90, 152, 255, 0) 56%),
 			radial-gradient(circle at 88% 122%, rgba(239, 91, 109, 0.1), rgba(239, 91, 109, 0) 62%);
 		border-color: rgba(255, 255, 255, 0.14) !important;
