@@ -261,7 +261,74 @@ class TestToolCatalogRouters(AbstractPostgresTest):
 
         server_tool = next((tool for tool in result if tool.id == f"server:{server_id}"), None)
         assert server_tool is not None
+        assert server_tool.meta.origin == "external"
+        assert server_tool.meta.source_of_truth == "openapi-tool-server"
+        assert server_tool.meta.execution_boundary == "external"
         assert server_tool.write_access is False
+        assert server_tool.catalog_kind == "external"
+
+    def test_get_tool_list_normalizes_custom_tool_metadata(self):
+        _insert_tool(
+            self.db,
+            "public_tool",
+            meta={"description": "public", "published": True, "visibility": "public"},
+        )
+
+        with mock_webui_user(id="2", role="user") as user:
+            result = self.run_async(
+                tools.get_tool_list(request=self.request, user=user, db=self.db)
+            )
+
+        custom_tool = next((tool for tool in result if tool.id == "public_tool"), None)
+        assert custom_tool is not None
+        assert custom_tool.meta.origin == "host"
+        assert custom_tool.meta.source_of_truth == "open-webui-tool"
+        assert custom_tool.meta.execution_boundary == "open-webui"
+        assert custom_tool.catalog_kind == "custom"
+
+    def test_get_tool_list_includes_core_catalog_tools(self, monkeypatch):
+        async def _fake_get_core_tool_entries(_request):
+            return [
+                {
+                    "id": "internet_search",
+                    "user_id": "system:agent-core",
+                    "name": "网络搜索",
+                    "meta": {
+                        "description": "Run internet search using Bocha API.",
+                        "origin": "core",
+                        "catalog_kind": "core",
+                        "source_of_truth": "agent-core",
+                        "execution_boundary": "agent",
+                        "mutability": "locked",
+                        "available": True,
+                        "availability_state": "registered",
+                    },
+                    "access_grants": [],
+                    "updated_at": 1,
+                    "created_at": 1,
+                    "write_access": False,
+                    "installed": False,
+                    "installable": False,
+                    "catalog_kind": "core",
+                }
+            ]
+
+        monkeypatch.setattr(tools, "_get_core_tool_entries", _fake_get_core_tool_entries)
+
+        with mock_webui_user(id="2", role="user") as user:
+            result = self.run_async(
+                tools.get_tool_list(request=self.request, user=user, db=self.db)
+            )
+
+        core_tool = next((tool for tool in result if tool.id == "internet_search"), None)
+        assert core_tool is not None
+        assert core_tool.meta.origin == "core"
+        assert core_tool.meta.source_of_truth == "agent-core"
+        assert core_tool.meta.execution_boundary == "agent"
+        assert core_tool.write_access is False
+        assert core_tool.installed is False
+        assert core_tool.installable is False
+        assert core_tool.catalog_kind == "core"
 
     def test_get_builtin_tool_list_returns_catalog(self):
         with mock_webui_user(id="2", role="user") as user:
@@ -281,6 +348,41 @@ class TestToolCatalogRouters(AbstractPostgresTest):
             "image_generation",
             "code_interpreter",
         }.issubset(tool_ids)
+        host_tool = next(
+            tool for tool in result if (tool["id"] if isinstance(tool, dict) else tool.id) == "web_search"
+        )
+        host_meta = host_tool["meta"] if isinstance(host_tool, dict) else host_tool.meta
+        host_origin = host_meta["origin"] if isinstance(host_meta, dict) else host_meta.origin
+        host_boundary = (
+            host_meta["execution_boundary"]
+            if isinstance(host_meta, dict)
+            else host_meta.execution_boundary
+        )
+        assert host_origin == "host"
+        assert host_boundary == "open-webui"
+
+    def test_image_generation_catalog_entry_is_disabled_without_real_backend_config(self):
+        self.request.app.state.config.ENABLE_IMAGE_GENERATION = True
+        self.request.app.state.config.IMAGE_GENERATION_ENGINE = "openai"
+        self.request.app.state.config.IMAGES_OPENAI_API_BASE_URL = ""
+        self.request.app.state.config.IMAGES_OPENAI_API_KEY = ""
+        self.request.app.state.config.ENABLE_IMAGE_EDIT = False
+
+        with mock_webui_user(id="2", role="user") as user:
+            result = self.run_async(
+                tools.get_builtin_tool_list(request=self.request, user=user)
+            )
+
+        image_tool = next(
+            tool
+            for tool in result
+            if (tool["id"] if isinstance(tool, dict) else tool.id) == "image_generation"
+        )
+        image_meta = image_tool["meta"] if isinstance(image_tool, dict) else image_tool.meta
+
+        assert tool_utils.is_image_generation_tool_available(self.request.app.state.config) is False
+        assert image_meta["available"] is False
+        assert image_meta["availability_state"] == "disabled"
 
     def test_install_uninstall_server_tool(self, monkeypatch):
         server_id = "server-1"

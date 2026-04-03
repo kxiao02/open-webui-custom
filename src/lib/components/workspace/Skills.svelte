@@ -55,6 +55,7 @@
 	let tagsContainerElement: HTMLDivElement;
 	let viewOption = '';
 	let page = 1;
+	const canExportSkills = () => $user?.role === 'admin' || $user?.permissions?.workspace?.skills;
 
 	const loadSkillItems = async () => {
 		if (!loaded) return;
@@ -275,7 +276,7 @@
 					</button>
 				{/if}
 
-				{#if total && $user?.role === 'admin'}
+				{#if total && canExportSkills()}
 					<button
 						class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
 						on:click={async () => {
@@ -297,9 +298,9 @@
 					</button>
 				{/if}
 
-				{#if $user?.role === 'admin'}
+				{#if $user}
 					<a
-						class=" px-2 py-1.5 rounded-xl bg-black text-white dark:bg-white dark:text-black transition font-medium text-sm flex items-center"
+						class="px-2 py-1.5 rounded-xl bg-black text-white hover:bg-gray-900 dark:bg-white dark:text-black dark:hover:bg-gray-100 transition font-medium text-sm flex items-center"
 						href="/workspace/skills/create"
 					>
 						<Plus className="size-3" strokeWidth="2.5" />
@@ -372,19 +373,33 @@
 		{:else if (filteredItems ?? []).length !== 0}
 			<div class=" my-2 gap-2 grid px-3 lg:grid-cols-2">
 				{#each filteredItems as skill}
+					{@const canEdit = skill.write_access}
 					<Tooltip content={skill?.description ?? skill?.id}>
 						<div
-							class=" flex space-x-4 text-left w-full px-3 py-2.5 transition rounded-2xl {skill.write_access
-								? 'cursor-pointer dark:hover:bg-gray-850/50 hover:bg-gray-50'
-								: 'cursor-not-allowed opacity-60'}"
+							class="flex space-x-4 text-left w-full px-3 py-2.5 transition rounded-2xl dark:hover:bg-gray-850/50 hover:bg-gray-50"
 						>
-							{#if skill.write_access}
-								<a
-									class=" flex flex-1 space-x-3.5 cursor-pointer w-full"
-									href={`/workspace/skills/edit?id=${encodeURIComponent(skill.id)}`}
-								>
-									<div class="flex items-center text-left">
-										<div class=" flex-1 self-center">
+							<div
+								class="flex flex-1 space-x-3.5 w-full {canEdit ? 'cursor-pointer' : ''}"
+								role={canEdit ? 'button' : undefined}
+								tabindex={canEdit ? 0 : undefined}
+								on:click={() => {
+									if (canEdit) {
+										goto(`/workspace/skills/edit?id=${encodeURIComponent(skill.id)}`);
+									}
+								}}
+								on:keydown={(event) => {
+									if (!canEdit) {
+										return;
+									}
+									if (event.key === 'Enter' || event.key === ' ') {
+										event.preventDefault();
+										goto(`/workspace/skills/edit?id=${encodeURIComponent(skill.id)}`);
+									}
+								}}
+							>
+								<div class="flex items-center text-left w-full">
+									<div class="flex-1 self-center w-full">
+										<div class="flex items-center justify-between w-full gap-2">
 											<Tooltip content={skill.id} placement="top-start">
 												<div class="flex items-center gap-2">
 													<div class="line-clamp-1 text-sm">
@@ -401,107 +416,71 @@
 													{/if}
 												</div>
 											</Tooltip>
-											<div class="px-0.5">
-												<div class="text-xs text-gray-500 shrink-0">
-													<Tooltip
-														content={skill?.user?.email ?? $i18n.t('Deleted User')}
-														className="flex shrink-0"
-														placement="top-start"
-													>
-														{$i18n.t('By {{name}}', {
-															name: capitalizeFirstLetter(
-																skill?.user?.name ?? skill?.user?.email ?? $i18n.t('Deleted User')
-															)
-														})}
-													</Tooltip>
-												</div>
-											</div>
-										</div>
-									</div>
-								</a>
-							{:else}
-								<div class=" flex flex-1 space-x-3.5 w-full">
-									<div class="flex items-center text-left w-full">
-										<div class="flex-1 self-center w-full">
-											<div class="flex items-center justify-between w-full gap-2">
-												<Tooltip content={skill.id} placement="top-start">
-													<div class="flex items-center gap-2">
-														<div class="line-clamp-1 text-sm">
-															{skill.name}
-														</div>
-														{#if !skill?.meta?.published}
-															<Badge type="muted" content={$i18n.t('Draft')} />
-														{/if}
-														{#if skill?.meta?.visibility === 'hidden'}
-															<Badge type="muted" content={$i18n.t('Hidden')} />
-														{/if}
-														{#if !skill.is_active}
-															<Badge type="muted" content={$i18n.t('Inactive')} />
-														{/if}
-													</div>
-												</Tooltip>
+											{#if !canEdit}
 												<Badge type="muted" content={$i18n.t('Read Only')} />
-											</div>
-											<div class="px-0.5">
-												<div class="text-xs text-gray-500 shrink-0">
-													<Tooltip
-														content={skill?.user?.email ?? $i18n.t('Deleted User')}
-														className="flex shrink-0"
-														placement="top-start"
-													>
-														{$i18n.t('By {{name}}', {
-															name: capitalizeFirstLetter(
-																skill?.user?.name ?? skill?.user?.email ?? $i18n.t('Deleted User')
-															)
-														})}
-													</Tooltip>
-												</div>
+											{/if}
+										</div>
+										<div class="px-0.5">
+											<div class="text-xs text-gray-500 shrink-0">
+												<Tooltip
+													content={skill?.user?.email ?? $i18n.t('Deleted User')}
+													className="flex shrink-0"
+													placement="top-start"
+												>
+													{$i18n.t('By {{name}}', {
+														name: capitalizeFirstLetter(
+															skill?.user?.name ?? skill?.user?.email ?? $i18n.t('Deleted User')
+														)
+													})}
+												</Tooltip>
 											</div>
 										</div>
 									</div>
 								</div>
-							{/if}
-							{#if skill.write_access}
-								<div class="flex flex-row gap-0.5 self-center">
-									{#if shiftKey}
-										<Tooltip content={$i18n.t('Delete')}>
-											<button
-												class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-												type="button"
-												aria-label={$i18n.t('Delete')}
-												on:click={() => {
-													deleteHandler(skill);
-												}}
-											>
-												<GarbageBin />
-											</button>
-										</Tooltip>
-									{:else}
-										<SkillMenu
-											editHandler={() => {
-												goto(`/workspace/skills/edit?id=${encodeURIComponent(skill.id)}`);
+							</div>
+							<div class="flex flex-row gap-0.5 self-center">
+								{#if shiftKey && canEdit}
+									<Tooltip content={$i18n.t('Delete')}>
+										<button
+											class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+											type="button"
+											aria-label={$i18n.t('Delete')}
+											on:click|stopPropagation={() => {
+												deleteHandler(skill);
 											}}
-											cloneHandler={() => {
-												cloneHandler(skill);
-											}}
-											exportHandler={() => {
-												exportHandler(skill);
-											}}
-											deleteHandler={async () => {
-												selectedSkill = skill;
-												showDeleteConfirm = true;
-											}}
-											onClose={() => {}}
 										>
-											<button
-												class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-												type="button"
-											>
-												<EllipsisHorizontal className="size-5" />
-											</button>
-										</SkillMenu>
-									{/if}
+											<GarbageBin />
+										</button>
+									</Tooltip>
+								{:else}
+									<SkillMenu
+										writeAccess={skill.write_access}
+										editHandler={() => {
+											goto(`/workspace/skills/edit?id=${encodeURIComponent(skill.id)}`);
+										}}
+										cloneHandler={() => {
+											cloneHandler(skill);
+										}}
+										exportHandler={() => {
+											exportHandler(skill);
+										}}
+										deleteHandler={async () => {
+											selectedSkill = skill;
+											showDeleteConfirm = true;
+										}}
+										onClose={() => {}}
+									>
+										<button
+											class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+											type="button"
+											on:click|stopPropagation
+										>
+											<EllipsisHorizontal className="size-5" />
+										</button>
+									</SkillMenu>
+								{/if}
 
+								{#if canEdit}
 									<button on:click|stopPropagation|preventDefault>
 										<Tooltip content={skill.is_active ? $i18n.t('Enabled') : $i18n.t('Disabled')}>
 											<Switch
@@ -512,8 +491,8 @@
 											/>
 										</Tooltip>
 									</button>
-								</div>
-							{/if}
+								{/if}
+							</div>
 						</div>
 					</Tooltip>
 				{/each}

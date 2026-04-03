@@ -419,7 +419,10 @@
 					? 'bg-gray-100 dark:bg-gray-950 selected'
 					: ' group-hover:bg-gray-100 dark:group-hover:bg-gray-950'}  whitespace-nowrap text-ellipsis"
 			href="/c/{id}"
-			on:click={() => {
+			on:click={async (e) => {
+				e.stopImmediatePropagation();
+				e.preventDefault();
+
 				dispatch('select');
 
 				if ($selectedFolder) {
@@ -428,6 +431,12 @@
 
 				if ($mobile) {
 					showSidebar.set(false);
+				}
+
+				try {
+					await goto(`/c/${id}`);
+				} finally {
+					dispatch('unselect');
 				}
 			}}
 			on:dblclick={async (e) => {

@@ -26,6 +26,7 @@
 
 	import { uploadFile } from '$lib/apis/files';
 	import { toast } from 'svelte-sonner';
+	import { hasGeneratedFilesInHistory } from '$lib/utils/generated-files';
 
 	import Controls from './Controls/Controls.svelte';
 	import CallOverlay from './MessageInput/CallOverlay.svelte';
@@ -64,10 +65,15 @@
 	let paneReady = false;
 
 	// Tab state for Controls+Files panel
-	let activeTab = savedTab;
+	let activeTab: 'controls' | 'files' | 'overview' | 'preview' = savedTab;
+	let wasFilePreviewOpen = false;
+	let lastShowFileNavPath: string | null = null;
+	let lastSelectedTerminalId: string | null = null;
 	// svelte-ignore reactive_declaration_module_script_dependency
 	$: {
-		savedTab = activeTab;
+		if (activeTab !== 'preview') {
+			savedTab = activeTab;
+		}
 	}
 
 	$: hasMessages = history?.messages && Object.keys(history.messages).length > 0;
@@ -77,30 +83,65 @@
 		!!$selectedTerminalId ||
 		(codeInterpreterEnabled && $config?.code?.interpreter_engine !== 'jupyter');
 	$: showOverviewTab = hasMessages;
+	$: previewAvailable = hasGeneratedFilesInHistory(history);
+	$: showPreviewTab = previewAvailable;
+	$: isPreviewMode = $showFilePreview;
 
 	// Tab fallback: if active tab becomes hidden, switch to next available
 	$: if (!showOverviewTab && activeTab === 'overview') activeTab = 'controls';
 	$: if (!showFilesTab && activeTab === 'files') activeTab = 'controls';
+	$: if (!showPreviewTab && activeTab === 'preview') {
+		if (showFilesTab) activeTab = 'files';
+		else if (showControlsTab) activeTab = 'controls';
+		else if (showOverviewTab) activeTab = 'overview';
+	}
+	$: if (activeTab === 'preview' && !$showFilePreview) {
+		if (showFilesTab) activeTab = 'files';
+		else if (showControlsTab) activeTab = 'controls';
+		else if (showOverviewTab) activeTab = 'overview';
+	}
 	$: if (!showControlsTab && activeTab === 'controls') {
 		if (showFilesTab) activeTab = 'files';
 		else if (showOverviewTab) activeTab = 'overview';
 	}
 
 	// Auto-close if there are no visible tabs
-	$: if (!showControlsTab && !showFilesTab && !showOverviewTab) {
+	$: if (!showControlsTab && !showFilesTab && !showOverviewTab && !showPreviewTab) {
 		showControls.set(false);
 	}
 
 	// Auto-switch to Files tab when display_file is triggered
-	$: if ($showFileNavPath) {
-		activeTab = 'files';
-		showControls.set(true);
+	$: {
+		if ($showFileNavPath && $showFileNavPath !== lastShowFileNavPath) {
+			lastShowFileNavPath = $showFileNavPath;
+			activeTab = 'files';
+			showControls.set(true);
+		} else if (!$showFileNavPath) {
+			lastShowFileNavPath = null;
+		}
+	}
+
+	$: {
+		if ($showFilePreview && !wasFilePreviewOpen) {
+			wasFilePreviewOpen = true;
+			activeTab = 'preview';
+			showControls.set(true);
+		}
+
+		if (!$showFilePreview && wasFilePreviewOpen) {
+			wasFilePreviewOpen = false;
+		}
 	}
 
 	// Auto-open Files tab when a terminal is selected
-	$: if ($selectedTerminalId) {
-		activeTab = 'files';
-		showControls.set(true);
+	$: {
+		if ($selectedTerminalId && $selectedTerminalId !== lastSelectedTerminalId) {
+			lastSelectedTerminalId = $selectedTerminalId;
+			activeTab = 'files';
+			showControls.set(true);
+		} else if (!$selectedTerminalId) {
+			lastSelectedTerminalId = null;
+		}
 	}
 
 	// Attach a terminal file to the chat input
@@ -145,15 +186,26 @@
 		}
 	};
 
+	const getPreferredPaneSize = () => {
+		const container = document.getElementById('chat-container');
+		if (!container) return minSize;
+
+		const preferredWidthPx = activeTab === 'preview' || $showFilePreview
+			? Math.min(Math.max(Math.floor(container.clientWidth * 0.42), 560), 760)
+			: 350;
+		return Math.max(minSize, Math.floor((preferredWidthPx / container.clientWidth) * 100));
+	};
+
 	export const openPane = () => {
+		const preferredMinSize = getPreferredPaneSize();
 		if (parseInt(localStorage?.chatControlsSize)) {
 			const container = document.getElementById('chat-container');
 			let size = Math.floor(
 				(parseInt(localStorage?.chatControlsSize) / container.clientWidth) * 100
 			);
-			pane.resize(size);
+			pane.resize(Math.max(size, preferredMinSize));
 		} else {
-			pane.resize(minSize);
+			pane.resize(preferredMinSize);
 		}
 	};
 
@@ -176,8 +228,15 @@
 		}
 	};
 
-	const onMouseDown = () => {
-		dragged = true;
+	const isControlsResizerInteraction = (event: MouseEvent): boolean => {
+		const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+		return path.some(
+			(node) => node instanceof HTMLElement && node.id === 'controls-resizer'
+		);
+	};
+
+	const onMouseDown = (event: MouseEvent) => {
+		dragged = isControlsResizerInteraction(event);
 	};
 	const onMouseUp = () => {
 		dragged = false;
@@ -214,14 +273,15 @@
 				for (let entry of entries) {
 					const width = entry.contentRect.width;
 					minSize = Math.floor((350 / width) * 100);
+					const preferredMinSize = getPreferredPaneSize();
 					if ($showControls) {
-						if (pane && pane.isExpanded() && pane.getSize() < minSize) {
-							pane.resize(minSize);
+						if (pane && pane.isExpanded() && pane.getSize() < preferredMinSize) {
+							pane.resize(preferredMinSize);
 						} else {
 							let size = Math.floor(
 								(parseInt(localStorage?.chatControlsSize) / container.clientWidth) * 100
 							);
-							if (size < minSize && pane) pane.resize(minSize);
+							if (size < preferredMinSize && pane) pane.resize(preferredMinSize);
 						}
 					}
 				}
@@ -257,6 +317,12 @@
 	};
 
 	$: if (paneReady && !chatId) closeHandler();
+	$: if (paneReady && largeScreen && $showControls && $showFilePreview && pane?.isExpanded()) {
+		const preferredSize = getPreferredPaneSize();
+		if (pane.getSize() < preferredSize) {
+			pane.resize(preferredSize);
+		}
+	}
 
 	// Helper: is a "special" full-screen panel active?
 	$: specialPanel = $showCallOverlay || $showArtifacts || $showEmbeds;
@@ -288,76 +354,101 @@
 					</div>
 				{:else if $showEmbeds}
 					<Embeds />
-				{:else if $showFilePreview}
-					<FilePreview {history} />
 				{:else if $showArtifacts}
 					<Artifacts {history} />
 				{:else}
 					<!-- Controls + Files tabs -->
 					<div class="flex flex-col h-full min-h-0">
-						<!-- Tab bar -->
-						<div class="flex items-center justify-between px-2 pt-2.5 pb-2 shrink-0">
-							<div class="flex gap-1 min-w-0 overflow-x-auto scrollbar-hidden">
-								{#if showControlsTab}
-									<button
-										class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
-										'controls'
-											? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
-											: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
-										on:click={() => (activeTab = 'controls')}
-									>
-										{$i18n.t('Controls')}
-									</button>
-								{/if}
-								{#if showFilesTab}
-									<button
-										class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
-										'files'
-											? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
-											: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
-										on:click={() => (activeTab = 'files')}
-									>
-										{$i18n.t('Files')}
-									</button>
-								{/if}
-								{#if showOverviewTab}
-									<button
-										class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
-										'overview'
-											? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
-											: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
-										on:click={() => (activeTab = 'overview')}
-									>
-										{$i18n.t('Overview')}
-									</button>
-								{/if}
-							</div>
-							<button
-								class="p-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition text-gray-500 dark:text-gray-400"
-								on:click={() => showControls.set(false)}
-								aria-label={$i18n.t('Close')}
-							>
-								<svg
-									xmlns="http://www.w3.org/2000/svg"
-									viewBox="0 0 24 24"
-									fill="none"
-									stroke="currentColor"
-									stroke-width="1.5"
-									class="size-4"
+						{#if !isPreviewMode}
+							<!-- Tab bar -->
+							<div class="flex items-center justify-between px-2 pt-2.5 pb-2 shrink-0">
+								<div class="flex gap-1 min-w-0 overflow-x-auto scrollbar-hidden">
+									{#if showControlsTab}
+										<button
+											class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
+											'controls'
+												? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
+												: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
+											on:click={() => {
+												if ($showFilePreview) showFilePreview.set(false);
+												activeTab = 'controls';
+											}}
+										>
+											控制
+										</button>
+									{/if}
+									{#if showFilesTab}
+										<button
+											class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
+											'files'
+												? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
+												: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
+											on:click={() => {
+												if ($showFilePreview) showFilePreview.set(false);
+												activeTab = 'files';
+											}}
+										>
+											文件
+										</button>
+									{/if}
+									{#if showOverviewTab}
+										<button
+											class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
+											'overview'
+												? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
+												: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
+											on:click={() => {
+												if ($showFilePreview) showFilePreview.set(false);
+												activeTab = 'overview';
+											}}
+										>
+											概览
+										</button>
+									{/if}
+									{#if showPreviewTab}
+										<button
+											class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
+											'preview'
+												? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
+												: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
+											on:click={() => {
+												activeTab = 'preview';
+												showFilePreview.set(true);
+											}}
+										>
+											文件预览
+										</button>
+									{/if}
+								</div>
+								<button
+									class="p-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition text-gray-500 dark:text-gray-400"
+									on:click={() => showControls.set(false)}
+									aria-label={$i18n.t('Close')}
 								>
-									<path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
-								</svg>
-							</button>
-						</div>
+									<svg
+										xmlns="http://www.w3.org/2000/svg"
+										viewBox="0 0 24 24"
+										fill="none"
+										stroke="currentColor"
+										stroke-width="1.5"
+										class="size-4"
+									>
+										<path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
+									</svg>
+								</button>
+							</div>
+						{/if}
 
 						<div
-							class="flex-1 min-h-0 {activeTab === 'overview'
+							class="flex-1 min-h-0 {isPreviewMode || activeTab === 'overview'
 								? 'h-full'
 								: activeTab === 'controls'
 									? 'overflow-y-auto px-3 pt-1'
 									: ''}"
 						>
-							{#if activeTab === 'overview'}
+							{#if $showFilePreview}
+								<FilePreview {history} />
+							{:else if activeTab === 'overview'}
 								<Overview
 									{history}
 									onNodeClick={(e) => {
@@ -396,8 +487,9 @@
 		defaultSize={0}
 		onResize={(size) => {
 			if ($showControls && pane.isExpanded()) {
-				if (size < minSize) pane.resize(minSize);
-				if (size < minSize) {
+				const preferredMinSize = getPreferredPaneSize();
+				if (size < preferredMinSize) pane.resize(preferredMinSize);
+				if (size < preferredMinSize) {
 					localStorage.chatControlsSize = 0;
 				} else {
 					const container = document.getElementById('chat-container');
@@ -417,7 +509,7 @@
 					class="w-full {specialPanel && !$showCallOverlay
 						? ' '
 						: 'bg-white dark:shadow-lg dark:bg-gray-850'} z-40 pointer-events-auto {activeTab ===
-					'files'
+					'files' || $showFilePreview
 						? ''
 						: 'overflow-y-auto'} scrollbar-hidden"
 					id="controls-container"
@@ -436,76 +528,101 @@
 						</div>
 					{:else if $showEmbeds}
 						<Embeds overlay={dragged} />
-					{:else if $showFilePreview}
-						<FilePreview {history} overlay={dragged} />
 					{:else if $showArtifacts}
 						<Artifacts {history} overlay={dragged} />
 					{:else}
 						<!-- Controls + Files tabs -->
 						<div class="flex flex-col h-full min-h-0">
-							<!-- Tab bar -->
-							<div class="flex items-center justify-between px-2 pt-2.5 pb-2 shrink-0">
-								<div class="flex gap-1 min-w-0 overflow-x-auto scrollbar-hidden">
-									{#if showControlsTab}
-										<button
-											class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
-											'controls'
-												? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
-												: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
-											on:click={() => (activeTab = 'controls')}
-										>
-											{$i18n.t('Controls')}
-										</button>
-									{/if}
-									{#if showFilesTab}
-										<button
-											class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
-											'files'
-												? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
-												: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
-											on:click={() => (activeTab = 'files')}
-										>
-											{$i18n.t('Files')}
-										</button>
-									{/if}
-									{#if showOverviewTab}
-										<button
-											class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
-											'overview'
-												? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
-												: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
-											on:click={() => (activeTab = 'overview')}
-										>
-											{$i18n.t('Overview')}
-										</button>
-									{/if}
-								</div>
-								<button
-									class="p-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition text-gray-500 dark:text-gray-400"
-									on:click={() => showControls.set(false)}
-									aria-label={$i18n.t('Close')}
-								>
-									<svg
-										xmlns="http://www.w3.org/2000/svg"
-										viewBox="0 0 24 24"
-										fill="none"
-										stroke="currentColor"
-										stroke-width="1.5"
-										class="size-4"
+							{#if !isPreviewMode}
+								<!-- Tab bar -->
+								<div class="flex items-center justify-between px-2 pt-2.5 pb-2 shrink-0">
+									<div class="flex gap-1 min-w-0 overflow-x-auto scrollbar-hidden">
+										{#if showControlsTab}
+											<button
+												class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
+												'controls'
+													? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
+													: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
+												on:click={() => {
+													if ($showFilePreview) showFilePreview.set(false);
+													activeTab = 'controls';
+												}}
+											>
+												控制
+											</button>
+										{/if}
+										{#if showFilesTab}
+											<button
+												class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
+												'files'
+													? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
+													: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
+												on:click={() => {
+													if ($showFilePreview) showFilePreview.set(false);
+													activeTab = 'files';
+												}}
+											>
+												文件
+											</button>
+										{/if}
+										{#if showOverviewTab}
+											<button
+												class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
+												'overview'
+													? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
+													: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
+												on:click={() => {
+													if ($showFilePreview) showFilePreview.set(false);
+													activeTab = 'overview';
+												}}
+											>
+												概览
+											</button>
+										{/if}
+										{#if showPreviewTab}
+											<button
+												class="px-2.5 py-1 text-sm rounded-lg transition whitespace-nowrap {activeTab ===
+												'preview'
+													? 'bg-gray-100 dark:bg-gray-800 font-medium text-gray-900 dark:text-white'
+													: 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'}"
+												on:click={() => {
+													activeTab = 'preview';
+													showFilePreview.set(true);
+												}}
+											>
+												文件预览
+											</button>
+										{/if}
+									</div>
+									<button
+										class="p-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition text-gray-500 dark:text-gray-400"
+										on:click={() => showControls.set(false)}
+										aria-label={$i18n.t('Close')}
 									>
-										<path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
-									</svg>
-								</button>
-							</div>
+										<svg
+											xmlns="http://www.w3.org/2000/svg"
+											viewBox="0 0 24 24"
+											fill="none"
+											stroke="currentColor"
+											stroke-width="1.5"
+											class="size-4"
+										>
+											<path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
+										</svg>
+									</button>
+								</div>
+							{/if}
 
 							<div
-								class="flex-1 min-h-0 {activeTab === 'overview'
+								class="flex-1 min-h-0 {isPreviewMode || activeTab === 'overview'
 									? 'h-full'
 									: activeTab === 'controls'
 										? 'overflow-y-auto px-3 pt-1'
 										: ''}"
 							>
-								{#if activeTab === 'overview'}
+								{#if $showFilePreview}
+									<FilePreview {history} overlay={dragged} />
+								{:else if activeTab === 'overview'}
 									<Overview
 										{history}
 										onNodeClick={(e) => {

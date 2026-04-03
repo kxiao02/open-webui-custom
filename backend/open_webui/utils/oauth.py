@@ -101,6 +101,16 @@ def _get_nested_value(data: dict, path: str):
     return current
 
 
+def _get_first_nested_value(data: dict, paths: list[str]):
+    for path in paths:
+        value = _get_nested_value(data, path) or data.get(path)
+        if isinstance(value, str):
+            value = value.strip()
+        if value:
+            return value
+    return None
+
+
 class OAuthClientMetadata(MCPOAuthClientMetadata):
     token_endpoint_auth_method: Literal[
         "none", "client_secret_basic", "client_secret_post"
@@ -1684,17 +1694,37 @@ class OAuthManager:
                 if not user_data:
                     raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
+                account_no_path = enterprise_cfg.get("account_no_path") or ""
+                account_no = _get_nested_value(user_data, account_no_path)
                 id_claim = enterprise_cfg.get("id_claim") or "id"
-                sub = _get_nested_value(user_data, id_claim) or user_data.get(id_claim)
+                main_account_id = _get_nested_value(user_data, id_claim) or user_data.get(
+                    id_claim
+                )
+                sub = account_no or main_account_id
                 if not sub:
                     raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
-                account_no_path = enterprise_cfg.get("account_no_path") or ""
-                account_no = _get_nested_value(user_data, account_no_path)
+                actual_name = _get_first_nested_value(
+                    user_data,
+                    [
+                        "attributes.account_name",
+                        "attributes.accountName",
+                        "account_name",
+                        "accountName",
+                        "attributes.nick_name",
+                        "attributes.nickName",
+                        "nick_name",
+                        "nickName",
+                    ],
+                )
 
                 oauth_payload = {"sub": sub}
                 if account_no:
                     oauth_payload["account_no"] = account_no
+                if main_account_id:
+                    oauth_payload["main_account_id"] = main_account_id
+                if actual_name:
+                    oauth_payload["actual_name"] = actual_name
 
                 # Extract email
                 email = ""
@@ -1730,8 +1760,8 @@ class OAuthManager:
                 ):
                     raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
-                # Set name for profile if available
-                name = account_no or sub or email
+                # Use the actual person name when IAM exposes it, otherwise fall back to account_no.
+                name = actual_name or account_no or sub or email
 
                 # Compute expires_at using profile hints if present
                 token_expire = _get_nested_value(user_data, "attributes.token_expire")
@@ -1757,6 +1787,18 @@ class OAuthManager:
                     try:
                         # Check if the user exists
                         user = Users.get_user_by_oauth_sub(provider, sub, db=db_session)
+                        if (
+                            not user
+                            and main_account_id
+                            and main_account_id != sub
+                        ):
+                            user = Users.get_user_by_oauth_sub(
+                                provider, main_account_id, db=db_session
+                            )
+                        if not user and account_no:
+                            user = Users.get_user_by_oauth_provider_field(
+                                "portal", "account_no", account_no, db=db_session
+                            )
                         if not user and auth_manager_config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL:
                             user = Users.get_user_by_email(email, db=db_session)
                             if user:

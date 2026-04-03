@@ -24,7 +24,7 @@
 <Modal bind:show size="md">
 	<div>
 		<div class=" flex justify-between dark:text-gray-300 px-5 pt-4 pb-0.5">
-			<div class=" text-lg font-medium self-center">{$i18n.t('Available Tools')}</div>
+			<div class=" text-lg font-medium self-center">{$i18n.t('Enabled')} {$i18n.t('Tools')}</div>
 			<button
 				class="self-center"
 				aria-label={$i18n.t('Close')}

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
 	import dayjs from 'dayjs';
-
+	import { goto } from '$app/navigation';
 	import { createEventDispatcher, onDestroy } from 'svelte';
 	import { onMount, tick, getContext } from 'svelte';
 	import type { Writable } from 'svelte/store';
@@ -14,6 +14,8 @@
 	import { createNewFeedback, getFeedbackById, updateFeedbackById } from '$lib/apis/evaluations';
 	import { getChatById } from '$lib/apis/chats';
 	import { generateTags } from '$lib/apis';
+	import { createNewSkill } from '$lib/apis/skills';
+	import { createNewTool } from '$lib/apis/tools';
 	import { downloadFileBlob } from '$lib/apis/terminal';
 
 	import {
@@ -47,25 +49,43 @@
 		removeDetails,
 		removeAllDetails
 	} from '$lib/utils';
-	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
+import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	import {
 		type GeneratedFileItem,
-		collectGeneratedFilesFromMessage
+		collectGeneratedFilesFromMessage,
+		getToolCallArtifactEvidence,
+		getToolCallAttrs,
+		inferFileName,
+		isFileGeneratingToolId,
+		isDownloadRef,
+		isPrimaryDocumentArtifact,
+		triggerGeneratedFileDownload,
+		resolveToolCallStatus,
+		shouldHideHelperArtifact
 	} from '$lib/utils/generated-files';
 	import { openGeneratedFilePreview } from '$lib/utils/generated-file-preview';
+	import {
+		type ParsedToolDraft,
+		getToolVersionRequirement,
+		parseToolDraftFromMessageContent
+	} from '$lib/utils/tool-drafts';
+	import { type ParsedSkillDraft, parseSkillDraftFromMessageContent } from '$lib/utils/skill-drafts';
 	import { resolveToolDisplay } from '$lib/utils/tool-display';
 
 	import Name from './Name.svelte';
 	import ProfileImage from './ProfileImage.svelte';
 	import Skeleton from './Skeleton.svelte';
+	import FileItem from '$lib/components/common/FileItem.svelte';
 	import Image from '$lib/components/common/Image.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import RateComment from './RateComment.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
+	import Switch from '$lib/components/common/Switch.svelte';
 	import WebSearchResults from './ResponseMessage/WebSearchResults.svelte';
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
 
+	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 
 	import Error from './Error.svelte';
@@ -81,6 +101,7 @@
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
+	import AccessControl from '$lib/components/workspace/common/AccessControl.svelte';
 
 	interface MessageType {
 		id: string;
@@ -150,12 +171,63 @@
 		return 'error';
 	};
 
+	const safeStringify = (value: unknown): string => {
+		if (value === null || value === undefined) return '';
+		if (typeof value === 'string') return value;
+		try {
+			return JSON.stringify(value);
+		} catch {
+			return String(value);
+		}
+	};
+
+	const hashString = (value: string): string => {
+		let hash = 2166136261;
+		for (let index = 0; index < value.length; index += 1) {
+			hash ^= value.charCodeAt(index);
+			hash = Math.imul(hash, 16777619);
+		}
+		return (hash >>> 0).toString(36);
+	};
+
+	const buildStructuredSignature = (value: unknown): string => {
+		const serialized = safeStringify(value);
+		if (!serialized) return '';
+		return `${serialized.length}:${hashString(serialized)}`;
+	};
+
+	const buildOutputSignature = (value: unknown): string => {
+		if (!Array.isArray(value)) return '';
+		return value
+			.map((item) => {
+				if (!item || typeof item !== 'object') return String(item ?? '');
+				const record = item as Record<string, unknown>;
+				return [
+					record.type ?? '',
+					record.id ?? '',
+					record.call_id ?? '',
+					record.status ?? '',
+					record.name ?? '',
+					record.tool_name ?? '',
+					buildStructuredSignature(record.arguments),
+					buildStructuredSignature(record.output),
+					buildStructuredSignature(record.content),
+					buildStructuredSignature(record.summary)
+				].join(':');
+			})
+			.join('|');
+	};
+
 	const buildMessageMetaKey = (source: MessageType): string => {
 		if (!source) return '';
 		const info = source.info ?? {};
 		const status = source.status ?? {};
 		const annotation = source.annotation ?? {};
+		const outputSignature = buildOutputSignature((source as any).output);
 		const filesLength = Array.isArray((source as any).files) ? (source as any).files.length : 0;
+		const followUpsLength = Array.isArray((source as any).followUps)
+			? (source as any).followUps.length
+			: 0;
 		const sourcesLength = Array.isArray((source as any).sources) ? (source as any).sources.length : 0;
 		const statusHistoryLength = Array.isArray((source as any).statusHistory)
 			? (source as any).statusHistory.length
@@ -170,7 +242,9 @@
 			getErrorKey(source.error),
 			`${status?.action ?? ''}:${status?.done ?? ''}`,
 			statusHistoryLength,
+			outputSignature,
 			filesLength,
+			followUpsLength,
 			sourcesLength,
 			codeExecutionsLength,
 			embedsLength,
@@ -252,16 +326,72 @@
 
 	let showRateComment = false;
 	let generatedFiles: GeneratedFileItem[] = [];
+	let displayGeneratedFiles: GeneratedFileItem[] = [];
+	let visibleMessageFiles: any[] = [];
 	let generatedFilesKey = '';
 	let generatedFilesListKey = '';
 	let parsedContentKey = '';
 	let parsedGeneratedFilesKey = '';
+	let parsedOutputKey = '';
+	let parsedSkillDraftKey = '';
+	let parsedSkillDraft: ParsedSkillDraft | null = null;
+	let editableSkillDraftKey = '';
+	let editableSkillDraft: {
+		id: string;
+		name: string;
+		description: string;
+		content: string;
+		meta: ParsedSkillDraft['meta'];
+		access_grants: any[];
+	} | null = null;
+	let parsedToolDraftKey = '';
+	let parsedToolDraft: ParsedToolDraft | null = null;
+	let editableToolDraftKey = '';
+	let editableToolDraft: {
+		id: string;
+		name: string;
+		content: string;
+		meta: ParsedToolDraft['meta'];
+		access_grants: any[];
+	} | null = null;
+	let showCreateSkillConfirm = false;
+	let showCreateToolConfirm = false;
+	let creatingSkillDraft = false;
+	let creatingToolDraft = false;
+	let canSharePublicSkill = false;
+	let canSharePublicTool = false;
+
+	const cloneSkillDraftForEditing = (draft: ParsedSkillDraft) => ({
+		id: draft.id,
+		name: draft.name,
+		description: draft.description,
+		content: draft.content,
+		meta: {
+			...draft.meta,
+			tags: Array.isArray(draft.meta?.tags) ? [...draft.meta.tags] : [],
+			dependencies: Array.isArray(draft.meta?.dependencies) ? [...draft.meta.dependencies] : []
+		},
+		access_grants: Array.isArray(draft.access_grants) ? structuredClone(draft.access_grants) : []
+	});
+
+	const cloneToolDraftForEditing = (draft: ParsedToolDraft) => ({
+		id: draft.id,
+		name: draft.name,
+		content: draft.content,
+		meta: {
+			...draft.meta,
+			manifest: { ...(draft.meta?.manifest ?? {}) },
+			dependencies: Array.isArray(draft.meta?.dependencies) ? [...draft.meta.dependencies] : []
+		},
+		access_grants: Array.isArray(draft.access_grants) ? structuredClone(draft.access_grants) : []
+	});
 
 	const buildFilesKey = (messageData: MessageType): string => {
 		if (!messageData) return '';
 		const rawContent = messageData.content ?? '';
 		const hasToolCalls = rawContent.includes('type="tool_calls"');
 		const contentKey = hasToolCalls ? rawContent : '';
+		const outputKey = buildOutputSignature((messageData as any)?.output);
 		const files = Array.isArray((messageData as any)?.files) ? (messageData as any).files : [];
 		const filesKey = files
 			.map((file: any) =>
@@ -276,7 +406,7 @@
 				].join(':')
 			)
 			.join('|');
-		return `${hasToolCalls ? '1' : '0'}::${contentKey}::${filesKey}`;
+		return `${hasToolCalls ? '1' : '0'}::${contentKey}::${outputKey}::${filesKey}`;
 	};
 
 	const buildGeneratedFilesListKey = (files: GeneratedFileItem[]): string =>
@@ -288,6 +418,106 @@
 			generatedFilesKey = nextKey;
 			generatedFiles = collectGeneratedFilesFromMessage(message);
 			generatedFilesListKey = buildGeneratedFilesListKey(generatedFiles);
+		}
+	}
+
+	$: displayGeneratedFiles = generatedFiles;
+
+	const normalizeGeneratedFileMatchToken = (value: unknown): string => {
+		if (typeof value !== 'string') return '';
+		return value
+			.trim()
+			.replace(/^[\-\u2022*]+\s*/, '')
+			.replace(/^['"`“”‘’]+|['"`“”‘’]+$/g, '')
+			.replace(/[.,;:!?，。！？；：）】》」』]+$/g, '')
+			.trim()
+			.toLowerCase();
+	};
+
+	const normalizeWorkbookVariantMatchToken = (value: string): string => {
+		if (!/\.(?:xlsx|xls)$/i.test(value)) return value;
+		return value.replace(/(?:[_\-\s]|\s*\()\d+\)?(?=\.[^.]+$)/, '');
+	};
+
+	const buildGeneratedFileMatchKeys = (files: GeneratedFileItem[]): Set<string> => {
+		const matchKeys = new Set<string>();
+
+		for (const file of files) {
+			for (const candidate of [
+				file.name,
+				inferFileName(file.url ?? file.path ?? ''),
+				file.url,
+				file.path
+			]) {
+				const normalized = normalizeGeneratedFileMatchToken(candidate);
+				if (normalized) {
+					matchKeys.add(normalized);
+					const variantNormalized = normalizeWorkbookVariantMatchToken(normalized);
+					if (variantNormalized) {
+						matchKeys.add(variantNormalized);
+					}
+				}
+			}
+		}
+
+		return matchKeys;
+	};
+
+	const isMessageFileDuplicatedByGeneratedFiles = (
+		file: Record<string, unknown>,
+		matchKeys: Set<string>
+	): boolean => {
+		for (const candidate of [
+			file?.name,
+			file?.filename,
+			file?.fileName,
+			file?.url,
+			file?.path,
+			inferFileName(String(file?.url ?? file?.path ?? file?.id ?? ''))
+		]) {
+			const normalized = normalizeGeneratedFileMatchToken(candidate);
+			if (normalized && matchKeys.has(normalized)) {
+				return true;
+			}
+			const variantNormalized = normalizeWorkbookVariantMatchToken(normalized);
+			if (variantNormalized && matchKeys.has(variantNormalized)) {
+				return true;
+			}
+		}
+
+		return false;
+	};
+
+	$: {
+		const messageFiles = Array.isArray(message?.files) ? message.files : [];
+		const hasPrimaryDocumentArtifact = displayGeneratedFiles.some((file) =>
+			isPrimaryDocumentArtifact(file)
+		);
+		if (
+			message?.role !== 'assistant' ||
+			messageFiles.length === 0 ||
+			displayGeneratedFiles.length === 0
+		) {
+			visibleMessageFiles = messageFiles;
+		} else {
+			const matchKeys = buildGeneratedFileMatchKeys(displayGeneratedFiles);
+			visibleMessageFiles = messageFiles.filter(
+				(file: Record<string, unknown>) =>
+					!isMessageFileDuplicatedByGeneratedFiles(file, matchKeys) &&
+					!shouldHideHelperArtifact(
+						{
+							name:
+								(typeof file?.name === 'string' && file.name) ||
+								(typeof file?.filename === 'string' && file.filename) ||
+								(typeof file?.fileName === 'string' && file.fileName) ||
+								inferFileName(String(file?.url ?? file?.path ?? file?.id ?? '')),
+							url: typeof file?.url === 'string' ? file.url : undefined,
+							path: typeof file?.path === 'string' ? file.path : undefined,
+							source: 'assistant'
+						},
+						hasPrimaryDocumentArtifact
+					)
+			);
 		}
 	}
 
@@ -336,10 +566,27 @@
 		}
 
 		if (!file.url) return;
-		window.open(file.url, '_blank', 'noopener,noreferrer');
+		await triggerGeneratedFileDownload(file.url, file.name);
 	};
 
 	const INLINE_GENERATED_FILES_MARKER = '<!--__GENERATED_FILES__-->';
+
+	const GENERATED_FILE_LINK_REGEX =
+		/(?:^|https?:\/\/[^/]+\/)(?:api\/v1|openai\/v1|v1)\/files\/[^)\s?#]+(?:\/content)?(?:[?#][^)\s]*)?$/i;
+
+	const isGeneratedFileLinkTarget = (value: string): boolean => {
+		const normalized = value.trim();
+		if (!normalized) return false;
+		if (normalized.includes('sandbox:/mnt/data/')) return true;
+		if (GENERATED_FILE_LINK_REGEX.test(normalized)) return true;
+		if (
+			isDownloadRef(normalized) &&
+			/(?:\/files\/|\/content(?:[?#].*)?$)/i.test(normalized)
+		) {
+			return true;
+		}
+		return false;
+	};
 
 	const normalizeSourcesHeading = (content: string): string => {
 		if (!content) return '';
@@ -350,8 +597,10 @@
 	};
 
 	const TOOL_CALL_BLOCK_REGEX = /<details\b[^>]*\btype="tool_calls"[^>]*>[\s\S]*?<\/details>/gim;
-	const TOOL_CALL_OPEN_TAG_REGEX = /^<details\b([^>]*)>/i;
-	const TOOL_CALL_ATTR_REGEX = /(\w+)="([^"]*)"/g;
+	const REASONING_BLOCK_REGEX = /<details\b[^>]*\btype="reasoning"[^>]*>[\s\S]*?<\/details>/gim;
+	const REASONING_OPEN_BLOCK_REGEX = /<details\b[^>]*\btype="reasoning"[^>]*>/gi;
+	const REASONING_SUMMARY_REGEX = /<summary>[\s\S]*?<\/summary>/i;
+	const REASONING_CLOSE_TAG = '</details>';
 
 	type ProcessToolCallItem = { key: string; attrs: Record<string, string> };
 	type ProcessToolCallGroup = {
@@ -361,35 +610,62 @@
 		items: ProcessToolCallItem[];
 	};
 	type ProcessToolVisualTiming = { firstSeenAt: number };
+	type LiveThinkingDisplayItem = { id: number; text: string; fading: boolean };
 
 	const MIN_PROCESS_RUNNING_MS = 900;
+	const LIVE_THINKING_REMOVE_MS = 260;
 	const processToolVisualTimingByKeyByMessageId = new Map<
 		string,
 		Map<string, ProcessToolVisualTiming>
 	>();
 
-	const normalizeProcessToolStatus = (attrs: Record<string, string>): string => {
-		const normalized = (attrs.status || '').trim().toLowerCase();
-		if (['running', 'success', 'error', 'timeout'].includes(normalized)) {
-			return normalized;
-		}
-		return (attrs.done || '').trim().toLowerCase() === 'true' ? 'success' : 'running';
+	const normalizeProcessToolStatus = (
+		attrs: Record<string, string>,
+		hasArtifacts?: boolean
+	): string => {
+		return resolveToolCallStatus(attrs, { promoteArtifactRunning: hasArtifacts !== false });
 	};
 
-	const getToolCallAttrs = (block: string): Record<string, string> => {
-		const openTag = block.match(TOOL_CALL_OPEN_TAG_REGEX)?.[1] ?? '';
-		const attrs: Record<string, string> = {};
-		for (const item of openTag.matchAll(TOOL_CALL_ATTR_REGEX)) {
-			attrs[item[1]] = item[2];
+	const upsertToolCallAttr = (openTag: string, name: string, value: string): string => {
+		const attrRegex = new RegExp(`\\s${name}="[^"]*"`, 'i');
+		if (attrRegex.test(openTag)) {
+			return openTag.replace(attrRegex, ` ${name}="${value}"`);
 		}
-		return attrs;
+		return openTag.replace(/>$/, ` ${name}="${value}">`);
+	};
+
+	const promoteFileGeneratingToolCallBlocks = (
+		content: string,
+		files: GeneratedFileItem[]
+	): string => {
+		if (!content || !content.includes('type="tool_calls"')) return content;
+		if (!files.some((file) => isPrimaryDocumentArtifact(file))) return content;
+
+		return content.replace(TOOL_CALL_BLOCK_REGEX, (block) => {
+			const openTagMatch = block.match(/^<details\b[^>]*>/i);
+			if (!openTagMatch) return block;
+
+			const attrs = getToolCallAttrs(block);
+			if (!isFileGeneratingToolId(attrs.tool_id || attrs.tool_name || attrs.name)) {
+				return block;
+			}
+
+			const resolvedStatus = resolveToolCallStatus(attrs, { promoteArtifactRunning: false });
+			if (resolvedStatus === 'success' || resolvedStatus === 'error' || resolvedStatus === 'timeout') {
+				return block;
+			}
+
+			let normalizedOpenTag = upsertToolCallAttr(openTagMatch[0], 'status', 'success');
+			normalizedOpenTag = upsertToolCallAttr(normalizedOpenTag, 'done', 'true');
+			return `${normalizedOpenTag}${block.slice(openTagMatch[0].length)}`;
+		});
 	};
 
 	const getToolCallKey = (attrs: Record<string, string>): string => {
-		const callKey = (attrs.call_key || '').trim();
-		if (callKey) return `call_key:${callKey}`;
 		const id = (attrs.id || '').trim();
 		if (id) return `id:${id}`;
+		const callKey = (attrs.call_key || '').trim();
+		if (callKey) return `call_key:${callKey}`;
 		const name = (attrs.tool_id || attrs.name || '').trim();
 		const args = (attrs.arguments || '').trim();
 		if (!name && !args) return '';
@@ -401,6 +677,137 @@
 		const args = (attrs.arguments || '').trim();
 		if (!name && !args) return '';
 		return `name_args:${name}|${args}`;
+	};
+
+	const normalizeOutputToolStatus = (value: unknown): string => {
+		if (typeof value !== 'string') return '';
+		const normalized = value.trim().toLowerCase();
+		if (!normalized) return '';
+		if (normalized === 'in_progress') return 'running';
+		if (normalized === 'completed') return 'success';
+		return normalized;
+	};
+
+	const normalizeToolCallPayloadValue = (value: unknown): string => {
+		if (value === null || value === undefined) return '';
+		if (typeof value === 'string') return value;
+		return safeStringify(value);
+	};
+
+	const extractToolCallOutputText = (value: unknown): string => {
+		if (typeof value === 'string') return value;
+		if (Array.isArray(value)) {
+			return value
+				.map((part) => {
+					if (typeof part === 'string') return part;
+					if (!part || typeof part !== 'object') return '';
+					const record = part as Record<string, unknown>;
+					const text = record.text ?? record.output ?? record.content;
+					if (typeof text === 'string') return text;
+					if (text === null || text === undefined) return '';
+					return safeStringify(text);
+				})
+				.filter(Boolean)
+				.join('\n')
+				.trim();
+		}
+		if (value && typeof value === 'object') {
+			return safeStringify(value);
+		}
+		return String(value ?? '');
+	};
+
+	const collectToolCallsFromOutput = (value: unknown): ProcessToolCallItem[] => {
+		if (!Array.isArray(value)) return [];
+		const grouped = new Map<string, { call?: Record<string, unknown>; output?: Record<string, unknown> }>();
+
+		for (const entry of value) {
+			if (!entry || typeof entry !== 'object') continue;
+			const record = entry as Record<string, unknown>;
+			const type = record.type;
+			if (type !== 'function_call' && type !== 'function_call_output') continue;
+			const callId = String(record.call_id ?? record.id ?? '').trim();
+			const key = callId || `${type}:${record.id ?? ''}`;
+			const group = grouped.get(key) ?? {};
+			if (type === 'function_call') {
+				group.call = record;
+			} else {
+				group.output = record;
+			}
+			grouped.set(key, group);
+		}
+
+		const items: ProcessToolCallItem[] = [];
+		for (const [fallbackKey, group] of grouped.entries()) {
+			const callItem = group.call ?? {};
+			const outputItem = group.output ?? {};
+			const toolName = String(
+				(callItem.name ?? outputItem.name ?? 'tool') as string
+			).trim();
+			const statusValue = normalizeOutputToolStatus(
+				outputItem.status ?? callItem.status ?? ''
+			);
+			const done = statusValue && statusValue !== 'running' ? 'true' : 'false';
+			const attrs: Record<string, string> = {
+				type: 'tool_calls',
+				id: String(callItem.id ?? outputItem.id ?? ''),
+				call_key: String(callItem.call_id ?? outputItem.call_id ?? ''),
+				name: toolName,
+				tool_id: toolName,
+				tool_name: toolName,
+				arguments: normalizeToolCallPayloadValue(callItem.arguments),
+				result: extractToolCallOutputText(outputItem.output ?? outputItem.result ?? ''),
+				files: normalizeToolCallPayloadValue(outputItem.files),
+				embeds: normalizeToolCallPayloadValue(outputItem.embeds),
+				status: statusValue,
+				done
+			};
+			const key = getToolCallKey(attrs) || getToolCallFallbackKey(attrs) || fallbackKey;
+			items.push({ key: key || `${toolName}-${items.length}`, attrs });
+		}
+
+		return items;
+	};
+
+	const mergeToolCallAttrs = (
+		base: Record<string, string>,
+		next: Record<string, string>
+	): Record<string, string> => {
+		const merged = { ...base };
+		for (const [key, value] of Object.entries(next)) {
+			if (value) {
+				merged[key] = value;
+			}
+		}
+		return merged;
+	};
+
+	const mergeProcessToolCalls = (
+		contentItems: ProcessToolCallItem[],
+		outputItems: ProcessToolCallItem[]
+	): ProcessToolCallItem[] => {
+		if (outputItems.length === 0) {
+			return contentItems;
+		}
+
+		const merged = [...contentItems];
+		const indexByKey = new Map(merged.map((item, index) => [item.key, index]));
+
+		for (const outputItem of outputItems) {
+			const existingIndex = indexByKey.get(outputItem.key);
+			if (existingIndex === undefined) {
+				indexByKey.set(outputItem.key, merged.length);
+				merged.push(outputItem);
+				continue;
+			}
+			const existing = merged[existingIndex];
+			merged[existingIndex] = {
+				key: existing.key,
+				attrs: mergeToolCallAttrs(existing.attrs, outputItem.attrs)
+			};
+		}
+
+		return merged;
 	};
 
 	const dedupeToolCallBlocks = (content: string): string => {
@@ -513,9 +920,34 @@
 		return `最近一步：${label} · 执行中`;
 	};
 
-	const stripDownloadSection = (content: string, allowInlineFiles: boolean): string => {
+	const getStandaloneGeneratedFileLineValue = (value: string): string => {
+		const normalized = normalizeGeneratedFileMatchToken(value);
+		if (!normalized) return '';
+
+		const labeledMatch = normalized.match(
+			/^(?:文件名|输出文件|生成文件|output[_ ]?file|file(?:name)?|generated file)\s*[:：]\s*(.+)$/i
+		);
+		if (labeledMatch?.[1]) {
+			return normalizeGeneratedFileMatchToken(labeledMatch[1]);
+		}
+
+		return normalized;
+	};
+
+	const isStandaloneGeneratedFileLine = (
+		line: string,
+		generatedFiles: GeneratedFileItem[]
+	): boolean => {
+		if (!generatedFiles.length) return false;
+		return buildGeneratedFileMatchKeys(generatedFiles).has(
+			getStandaloneGeneratedFileLineValue(line)
+		);
+	};
+
+	const stripDownloadSection = (content: string, generatedFiles: GeneratedFileItem[]): string => {
 		if (!content) return '';
 
+		const allowInlineFiles = generatedFiles.length > 0;
 		const lines = content.split('\n');
 		const output: string[] = [];
 		let markerInserted = false;
@@ -523,18 +955,18 @@
 		for (const line of lines) {
 			const trimmed = line.trim();
 			const linkMatch = trimmed.match(/\[[^\]]+\]\(([^)]+)\)/);
-			const linkTarget = (linkMatch?.[1] || '').toLowerCase();
-			const hasGeneratedFileLink =
-				!!linkTarget &&
-				(linkTarget.includes('/openai/v1/files/') ||
-					linkTarget.includes('/v1/files/') ||
-					linkTarget.includes('sandbox:/mnt/data/'));
+			const linkTarget = linkMatch?.[1] || '';
+			const hasGeneratedFileLink = isGeneratedFileLinkTarget(linkTarget);
 
 			const hasDownloadLabel =
 				allowInlineFiles &&
 				/(文件下载|下载链接|下载地址|生成文件（可下载）|生成文件\(可下载\))/i.test(trimmed);
 
-			if (hasDownloadLabel || hasGeneratedFileLink) {
+			if (
+				hasDownloadLabel ||
+				hasGeneratedFileLink ||
+				isStandaloneGeneratedFileLine(trimmed, generatedFiles)
+			) {
 				if (allowInlineFiles && !markerInserted) {
 					output.push(INLINE_GENERATED_FILES_MARKER);
 					markerInserted = true;
@@ -586,17 +1018,340 @@
 		};
 	};
 
+	const escapeHtmlForStructuredBlock = (value: string): string =>
+		value
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;');
+
+	const extractOutputTextParts = (value: unknown): string => {
+		if (!Array.isArray(value)) return '';
+
+		return value
+			.map((part) => {
+				if (!part || typeof part !== 'object') return '';
+				const record = part as Record<string, unknown>;
+				const text = record.text;
+				if (typeof text === 'string') return text;
+				if (text === null || text === undefined) return '';
+				return safeStringify(text);
+			})
+			.filter(Boolean)
+			.join('');
+	};
+
+	const serializeReasoningOutputForDisplay = (value: unknown): string => {
+		if (!Array.isArray(value)) return '';
+
+		const blocks: string[] = [];
+
+		value.forEach((entry, index) => {
+			if (!entry || typeof entry !== 'object') return;
+			const item = entry as Record<string, unknown>;
+			if (item.type !== 'reasoning') return;
+
+			const sourceParts =
+				Array.isArray(item.summary) && item.summary.length > 0 ? item.summary : item.content;
+			const reasoningText = extractOutputTextParts(sourceParts).trim();
+			if (!reasoningText) return;
+
+			const duration = typeof item.duration === 'number' ? item.duration : undefined;
+			const status = typeof item.status === 'string' ? item.status : '';
+			const isLastItem = index === value.length - 1;
+			const display = escapeHtmlForStructuredBlock(
+				reasoningText
+					.split(/\r?\n/)
+					.map((line) => (line.startsWith('>') ? line : `> ${line}`))
+					.join('\n')
+			);
+
+			if (status === 'completed' || duration !== undefined || !isLastItem) {
+				blocks.push(
+					`<details type="reasoning" done="true" duration="${duration ?? 0}">\n<summary>Thought for ${duration ?? 0} seconds</summary>\n${display}\n</details>`
+				);
+				return;
+			}
+
+			blocks.push(
+				`<details type="reasoning" done="false">\n<summary>Thinking…</summary>\n${display}\n</details>`
+			);
+		});
+
+		return blocks.join('\n\n').trim();
+	};
+
+	const mergeOutputReasoningIntoContent = (content: string, output: unknown): string => {
+		if (!Array.isArray(output)) return content;
+		if (content.includes('type="reasoning"')) return content;
+
+		const reasoningMarkup = serializeReasoningOutputForDisplay(output);
+		if (!reasoningMarkup) return content;
+
+		return content ? `${reasoningMarkup}\n\n${content}`.trim() : reasoningMarkup;
+	};
+
+	const extractLatestReasoningFromOutput = (value: unknown): string => {
+		if (!Array.isArray(value)) return '';
+
+		for (let idx = value.length - 1; idx >= 0; idx -= 1) {
+			const entry = value[idx] as Record<string, unknown> | undefined;
+			if (!entry || entry.type !== 'reasoning') continue;
+			const sourceParts =
+				Array.isArray(entry.summary) && entry.summary.length > 0 ? entry.summary : entry.content;
+			const text = extractOutputTextParts(sourceParts).trim();
+			if (text) return text;
+		}
+
+		return '';
+	};
+
+	const extractLatestReasoningFromContent = (content: string): string => {
+		if (!content || !content.includes('type="reasoning"')) return '';
+		const matches = Array.from(content.matchAll(REASONING_BLOCK_REGEX));
+		if (!matches.length) return '';
+		const block = matches[matches.length - 1]?.[0] ?? '';
+		if (!block) return '';
+		return normalizeLeakedFormatting(
+			block
+				.replace(REASONING_SUMMARY_REGEX, '')
+				.replace(/<\/?[^>]+>/g, ' ')
+				.replace(/&nbsp;/gi, ' ')
+		)
+			.replace(/\n{3,}/g, '\n\n')
+			.trim();
+	};
+
+	const getStableReasoningText = (content: string, output: unknown): string => {
+		const outputText = extractLatestReasoningFromOutput(output);
+		if (outputText) return outputText;
+		return extractLatestReasoningFromContent(content);
+	};
+
 	let processContent = '';
 	let processToolCallItems: ProcessToolCallItem[] = [];
 	let processToolCallGroups: ProcessToolCallGroup[] = [];
+	let hasRunningProcessToolCalls = false;
+	let showProcessPane = false;
 	let processSummary = '';
 	let showProcessToolHistory = !message?.done;
+	let lastProcessDoneState = Boolean(message?.done);
 	let processStatusTick = 0;
 	let processStatusTimer: ReturnType<typeof setTimeout> | null = null;
 	let finalMessageContent = '';
 	let finalContentBeforeGeneratedFiles = '';
 	let finalContentAfterGeneratedFiles = '';
 	let placeInlineGeneratedFiles = false;
+	let liveThinkingStreaming = false;
+	let liveThinkingActive = false;
+	let liveThinkingUnits: string[] = [];
+	let liveThinkingVisibleItems: LiveThinkingDisplayItem[] = [];
+	let liveThinkingNextId = 0;
+	const liveThinkingRemovalTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+	const getLatestReasoningOpenBlock = (content: string): { start: number; end: number } | null => {
+		if (!content || !content.includes('type="reasoning"')) return null;
+
+		let lastMatch: RegExpExecArray | null = null;
+		for (const match of content.matchAll(REASONING_OPEN_BLOCK_REGEX)) {
+			lastMatch = match;
+		}
+
+		if (!lastMatch || lastMatch.index === undefined) return null;
+
+		return {
+			start: lastMatch.index,
+			end: lastMatch.index + lastMatch[0].length
+		};
+	};
+
+	const hasActiveReasoningBlock = (content: string): boolean => {
+		const latestBlock = getLatestReasoningOpenBlock(content);
+		if (!latestBlock) return false;
+		return content.indexOf(REASONING_CLOSE_TAG, latestBlock.end) === -1;
+	};
+
+	const stripActiveReasoningBlock = (content: string): string => {
+		const latestBlock = getLatestReasoningOpenBlock(content);
+		if (!latestBlock) return content;
+		if (content.indexOf(REASONING_CLOSE_TAG, latestBlock.end) !== -1) return content;
+		return content.slice(0, latestBlock.start).trimEnd();
+	};
+
+	const stripCompletedReasoningBlocks = (content: string): string => {
+		if (!content || !content.includes('type="reasoning"')) return content;
+		return content.replace(REASONING_BLOCK_REGEX, '').replace(/\n{3,}/g, '\n\n').trim();
+	};
+
+	const extractActiveReasoningText = (content: string): string => {
+		const latestBlock = getLatestReasoningOpenBlock(content);
+		if (!latestBlock) return '';
+		if (content.indexOf(REASONING_CLOSE_TAG, latestBlock.end) !== -1) return '';
+
+		return normalizeLeakedFormatting(
+			content
+				.slice(latestBlock.end)
+				.replace(REASONING_SUMMARY_REGEX, '')
+				.replace(/<\/?[^>]+>/g, ' ')
+				.replace(/&nbsp;/gi, ' ')
+		)
+			.replace(/\n{3,}/g, '\n\n')
+			.trim();
+	};
+
+	const splitLiveThinkingUnits = (text: string): string[] => {
+		if (!text) return [];
+
+		const paragraphs = text
+			.replace(/\r\n/g, '\n')
+			.split(/\n{2,}/)
+			.map((segment) => segment.trim())
+			.filter(Boolean);
+		const units: string[] = [];
+
+		for (const paragraph of paragraphs) {
+			const sentences = Array.from(
+				paragraph.matchAll(/[^。！？!?\.]+(?:[。！？!?\.]+(?=\s|$)|$)/g)
+			)
+				.map((match) => match[0]?.trim() ?? '')
+				.filter(Boolean);
+
+			if (sentences.length > 1) {
+				units.push(...sentences);
+			} else {
+				units.push(paragraph);
+			}
+		}
+
+		return units;
+	};
+
+	const clearLiveThinkingRemovalTimer = (itemId: number) => {
+		const timer = liveThinkingRemovalTimers.get(itemId);
+		if (timer) {
+			clearTimeout(timer);
+			liveThinkingRemovalTimers.delete(itemId);
+		}
+	};
+
+	const clearAllLiveThinkingRemovalTimers = () => {
+		for (const itemId of Array.from(liveThinkingRemovalTimers.keys())) {
+			clearLiveThinkingRemovalTimer(itemId);
+		}
+	};
+
+	const scheduleLiveThinkingRemoval = (itemId: number) => {
+		clearLiveThinkingRemovalTimer(itemId);
+		const timer = setTimeout(() => {
+			liveThinkingRemovalTimers.delete(itemId);
+			liveThinkingVisibleItems = liveThinkingVisibleItems.filter((item) => item.id !== itemId);
+		}, LIVE_THINKING_REMOVE_MS);
+		liveThinkingRemovalTimers.set(itemId, timer);
+	};
+
+	const fadeOutPreviousLiveThinkingItems = (activeItemId: number | null = null) => {
+		let changed = false;
+		liveThinkingVisibleItems = liveThinkingVisibleItems.map((item) => {
+			if (item.id === activeItemId || item.fading) {
+				return item;
+			}
+			changed = true;
+			scheduleLiveThinkingRemoval(item.id);
+			return {
+				...item,
+				fading: true
+			};
+		});
+
+		if (!changed && activeItemId === null) {
+			liveThinkingVisibleItems = [...liveThinkingVisibleItems];
+		}
+	};
+
+	const showLatestLiveThinkingUnit = (unit: string) => {
+		const normalizedUnit = unit.trim();
+		if (!normalizedUnit) return;
+
+		const activeItem = liveThinkingVisibleItems.find((item) => !item.fading);
+		if (activeItem) {
+			fadeOutPreviousLiveThinkingItems(activeItem.id);
+		}
+
+		const nextItemId = ++liveThinkingNextId;
+		liveThinkingVisibleItems = [
+			...liveThinkingVisibleItems,
+			{ id: nextItemId, text: normalizedUnit, fading: false }
+		];
+	};
+
+	const updateLiveThinkingCurrentUnit = (unit: string) => {
+		const normalizedUnit = unit.trim();
+		if (!normalizedUnit) return;
+
+		const activeItem = liveThinkingVisibleItems.find((item) => !item.fading);
+		if (!activeItem) {
+			showLatestLiveThinkingUnit(normalizedUnit);
+			return;
+		}
+
+		if (activeItem.text === normalizedUnit) {
+			return;
+		}
+
+		liveThinkingVisibleItems = liveThinkingVisibleItems.map((item) =>
+			item.id === activeItem.id
+				? {
+						...item,
+						text: normalizedUnit
+					}
+				: item
+		);
+	};
+
+	const resetLiveThinkingDisplay = (units: string[]) => {
+		clearAllLiveThinkingRemovalTimers();
+		const latestUnit = units.at(-1)?.trim() ?? '';
+		liveThinkingVisibleItems = latestUnit
+			? [{ id: ++liveThinkingNextId, text: latestUnit, fading: false }]
+			: [];
+	};
+
+	const syncLiveThinkingDisplay = (units: string[]) => {
+		const normalizedUnits = units.map((unit) => unit.trim()).filter(Boolean);
+		const previousUnits = liveThinkingUnits;
+
+		if (normalizedUnits.length === 0) {
+			liveThinkingUnits = [];
+			fadeOutPreviousLiveThinkingItems();
+			return;
+		}
+
+		const previousComparablePrefix = previousUnits.slice(
+			0,
+			Math.max(0, previousUnits.length - 1)
+		);
+		const nextComparablePrefix = normalizedUnits.slice(
+			0,
+			Math.max(0, normalizedUnits.length - 1)
+		);
+		const stablePrefixChanged =
+			previousComparablePrefix.length > nextComparablePrefix.length ||
+			previousComparablePrefix.some((unit, index) => nextComparablePrefix[index] !== unit);
+
+		if (stablePrefixChanged) {
+			resetLiveThinkingDisplay(normalizedUnits);
+			liveThinkingUnits = normalizedUnits;
+			return;
+		}
+
+		if (normalizedUnits.length > previousUnits.length) {
+			showLatestLiveThinkingUnit(normalizedUnits.at(-1) ?? '');
+		} else {
+			updateLiveThinkingCurrentUnit(normalizedUnits.at(-1) ?? '');
+		}
+
+		liveThinkingUnits = normalizedUnits;
+	};
 
 	const clearProcessStatusTimer = () => {
 		if (processStatusTimer) {
@@ -628,7 +1383,8 @@
 	): Record<string, string> | null => {
 		if (!item) return null;
 
-		const rawStatus = normalizeProcessToolStatus(item.attrs);
+		const hasArtifacts = getToolCallArtifactEvidence(item.attrs);
+		const rawStatus = normalizeProcessToolStatus(item.attrs, hasArtifacts);
 		const now = Date.now();
 		const timingMap = getProcessTimingMapForMessage(message?.id);
 		let timing = timingMap.get(item.key);
@@ -643,7 +1399,7 @@
 		}
 
 		const elapsedMs = now - timing.firstSeenAt;
-		if (elapsedMs < MIN_PROCESS_RUNNING_MS) {
+		if (!hasArtifacts && elapsedMs < MIN_PROCESS_RUNNING_MS) {
 			scheduleProcessStatusRefresh(MIN_PROCESS_RUNNING_MS - elapsedMs);
 			return {
 				...item.attrs,
@@ -656,11 +1412,24 @@
 		return item.attrs;
 	};
 
-	const computeParsedContent = (rawContent: string) => {
-		const normalizedContent = dedupeToolCallBlocks(normalizeSourcesHeading(rawContent));
-		const { process, final } = splitToolCallSection(normalizedContent);
+	const computeParsedContent = (rawContent: string, output: unknown) => {
+		const effectiveContent = mergeOutputReasoningIntoContent(rawContent, output);
+		const normalizedContent = promoteFileGeneratingToolCallBlocks(
+			dedupeToolCallBlocks(normalizeSourcesHeading(effectiveContent)),
+			generatedFiles
+		);
+		const activeReasoningText = extractActiveReasoningText(normalizedContent);
+		const latestReasoningText = getStableReasoningText(normalizedContent, output);
+		liveThinkingStreaming = hasActiveReasoningBlock(normalizedContent);
+		const keepReasoningVisible =
+			!message?.done && (!liveThinkingStreaming || !activeReasoningText) && !!latestReasoningText;
+		const liveThinkingText = activeReasoningText || (keepReasoningVisible ? latestReasoningText : '');
+		syncLiveThinkingDisplay(splitLiveThinkingUnits(liveThinkingText));
+
+		const renderContent = stripActiveReasoningBlock(normalizedContent);
+		const { process, final } = splitToolCallSection(renderContent);
 		processContent = process;
-		processToolCallItems = Array.from(process.matchAll(TOOL_CALL_BLOCK_REGEX))
+		const contentToolCallItems = Array.from(process.matchAll(TOOL_CALL_BLOCK_REGEX))
 			.map((match, index) => {
 				const block = match[0] || '';
 				const attrs = getToolCallAttrs(block);
@@ -675,6 +1444,13 @@
 				};
 			})
 			.filter((item) => Object.keys(item.attrs).length > 0);
+		const outputToolCallItems = collectToolCallsFromOutput(output);
+		processToolCallItems = mergeProcessToolCalls(contentToolCallItems, outputToolCallItems);
+		hasRunningProcessToolCalls = processToolCallItems.some(
+			(item) =>
+				normalizeProcessToolStatus(item.attrs, getToolCallArtifactEvidence(item.attrs)) ===
+				'running'
+		);
 
 		const timingMap = getProcessTimingMapForMessage(message?.id);
 		const activeProcessKeys = new Set(processToolCallItems.map((item) => item.key));
@@ -687,7 +1463,7 @@
 		processToolCallGroups = groupProcessToolCallItems(processToolCallItems);
 
 		const cleanedFinal = normalizeLeakedFormatting(
-			stripDownloadSection(final, generatedFiles.length > 0)
+			stripDownloadSection(final, generatedFiles)
 		);
 		finalMessageContent = cleanedFinal;
 
@@ -705,11 +1481,120 @@
 
 	$: {
 		const rawContent = message?.content ?? '';
-		if (rawContent !== parsedContentKey || generatedFilesListKey !== parsedGeneratedFilesKey) {
+		const outputKey = buildOutputSignature(message?.output);
+		if (
+			rawContent !== parsedContentKey ||
+			generatedFilesListKey !== parsedGeneratedFilesKey ||
+			outputKey !== parsedOutputKey
+		) {
 			parsedContentKey = rawContent;
 			parsedGeneratedFilesKey = generatedFilesListKey;
-			computeParsedContent(rawContent);
+			parsedOutputKey = outputKey;
+			computeParsedContent(rawContent, message?.output);
 		}
+	}
+
+	$: {
+		const doneNow = Boolean(message?.done);
+		const hasProcessToolCalls = processToolCallItems.length > 0;
+		showProcessPane = hasProcessToolCalls && (doneNow || hasRunningProcessToolCalls);
+		if (!showProcessPane) {
+			showProcessToolHistory = false;
+		} else if (doneNow && !lastProcessDoneState) {
+			// Collapse the live process pane once execution completes so the footer actions
+			// stay in their stable post-run position without requiring a page refresh.
+			showProcessToolHistory = false;
+		}
+		lastProcessDoneState = doneNow;
+	}
+
+	$: liveThinkingActive = liveThinkingStreaming || liveThinkingVisibleItems.length > 0;
+
+	$: {
+		const nextKey = `${message?.done ? '1' : '0'}::${message?.content ?? ''}`;
+		if (nextKey !== parsedSkillDraftKey) {
+			parsedSkillDraftKey = nextKey;
+			parsedSkillDraft =
+				message?.done && !message?.error
+					? parseSkillDraftFromMessageContent(message.content ?? '')
+					: null;
+		}
+	}
+
+	$: {
+		const nextKey = `${message?.done ? '1' : '0'}::${message?.content ?? ''}`;
+		if (nextKey !== parsedToolDraftKey) {
+			parsedToolDraftKey = nextKey;
+			parsedToolDraft =
+				message?.done && !message?.error
+					? parseToolDraftFromMessageContent(message.content ?? '')
+					: null;
+		}
+	}
+
+	$: {
+		const nextKey = parsedSkillDraft ? `${message?.id ?? ''}::${parsedSkillDraft.id}` : '';
+		if (!nextKey) {
+			editableSkillDraftKey = '';
+			editableSkillDraft = null;
+		} else if (nextKey !== editableSkillDraftKey) {
+			editableSkillDraftKey = nextKey;
+			editableSkillDraft = cloneSkillDraftForEditing(parsedSkillDraft);
+		}
+	}
+
+	$: {
+		const nextKey = parsedToolDraft ? `${message?.id ?? ''}::${parsedToolDraft.id}` : '';
+		if (!nextKey) {
+			editableToolDraftKey = '';
+			editableToolDraft = null;
+		} else if (nextKey !== editableToolDraftKey) {
+			editableToolDraftKey = nextKey;
+			editableToolDraft = cloneToolDraftForEditing(parsedToolDraft);
+		}
+	}
+
+	$: canSharePublicSkill = $user?.role === 'admin' || !!$user?.permissions?.sharing?.public_skills;
+	$: canSharePublicTool = $user?.role === 'admin' || !!$user?.permissions?.sharing?.public_tools;
+
+	$: if (editableSkillDraft && !canSharePublicSkill && editableSkillDraft.meta.visibility === 'public') {
+		editableSkillDraft = {
+			...editableSkillDraft,
+			meta: {
+				...editableSkillDraft.meta,
+				visibility: 'restricted'
+			}
+		};
+	}
+
+	$: if (editableSkillDraft && $user?.role !== 'admin' && editableSkillDraft.meta.is_default) {
+		editableSkillDraft = {
+			...editableSkillDraft,
+			meta: {
+				...editableSkillDraft.meta,
+				is_default: false
+			}
+		};
+	}
+
+	$: if (editableToolDraft && !canSharePublicTool && editableToolDraft.meta.visibility === 'public') {
+		editableToolDraft = {
+			...editableToolDraft,
+			meta: {
+				...editableToolDraft.meta,
+				visibility: 'restricted'
+			}
+		};
+	}
+
+	$: if (editableToolDraft && $user?.role !== 'admin' && editableToolDraft.meta.is_default) {
+		editableToolDraft = {
+			...editableToolDraft,
+			meta: {
+				...editableToolDraft.meta,
+				is_default: false
+			}
+		};
 	}
 
 	$: {
@@ -734,6 +1619,118 @@
 		if (res) {
 			toast.success($i18n.t('Copying to clipboard was successful!'));
 		}
+	};
+
+	const createSkillDraftHandler = async () => {
+		if (!editableSkillDraft || creatingSkillDraft) {
+			return;
+		}
+
+		const draft = {
+			...editableSkillDraft,
+			id: editableSkillDraft.id.trim(),
+			name: editableSkillDraft.name.trim(),
+			description: editableSkillDraft.description.trim(),
+			content: editableSkillDraft.content,
+			meta: {
+				...editableSkillDraft.meta,
+				category: editableSkillDraft.meta.category.trim(),
+				dependencies: Array.isArray(editableSkillDraft.meta.dependencies)
+					? editableSkillDraft.meta.dependencies.map((value) => `${value}`.trim()).filter(Boolean)
+					: []
+			}
+		};
+
+		if (!draft.id || !draft.name || !draft.content.trim()) {
+			toast.error($i18n.t('Skill ID, name, and content are required'));
+			return;
+		}
+
+		creatingSkillDraft = true;
+
+		const createdSkill = await createNewSkill(localStorage.token, {
+			id: draft.id,
+			name: draft.name,
+			description: draft.description,
+			meta: draft.meta,
+			content: draft.content,
+			access_grants: draft.access_grants
+		}).catch((error) => {
+			toast.error(`${error}`);
+			return null;
+		});
+
+		creatingSkillDraft = false;
+
+		if (!createdSkill) {
+			return;
+		}
+
+		toast.success($i18n.t('Skill created successfully'));
+		showCreateSkillConfirm = false;
+		await goto(`/workspace/skills/edit?id=${encodeURIComponent(createdSkill.id)}`);
+	};
+
+	const createToolDraftHandler = async () => {
+		if (!editableToolDraft || creatingToolDraft) {
+			return;
+		}
+
+		const draft = {
+			...editableToolDraft,
+			id: editableToolDraft.id.trim(),
+			name: editableToolDraft.name.trim(),
+			content: editableToolDraft.content,
+			meta: {
+				...editableToolDraft.meta,
+				description: editableToolDraft.meta.description.trim(),
+				category: editableToolDraft.meta.category.trim(),
+				dependencies: Array.isArray(editableToolDraft.meta.dependencies)
+					? editableToolDraft.meta.dependencies.map((value) => `${value}`.trim()).filter(Boolean)
+					: []
+			}
+		};
+
+		if (!draft.id || !draft.name || !draft.content.trim()) {
+			toast.error($i18n.t('Tool ID, name, and code are required'));
+			return;
+		}
+
+		const requiredVersion = getToolVersionRequirement(draft.content, WEBUI_VERSION);
+		if (requiredVersion) {
+			toast.error(
+				$i18n.t(
+					'Open WebUI version (v{{OPEN_WEBUI_VERSION}}) is lower than required version (v{{REQUIRED_VERSION}})',
+					{
+						OPEN_WEBUI_VERSION: WEBUI_VERSION,
+						REQUIRED_VERSION: requiredVersion
+					}
+				)
+			);
+			return;
+		}
+
+		creatingToolDraft = true;
+
+		const createdTool = await createNewTool(localStorage.token, {
+			id: draft.id,
+			name: draft.name,
+			meta: draft.meta,
+			content: draft.content,
+			access_grants: draft.access_grants
+		}).catch((error) => {
+			toast.error(`${error}`);
+			return null;
+		});
+
+		creatingToolDraft = false;
+
+		if (!createdTool) {
+			return;
+		}
+
+		toast.success($i18n.t('Tool created successfully'));
+		showCreateToolConfirm = false;
 	};
 
 	const stopAudio = () => {
@@ -1148,6 +2145,7 @@
 
 	onDestroy(() => {
 		clearProcessStatusTimer();
+		clearAllLiveThinkingRemovalTimers();
 		if (message?.id) {
 			processToolVisualTimingByKeyByMessageId.delete(message.id);
 		}
@@ -1169,6 +2167,306 @@
 		deleteMessageHandler();
 	}}
 />
+
+<ConfirmDialog
+	bind:show={showCreateSkillConfirm}
+	title={`${$i18n.t('Create')} ${$i18n.t('Skills')}`}
+	confirmLabel={$i18n.t('Create')}
+	cancelLabel={$i18n.t('Cancel')}
+	onConfirm={createSkillDraftHandler}
+>
+	{#if editableSkillDraft}
+		<div class="max-h-[60vh] space-y-4 overflow-y-auto pr-1 text-sm text-gray-600 dark:text-gray-300">
+			<p>
+				This will create the skill in your workspace. You can keep chatting here and edit it
+				later from Workspace.
+			</p>
+
+			<div class="grid gap-3 sm:grid-cols-2">
+				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{$i18n.t('Name')}
+					</div>
+					<input
+						bind:value={editableSkillDraft.name}
+						class="mt-1 w-full bg-transparent text-[13px] text-gray-900 outline-hidden dark:text-gray-100"
+						type="text"
+						placeholder={$i18n.t('Skill name')}
+					/>
+				</label>
+
+				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{$i18n.t('Skill ID')}
+					</div>
+					<input
+						bind:value={editableSkillDraft.id}
+						class="mt-1 w-full break-all bg-transparent font-mono text-[13px] text-gray-900 outline-hidden dark:text-gray-100"
+						type="text"
+						placeholder={$i18n.t('Skill ID')}
+						autocapitalize="off"
+						autocorrect="off"
+						spellcheck="false"
+					/>
+				</label>
+
+				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{$i18n.t('Visibility')}
+					</div>
+					<select
+						bind:value={editableSkillDraft.meta.visibility}
+						class="mt-1 w-full rounded-lg border border-gray-200 bg-white px-2 py-1 text-[13px] font-medium text-gray-900 outline-hidden dark:border-gray-700 dark:bg-gray-950 dark:text-gray-100"
+					>
+						{#if canSharePublicSkill || editableSkillDraft.meta.visibility === 'public'}
+							<option value="public">{$i18n.t('Public')}</option>
+						{/if}
+						<option value="restricted">{$i18n.t('Restricted')}</option>
+						<option value="hidden">{$i18n.t('Private')}</option>
+					</select>
+				</label>
+
+				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{$i18n.t('Category')}
+					</div>
+					<input
+						bind:value={editableSkillDraft.meta.category}
+						class="mt-1 w-full bg-transparent text-[13px] text-gray-900 outline-hidden dark:text-gray-100"
+						type="text"
+						placeholder={$i18n.t('Category')}
+					/>
+				</label>
+			</div>
+
+			<label class="block">
+				<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+					{$i18n.t('Description')}
+				</div>
+				<textarea
+					bind:value={editableSkillDraft.description}
+					class="mt-1 w-full resize-y rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-[13px] text-gray-700 outline-hidden dark:border-gray-800 dark:bg-gray-900/80 dark:text-gray-200"
+					rows="3"
+					placeholder={$i18n.t('Description')}
+				></textarea>
+			</label>
+
+			<label class="block">
+				<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+					{$i18n.t('Dependencies')}
+				</div>
+				<input
+					class="mt-1 w-full rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-[13px] text-gray-700 outline-hidden dark:border-gray-800 dark:bg-gray-900/80 dark:text-gray-200"
+					type="text"
+					value={(editableSkillDraft.meta.dependencies ?? []).join(', ')}
+					placeholder={$i18n.t('Comma-separated skill dependencies')}
+					on:input={(event) => {
+						editableSkillDraft.meta.dependencies = event.currentTarget.value
+							.split(',')
+							.map((value) => value.trim())
+							.filter(Boolean);
+						editableSkillDraft = { ...editableSkillDraft };
+					}}
+				/>
+			</label>
+
+			<div class="flex flex-wrap items-center gap-4 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<label class="flex items-center gap-2">
+					<Switch bind:state={editableSkillDraft.meta.published} />
+					<span>{$i18n.t('Published')}</span>
+				</label>
+
+				{#if $user?.role === 'admin'}
+					<label class="flex items-center gap-2">
+						<Switch bind:state={editableSkillDraft.meta.is_default} />
+						<span>{$i18n.t('Default')}</span>
+					</label>
+				{/if}
+			</div>
+
+			<div class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<div class="mb-3 flex items-center justify-between gap-3">
+					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{$i18n.t('Permissions')}
+					</div>
+					<div class="text-xs text-gray-500 dark:text-gray-400">
+						{editableSkillDraft.access_grants?.length ?? 0}
+					</div>
+				</div>
+
+				<AccessControl
+					bind:accessGrants={editableSkillDraft.access_grants}
+					accessRoles={['read', 'write']}
+					share={$user?.permissions?.sharing?.skills || $user?.role === 'admin'}
+					sharePublic={canSharePublicSkill}
+					shareUsers={($user?.permissions?.access_grants?.allow_users ?? true) || $user?.role === 'admin'}
+				/>
+			</div>
+
+			<label class="block">
+				<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+					Content
+				</div>
+				<textarea
+					bind:value={editableSkillDraft.content}
+					class="mt-1 min-h-72 w-full resize-y rounded-2xl border border-gray-200 bg-gray-950 px-4 py-3 font-mono text-[12px] leading-5 text-gray-100 outline-hidden dark:border-gray-800"
+					rows="16"
+					spellcheck="false"
+				></textarea>
+			</label>
+		</div>
+	{/if}
+</ConfirmDialog>
+
+<ConfirmDialog
+	bind:show={showCreateToolConfirm}
+	title={`${$i18n.t('Create')} ${$i18n.t('Tools')}`}
+	confirmLabel={$i18n.t('Create')}
+	cancelLabel={$i18n.t('Cancel')}
+	onConfirm={createToolDraftHandler}
+>
+	{#if editableToolDraft}
+		<div class="max-h-[60vh] space-y-4 overflow-y-auto pr-1 text-sm text-gray-600 dark:text-gray-300">
+			<p>
+				This will create the tool in your workspace. You can keep chatting here and edit it
+				later from Workspace.
+			</p>
+
+			<div class="grid gap-3 sm:grid-cols-2">
+				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{$i18n.t('Name')}
+					</div>
+					<input
+						bind:value={editableToolDraft.name}
+						class="mt-1 w-full bg-transparent text-[13px] text-gray-900 outline-hidden dark:text-gray-100"
+						type="text"
+						placeholder={$i18n.t('Tool name')}
+					/>
+				</label>
+
+				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{$i18n.t('Tool ID')}
+					</div>
+					<input
+						bind:value={editableToolDraft.id}
+						class="mt-1 w-full break-all bg-transparent font-mono text-[13px] text-gray-900 outline-hidden dark:text-gray-100"
+						type="text"
+						placeholder={$i18n.t('Tool ID')}
+						autocapitalize="off"
+						autocorrect="off"
+						spellcheck="false"
+					/>
+				</label>
+
+				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{$i18n.t('Visibility')}
+					</div>
+					<select
+						bind:value={editableToolDraft.meta.visibility}
+						class="mt-1 w-full rounded-lg border border-gray-200 bg-white px-2 py-1 text-[13px] font-medium text-gray-900 outline-hidden dark:border-gray-700 dark:bg-gray-950 dark:text-gray-100"
+					>
+						{#if canSharePublicTool || editableToolDraft.meta.visibility === 'public'}
+							<option value="public">{$i18n.t('Public')}</option>
+						{/if}
+						<option value="restricted">{$i18n.t('Restricted')}</option>
+						<option value="hidden">{$i18n.t('Private')}</option>
+					</select>
+				</label>
+
+				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{$i18n.t('Category')}
+					</div>
+					<input
+						bind:value={editableToolDraft.meta.category}
+						class="mt-1 w-full bg-transparent text-[13px] text-gray-900 outline-hidden dark:text-gray-100"
+						type="text"
+						placeholder={$i18n.t('Category')}
+					/>
+				</label>
+			</div>
+
+			<label class="block">
+				<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+					{$i18n.t('Description')}
+				</div>
+				<textarea
+					bind:value={editableToolDraft.meta.description}
+					class="mt-1 w-full resize-y rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-[13px] text-gray-700 outline-hidden dark:border-gray-800 dark:bg-gray-900/80 dark:text-gray-200"
+					rows="3"
+					placeholder={$i18n.t('Description')}
+				></textarea>
+			</label>
+
+			<label class="block">
+				<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+					{$i18n.t('Dependencies')}
+				</div>
+				<input
+					class="mt-1 w-full rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-[13px] text-gray-700 outline-hidden dark:border-gray-800 dark:bg-gray-900/80 dark:text-gray-200"
+					type="text"
+					value={(editableToolDraft.meta.dependencies ?? []).join(', ')}
+					placeholder={$i18n.t('Comma-separated tool dependencies')}
+					on:input={(event) => {
+						editableToolDraft.meta.dependencies = event.currentTarget.value
+							.split(',')
+							.map((value) => value.trim())
+							.filter(Boolean);
+						editableToolDraft = { ...editableToolDraft };
+					}}
+				/>
+			</label>
+
+			<div class="flex flex-wrap items-center gap-4 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<label class="flex items-center gap-2">
+					<Switch bind:state={editableToolDraft.meta.published} />
+					<span>{$i18n.t('Published')}</span>
+				</label>
+
+				{#if $user?.role === 'admin'}
+					<label class="flex items-center gap-2">
+						<Switch bind:state={editableToolDraft.meta.is_default} />
+						<span>{$i18n.t('Default')}</span>
+					</label>
+				{/if}
+			</div>
+
+			<div class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<div class="mb-3 flex items-center justify-between gap-3">
+					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+						{$i18n.t('Permissions')}
+					</div>
+					<div class="text-xs text-gray-500 dark:text-gray-400">
+						{editableToolDraft.access_grants?.length ?? 0}
+					</div>
+				</div>
+
+				<AccessControl
+					bind:accessGrants={editableToolDraft.access_grants}
+					accessRoles={['read', 'write']}
+					share={$user?.permissions?.sharing?.tools || $user?.role === 'admin'}
+					sharePublic={canSharePublicTool}
+					shareUsers={($user?.permissions?.access_grants?.allow_users ?? true) || $user?.role === 'admin'}
+				/>
+			</div>
+
+			<label class="block">
+				<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
+					{$i18n.t('Code')}
+				</div>
+				<textarea
+					bind:value={editableToolDraft.content}
+					class="mt-1 min-h-72 w-full resize-y rounded-2xl border border-gray-200 bg-gray-950 px-4 py-3 font-mono text-[12px] leading-5 text-gray-100 outline-hidden dark:border-gray-800"
+					rows="16"
+					spellcheck="false"
+				></textarea>
+			</label>
+		</div>
+	{/if}
+</ConfirmDialog>
 
 {#key message.id}
 	<div
@@ -1218,12 +2516,12 @@
 							<StatusHistory statusHistory={message?.statusHistory} expand={true} />
 						{/if}
 
-						{#if message?.files && message.files.length > 0}
+						{#if visibleMessageFiles.length > 0}
 							<div
 								class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap"
 								dir={$settings?.chatDirection ?? 'auto'}
 							>
-								{#each message.files as file}
+								{#each visibleMessageFiles as file}
 									<div>
 										{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
 											<Image src={file.url} alt={message.content} />
@@ -1334,7 +2632,7 @@
 							class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
 							id="response-content-container"
 						>
-							{#if processContent}
+							{#if showProcessPane}
 								<div
 									class="mb-2 w-full overflow-hidden rounded-xl border border-gray-200/90 bg-gray-50/80 dark:border-gray-800 dark:bg-gray-900/70"
 								>
@@ -1433,7 +2731,27 @@
 								</div>
 							{/if}
 
-							{#if finalMessageContent === '' && !processContent && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
+							{#if liveThinkingActive}
+								<div class="mb-3 overflow-hidden rounded-2xl border border-amber-200/80 bg-gradient-to-br from-amber-50/95 via-white to-orange-50/90 shadow-xs dark:border-amber-900/70 dark:from-gray-900 dark:via-gray-900 dark:to-amber-950/40">
+									<div class="flex items-center gap-2 px-3 py-2 text-sm font-medium text-amber-900 dark:text-amber-100">
+										<Spinner className="size-4" />
+										<span>{$i18n.t('Thinking...')}</span>
+									</div>
+									<div class="space-y-2 px-3 pb-3" aria-live="polite">
+										{#each liveThinkingVisibleItems as item (item.id)}
+											<div
+												class={`rounded-xl border border-white/70 bg-white/75 px-3 py-2 text-sm leading-6 text-gray-700 shadow-xs transition-opacity dark:border-gray-800/80 dark:bg-gray-900/70 dark:text-gray-200 ${item.fading ? 'opacity-45' : 'opacity-100'}`}
+												in:fade={{ duration: 180 }}
+												out:fade={{ duration: LIVE_THINKING_REMOVE_MS }}
+											>
+												{item.text}
+											</div>
+										{/each}
+									</div>
+								</div>
+							{/if}
+
+							{#if finalMessageContent === '' && processToolCallItems.length === 0 && !liveThinkingActive && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
 								<Skeleton />
 							{:else if finalMessageContent && message.error !== true}
 								<!-- always show message contents even if there's an error -->
@@ -1525,7 +2843,7 @@
 								<Error content={message?.error?.content ?? message.content} />
 							{/if}
 
-							{#if generatedFiles.length > 0 && placeInlineGeneratedFiles}
+							{#if displayGeneratedFiles.length > 0 && placeInlineGeneratedFiles}
 								<div
 									class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900/70"
 								>
@@ -1535,7 +2853,7 @@
 										生成文件
 									</div>
 									<div class="space-y-1.5 p-2">
-										{#each generatedFiles as file}
+										{#each displayGeneratedFiles as file}
 											<div
 												class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850"
 											>
@@ -1617,7 +2935,7 @@
 								{/if}
 							{/if}
 
-							{#if generatedFiles.length > 0 && !placeInlineGeneratedFiles}
+							{#if displayGeneratedFiles.length > 0 && !placeInlineGeneratedFiles}
 								<div
 									class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900/70"
 								>
@@ -1627,7 +2945,7 @@
 										生成文件
 									</div>
 									<div class="space-y-1.5 p-2">
-										{#each generatedFiles as file}
+										{#each displayGeneratedFiles as file}
 											<div
 												class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850"
 											>
@@ -1847,6 +3165,66 @@
 										</svg>
 									</button>
 								</Tooltip>
+
+								{#if !readOnly && parsedToolDraft}
+									<Tooltip content={`${$i18n.t('Create')} ${$i18n.t('Tools')}`} placement="bottom">
+										<button
+											type="button"
+											aria-label={`${$i18n.t('Create')} ${$i18n.t('Tools')}`}
+											class="visible inline-flex min-w-fit items-center gap-1.5 rounded-lg px-2.5 py-1.5 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black transition"
+											on:click={() => {
+												showCreateToolConfirm = true;
+											}}
+										>
+											<svg
+												xmlns="http://www.w3.org/2000/svg"
+												fill="none"
+												viewBox="0 0 24 24"
+												stroke-width="2.2"
+												stroke="currentColor"
+												class="size-4"
+												aria-hidden="true"
+											>
+												<path
+													stroke-linecap="round"
+													stroke-linejoin="round"
+													d="M4.5 12h15m-7.5-7.5v15"
+												/>
+											</svg>
+											<span class="text-xs font-medium">{$i18n.t('Create')}</span>
+										</button>
+									</Tooltip>
+								{/if}
+
+								{#if !readOnly && parsedSkillDraft}
+									<Tooltip content={`${$i18n.t('Create')} ${$i18n.t('Skills')}`} placement="bottom">
+										<button
+											type="button"
+											aria-label={`${$i18n.t('Create')} ${$i18n.t('Skills')}`}
+											class="visible inline-flex min-w-fit items-center gap-1.5 rounded-lg px-2.5 py-1.5 hover:bg-black/5 dark:hover:bg-white/5 dark:hover:text-white hover:text-black transition"
+											on:click={() => {
+												showCreateSkillConfirm = true;
+											}}
+										>
+											<svg
+												xmlns="http://www.w3.org/2000/svg"
+												fill="none"
+												viewBox="0 0 24 24"
+												stroke-width="2.2"
+												stroke="currentColor"
+												class="size-4"
+												aria-hidden="true"
+											>
+												<path
+													stroke-linecap="round"
+													stroke-linejoin="round"
+													d="M4.5 12h15m-7.5-7.5v15"
+												/>
+											</svg>
+											<span class="text-xs font-medium">{$i18n.t('Create')}</span>
+										</button>
+									</Tooltip>
+								{/if}
 
 								{#if $user?.permissions?.chat?.tts ?? true}
 									<Tooltip content={$i18n.t('Read Aloud')} placement="bottom">

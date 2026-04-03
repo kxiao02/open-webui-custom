@@ -166,6 +166,69 @@ BUILTIN_TOOL_CATALOG: tuple[dict[str, Any], ...] = (
 )
 
 
+def _has_nonempty_config_value(config: Any, attr_name: str) -> bool:
+    value = getattr(config, attr_name, None)
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return bool(value)
+    return bool(value)
+
+
+def is_image_generation_configured(config: Any) -> bool:
+    if not bool(getattr(config, "ENABLE_IMAGE_GENERATION", False)):
+        return False
+
+    engine = str(getattr(config, "IMAGE_GENERATION_ENGINE", "") or "").strip().lower()
+
+    if engine == "openai":
+        return _has_nonempty_config_value(
+            config, "IMAGES_OPENAI_API_BASE_URL"
+        ) and _has_nonempty_config_value(config, "IMAGES_OPENAI_API_KEY")
+
+    if engine == "gemini":
+        return _has_nonempty_config_value(
+            config, "IMAGES_GEMINI_API_BASE_URL"
+        ) and _has_nonempty_config_value(config, "IMAGES_GEMINI_API_KEY")
+
+    if engine == "comfyui":
+        return _has_nonempty_config_value(config, "COMFYUI_BASE_URL") and (
+            _has_nonempty_config_value(config, "COMFYUI_WORKFLOW")
+            or _has_nonempty_config_value(config, "COMFYUI_WORKFLOW_NODES")
+        )
+
+    return _has_nonempty_config_value(config, "AUTOMATIC1111_BASE_URL")
+
+
+def is_image_edit_configured(config: Any) -> bool:
+    if not bool(getattr(config, "ENABLE_IMAGE_EDIT", False)):
+        return False
+
+    engine = str(getattr(config, "IMAGE_EDIT_ENGINE", "") or "").strip().lower()
+
+    if engine == "openai":
+        return _has_nonempty_config_value(
+            config, "IMAGES_EDIT_OPENAI_API_BASE_URL"
+        ) and _has_nonempty_config_value(config, "IMAGES_EDIT_OPENAI_API_KEY")
+
+    if engine == "gemini":
+        return _has_nonempty_config_value(
+            config, "IMAGES_EDIT_GEMINI_API_BASE_URL"
+        ) and _has_nonempty_config_value(config, "IMAGES_EDIT_GEMINI_API_KEY")
+
+    if engine == "comfyui":
+        return _has_nonempty_config_value(config, "IMAGES_EDIT_COMFYUI_BASE_URL") and (
+            _has_nonempty_config_value(config, "IMAGES_EDIT_COMFYUI_WORKFLOW")
+            or _has_nonempty_config_value(config, "IMAGES_EDIT_COMFYUI_WORKFLOW_NODES")
+        )
+
+    return False
+
+
+def is_image_generation_tool_available(config: Any) -> bool:
+    return is_image_generation_configured(config) or is_image_edit_configured(config)
+
+
 def get_builtin_tool_catalog(request: Request) -> list[dict[str, Any]]:
     config = request.app.state.config
     catalog: list[dict[str, Any]] = []
@@ -183,10 +246,7 @@ def get_builtin_tool_catalog(request: Request) -> list[dict[str, Any]]:
         elif tool_id == "web_search":
             available = bool(getattr(config, "ENABLE_WEB_SEARCH", False))
         elif tool_id == "image_generation":
-            available = bool(
-                getattr(config, "ENABLE_IMAGE_GENERATION", False)
-                or getattr(config, "ENABLE_IMAGE_EDIT", False)
-            )
+            available = is_image_generation_tool_available(config)
         elif tool_id == "code_interpreter":
             available = bool(getattr(config, "ENABLE_CODE_INTERPRETER", True))
 
@@ -197,10 +257,15 @@ def get_builtin_tool_catalog(request: Request) -> list[dict[str, Any]]:
                 "meta": {
                     "description": item["description"],
                     "category": "builtin",
-                    "origin": "builtin",
+                    "origin": "host",
+                    "catalog_kind": "host",
+                    "source_of_truth": "open-webui",
+                    "execution_boundary": "open-webui",
                     "mutability": "locked",
                     "default_enabled": True,
                     "available": available,
+                    "availability_state": "ready" if available else "disabled",
+                    "visibility": "public",
                     "capability_requirements": item["capability_requirements"],
                     "feature_requirements": item["feature_requirements"],
                     "config_requirements": item["config_requirements"],
@@ -598,14 +663,14 @@ def get_builtin_tools(
     # Add image generation/edit tools if builtin category enabled AND enabled globally AND model has image_generation capability
     if (
         is_builtin_tool_enabled("image_generation")
-        and getattr(request.app.state.config, "ENABLE_IMAGE_GENERATION", False)
+        and is_image_generation_configured(request.app.state.config)
         and get_model_capability("image_generation")
         and features.get("image_generation")
     ):
         builtin_functions.append(generate_image)
     if (
         is_builtin_tool_enabled("image_generation")
-        and getattr(request.app.state.config, "ENABLE_IMAGE_EDIT", False)
+        and is_image_edit_configured(request.app.state.config)
         and get_model_capability("image_generation")
         and features.get("image_generation")
     ):

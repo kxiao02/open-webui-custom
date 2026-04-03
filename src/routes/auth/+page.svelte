@@ -38,7 +38,11 @@
 	let autoSignInAttempted = false;
 	let configReady = false;
 	let loginFormEnabled = false;
+	let portalSsoConfigured = false;
 	let providersEnabled = false;
+	let portalSsoEnabled = false;
+	let externalSignInEnabled = false;
+	let authRedirectInProgress = false;
 	let trustedHeaderAuth = false;
 
 	let form = null;
@@ -170,8 +174,98 @@
 		return 'signin';
 	};
 
+	const normalizeRedirectPath = (value) => {
+		if (!value) {
+			return null;
+		}
+
+		try {
+			const parsed = new URL(value, window.location.origin);
+			if (parsed.origin !== window.location.origin) {
+				return null;
+			}
+
+			return `${parsed.pathname}${parsed.search}${parsed.hash}` || '/';
+		} catch (error) {
+			console.warn('Unable to parse auth redirect path:', error);
+			return null;
+		}
+	};
+
+	const extractPortalTicketContext = () => {
+		const rawRedirectPath = normalizeRedirectPath($page.url.searchParams.get('redirect'));
+		const topLevelTicket = ($page.url.searchParams.get('ticket') || '').trim();
+
+		if (topLevelTicket) {
+			return {
+				ticket: topLevelTicket,
+				redirectPath: rawRedirectPath || '/'
+			};
+		}
+
+		if (!rawRedirectPath) {
+			return null;
+		}
+
+		const nestedRedirectUrl = new URL(rawRedirectPath, window.location.origin);
+		const nestedTicket = (nestedRedirectUrl.searchParams.get('ticket') || '').trim();
+		if (!nestedTicket) {
+			return null;
+		}
+
+		nestedRedirectUrl.searchParams.delete('ticket');
+
+		return {
+			ticket: nestedTicket,
+			redirectPath:
+				normalizeRedirectPath(
+					`${nestedRedirectUrl.pathname}${nestedRedirectUrl.search}${nestedRedirectUrl.hash}`
+				) || '/'
+		};
+	};
+
+	const resolveRequestedRedirectPath = () => {
+		return (
+			extractPortalTicketContext()?.redirectPath ??
+			normalizeRedirectPath($page.url.searchParams.get('redirect')) ??
+			'/'
+		);
+	};
+
+	const persistRedirectPath = (redirectPath: string | null) => {
+		if (redirectPath && redirectPath !== '/') {
+			localStorage.setItem('redirectPath', redirectPath);
+			return;
+		}
+
+		localStorage.removeItem('redirectPath');
+	};
+
+	const maybePortalSsoCallback = async () => {
+		if (authRedirectInProgress || !portalSsoConfigured) {
+			return;
+		}
+
+		const ticketContext = extractPortalTicketContext();
+		if (!ticketContext) {
+			return;
+		}
+
+		const query = new URLSearchParams({
+			ticket: ticketContext.ticket
+		});
+
+		if (ticketContext.redirectPath && ticketContext.redirectPath !== '/') {
+			query.set('redirect', ticketContext.redirectPath);
+		}
+
+		authRedirectInProgress = true;
+		persistRedirectPath(ticketContext.redirectPath);
+		window.location.replace(`${WEBUI_BASE_URL}/sso/portal/callback?${query.toString()}`);
+	};
+
 	const maybeAutoSignIn = async () => {
-		if (autoSignInAttempted || !configReady) {
+		if (autoSignInAttempted || !configReady || authRedirectInProgress) {
 			return;
 		}
 		if (trustedHeaderAuth) {
@@ -204,13 +298,11 @@
 	}
 
 	onMount(async () => {
-		const redirectPath = $page.url.searchParams.get('redirect');
+		const redirectPath = resolveRequestedRedirectPath();
 		if ($user !== undefined) {
 			goto(redirectPath || '/');
 		} else {
-			if (redirectPath) {
-				localStorage.setItem('redirectPath', redirectPath);
-			}
+			persistRedirectPath(redirectPath);
 		}
 
 		const error = $page.url.searchParams.get('error');
@@ -225,10 +317,14 @@
 	$: configReady = $configStatus === 'ready' && !!$config;
 	$: loginFormEnabled =
 		configReady && ($config?.features.enable_login_form || $config?.features.enable_ldap || form);
-	$: providersEnabled =
-		configReady && Object.keys($config?.oauth?.providers ?? {}).length > 0;
+	$: portalSsoConfigured = configReady && ($config?.portal_sso?.enabled ?? false);
+	$: providersEnabled = configReady && Object.keys($config?.oauth?.providers ?? {}).length > 0;
+	$: portalSsoEnabled =
+		portalSsoConfigured && ($config?.portal_sso?.app_initiated_enabled ?? false);
+	$: externalSignInEnabled = providersEnabled || portalSsoEnabled;
 	$: trustedHeaderAuth =
-		configReady && (($config?.features.auth_trusted_header ?? false) || $config?.features.auth === false);
+		configReady &&
+		(($config?.features.auth_trusted_header ?? false) || $config?.features.auth === false);
 
 	$: if (configReady && !modeInitialized) {
 		mode = resolveInitialMode();
@@ -246,6 +342,7 @@
 	}
 
 	$: if (configReady) {
+		maybePortalSsoCallback();
 		maybeAutoSignIn();
 	}
 </script>
@@ -271,7 +368,9 @@
 	<div class="w-full absolute top-0 left-0 right-0 h-8 drag-region" />
 
 	{#if !loaded}
-		<div class="fixed inset-0 flex items-center justify-center font-primary z-50 text-black dark:text-white">
+		<div
+			class="fixed inset-0 flex items-center justify-center font-primary z-50 text-black dark:text-white"
+		>
 			<div class="flex items-center gap-3 text-base font-medium">
 				<Spinner className="size-5" />
 				<span>{$i18n.t('Loading configuration...')}</span>
@@ -285,13 +384,17 @@
 			id="auth-container"
 		>
 			<div class="w-full px-10 min-h-screen flex flex-col text-center">
-				{#if trustedHeaderAuth}
+				{#if trustedHeaderAuth || authRedirectInProgress}
 					<div class=" my-auto pb-10 w-full sm:max-w-md">
 						<div
 							class="flex items-center justify-center gap-3 text-xl sm:text-2xl text-center font-medium dark:text-gray-200"
 						>
 							<div>
-								{$i18n.t('Signing in to {{WEBUI_NAME}}', { WEBUI_NAME: $WEBUI_NAME })}
+								{$i18n.t('Signing in to {{WEBUI_NAME}}', {
+									WEBUI_NAME: authRedirectInProgress
+										? ($config?.portal_sso?.provider_name ?? $WEBUI_NAME)
+										: $WEBUI_NAME
+								})}
 							</div>
 
 							<div>
@@ -482,7 +585,7 @@
 								</div>
 							</form>
 
-							{#if providersEnabled}
+							{#if externalSignInEnabled}
 								<div class="inline-flex items-center justify-center w-full">
 									<hr class="w-32 h-px my-4 border-0 dark:bg-gray-100/10 bg-gray-700/10" />
 									{#if loginFormEnabled}
@@ -495,6 +598,29 @@
 									<hr class="w-32 h-px my-4 border-0 dark:bg-gray-100/10 bg-gray-700/10" />
 								</div>
 								<div class="flex flex-col space-y-2">
+									{#if portalSsoEnabled}
+										<button
+											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+											on:click={() => {
+												const query = new URLSearchParams();
+												const redirectPath =
+													$page.url.searchParams.get('redirect') ||
+													localStorage.getItem('redirectPath') ||
+													'';
+												if (redirectPath) {
+													query.set('redirect', redirectPath);
+												}
+												const search = query.toString();
+												window.location.href = `${WEBUI_BASE_URL}/sso/portal/login${search ? `?${search}` : ''}`;
+											}}
+										>
+											<span
+												>{$i18n.t('Continue with {{provider}}', {
+													provider: $config?.portal_sso?.provider_name ?? 'AI 门户'
+												})}</span
+											>
+										</button>
+									{/if}
 									{#if $config?.oauth?.providers?.google}
 										<button
 											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"

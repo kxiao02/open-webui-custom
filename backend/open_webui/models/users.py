@@ -447,22 +447,30 @@ class UsersTable:
     def get_user_by_oauth_sub(
         self, provider: str, sub: str, db: Optional[Session] = None
     ) -> Optional[UserModel]:
+        return self.get_user_by_oauth_provider_field(
+            provider, "sub", sub, db=db
+        )
+
+    def get_user_by_oauth_provider_field(
+        self, provider: str, field: str, value: str, db: Optional[Session] = None
+    ) -> Optional[UserModel]:
         try:
             with get_db_context(db) as db:  # type: Session
                 dialect_name = db.bind.dialect.name
 
                 query = db.query(User)
                 if dialect_name == "sqlite":
-                    query = query.filter(User.oauth.contains({provider: {"sub": sub}}))
+                    query = query.filter(
+                        User.oauth.contains({provider: {field: value}})
+                    )
                 elif dialect_name == "postgresql":
                     query = query.filter(
-                        User.oauth[provider].cast(JSONB)["sub"].astext == sub
+                        User.oauth[provider].cast(JSONB)[field].astext == value
                     )
 
                 user = query.first()
                 return UserModel.model_validate(user) if user else None
-        except Exception as e:
-            # You may want to log the exception here
+        except Exception:
             return None
 
     def get_user_by_scim_external_id(

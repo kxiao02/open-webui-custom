@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { createEventDispatcher, getContext } from 'svelte';
-	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
 	import { formatFileSize } from '$lib/utils';
+	import { normalizeOpenWebUiFileUrl } from '$lib/utils/generated-files';
 	import { settings } from '$lib/stores';
 
 	import FileItemModal from './FileItemModal.svelte';
@@ -63,13 +63,11 @@
 			const normalizedUrl = typeof url === 'string' ? url.trim() : '';
 			if (normalizedUrl && normalizedUrl !== 'null' && normalizedUrl !== 'undefined') {
 				if (type === 'file') {
-					if (normalizedUrl.startsWith('http')) {
-						window.open(`${normalizedUrl}/content`, '_blank').focus();
-					} else {
-						window.open(`${WEBUI_API_BASE_URL}/files/${normalizedUrl}/content`, '_blank').focus();
-					}
+					const popup = window.open(normalizeOpenWebUiFileUrl(normalizedUrl), '_blank');
+					popup?.focus();
 				} else {
-					window.open(`${normalizedUrl}`, '_blank').focus();
+					const popup = window.open(`${normalizedUrl}`, '_blank');
+					popup?.focus();
 				}
 			}
 		}

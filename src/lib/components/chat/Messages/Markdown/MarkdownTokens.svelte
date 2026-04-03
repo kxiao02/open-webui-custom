@@ -20,6 +20,7 @@
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
+	import Spinner from '$lib/components/common/Spinner.svelte';
 
 	import HtmlToken from './HTMLToken.svelte';
 	import Clipboard from '$lib/components/icons/Clipboard.svelte';
@@ -340,6 +341,27 @@
 				open={false}
 				className="w-full space-y-1"
 			/>
+		{:else if token?.attributes?.type === 'reasoning'}
+			<div class="my-2 w-full overflow-hidden rounded-2xl border border-amber-200/80 bg-gradient-to-br from-amber-50/95 via-white to-orange-50/90 shadow-xs dark:border-amber-900/70 dark:from-gray-900 dark:via-gray-900 dark:to-amber-950/40">
+				<div class="flex items-center gap-2 px-3 py-2 text-sm font-medium text-amber-900 dark:text-amber-100">
+					{#if !done}
+						<Spinner className="size-4" />
+					{/if}
+					<span>{!done ? $i18n.t('Thinking...') : token.summary || $i18n.t('Thinking')}</span>
+				</div>
+				<div class="px-3 pb-3 text-sm leading-6 text-gray-700 dark:text-gray-200">
+					<svelte:self
+						id={`${id}-${tokenIdx}-r`}
+						tokens={marked.lexer(decode(token.text))}
+						attributes={token?.attributes}
+						{done}
+						{editCodeBlock}
+						{onTaskClick}
+						{sourceIds}
+						{onSourceClick}
+					/>
+				</div>
+			</div>
 		{:else if textContent.length > 0}
 			<Collapsible
 				title={token.summary}

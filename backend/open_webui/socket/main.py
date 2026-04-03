@@ -38,6 +38,7 @@ from open_webui.env import (
     WEBSOCKET_SERVER_LOGGING,
     WEBSOCKET_SERVER_ENGINEIO_LOGGING,
     WEBSOCKET_EVENT_CALLER_TIMEOUT,
+    INSTANCE_ID,
 )
 from open_webui.utils.auth import decode_token
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
@@ -705,7 +706,7 @@ async def yjs_document_update(sid, data):
             await document_save_handler(document_id, data.get("data", {}), user)
 
         if data.get("data"):
-            await create_task(REDIS, debounced_save(), document_id)
+            await create_task(REDIS, debounced_save(), document_id, INSTANCE_ID)
 
     except Exception as e:
         log.error(f"Error in yjs_document_update: {e}")

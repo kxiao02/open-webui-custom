@@ -1416,6 +1416,7 @@ export const getVersion = async (token: string) => {
 
 	const res = await fetch(`${WEBUI_BASE_URL}/api/version`, {
 		method: 'GET',
+		cache: 'no-store',
 		headers: {
 			'Content-Type': 'application/json',
 			Authorization: `Bearer ${token}`

@@ -8,6 +8,10 @@
 			return '/workspace/models';
 		}
 
+		if ($user) {
+			return '/workspace/tools';
+		}
+
 		if (
 			($config?.features?.enable_knowledge ?? true) &&
 			$user?.role === 'user' &&

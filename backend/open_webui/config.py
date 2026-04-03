@@ -845,14 +845,14 @@ ENTERPRISE_OAUTH_REDIRECT_URI = PersistentConfig(
 ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM = PersistentConfig(
     "ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM",
     "enterprise_oauth.authorize_redirect_param",
-    os.environ.get("ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM", "redirect_url"),
+    os.environ.get("ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM", "redirect_uri"),
     prefer_env=True,
 )
 
 ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM = PersistentConfig(
     "ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM",
     "enterprise_oauth.token_redirect_param",
-    os.environ.get("ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM", "redirect.uri"),
+    os.environ.get("ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM", "redirect_uri"),
     prefer_env=True,
 )
 
@@ -881,6 +881,62 @@ ENTERPRISE_OAUTH_EMAIL_DOMAIN = PersistentConfig(
     "ENTERPRISE_OAUTH_EMAIL_DOMAIN",
     "enterprise_oauth.email_domain",
     os.environ.get("ENTERPRISE_OAUTH_EMAIL_DOMAIN", "local"),
+    prefer_env=True,
+)
+
+PORTAL_SSO_ENABLED = PersistentConfig(
+    "PORTAL_SSO_ENABLED",
+    "portal_sso.enabled",
+    os.environ.get("PORTAL_SSO_ENABLED", "False").lower() == "true",
+    prefer_env=True,
+)
+
+PORTAL_SSO_PROVIDER_NAME = PersistentConfig(
+    "PORTAL_SSO_PROVIDER_NAME",
+    "portal_sso.provider_name",
+    os.environ.get("PORTAL_SSO_PROVIDER_NAME", "AI 门户"),
+    prefer_env=True,
+)
+
+PORTAL_SSO_APP_INITIATED_ENABLED = PersistentConfig(
+    "PORTAL_SSO_APP_INITIATED_ENABLED",
+    "portal_sso.app_initiated_enabled",
+    os.environ.get("PORTAL_SSO_APP_INITIATED_ENABLED", "False").lower() == "true",
+    prefer_env=True,
+)
+
+PORTAL_SSO_VALIDATE_URL = PersistentConfig(
+    "PORTAL_SSO_VALIDATE_URL",
+    "portal_sso.validate_url",
+    os.environ.get("PORTAL_SSO_VALIDATE_URL", ""),
+    prefer_env=True,
+)
+
+PORTAL_SSO_ENTRY_URL_TEMPLATE = PersistentConfig(
+    "PORTAL_SSO_ENTRY_URL_TEMPLATE",
+    "portal_sso.entry_url_template",
+    os.environ.get("PORTAL_SSO_ENTRY_URL_TEMPLATE", ""),
+    prefer_env=True,
+)
+
+PORTAL_SSO_TIMEOUT_SECONDS = PersistentConfig(
+    "PORTAL_SSO_TIMEOUT_SECONDS",
+    "portal_sso.timeout_seconds",
+    int(os.environ.get("PORTAL_SSO_TIMEOUT_SECONDS", "10")),
+    prefer_env=True,
+)
+
+PORTAL_SSO_AUTO_SIGNUP = PersistentConfig(
+    "PORTAL_SSO_AUTO_SIGNUP",
+    "portal_sso.auto_signup",
+    os.environ.get("PORTAL_SSO_AUTO_SIGNUP", "True").lower() == "true",
+    prefer_env=True,
+)
+
+PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN = PersistentConfig(
+    "PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN",
+    "portal_sso.synthetic_email_domain",
+    os.environ.get("PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN", "portal.local"),
     prefer_env=True,
 )
 
@@ -2211,11 +2267,12 @@ TITLE_GENERATION_PROMPT_TEMPLATE = PersistentConfig(
 )
 
 DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE = """### Task:
-Generate a concise, 3-5 word title with an emoji summarizing the chat history.
+Generate a concise, 3-5 word Simplified Chinese title with an emoji summarizing the chat history.
 ### Guidelines:
 - The title should clearly represent the main theme or subject of the conversation.
 - Use emojis that enhance understanding of the topic, but avoid quotation marks or special formatting.
-- Write the title in the chat's primary language; default to English if multilingual.
+- Always write the title in Simplified Chinese.
+- Preserve product names, code identifiers, APIs, and acronyms in their original form when translating them would be awkward or misleading.
 - Prioritize accuracy over excessive creativity; keep it clear and simple.
 - Your entire response must consist solely of the JSON object, without any introductory or concluding text.
 - The output must be a single, raw JSON object, without any markdown code fences or other encapsulating text.
@@ -2223,12 +2280,12 @@ Generate a concise, 3-5 word title with an emoji summarizing the chat history.
 ### Output:
 JSON format: { "title": "your concise title here" }
 ### Examples:
-- { "title": "📉 Stock Market Trends" },
-- { "title": "🍪 Perfect Chocolate Chip Recipe" },
-- { "title": "Evolution of Music Streaming" },
-- { "title": "Remote Work Productivity Tips" },
-- { "title": "Artificial Intelligence in Healthcare" },
-- { "title": "🎮 Video Game Development Insights" }
+- { "title": "📉 股市走势分析" },
+- { "title": "🍪 巧克力曲奇配方" },
+- { "title": "🎵 音乐流媒体演变" },
+- { "title": "💼 远程办公提效" },
+- { "title": "🧠 AI 医疗应用" },
+- { "title": "🎮 游戏开发洞察" }
 ### Chat History:
 <chat_history>
 {{MESSAGES:END:2}}

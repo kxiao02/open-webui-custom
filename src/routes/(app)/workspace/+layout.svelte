@@ -20,9 +20,17 @@
 
 	let loaded = false;
 
+	const isDirectSkillEditorRoute = () =>
+		$page.url.pathname.startsWith('/workspace/skills/edit') ||
+		$page.url.pathname.startsWith('/workspace/skills/create');
+
 	const getWorkspaceFallbackPath = () => {
 		if ($user?.role === 'admin') {
 			return '/workspace/models';
+		}
+
+		if ($user) {
+			return '/workspace/tools';
 		}
 
 		if (
@@ -54,7 +62,7 @@
 
 	onMount(async () => {
 		if ($user?.role !== 'admin') {
-			if ($page.url.pathname.includes('/models') && !$user?.permissions?.workspace?.models) {
+			if ($page.url.pathname.includes('/models')) {
 				goto(getWorkspaceFallbackPath());
 			} else if (
 				$page.url.pathname.includes('/knowledge') &&
@@ -66,9 +74,7 @@
 				!$user?.permissions?.workspace?.prompts
 			) {
 				goto(getWorkspaceFallbackPath());
-			} else if ($page.url.pathname.includes('/tools') && !$user?.permissions?.workspace?.tools) {
-				goto(getWorkspaceFallbackPath());
-			} else if ($page.url.pathname.includes('/skills') && !$user?.permissions?.workspace?.skills) {
+			} else if ($page.url.pathname.includes('/skills') && !$user && !isDirectSkillEditorRoute()) {
 				goto(getWorkspaceFallbackPath());
 			}
 		}
@@ -117,7 +123,7 @@
 					<div
 						class="flex gap-1 scrollbar-none overflow-x-auto w-fit text-center text-sm font-medium rounded-full bg-transparent py-1 touch-auto pointer-events-auto"
 					>
-						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.models}
+						{#if $user?.role === 'admin'}
 							<a
 								draggable="false"
 								aria-current={$page.url.pathname.includes('/workspace/models') ? 'page' : null}
@@ -152,7 +158,7 @@
 							>
 						{/if}
 
-						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.skills}
+						{#if $user}
 							<a
 								draggable="false"
 								aria-current={$page.url.pathname.includes('/workspace/skills') ? 'page' : null}
@@ -165,7 +171,7 @@
 							</a>
 						{/if}
 
-						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.tools}
+						{#if $user}
 							<a
 								draggable="false"
 								aria-current={$page.url.pathname.includes('/workspace/tools') ? 'page' : null}

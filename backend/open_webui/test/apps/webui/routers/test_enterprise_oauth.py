@@ -13,9 +13,36 @@ from fastapi import HTTPException
 from open_webui.routers import auths, configs
 from open_webui.test_support import AbstractPostgresTest
 from open_webui.utils.oauth import OAuthManager
+from open_webui.utils.portal_sso import PortalSSOManager
 
 
 class TestEnterpriseOAuth(AbstractPostgresTest):
+    def _snapshot_portal_sso_config(self):
+        return {
+            "enabled": config.PORTAL_SSO_ENABLED.value,
+            "provider_name": config.PORTAL_SSO_PROVIDER_NAME.value,
+            "app_initiated_enabled": config.PORTAL_SSO_APP_INITIATED_ENABLED.value,
+            "validate_url": config.PORTAL_SSO_VALIDATE_URL.value,
+            "entry_url_template": config.PORTAL_SSO_ENTRY_URL_TEMPLATE.value,
+            "timeout_seconds": config.PORTAL_SSO_TIMEOUT_SECONDS.value,
+            "auto_signup": config.PORTAL_SSO_AUTO_SIGNUP.value,
+            "synthetic_email_domain": config.PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN.value,
+        }
+
+    def _restore_portal_sso_config(self, snapshot):
+        config.PORTAL_SSO_ENABLED.value = snapshot["enabled"]
+        config.PORTAL_SSO_PROVIDER_NAME.value = snapshot["provider_name"]
+        config.PORTAL_SSO_APP_INITIATED_ENABLED.value = snapshot[
+            "app_initiated_enabled"
+        ]
+        config.PORTAL_SSO_VALIDATE_URL.value = snapshot["validate_url"]
+        config.PORTAL_SSO_ENTRY_URL_TEMPLATE.value = snapshot["entry_url_template"]
+        config.PORTAL_SSO_TIMEOUT_SECONDS.value = snapshot["timeout_seconds"]
+        config.PORTAL_SSO_AUTO_SIGNUP.value = snapshot["auto_signup"]
+        config.PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN.value = snapshot[
+            "synthetic_email_domain"
+        ]
+
     def _setup_enterprise_provider(self, enterprise_cfg: dict | None = None):
         original_providers = copy.deepcopy(config.OAUTH_PROVIDERS)
         config.OAUTH_PROVIDERS.clear()
@@ -56,6 +83,7 @@ class TestEnterpriseOAuth(AbstractPostgresTest):
             "id": "sysadmin",
             "attributes": {
                 "account_no": "sysmintest",
+                "account_name": "System Mint",
                 "token_expire": "3600",
                 "token_gtime": str(int(time.time() * 1000)),
             },
@@ -90,8 +118,12 @@ class TestEnterpriseOAuth(AbstractPostgresTest):
 
             user = Users.get_user_by_email("sysmintest@example.com", db=self.db)
             assert user is not None
+            assert user.name == "System Mint"
             assert user.oauth and "enterprise" in user.oauth
+            assert user.oauth["enterprise"].get("sub") == "sysmintest"
             assert user.oauth["enterprise"].get("account_no") == "sysmintest"
+            assert user.oauth["enterprise"].get("main_account_id") == "sysadmin"
+            assert user.oauth["enterprise"].get("actual_name") == "System Mint"
 
             sessions = OAuthSessions.get_sessions_by_user_id(user.id, db=self.db)
             assert sessions
@@ -353,3 +385,211 @@ class TestEnterpriseOAuth(AbstractPostgresTest):
             assert "deployment-managed" in exc.detail
         else:
             raise AssertionError("Expected Enterprise OAuth runtime update to be rejected")
+
+    def test_enterprise_oauth_links_existing_portal_user_by_account_no(
+        self, monkeypatch
+    ):
+        token = {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "expires_in": 3600,
+        }
+        userinfo = {
+            "id": "sysadmin",
+            "attributes": {
+                "account_no": "sysmintest",
+                "account_name": "System Mint",
+            },
+        }
+
+        original_providers = self._setup_enterprise_provider()
+        prev_signup = config.ENABLE_OAUTH_SIGNUP.value
+        prev_domains = config.OAUTH_ALLOWED_DOMAINS.value
+        try:
+            config.ENABLE_OAUTH_SIGNUP.value = True
+            config.OAUTH_ALLOWED_DOMAINS.value = ["*"]
+
+            portal_user = Users.insert_new_user(
+                id="portal-user",
+                name="Portal Name",
+                email="portal@example.com",
+                role="user",
+                oauth={
+                    "portal": {
+                        "sub": "GLOBAL-1",
+                        "account_no": "sysmintest",
+                    }
+                },
+                db=self.db,
+            )
+            assert portal_user is not None
+
+            request = self.make_request(
+                "/oauth/enterprise/login/callback",
+                query_string=b"code=code",
+            )
+            response = self.make_response()
+            manager = OAuthManager(request.app)
+
+            async def _fake_token(_cfg, _params):
+                return token
+
+            async def _fake_profile(_cfg, _access_token):
+                return userinfo
+
+            monkeypatch.setattr(manager, "_enterprise_request_token", _fake_token)
+            monkeypatch.setattr(manager, "_enterprise_fetch_profile", _fake_profile)
+
+            self.run_async(
+                manager.handle_callback(request, "enterprise", response, db=self.db)
+            )
+
+            linked_user = Users.get_user_by_id("portal-user", db=self.db)
+            assert linked_user is not None
+            assert linked_user.oauth["enterprise"]["sub"] == "sysmintest"
+            assert linked_user.oauth["portal"]["sub"] == "GLOBAL-1"
+        finally:
+            config.ENABLE_OAUTH_SIGNUP.value = prev_signup
+            config.OAUTH_ALLOWED_DOMAINS.value = prev_domains
+            self._restore_providers(original_providers)
+
+    def test_portal_sso_callback_creates_user_and_sets_name_from_nick_name(
+        self, monkeypatch
+    ):
+        snapshot = self._snapshot_portal_sso_config()
+        try:
+            config.PORTAL_SSO_ENABLED.value = True
+            config.PORTAL_SSO_VALIDATE_URL.value = "https://portal.example.com/casValidate"
+            config.PORTAL_SSO_AUTO_SIGNUP.value = True
+            config.PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN.value = "portal.example.com"
+
+            request = self.make_request(
+                "/sso/portal/callback",
+                query_string=b"ticket=t1",
+            )
+            manager = PortalSSOManager(request.app)
+
+            async def _fake_validate(_ticket):
+                return {
+                    "portal_sub": "GLOBAL-USER-1",
+                    "account_no": "sysmintest",
+                    "actual_name": "张三",
+                    "display_name": "sysmintest",
+                    "nick_name": "张三",
+                    "email": "",
+                    "roles": ["common"],
+                    "tenant_id": "tenant-1",
+                    "company_name": "company-1",
+                    "telephone": "",
+                }
+
+            monkeypatch.setattr(manager, "_validate_ticket", _fake_validate)
+
+            redirect = self.run_async(manager.handle_callback(request, db=self.db))
+
+            user = Users.get_user_by_oauth_sub("portal", "GLOBAL-USER-1", db=self.db)
+            assert user is not None
+            assert user.name == "张三"
+            assert user.oauth["portal"]["account_no"] == "sysmintest"
+            assert user.oauth["portal"]["nick_name"] == "张三"
+            assert redirect.headers["location"].endswith("/auth")
+        finally:
+            self._restore_portal_sso_config(snapshot)
+
+    def test_portal_sso_login_requires_app_initiated_enablement(self):
+        snapshot = self._snapshot_portal_sso_config()
+        try:
+            config.PORTAL_SSO_ENABLED.value = True
+            config.PORTAL_SSO_APP_INITIATED_ENABLED.value = False
+            config.PORTAL_SSO_ENTRY_URL_TEMPLATE.value = (
+                "https://portal.example.com/login?service={callback}"
+            )
+
+            request = self.make_request("/sso/portal/login")
+            manager = PortalSSOManager(request.app)
+
+            try:
+                self.run_async(manager.handle_login(request))
+            except HTTPException as exc:
+                assert exc.status_code == 404
+            else:
+                raise AssertionError(
+                    "Expected portal app-initiated login to be disabled"
+                )
+        finally:
+            self._restore_portal_sso_config(snapshot)
+
+    def test_portal_sso_login_builds_redirect_when_app_initiated_enabled(self):
+        snapshot = self._snapshot_portal_sso_config()
+        try:
+            config.PORTAL_SSO_ENABLED.value = True
+            config.PORTAL_SSO_APP_INITIATED_ENABLED.value = True
+            config.PORTAL_SSO_ENTRY_URL_TEMPLATE.value = (
+                "https://portal.example.com/login?service={callback}"
+            )
+
+            request = self.make_request(
+                "/sso/portal/login",
+                query_string=b"redirect=%2Fworkspace",
+            )
+            manager = PortalSSOManager(request.app)
+
+            redirect = self.run_async(manager.handle_login(request))
+
+            assert redirect.status_code in {302, 307}
+            assert (
+                redirect.headers["location"]
+                == "https://portal.example.com/login?service=http%3A%2F%2Ftestserver%2Fsso%2Fportal%2Fcallback%3Fredirect%3D%252Fworkspace"
+            )
+        finally:
+            self._restore_portal_sso_config(snapshot)
+
+    def test_portal_sso_callback_links_existing_enterprise_user_by_account_no(
+        self, monkeypatch
+    ):
+        snapshot = self._snapshot_portal_sso_config()
+        try:
+            config.PORTAL_SSO_ENABLED.value = True
+            config.PORTAL_SSO_VALIDATE_URL.value = "https://portal.example.com/casValidate"
+            config.PORTAL_SSO_AUTO_SIGNUP.value = True
+
+            enterprise_user = Users.insert_new_user(
+                id="enterprise-user",
+                name="System Mint",
+                email="sysmintest@example.com",
+                role="user",
+                oauth={"enterprise": {"sub": "sysmintest", "account_no": "sysmintest"}},
+                db=self.db,
+            )
+            assert enterprise_user is not None
+
+            request = self.make_request(
+                "/sso/portal/callback",
+                query_string=b"ticket=t2",
+            )
+            manager = PortalSSOManager(request.app)
+
+            async def _fake_validate(_ticket):
+                return {
+                    "portal_sub": "GLOBAL-USER-2",
+                    "account_no": "sysmintest",
+                    "actual_name": "张三",
+                    "display_name": "sysmintest",
+                    "nick_name": "张三",
+                    "email": "sysmintest@example.com",
+                    "roles": ["common"],
+                    "tenant_id": "tenant-1",
+                    "company_name": "company-1",
+                    "telephone": "",
+                }
+
+            monkeypatch.setattr(manager, "_validate_ticket", _fake_validate)
+
+            self.run_async(manager.handle_callback(request, db=self.db))
+
+            linked_user = Users.get_user_by_id("enterprise-user", db=self.db)
+            assert linked_user is not None
+            assert linked_user.oauth["portal"]["sub"] == "GLOBAL-USER-2"
+            assert linked_user.oauth["portal"]["account_no"] == "sysmintest"
+        finally:
+            self._restore_portal_sso_config(snapshot)

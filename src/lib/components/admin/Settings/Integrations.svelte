@@ -52,8 +52,8 @@
 		ENTERPRISE_OAUTH_CHECK_TOKEN_URL: '',
 		ENTERPRISE_OAUTH_LOGOUT_URL: '',
 		ENTERPRISE_OAUTH_REDIRECT_URI: '',
-		ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM: 'redirect_url',
-		ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM: 'redirect.uri',
+		ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM: 'redirect_uri',
+		ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM: 'redirect_uri',
 		ENTERPRISE_OAUTH_ID_CLAIM: 'id',
 		ENTERPRISE_OAUTH_ACCOUNT_NO_PATH: 'attributes.account_no',
 		ENTERPRISE_OAUTH_EMAIL_CLAIM: '',
@@ -61,6 +61,9 @@
 	};
 	let enterpriseOAuthLoading = true;
 	let enterpriseOAuthError: string | null = null;
+	let enterpriseOAuthDeploymentManaged = false;
+	let enterpriseOAuthMissingRequiredEnv: string[] = [];
+	let enterpriseOAuthEffectiveRedirectUri = '';
 
 	const addConnectionHandler = async (server) => {
 		servers = [...servers, server];
@@ -163,8 +166,8 @@
 				ENTERPRISE_OAUTH_CHECK_TOKEN_URL: '',
 				ENTERPRISE_OAUTH_LOGOUT_URL: '',
 				ENTERPRISE_OAUTH_REDIRECT_URI: '',
-				ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM: 'redirect_url',
-				ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM: 'redirect.uri',
+				ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM: 'redirect_uri',
+				ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM: 'redirect_uri',
 				ENTERPRISE_OAUTH_ID_CLAIM: 'id',
 				ENTERPRISE_OAUTH_ACCOUNT_NO_PATH: 'attributes.account_no',
 				ENTERPRISE_OAUTH_EMAIL_CLAIM: '',
@@ -222,14 +225,39 @@
 				''
 			),
 			ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM:
-				payload.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM ?? 'redirect_url',
+				payload.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM ?? 'redirect_uri',
 			ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM:
-				payload.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM ?? 'redirect.uri',
+				payload.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM ?? 'redirect_uri',
 			ENTERPRISE_OAUTH_ID_CLAIM: payload.ENTERPRISE_OAUTH_ID_CLAIM ?? 'id',
 			ENTERPRISE_OAUTH_ACCOUNT_NO_PATH:
 				payload.ENTERPRISE_OAUTH_ACCOUNT_NO_PATH ?? 'attributes.account_no',
 			ENTERPRISE_OAUTH_EMAIL_CLAIM: payload.ENTERPRISE_OAUTH_EMAIL_CLAIM ?? '',
 			ENTERPRISE_OAUTH_EMAIL_DOMAIN: payload.ENTERPRISE_OAUTH_EMAIL_DOMAIN ?? 'local'
+		};
+	};
+
+	const normalizeEnterpriseOAuthDiagnostics = (payload) => {
+		const deploymentManaged = coerceBoolean(
+			pickValue(payload, ['ENTERPRISE_OAUTH_DEPLOYMENT_MANAGED', 'DEPLOYMENT_MANAGED'], false)
+		);
+		const missingRaw = pickValue(
+			payload,
+			['ENTERPRISE_OAUTH_MISSING_REQUIRED_ENV', 'MISSING_REQUIRED_ENV'],
+			[]
+		);
+		const missingRequiredEnv = Array.isArray(missingRaw)
+			? missingRaw.filter((entry) => Boolean(entry))
+			: [];
+		const effectiveRedirectUri = pickValue(
+			payload,
+			['ENTERPRISE_OAUTH_EFFECTIVE_REDIRECT_URI', 'EFFECTIVE_REDIRECT_URI'],
+			''
+		);
+
+		return {
+			deploymentManaged,
+			missingRequiredEnv,
+			effectiveRedirectUri
 		};
 	};
 
@@ -252,8 +280,15 @@
 		try {
 			const enterpriseRes = await getEnterpriseOAuthConfig(localStorage.token);
 			enterpriseOAuthForm = normalizeEnterpriseOAuthForm(enterpriseRes);
+			const diagnostics = normalizeEnterpriseOAuthDiagnostics(enterpriseRes);
+			enterpriseOAuthDeploymentManaged = diagnostics.deploymentManaged;
+			enterpriseOAuthMissingRequiredEnv = diagnostics.missingRequiredEnv;
+			enterpriseOAuthEffectiveRedirectUri = diagnostics.effectiveRedirectUri;
 		} catch (err) {
 			enterpriseOAuthError = err?.message ?? 'Failed to load enterprise OAuth config';
+			enterpriseOAuthDeploymentManaged = false;
+			enterpriseOAuthMissingRequiredEnv = [];
+			enterpriseOAuthEffectiveRedirectUri = '';
 		} finally {
 			enterpriseOAuthLoading = false;
 		}
@@ -365,7 +400,13 @@
 						</div>
 
 						<div class="text-xs text-gray-500 mb-2">
-							{$i18n.t('Deployment-managed configuration. This screen is read-only.')}
+							{#if enterpriseOAuthDeploymentManaged}
+								{$i18n.t('Deployment-managed configuration detected. This screen is read-only.')}
+							{:else}
+								{$i18n.t(
+									'Deployment-managed configuration not detected. This screen remains read-only during rollout.'
+								)}
+							{/if}
 						</div>
 						{#if enterpriseOAuthLoading}
 							<div class="text-xs text-gray-500 mb-2 flex items-center gap-2">
@@ -384,6 +425,34 @@
 								'To change Enterprise OAuth, update ENTERPRISE_OAUTH_* in your deployment environment (compose/.env/secret manager) and restart Open WebUI. Runtime edits are not supported.'
 							)}
 						</div>
+						{#if !enterpriseOAuthLoading}
+							{#if enterpriseOAuthDeploymentManaged && enterpriseOAuthMissingRequiredEnv.length > 0}
+								<div
+									class="text-xs text-amber-600 dark:text-amber-400 mb-2 rounded-lg border border-amber-200/60 dark:border-amber-900/40 bg-amber-50/60 dark:bg-amber-950/20 px-3 py-2"
+								>
+									{$i18n.t('Missing required Enterprise OAuth environment variables:')}
+									{' '}
+									<span class="font-mono break-all">
+										{enterpriseOAuthMissingRequiredEnv.join(', ')}
+									</span>
+								</div>
+							{/if}
+							<div
+								class="text-xs text-gray-500 mb-3 rounded-lg border border-gray-100/60 dark:border-gray-800/60 bg-gray-50/60 dark:bg-gray-900/40 px-3 py-2"
+							>
+								{#if enterpriseOAuthEffectiveRedirectUri}
+									{$i18n.t('Effective redirect URI:')}
+									{' '}
+									<span class="font-mono break-all">
+										{enterpriseOAuthEffectiveRedirectUri}
+									</span>
+								{:else}
+									{$i18n.t(
+										'Effective redirect URI unavailable. Set ENTERPRISE_OAUTH_REDIRECT_URI or WEBUI_URL.'
+									)}
+								{/if}
+							</div>
+						{/if}
 
 						<div class="flex items-center justify-between mb-3">
 							<div class="text-xs text-gray-500">

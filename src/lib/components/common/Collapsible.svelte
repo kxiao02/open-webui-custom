@@ -46,7 +46,12 @@
 		showCallOverlay,
 		showFilePreview
 	} from '$lib/stores';
-	import { WEBUI_API_BASE_URL } from '$lib/constants';
+import {
+	isFileGeneratingToolId,
+	normalizeOpenWebUiFileUrl as normalizeGeneratedFileUrl,
+	parseToolCallPayload,
+	resolveToolCallStatus
+} from '$lib/utils/generated-files';
 	import { resolveToolDisplay } from '$lib/utils/tool-display';
 
 	export let open = false;
@@ -120,26 +125,11 @@
 		return windowsPathPart.trim() || fallback;
 	}
 
-	function normalizeOpenWebUiFileUrl(value: string): string {
-		if (!value) return value;
-
-		let output = value;
-		if (output.includes('/v1/files/') && !output.includes('/openai/v1/files/')) {
-			output = output.replace(/(^|[^/])\/v1\/files\//g, '$1/openai/v1/files/');
-		}
-
-		if (output.startsWith('http') || output.startsWith('data:') || output.startsWith('/')) {
-			return output;
-		}
-
-		return `${WEBUI_API_BASE_URL}/files/${output}/content`;
-	}
-
 	function toToolFileItem(value: any, source: string): ToolFileItem | null {
 		if (typeof value === 'string') {
 			const ref = normalizeFileRef(value);
 			if (!ref) return null;
-			const url = normalizeOpenWebUiFileUrl(ref);
+			const url = normalizeGeneratedFileUrl(ref);
 			return {
 				id: `${source}:${url}`,
 				name: inferFileName(ref),
@@ -152,20 +142,27 @@
 		}
 
 		const ref =
-			normalizeFileRef(value.url) ||
+			normalizeFileRef(value.bridge_url) ||
+			normalizeFileRef(value.generated_file_url) ||
 			normalizeFileRef(value.download_url) ||
 			normalizeFileRef(value.downloadUrl) ||
-			normalizeFileRef(value.domainUrl) ||
-			normalizeFileRef(value.ossUrl) ||
-			normalizeFileRef(value.id) ||
+			normalizeFileRef(value.bridge_file_id) ||
 			normalizeFileRef(value.file_id) ||
-			normalizeFileRef(value.fileId);
+			normalizeFileRef(value.fileId) ||
+			(typeof value.url === 'string' &&
+			value.url.trim() &&
+			/^(?:https?:\/\/[^/]+)?\/?(?:api\/v1|openai\/v1|v1)\/(?:files|generated-files)\//i.test(
+				value.url.trim()
+			)
+				? value.url.trim()
+				: '') ||
+			'';
 
 		if (!ref) {
 			return null;
 		}
 
-		const url = normalizeOpenWebUiFileUrl(ref);
+		const url = normalizeGeneratedFileUrl(ref);
 		const name =
 			(typeof value.name === 'string' && value.name.trim()) ||
 			(typeof value.filename === 'string' && value.filename.trim()) ||
@@ -225,6 +222,56 @@
 		}
 
 		return dedupeToolFiles(files);
+	}
+
+	function hasResultFileArtifacts(parsedResult: any): boolean {
+		const visit = (value: any): boolean => {
+			if (!value) return false;
+			if (Array.isArray(value)) {
+				return value.some((entry) => visit(entry));
+			}
+			if (typeof value !== 'object') return false;
+
+			const record = value as Record<string, any>;
+			if (record.success === false) return false;
+
+			const listKeys = [
+				'files',
+				'generated_files',
+				'generatedFiles',
+				'fileList',
+				'fileInfo',
+				'outputs',
+				'artifacts',
+				'attachments'
+			];
+			for (const key of listKeys) {
+				const list = record[key];
+				if (Array.isArray(list) && list.length > 0) return true;
+			}
+
+			const stringKeys = [
+				'path',
+				'output_path',
+				'target_path',
+				'file_path',
+				'bridge_url',
+				'generated_file_url',
+				'download_url',
+				'downloadUrl',
+				'bridge_file_id',
+				'file_id',
+				'fileId',
+			];
+			for (const key of stringKeys) {
+				const value = record[key];
+				if (typeof value === 'string' && value.trim()) return true;
+			}
+
+			return false;
+		};
+
+		return visit(parsedResult);
 	}
 
 	const openFilePreviewPane = () => {
@@ -349,14 +396,6 @@
 		};
 	}
 
-	function normalizeToolStatus(status: string | undefined, done: string | undefined) {
-		const normalized = (status || '').trim().toLowerCase();
-		if (['running', 'success', 'error', 'timeout'].includes(normalized)) {
-			return normalized;
-		}
-		return done === 'true' ? 'success' : 'running';
-	}
-
 	function getToolStatusLabel(status: string) {
 		if (status === 'success') return '已完成';
 		if (status === 'timeout') return '已超时';
@@ -463,9 +502,25 @@
 			</div>
 		{:else}
 			{@const parsedArgs = parseJSONString(args)}
-			{@const parsedResult = parseJSONString(result)}
+			{@const parsedResult = parseToolCallPayload(result)}
 			{@const argsRecord = asRecord(parsedArgs)}
-			{@const toolStatus = normalizeToolStatus(attributes?.status, attributes?.done)}
+			{@const toolFiles = dedupeToolFiles([
+				...normalizeToolFiles(files),
+				...collectFilesFromToolResult(parsedResult)
+			])}
+			{@const supportsArtifactInference = isFileGeneratingToolId(
+				resolveToolDisplay({
+					toolId: attributes?.tool_id,
+					toolName: attributes?.tool_name,
+					legacyName: attributes?.name
+				}).toolId
+			)}
+			{@const hasArtifacts =
+				supportsArtifactInference &&
+				(toolFiles.length > 0 || hasResultFileArtifacts(parsedResult))}
+			{@const toolStatus = resolveToolCallStatus(attributes ?? {}, {
+				promoteArtifactRunning: hasArtifacts
+			})}
 			{@const statusDone = toolStatus === 'success'}
 			{@const statusTerminal = toolStatus !== 'running'}
 			{@const meta = getToolCardMeta(
@@ -482,10 +537,6 @@
 				normalizeSearchResultItems(entry)
 			)}
 			{@const visibleSearchItems = mergedSearchItems.length > 0 ? mergedSearchItems : searchItems}
-			{@const toolFiles = dedupeToolFiles([
-				...normalizeToolFiles(files),
-				...collectFilesFromToolResult(parsedResult)
-			])}
 			<div
 				class="my-1 w-full rounded-lg border border-gray-200/80 bg-white/90 dark:border-gray-800 dark:bg-gray-900/80"
 				data-tool-call-content="true"
@@ -661,7 +712,7 @@
 			</div>
 		{/if}
 
-		{#if normalizeToolStatus(attributes?.status, attributes?.done) !== 'running'}
+		{#if toolStatus !== 'running'}
 			{#if typeof files === 'object'}
 				{#each files ?? [] as file, idx}
 					{#if typeof file === 'string'}

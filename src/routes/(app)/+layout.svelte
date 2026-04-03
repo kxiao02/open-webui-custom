@@ -36,6 +36,10 @@
 		showSearch,
 		showSidebar,
 		showControls,
+		showOverview,
+		showFilePreview,
+		selectedGeneratedFilePreviewId,
+		selectedTerminalId,
 		mobile
 	} from '$lib/stores';
 
@@ -374,10 +378,6 @@
 		};
 		setupKeyboardShortcuts();
 
-		if ($user?.role === 'admin' && ($settings?.showChangelog ?? true)) {
-			showChangelog.set($settings?.version !== $config.version);
-		}
-
 		if ($user?.role === 'admin' || ($user?.permissions?.chat?.temporary ?? true)) {
 			if ($page.url.searchParams.get('temporary-chat') === 'true') {
 				temporaryChatEnabled.set(true);
@@ -388,12 +388,13 @@
 			}
 		}
 
-		// Persist showControls: track open/close state separately from saved size
-		// chatControlsSize always retains the last width for openPane()
-		await showControls.set(!$mobile ? localStorage.showControls === 'true' : false);
-		showControls.subscribe((value) => {
-			localStorage.showControls = value ? 'true' : 'false';
-		});
+		// Hard refresh should not resurrect the side pane or any preview state.
+		await showControls.set(false);
+		await showOverview.set(false);
+		await showFilePreview.set(false);
+		selectedGeneratedFilePreviewId.set(null);
+		selectedTerminalId.set(null);
+		localStorage.showControls = 'false';
 
 		await tick();
 

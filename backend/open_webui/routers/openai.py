@@ -57,6 +57,7 @@ from open_webui.utils.payload import (
 from open_webui.utils.misc import (
     cleanup_response,
     convert_logit_bias_input_to_json,
+    openai_chat_completion_message_template,
     stream_chunks_handler,
     stream_wrapper,
 )
@@ -69,7 +70,11 @@ from open_webui.utils.anthropic import is_anthropic_url, get_anthropic_models
 log = logging.getLogger(__name__)
 
 OPENWEBUI_FILE_LINK_RE = re.compile(r"(?<!/openai)/v1/files/")
+OPENWEBUI_GENERATED_FILE_LINK_RE = re.compile(
+    r"(?<!/openai)/v1/generated-files/"
+)
 THINKING_MODEL_SUFFIX = "-thinking"
+FORWARD_SESSION_INFO_HEADER_TASK = "X-OpenWebUI-Task"
 DEEPSEEK_REASONING_TAGS = (
     ("<think>", "</think>"),
     ("<thinking>", "</thinking>"),
@@ -237,9 +242,12 @@ async def get_models_request(url, key=None, user: UserModel = None):
 
 
 def _rewrite_openwebui_file_links_in_text(value: str) -> str:
-    if "/v1/files/" not in value:
+    if "/v1/files/" not in value and "/v1/generated-files/" not in value:
         return value
-    return OPENWEBUI_FILE_LINK_RE.sub("/openai/v1/files/", value)
+    rewritten = OPENWEBUI_FILE_LINK_RE.sub("/openai/v1/files/", value)
+    return OPENWEBUI_GENERATED_FILE_LINK_RE.sub(
+        "/openai/v1/generated-files/", rewritten
+    )
 
 
 def _rewrite_openwebui_file_links(value):
@@ -398,8 +406,11 @@ async def get_headers_and_cookies(
 
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
         headers = include_user_info_headers(headers, user)
-        if metadata and metadata.get("chat_id"):
-            headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata.get("chat_id")
+
+    if isinstance(metadata, dict) and metadata.get("chat_id"):
+        headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = str(metadata.get("chat_id"))
+    if isinstance(metadata, dict) and metadata.get("task"):
+        headers[FORWARD_SESSION_INFO_HEADER_TASK] = str(metadata.get("task"))
 
     token = None
     auth_type = config.get("auth_type")
@@ -1187,13 +1198,92 @@ def convert_to_responses_payload(payload: dict) -> dict:
     return responses_payload
 
 
+def _extract_responses_output_text(response: dict) -> str:
+    if not isinstance(response, dict):
+        return ""
+
+    output_text = response.get("output_text") or response.get("outputText")
+    if isinstance(output_text, str):
+        return output_text
+    if isinstance(output_text, list):
+        parts = [str(part) for part in output_text if part]
+        if parts:
+            return "\n".join(parts)
+
+    output = response.get("output")
+    if not isinstance(output, list):
+        return ""
+
+    text_parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        role = item.get("role")
+        if role and role != "assistant":
+            continue
+        content = item.get("content", [])
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = str(part.get("type") or "").strip()
+                if part_type in {"output_text", "text"}:
+                    text = part.get("text")
+                    if text:
+                        text_parts.append(str(text))
+        elif isinstance(content, str) and content:
+            text_parts.append(content)
+
+    return "\n".join(text_parts).strip()
+
+
 def convert_responses_result(response: dict) -> dict:
     """
-    Convert non-streaming Responses API result.
-    Just add done flag - pass through raw response, frontend handles output.
+    Convert non-streaming Responses API result to Chat Completions format.
+    Preserves structured output for Open WebUI persistence.
     """
+    if not isinstance(response, dict):
+        return response
+
     response["done"] = True
-    return response
+    if "choices" in response:
+        return response
+
+    model_name = str(response.get("model", "") or "")
+    content = _extract_responses_output_text(response)
+    chat_response = openai_chat_completion_message_template(
+        model_name, message=content or ""
+    )
+
+    chat_response["done"] = True
+
+    usage = response.get("usage")
+    if usage is not None:
+        chat_response["usage"] = usage
+
+    output = response.get("output")
+    if output is not None:
+        chat_response["output"] = output
+
+    if "id" in response:
+        chat_response["id"] = response["id"]
+
+    created = response.get("created")
+    if created is None:
+        created = response.get("created_at") or response.get("createdAt")
+    if created is not None:
+        try:
+            chat_response["created"] = int(created)
+        except Exception:
+            pass
+
+    for key in ("error", "status", "incomplete_details", "metadata", "system_fingerprint"):
+        if key in response:
+            chat_response[key] = response[key]
+
+    return chat_response
 
 
 @router.post("/chat/completions")
@@ -1215,6 +1305,12 @@ async def generate_chat_completion(
 
     payload = {**form_data}
     metadata = payload.pop("metadata", None)
+    if isinstance(metadata, dict):
+        task_value = metadata.get("task")
+        if task_value is not None:
+            task_text = str(task_value).strip()
+            if task_text:
+                payload.setdefault("task", task_text)
     payload.pop("thinking_mode_enabled", None)
     payload.pop("thinkingModeEnabled", None)
 

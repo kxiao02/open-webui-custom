@@ -25,6 +25,18 @@
 		}
 	};
 
+	const isHttpUrl = (value: string = '') => /^https?:\/\//i.test(value);
+
+	const getFaviconUrl = (value: string = '') => {
+		if (!isHttpUrl(value)) return '';
+
+		try {
+			return new URL('/favicon.ico', value).toString();
+		} catch {
+			return '';
+		}
+	};
+
 	const getInitial = (value: string = '') => {
 		const match = value.toUpperCase().match(/[A-Z0-9]/);
 		return match ? match[0] : '';
@@ -45,16 +57,22 @@
 
 	$: resolvedUrl = url || title;
 	$: domain = getDomain(resolvedUrl);
+	$: faviconUrl = getFaviconUrl(url);
 	$: initial = getInitial(domain);
 	$: toneClass = getTone(domain);
 	$: altText = title ? `${title} favicon` : `${domain || 'web source'} favicon`;
+	$: if (faviconUrl) {
+		faviconFailed = false;
+	}
 </script>
 
-{#if resolvedUrl && !faviconFailed}
+{#if faviconUrl && !faviconFailed}
 	<img
-		src={"https://www.google.com/s2/favicons?sz=32&domain=" + resolvedUrl}
+		src={faviconUrl}
 		alt={altText}
 		class={className}
+		loading="lazy"
+		referrerpolicy="no-referrer"
 		on:error={() => {
 			faviconFailed = true;
 		}}

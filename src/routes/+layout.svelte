@@ -57,7 +57,12 @@
 	import { getAllTags, getChatList } from '$lib/apis/chats';
 	import { chatCompletion } from '$lib/apis/openai';
 
-	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME } from '$lib/constants';
+	import {
+		WEBUI_API_BASE_URL,
+		WEBUI_BASE_URL,
+		WEBUI_BUILD_HASH,
+		WEBUI_HOSTNAME
+	} from '$lib/constants';
 	import { bestMatchingLanguage, displayFileHandler, toPlainNotificationText } from '$lib/utils';
 	import { setTextScale } from '$lib/utils/text-scale';
 
@@ -81,6 +86,31 @@
 			}
 		}
 		return false;
+	};
+
+	const getPreloadReloadKey = () => {
+		const appEntryHref = document
+			.querySelector('link[rel="modulepreload"][href*="/_app/immutable/entry/app."]')
+			?.getAttribute('href');
+
+		return `vite-preload-reload:${appEntryHref ?? window.location.pathname}`;
+	};
+
+	const preloadErrorHandler = async (event) => {
+		const reloadKey = getPreloadReloadKey();
+
+		if (sessionStorage.getItem(reloadKey)) {
+			console.error('Vite preload error persisted after reload:', event?.payload);
+			sessionStorage.removeItem(reloadKey);
+			return;
+		}
+
+		console.error('Vite preload error detected, forcing reload:', event?.payload);
+		event.preventDefault();
+		sessionStorage.setItem(reloadKey, '1');
+
+		await unregisterServiceWorkers();
+		location.reload();
 	};
 
 	// handle frontend updates (https://svelte.dev/docs/kit/configuration#version)
@@ -125,15 +155,23 @@
 
 		_socket.on('connect', async () => {
 			console.log('connected', _socket.id);
+			if (await updated.check()) {
+				await unregisterServiceWorkers();
+				location.href = location.href;
+				return;
+			}
+
 			const res = await getVersion(localStorage.token);
 
 			const deploymentId = res?.deployment_id ?? null;
 			const version = res?.version ?? null;
+			const buildHash = res?.build_hash ?? null;
 
-			if (version !== null || deploymentId !== null) {
+			if (version !== null || deploymentId !== null || buildHash !== null) {
 				if (
 					($WEBUI_VERSION !== null && version !== $WEBUI_VERSION) ||
-					($WEBUI_DEPLOYMENT_ID !== null && deploymentId !== $WEBUI_DEPLOYMENT_ID)
+					($WEBUI_DEPLOYMENT_ID !== null && deploymentId !== $WEBUI_DEPLOYMENT_ID) ||
+					(buildHash !== null && buildHash !== WEBUI_BUILD_HASH)
 				) {
 					await unregisterServiceWorkers();
 					location.href = location.href;
@@ -451,7 +489,7 @@
 
 				if ($isLastActiveTab) {
 					if ($settings?.notificationEnabled ?? false) {
-						new Notification(`${title} • Open WebUI`, {
+						new Notification(`${title} • ${$WEBUI_NAME}`, {
 							body: notificationContent,
 							icon: `${WEBUI_BASE_URL}/static/favicon.png`
 						});
@@ -658,7 +696,7 @@
 
 				if ($isLastActiveTab) {
 					if ($settings?.notificationEnabled ?? false) {
-						new Notification(`${title} • Open WebUI`, {
+						new Notification(`${title} • ${$WEBUI_NAME}`, {
 							body: notificationContent,
 							icon: `${WEBUI_API_BASE_URL}/users/${data?.user?.id}/profile/image`
 						});
@@ -718,6 +756,7 @@
 
 	onMount(async () => {
 		window.addEventListener('message', windowMessageEventHandler);
+		window.addEventListener('vite:preloadError', preloadErrorHandler);
 
 		let touchstartY = 0;
 
@@ -968,6 +1007,7 @@
 		return () => {
 			window.removeEventListener('resize', onResize);
 			window.removeEventListener('message', windowMessageEventHandler);
+			window.removeEventListener('vite:preloadError', preloadErrorHandler);
 			document.removeEventListener('touchstart', touchstartHandler);
 			document.removeEventListener('touchmove', touchmoveHandler);
 			document.removeEventListener('touchend', touchendHandler);

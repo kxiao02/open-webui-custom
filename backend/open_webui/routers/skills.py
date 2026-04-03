@@ -26,6 +26,7 @@ from open_webui.utils.catalog import (
     get_user_group_ids,
     is_skill_catalog_visible,
 )
+from open_webui.utils.skill_import import sync_minimax_document_skills
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
 from open_webui.constants import ERROR_MESSAGES
@@ -36,9 +37,30 @@ PAGE_ITEM_COUNT = 30
 
 router = APIRouter()
 
+class SkillSyncForm(BaseModel):
+    root_path: Optional[str] = None
+    dry_run: bool = False
 
-def _skill_write_access(user) -> bool:
-    return user.role == "admin"
+
+def _skill_write_access(
+    user, skill, user_group_ids: Optional[set[str]] = None, db: Session | None = None
+) -> bool:
+    if not skill:
+        return False
+    if user.role == "admin":
+        return True
+    if getattr(skill, "user_id", None) == user.id:
+        return True
+    if user_group_ids is None:
+        user_group_ids = get_user_group_ids(user.id, db=db)
+    return AccessGrants.has_access(
+        user_id=user.id,
+        resource_type="skill",
+        resource_id=skill.id,
+        permission="write",
+        user_group_ids=user_group_ids,
+        db=db,
+    )
 
 
 def _get_installed_skill_ids(
@@ -90,6 +112,7 @@ async def get_skill_list(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
+    user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
     filtered_skills = filter_visible_skills(Skills.get_skills(db=db), user, db=db)
     installed_skill_ids = _get_installed_skill_ids(
         user.id, [skill.id for skill in filtered_skills], db=db
@@ -121,7 +144,9 @@ async def get_skill_list(
         items=[
             SkillAccessResponse(
                 **skill.model_dump(),
-                write_access=_skill_write_access(user),
+                write_access=_skill_write_access(
+                    user, skill, user_group_ids=user_group_ids, db=db
+                ),
                 installed=skill.id in installed_skill_ids,
             )
             for skill in items
@@ -148,6 +173,42 @@ async def export_skills(
         )
     return Skills.get_skills(db=db)
 
+############################
+# Sync MiniMax Document Skills
+############################
+
+
+@router.post("/sync/minimax", response_model=dict)
+async def sync_minimax_skills(
+    form_data: SkillSyncForm = SkillSyncForm(),
+    user=Depends(get_admin_user),
+    db: Session = Depends(get_session),
+):
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.UNAUTHORIZED,
+        )
+
+    try:
+        return sync_minimax_document_skills(
+            user_id=user.id,
+            root_path=form_data.root_path,
+            db=db,
+            dry_run=form_data.dry_run,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT(str(exc)),
+        ) from exc
+    except Exception as exc:
+        log.exception("Failed to sync MiniMax document skills: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT(str(exc)),
+        ) from exc
+
 
 ############################
 # CreateNewSkill
@@ -158,14 +219,31 @@ async def export_skills(
 async def create_new_skill(
     request: Request,
     form_data: SkillForm,
-    user=Depends(get_admin_user),
+    user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
-    if user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.UNAUTHORIZED,
+    if user.role != "admin" and form_data.meta and form_data.meta.is_default:
+        form_data.meta.is_default = False
+
+    if user.role != "admin" and form_data.meta and form_data.meta.visibility == "public":
+        if not has_permission(
+            user.id,
+            "sharing.public_skills",
+            request.app.state.config.USER_PERMISSIONS,
+            db=db,
+        ):
+            form_data.meta.visibility = "restricted"
+
+    if user.role != "admin" and form_data.access_grants is not None:
+        form_data.access_grants = filter_allowed_access_grants(
+            request.app.state.config.USER_PERMISSIONS,
+            user.id,
+            user.role,
+            form_data.access_grants,
+            "sharing.public_skills",
+            db=db,
         )
+
     form_data.id = form_data.id.lower().replace(" ", "-")
 
     existing = Skills.get_skill_by_id(form_data.id, db=db)
@@ -208,7 +286,9 @@ async def get_skill_by_id(
         if is_skill_catalog_visible(skill, user, user_group_ids, db=db):
             return SkillAccessResponse(
                 **skill.model_dump(),
-                write_access=_skill_write_access(user),
+                write_access=_skill_write_access(
+                    user, skill, user_group_ids=user_group_ids, db=db
+                ),
                 installed=id in _get_installed_skill_ids(user.id, [id], db=db),
             )
         else:
@@ -268,19 +348,43 @@ async def update_skill_by_id(
     request: Request,
     id: str,
     form_data: SkillForm,
-    user=Depends(get_admin_user),
+    user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
-    if user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.UNAUTHORIZED,
-        )
     skill = Skills.get_skill_by_id(id, db=db)
     if not skill:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+    if not _skill_write_access(user, skill, user_group_ids=user_group_ids, db=db):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    if user.role != "admin" and form_data.meta and form_data.meta.is_default:
+        form_data.meta.is_default = False
+
+    if user.role != "admin" and form_data.meta and form_data.meta.visibility == "public":
+        if not has_permission(
+            user.id,
+            "sharing.public_skills",
+            request.app.state.config.USER_PERMISSIONS,
+            db=db,
+        ):
+            form_data.meta.visibility = "restricted"
+
+    if user.role != "admin" and form_data.access_grants is not None:
+        form_data.access_grants = filter_allowed_access_grants(
+            request.app.state.config.USER_PERMISSIONS,
+            user.id,
+            user.role,
+            form_data.access_grants,
+            "sharing.public_skills",
+            db=db,
         )
 
     try:
@@ -318,19 +422,21 @@ async def update_skill_access_by_id(
     request: Request,
     id: str,
     form_data: SkillAccessGrantsForm,
-    user=Depends(get_admin_user),
+    user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
-    if user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.UNAUTHORIZED,
-        )
     skill = Skills.get_skill_by_id(id, db=db)
     if not skill:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+    if not _skill_write_access(user, skill, user_group_ids=user_group_ids, db=db):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
     form_data.access_grants = filter_allowed_access_grants(
@@ -339,6 +445,7 @@ async def update_skill_access_by_id(
         user.role,
         form_data.access_grants,
         "sharing.public_skills",
+        db=db,
     )
 
     AccessGrants.set_access_grants("skill", id, form_data.access_grants, db=db)
@@ -353,15 +460,16 @@ async def update_skill_access_by_id(
 
 @router.post("/id/{id}/toggle", response_model=Optional[SkillModel])
 async def toggle_skill_by_id(
-    id: str, user=Depends(get_admin_user), db: Session = Depends(get_session)
+    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
 ):
-    if user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.UNAUTHORIZED,
-        )
     skill = Skills.get_skill_by_id(id, db=db)
     if skill:
+        user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+        if not _skill_write_access(user, skill, user_group_ids=user_group_ids, db=db):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+            )
         skill = Skills.toggle_skill_by_id(id, db=db)
 
         if skill:
@@ -387,19 +495,21 @@ async def toggle_skill_by_id(
 async def delete_skill_by_id(
     request: Request,
     id: str,
-    user=Depends(get_admin_user),
+    user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
-    if user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.UNAUTHORIZED,
-        )
     skill = Skills.get_skill_by_id(id, db=db)
     if not skill:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()
+    if not _skill_write_access(user, skill, user_group_ids=user_group_ids, db=db):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
     result = Skills.delete_skill_by_id(id, db=db)

@@ -1,5 +1,5 @@
 export type ClientCapabilities = {
-	schema_version: 1;
+	schema_version: 2;
 	generated_file_download: {
 		enabled: boolean;
 		delivery: 'openwebui_file';
@@ -13,6 +13,16 @@ export type ClientCapabilities = {
 		enabled: boolean;
 		mode: 'inline_or_modal';
 		types: string[];
+	};
+	workspace_tool_draft: {
+		enabled: boolean;
+		mode: 'confirm_then_edit';
+		format: 'python_tool_class';
+	};
+	workspace_skill_draft: {
+		enabled: boolean;
+		mode: 'confirm_then_edit';
+		format: 'markdown_skill';
 	};
 };
 
@@ -33,7 +43,7 @@ export const getClientCapabilities = ({
 	const shareEnabled = Boolean(hasPersistentChat && !temporaryChatEnabled && canShareChat);
 
 	return {
-		schema_version: 1,
+		schema_version: 2,
 		generated_file_download: {
 			enabled: true,
 			delivery: 'openwebui_file',
@@ -47,6 +57,16 @@ export const getClientCapabilities = ({
 			enabled: true,
 			mode: 'inline_or_modal',
 			types: PREVIEWABLE_FILE_TYPES
+		},
+		workspace_tool_draft: {
+			enabled: true,
+			mode: 'confirm_then_edit',
+			format: 'python_tool_class'
+		},
+		workspace_skill_draft: {
+			enabled: true,
+			mode: 'confirm_then_edit',
+			format: 'markdown_skill'
 		}
 	};
 };

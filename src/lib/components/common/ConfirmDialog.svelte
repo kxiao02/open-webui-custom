@@ -42,12 +42,22 @@
 	};
 
 	const handleKeyDown = (event: KeyboardEvent) => {
+		const target = event.target as HTMLElement | null;
+
 		if (event.key === 'Escape') {
 			console.log('Escape');
 			show = false;
 		}
 
 		if (event.key === 'Enter') {
+			if (
+				target instanceof HTMLTextAreaElement ||
+				target instanceof HTMLSelectElement ||
+				target?.isContentEditable
+			) {
+				return;
+			}
+
 			console.log('Enter');
 			event.preventDefault();
 			event.stopPropagation();

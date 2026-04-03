@@ -94,13 +94,7 @@
 
 	let newFolderId = null;
 
-	$: hasWorkspaceAccess =
-		$user?.role === 'admin' ||
-		$user?.permissions?.workspace?.models ||
-		$user?.permissions?.workspace?.knowledge ||
-		$user?.permissions?.workspace?.prompts ||
-		$user?.permissions?.workspace?.tools ||
-		$user?.permissions?.workspace?.skills;
+	$: hasWorkspaceAccess = !!$user;
 
 	$: if ($selectedFolder) {
 		initFolders();

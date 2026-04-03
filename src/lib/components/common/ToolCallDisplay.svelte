@@ -32,6 +32,11 @@
 		terminalServers
 	} from '$lib/stores';
 	import { openGeneratedFilePreview } from '$lib/utils/generated-file-preview';
+	import {
+		getToolCallArtifactEvidence,
+		isFileGeneratingToolId,
+		resolveToolCallStatus
+	} from '$lib/utils/generated-files';
 	import { normalizeToolId, resolveToolDisplay } from '$lib/utils/tool-display';
 
 	export let id: string = '';
@@ -95,14 +100,6 @@
 		} catch {
 			return null;
 		}
-	}
-
-	function normalizeStatus(status: string | undefined, done: string | undefined): string {
-		const normalized = (status || '').trim().toLowerCase();
-		if (['running', 'success', 'error', 'timeout'].includes(normalized)) {
-			return normalized;
-		}
-		return done === 'true' ? 'success' : 'running';
 	}
 
 	function getStatusMessage(status: string): string {
@@ -227,8 +224,16 @@
 		return id || componentId;
 	}
 
-	function getEffectiveStatus(rawStatus: string, visualKey: string): string {
+	function getEffectiveStatus(
+		rawStatus: string,
+		visualKey: string,
+		allowDelay: boolean
+	): string {
 		if (!visualKey) return rawStatus;
+		if (!allowDelay) {
+			clearVisualStatusTimer();
+			return rawStatus;
+		}
 
 		const now = Date.now();
 		let timing = toolVisualTimingByKey.get(visualKey);
@@ -270,16 +275,20 @@
 	});
 	$: displayName = toolDisplay.toolName;
 	$: normalizedToolId = toolDisplay.toolId || normalizeToolId(attributes?.name);
-	$: rawStatus = normalizeStatus(attributes?.status, attributes?.done);
+	$: normalizedAttrs = { ...(attributes ?? {}), tool_id: normalizedToolId || attributes?.tool_id || '' };
 	$: toolVisualKey = getToolVisualKey();
 	$: visualStatusTick;
-	$: status = getEffectiveStatus(rawStatus, toolVisualKey);
+	$: hasFiles = Array.isArray(files) && files.length > 0;
+	$: terminalResultFile = getGeneratedTerminalFile(normalizedToolId, parsedResult);
+	$: supportsArtifactInference = isFileGeneratingToolId(normalizedToolId);
+	$: hasResultArtifacts = supportsArtifactInference && getToolCallArtifactEvidence(normalizedAttrs);
+	$: hasArtifactEvidence = hasFiles || Boolean(terminalResultFile) || hasResultArtifacts;
+	$: statusCandidate = resolveToolCallStatus(normalizedAttrs);
+	$: status = getEffectiveStatus(statusCandidate, toolVisualKey, !hasArtifactEvidence);
 	$: isTerminal = status !== 'running';
 	$: isExecuting = status === 'running';
 	$: statusMessage = getStatusMessage(status);
 	$: hasEmbeds = embeds && Array.isArray(embeds) && embeds.length > 0;
-	$: hasFiles = Array.isArray(files) && files.length > 0;
-	$: terminalResultFile = getGeneratedTerminalFile(normalizedToolId, parsedResult);
 	$: canExpand = !hasEmbeds && (Boolean(args) || Boolean(result) || hasFiles);
 	$: if (!canExpand) open = false;
 </script>

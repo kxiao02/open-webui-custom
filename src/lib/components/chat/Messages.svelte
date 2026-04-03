@@ -63,6 +63,15 @@
 	export let loadMoreHistory: Function | null = null;
 	export let ensureHistoryLoaded: Function = async () => true;
 	let messagesLoading = false;
+	const INITIAL_VISIBLE_MESSAGES = 4;
+	const VISIBLE_MESSAGE_STEP = 4;
+	let visibleMessageCount = 0;
+	let renderedMessages: any[] = [];
+	let pendingVisibleReveal: number | null = null;
+	let revealRunId = 0;
+
+	const usesExternalHistoryPagination = () => typeof loadMoreHistory === 'function';
+	const usesLocalWindowing = () => messagesCount !== null && !usesExternalHistoryPagination();
 
 	const canLoadMoreHistory = () =>
 		Boolean(
@@ -74,19 +83,41 @@
 		);
 
 	const loadMoreMessages = async () => {
-		// scroll slightly down to disable continuous loading
 		const element = document.getElementById('messages-container');
-		if (!element || messagesCount === null) return;
-		element.scrollTop = element.scrollTop + 100;
+		if (!element) return;
+		const previousMessageCount = messages.length;
+		const previousVisibleMessageCount = visibleMessageCount;
+		const previousScrollTop = element.scrollTop;
+		const previousScrollHeight = element.scrollHeight;
 
 		messagesLoading = true;
 		if (canLoadMoreHistory() && typeof loadMoreHistory === 'function') {
 			await loadMoreHistory();
 		}
-		messagesCount += 20;
+		if (usesLocalWindowing() && messagesCount !== null) {
+			messagesCount += 20;
+		}
 		buildMessages();
 
+		if (messages.length > previousMessageCount) {
+			cancelVisibleReveal();
+			revealRunId += 1;
+			if (usesExternalHistoryPagination()) {
+				visibleMessageCount = messages.length;
+			} else {
+				const addedMessages = messages.length - previousMessageCount;
+				visibleMessageCount = Math.min(
+					messages.length,
+					Math.max(previousVisibleMessageCount + addedMessages, INITIAL_VISIBLE_MESSAGES)
+				);
+			}
+		}
+
 		await tick();
+		if (messages.length > previousMessageCount) {
+			const heightDelta = element.scrollHeight - previousScrollHeight;
+			element.scrollTop = Math.max(0, previousScrollTop + heightDelta);
+		}
 
 		messagesLoading = false;
 	};
@@ -94,13 +125,80 @@
 	let pendingRebuild: number | null = null;
 	let lastCurrentId: any = null;
 
+	const cancelVisibleReveal = () => {
+		if (pendingVisibleReveal) {
+			cancelAnimationFrame(pendingVisibleReveal);
+			pendingVisibleReveal = null;
+		}
+	};
+
+	const scheduleVisibleReveal = () => {
+		cancelVisibleReveal();
+
+		const runId = ++revealRunId;
+		const revealNextBatch = async () => {
+			if (runId !== revealRunId || visibleMessageCount >= messages.length) {
+				pendingVisibleReveal = null;
+				return;
+			}
+
+			const element = document.getElementById('messages-container');
+			const previousBottomOffset = element ? element.scrollHeight - element.scrollTop : 0;
+
+			visibleMessageCount = Math.min(messages.length, visibleMessageCount + VISIBLE_MESSAGE_STEP);
+			await tick();
+
+			if (runId !== revealRunId) {
+				pendingVisibleReveal = null;
+				return;
+			}
+
+			if (element) {
+				element.scrollTop = Math.max(0, element.scrollHeight - previousBottomOffset);
+			}
+
+			if (visibleMessageCount < messages.length) {
+				pendingVisibleReveal = requestAnimationFrame(() => {
+					void revealNextBatch();
+				});
+			} else {
+				pendingVisibleReveal = null;
+			}
+		};
+
+		if (visibleMessageCount < messages.length) {
+			pendingVisibleReveal = requestAnimationFrame(() => {
+				void revealNextBatch();
+			});
+		}
+	};
+
+	const resetVisibleMessages = () => {
+		cancelVisibleReveal();
+		revealRunId += 1;
+
+		if (usesExternalHistoryPagination()) {
+			visibleMessageCount = messages.length;
+			return;
+		}
+
+		if (messages.length <= INITIAL_VISIBLE_MESSAGES) {
+			visibleMessageCount = messages.length;
+			return;
+		}
+
+		visibleMessageCount = INITIAL_VISIBLE_MESSAGES;
+		scheduleVisibleReveal();
+	};
+
 	const buildMessages = () => {
 		let _messages: any[] = [];
+		const windowSize = usesLocalWindowing() ? messagesCount : null;
 
 		let message = history.messages[history.currentId];
 		const visitedMessageIds = new Set();
 
-		while (message && (messagesCount !== null ? _messages.length <= messagesCount : true)) {
+		while (message && (windowSize !== null ? _messages.length <= windowSize : true)) {
 			if (visitedMessageIds.has(message.id)) {
 				console.warn('Circular dependency detected in message history', message.id);
 				break;
@@ -119,6 +217,9 @@
 	const handleHistoryChange = (currentId: any, _messages: any) => {
 		if (!currentId) {
 			messages = [];
+			visibleMessageCount = 0;
+			renderedMessages = [];
+			cancelVisibleReveal();
 			return;
 		}
 
@@ -127,9 +228,12 @@
 
 		if (currentIdChanged) {
 			// Structural change: new chat, navigation, new message — rebuild immediately
-			cancelAnimationFrame(pendingRebuild);
+			if (pendingRebuild !== null) {
+				cancelAnimationFrame(pendingRebuild);
+			}
 			pendingRebuild = null;
 			buildMessages();
+			resetVisibleMessages();
 		} else if (_messages) {
 			// Content update (streaming) — throttle to once per frame
 			if (!pendingRebuild) {
@@ -142,6 +246,10 @@
 	};
 
 	$: handleHistoryChange(history.currentId, history.messages);
+	$: renderedMessages =
+		visibleMessageCount >= messages.length
+			? messages
+			: messages.slice(Math.max(messages.length - visibleMessageCount, 0));
 
 	$: if (autoScroll && bottomPadding) {
 		(async () => {
@@ -456,7 +564,10 @@
 	};
 
 	onDestroy(() => {
-		cancelAnimationFrame(pendingRebuild);
+		if (pendingRebuild !== null) {
+			cancelAnimationFrame(pendingRebuild);
+		}
+		cancelVisibleReveal();
 	});
 
 	const triggerScroll = () => {
@@ -493,7 +604,7 @@
 						</Loader>
 					{/if}
 					<ul role="log" aria-live="polite" aria-relevant="additions" aria-atomic="false">
-						{#each messages as message, messageIdx (message.id)}
+						{#each renderedMessages as message, messageIdx (message.id)}
 							<Message
 								{chatId}
 								bind:history

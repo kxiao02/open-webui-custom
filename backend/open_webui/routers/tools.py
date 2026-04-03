@@ -55,10 +55,15 @@ router = APIRouter()
 class BuiltinToolCatalogMeta(BaseModel):
     description: str = ""
     category: str = "builtin"
-    origin: str = "builtin"
+    origin: str = "host"
+    catalog_kind: str = "host"
+    source_of_truth: str = "open-webui"
+    execution_boundary: str = "open-webui"
     mutability: str = "locked"
     default_enabled: bool = True
     available: bool = True
+    availability_state: str = "ready"
+    visibility: str = "public"
     capability_requirements: list[str] = Field(default_factory=list)
     feature_requirements: list[str] = Field(default_factory=list)
     config_requirements: list[str] = Field(default_factory=list)
@@ -128,6 +133,106 @@ def _get_installed_tool_ids(
     )
 
 
+def _normalize_catalog_meta(
+    meta: Optional[dict],
+    *,
+    origin: str,
+    catalog_kind: str,
+    source_of_truth: str,
+    execution_boundary: str,
+    mutability: str,
+    visibility: str = "public",
+    available: bool = True,
+    availability_state: str = "ready",
+    category: Optional[str] = None,
+    default_enabled: Optional[bool] = None,
+) -> dict:
+    normalized = dict(meta or {})
+    normalized["origin"] = origin
+    normalized["catalog_kind"] = catalog_kind
+    normalized["source_of_truth"] = source_of_truth
+    normalized["execution_boundary"] = execution_boundary
+    normalized["mutability"] = mutability
+    normalized["visibility"] = normalized.get("visibility", visibility)
+    normalized["available"] = normalized.get("available", available)
+    normalized["availability_state"] = normalized.get(
+        "availability_state", availability_state
+    )
+    if category is not None:
+        normalized["category"] = normalized.get("category", category)
+    if default_enabled is not None:
+        normalized["default_enabled"] = normalized.get(
+            "default_enabled", default_enabled
+        )
+    return normalized
+
+
+def _bridge_catalog_url(openai_base_url: str) -> str:
+    base = openai_base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return f"{base}/tools/catalog"
+
+
+async def _get_core_tool_entries(request: Request) -> list[dict]:
+    now = int(time.time())
+    entries_by_id: dict[str, dict] = {}
+    api_base_urls = list(getattr(request.app.state.config, "OPENAI_API_BASE_URLS", []) or [])
+    api_keys = list(getattr(request.app.state.config, "OPENAI_API_KEYS", []) or [])
+    timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for idx, openai_base_url in enumerate(api_base_urls):
+            catalog_url = _bridge_catalog_url(openai_base_url)
+            headers = {}
+            if idx < len(api_keys) and api_keys[idx]:
+                headers["Authorization"] = f"Bearer {api_keys[idx]}"
+
+            try:
+                async with session.get(catalog_url, headers=headers) as response:
+                    if response.status != 200:
+                        continue
+                    payload = await response.json()
+            except Exception as exc:
+                log.debug("Failed to load bridge tool catalog from %s: %s", catalog_url, exc)
+                continue
+
+            raw_entries = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(raw_entries, list):
+                continue
+
+            for tool in raw_entries:
+                if not isinstance(tool, dict):
+                    continue
+                tool_id = str(tool.get("id", "")).strip()
+                if not tool_id or tool_id in entries_by_id:
+                    continue
+                meta = _normalize_catalog_meta(
+                    tool.get("meta") if isinstance(tool.get("meta"), dict) else {},
+                    origin="core",
+                    catalog_kind="core",
+                    source_of_truth="agent-core",
+                    execution_boundary="agent",
+                    mutability="locked",
+                    availability_state="registered",
+                )
+                entries_by_id[tool_id] = {
+                    "id": tool_id,
+                    "user_id": "system:agent-core",
+                    "name": tool.get("name", tool_id),
+                    "meta": meta,
+                    "access_grants": [],
+                    "updated_at": now,
+                    "created_at": now,
+                    "write_access": False,
+                    "installed": False,
+                    "installable": False,
+                    "catalog_kind": "core",
+                }
+
+    return list(entries_by_id.values())
+
+
 async def _get_server_tool_entries(request: Request, user, db=None):
     server_tools: list[dict] = []
     server_access_grants: dict[str, list] = {}
@@ -149,14 +254,23 @@ async def _get_server_tool_entries(request: Request, user, db=None):
                 "name": server.get("openapi", {})
                 .get("info", {})
                 .get("title", "Tool Server"),
-                "meta": {
-                    "description": server.get("openapi", {})
-                    .get("info", {})
-                    .get("description", ""),
-                },
+                "meta": _normalize_catalog_meta(
+                    {
+                        "description": server.get("openapi", {})
+                        .get("info", {})
+                        .get("description", ""),
+                    },
+                    origin="external",
+                    catalog_kind="external",
+                    source_of_truth="openapi-tool-server",
+                    execution_boundary="external",
+                    mutability="locked",
+                    category="server",
+                ),
                 "access_grants": [],
                 "updated_at": int(time.time()),
                 "created_at": int(time.time()),
+                "catalog_kind": "external",
             }
         )
 
@@ -188,12 +302,21 @@ async def _get_server_tool_entries(request: Request, user, db=None):
                 "id": tool_id,
                 "user_id": tool_id,
                 "name": server.get("info", {}).get("name", "MCP Tool Server"),
-                "meta": {
-                    "description": server.get("info", {}).get("description", ""),
-                },
+                "meta": _normalize_catalog_meta(
+                    {
+                        "description": server.get("info", {}).get("description", ""),
+                    },
+                    origin="external",
+                    catalog_kind="external",
+                    source_of_truth="mcp-tool-server",
+                    execution_boundary="external",
+                    mutability="locked",
+                    category="server",
+                ),
                 "access_grants": [],
                 "updated_at": int(time.time()),
                 "created_at": int(time.time()),
+                "catalog_kind": "external",
             }
             if auth_type == "oauth_2.1":
                 entry["authenticated"] = session_token is not None
@@ -391,6 +514,7 @@ async def get_tool_list(
 ):
     db_tools = filter_visible_tools(Tools.get_tools(defer_content=True, db=db), user, db=db)
     server_tools, server_access_grants = await _get_server_tool_entries(request, user, db=db)
+    core_tools = await _get_core_tool_entries(request)
 
     if user.role != "admin":
         user_group_ids = get_user_group_ids(user.id, db=db)
@@ -406,16 +530,31 @@ async def get_tool_list(
             )
         ]
 
-    all_ids = [tool.id for tool in db_tools] + [tool.get("id") for tool in server_tools]
+    all_ids = (
+        [tool.id for tool in db_tools]
+        + [tool.get("id") for tool in server_tools]
+        + [tool.get("id") for tool in core_tools]
+    )
     installed_tool_ids = _get_installed_tool_ids(user.id, all_ids, db=db)
 
     result: list[ToolAccessResponse] = []
     for tool in db_tools:
+        tool_data = tool.model_dump()
+        tool_data["meta"] = _normalize_catalog_meta(
+            tool_data.get("meta"),
+            origin="host",
+            catalog_kind="custom",
+            source_of_truth="open-webui-tool",
+            execution_boundary="open-webui",
+            mutability="editable" if _tool_write_access(user, tool, db=db) else "locked",
+            category="custom",
+        )
         result.append(
             ToolAccessResponse(
-                **tool.model_dump(),
+                **tool_data,
                 write_access=_tool_write_access(user, tool, db=db),
                 installed=tool.id in installed_tool_ids,
+                catalog_kind="custom",
             )
         )
     for tool in server_tools:
@@ -424,9 +563,19 @@ async def get_tool_list(
                 **tool,
                 write_access=False,
                 installed=tool.get("id") in installed_tool_ids,
+                installable=True,
             )
         )
-
+    for tool in core_tools:
+        tool_data = {
+            **tool,
+            "installed": tool.get("id") in installed_tool_ids,
+        }
+        result.append(
+            ToolAccessResponse(
+                **tool_data,
+            )
+        )
     return result
 
 
@@ -511,6 +660,15 @@ async def create_new_tools(
     if user.role != "admin" and form_data.meta and form_data.meta.is_default:
         form_data.meta.is_default = False
 
+    if user.role != "admin" and form_data.meta and form_data.meta.visibility == "public":
+        if not has_permission(
+            user.id,
+            "sharing.public_tools",
+            request.app.state.config.USER_PERMISSIONS,
+            db=db,
+        ):
+            form_data.meta.visibility = "restricted"
+
     if user.role != "admin" and form_data.access_grants is not None:
         form_data.access_grants = filter_allowed_access_grants(
             request.app.state.config.USER_PERMISSIONS,
@@ -518,6 +676,7 @@ async def create_new_tools(
             user.role,
             form_data.access_grants,
             "sharing.public_tools",
+            db=db,
         )
 
     if not form_data.id.isidentifier():
@@ -702,6 +861,23 @@ async def update_tools_by_id(
 
     if user.role != "admin" and form_data.meta and form_data.meta.is_default:
         form_data.meta.is_default = False
+    if user.role != "admin" and form_data.meta and form_data.meta.visibility == "public":
+        if not has_permission(
+            user.id,
+            "sharing.public_tools",
+            request.app.state.config.USER_PERMISSIONS,
+            db=db,
+        ):
+            form_data.meta.visibility = "restricted"
+    if user.role != "admin" and form_data.access_grants is not None:
+        form_data.access_grants = filter_allowed_access_grants(
+            request.app.state.config.USER_PERMISSIONS,
+            user.id,
+            user.role,
+            form_data.access_grants,
+            "sharing.public_tools",
+            db=db,
+        )
 
     try:
         form_data.content = replace_imports(form_data.content)

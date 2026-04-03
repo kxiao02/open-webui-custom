@@ -1,7 +1,49 @@
 import adapter from '@sveltejs/adapter-static';
 import * as child_process from 'node:child_process';
+import crypto from 'node:crypto';
 import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 import fs from 'node:fs';
+
+const resolveVersionName = () => {
+	if (process.env.APP_BUILD_HASH && process.env.APP_BUILD_HASH !== 'dev-build') {
+		return process.env.APP_BUILD_HASH;
+	}
+
+	try {
+		const head = child_process.execSync('git rev-parse HEAD').toString().trim();
+		const diff = child_process.execSync('git diff --binary HEAD -- .').toString();
+		const untrackedFiles = child_process
+			.execSync('git ls-files --others --exclude-standard -- .')
+			.toString()
+			.split('\n')
+			.map((file) => file.trim())
+			.filter(Boolean)
+			.sort();
+
+		if (!diff && untrackedFiles.length === 0) {
+			return head;
+		}
+
+		const hash = crypto.createHash('sha1');
+		hash.update(diff);
+		for (const file of untrackedFiles) {
+			hash.update(file);
+			hash.update(fs.readFileSync(new URL(file, import.meta.url)));
+		}
+
+		const diffHash = hash.digest('hex').slice(0, 12);
+		return `${head}-dirty-${diffHash}`;
+	} catch {
+		try {
+			return (
+				JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'))?.version ||
+				Date.now().toString()
+			);
+		} catch {
+			return Date.now().toString();
+		}
+	}
+};
 
 /** @type {import('@sveltejs/kit').Config} */
 const config = {
@@ -19,22 +61,7 @@ const config = {
 		}),
 		// poll for new version name every 60 seconds (to trigger reload mechanic in +layout.svelte)
 		version: {
-			name: (() => {
-				try {
-					return child_process.execSync('git rev-parse HEAD').toString().trim();
-				} catch {
-					// if git is not available, fallback to package.json version
-					// or current timestamp
-					try {
-						return (
-							JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
-								?.version || Date.now().toString()
-						);
-					} catch {
-						return Date.now().toString();
-					}
-				}
-			})(),
+			name: resolveVersionName(),
 			pollInterval: 60000
 		}
 	},

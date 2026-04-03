@@ -1502,6 +1502,19 @@ def save_docs_to_vector_db(
     add: bool = False,
     user=None,
 ) -> bool:
+    def _run_embedding_generation(awaitable, timeout: Optional[float] = None):
+        main_loop = getattr(request.app.state, "main_loop", None)
+        if isinstance(main_loop, asyncio.AbstractEventLoop) and main_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(awaitable, main_loop)
+            return future.result(timeout=timeout)
+
+        async def _await_with_optional_timeout():
+            if timeout is None:
+                return await awaitable
+            return await asyncio.wait_for(awaitable, timeout=timeout)
+
+        return asyncio.run(_await_with_optional_timeout())
+
     def _get_docs_info(docs: list[Document]) -> str:
         docs_info = set()
 
@@ -1633,19 +1646,19 @@ def save_docs_to_vector_db(
         log.info(f"generating embeddings for {collection_name}")
         embedding_function = request.app.state.EMBEDDING_FUNCTION
 
-        # Run async embedding in sync context using the main event loop
-        # This allows the main loop to stay responsive to health checks during long operations
+        # Bridge sync file-processing paths into async embedding generation.
+        # Prefer the shared app loop when available, but fall back to a local
+        # event loop for valid runtime paths where the app state has no main_loop.
         embedding_timeout = RAG_EMBEDDING_TIMEOUT
 
-        future = asyncio.run_coroutine_threadsafe(
+        embeddings = _run_embedding_generation(
             embedding_function(
                 list(map(lambda x: x.replace("\n", " "), texts)),
                 prefix=RAG_EMBEDDING_CONTENT_PREFIX,
                 user=user,
             ),
-            request.app.state.main_loop,
+            timeout=embedding_timeout,
         )
-        embeddings = future.result(timeout=embedding_timeout)
         log.info(f"embeddings generated {len(embeddings)} for {len(texts)} items")
 
         items = [
@@ -1696,10 +1709,17 @@ def process_file(
         file = Files.get_file_by_id_and_user_id(form_data.file_id, user.id, db=db)
 
     if file:
+        text_content = ""
+        content_hash = None
         try:
             Files.update_file_data_by_id(
                 file.id,
-                {"status": "processing", "error": None},
+                {
+                    "status": "processing",
+                    "error": None,
+                    "retrieval_status": "processing",
+                    "retrieval_error": None,
+                },
                 db=db,
             )
 
@@ -1846,11 +1866,20 @@ def process_file(
                 {"content": text_content},
                 db=db,
             )
-            hash = calculate_sha256_string(text_content)
+            content_hash = calculate_sha256_string(text_content)
 
             if request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL:
-                Files.update_file_data_by_id(file.id, {"status": "completed"}, db=db)
-                Files.update_file_hash_by_id(file.id, hash, db=db)
+                Files.update_file_data_by_id(
+                    file.id,
+                    {
+                        "status": "completed",
+                        "error": None,
+                        "retrieval_status": "skipped",
+                        "retrieval_error": None,
+                    },
+                    db=db,
+                )
+                Files.update_file_hash_by_id(file.id, content_hash, db=db)
                 return {
                     "status": True,
                     "collection_name": None,
@@ -1872,7 +1901,7 @@ def process_file(
                         metadata={
                             "file_id": file.id,
                             "name": file.filename,
-                            "hash": hash,
+                            "hash": content_hash,
                         },
                         add=(True if form_data.collection_name else False),
                         user=user,
@@ -1892,10 +1921,17 @@ def process_file(
 
                             Files.update_file_data_by_id(
                                 file.id,
-                                {"status": "completed"},
+                                {
+                                    "status": "completed",
+                                    "error": None,
+                                    "retrieval_status": "completed",
+                                    "retrieval_error": None,
+                                },
                                 db=session,
                             )
-                            Files.update_file_hash_by_id(file.id, hash, db=session)
+                            Files.update_file_hash_by_id(
+                                file.id, content_hash, db=session
+                            )
 
                             return {
                                 "status": True,
@@ -1912,14 +1948,37 @@ def process_file(
             log.exception(e)
             # Fresh session for error status update.
             error_detail = str(e.detail) if hasattr(e, "detail") else str(e)
+            content_extracted = bool(str(text_content or "").strip())
+            preserve_completed_status = content_extracted and not form_data.collection_name
             with get_db() as session:
-                Files.update_file_data_by_id(
-                    file.id,
-                    {"status": "failed", "error": error_detail},
-                    db=session,
-                )
-                # Clear the hash so the file can be re-uploaded after fixing the issue
-                Files.update_file_hash_by_id(file.id, None, db=session)
+                if preserve_completed_status:
+                    Files.update_file_data_by_id(
+                        file.id,
+                        {
+                            "status": "completed",
+                            "error": None,
+                            "retrieval_status": "failed",
+                            "retrieval_error": error_detail,
+                        },
+                        db=session,
+                    )
+                    if content_hash:
+                        Files.update_file_hash_by_id(
+                            file.id, content_hash, db=session
+                        )
+                else:
+                    Files.update_file_data_by_id(
+                        file.id,
+                        {
+                            "status": "failed",
+                            "error": error_detail,
+                            "retrieval_status": "failed",
+                            "retrieval_error": error_detail,
+                        },
+                        db=session,
+                    )
+                    # Clear the hash so the file can be re-uploaded after fixing the issue
+                    Files.update_file_hash_by_id(file.id, None, db=session)
 
             if "No pandoc was found" in str(e):
                 raise HTTPException(

@@ -17,12 +17,15 @@
 
 	export let builtinTools: Record<string, boolean> = {};
 	let builtinCatalog: BuiltinToolCatalogItem[] = [];
+	let internetSearchTool: BuiltinToolCatalogItem | null = null;
 
 	$: {
-		for (const tool of builtinCatalog) {
-			if (!(tool.id in builtinTools)) {
-				builtinTools[tool.id] = true;
-			}
+		internetSearchTool = builtinCatalog.find((tool) => tool.id === 'web_search') ?? null;
+		if (internetSearchTool && !(internetSearchTool.id in builtinTools)) {
+			builtinTools = {
+				...builtinTools,
+				[internetSearchTool.id]: true
+			};
 		}
 	}
 
@@ -31,19 +34,19 @@
 	});
 </script>
 
-<div>
-	<div class="flex w-full justify-between mb-1">
-		<div class="self-center text-xs font-medium text-gray-500">{$i18n.t('Builtin Tools')}</div>
-	</div>
-	<div class="flex items-center mt-2 flex-wrap">
-		{#each builtinCatalog as tool}
+{#if internetSearchTool}
+	<div>
+		<div class="flex w-full justify-between mb-1">
+			<div class="self-center text-xs font-medium text-gray-500">{$i18n.t('Internet Search')}</div>
+		</div>
+		<div class="flex items-center mt-2 flex-wrap">
 			<div class="flex items-center gap-2 mr-3">
 				<Checkbox
-					state={builtinTools[tool.id] !== false ? 'checked' : 'unchecked'}
+					state={builtinTools[internetSearchTool.id] !== false ? 'checked' : 'unchecked'}
 					on:change={(e) => {
 						builtinTools = {
 							...builtinTools,
-							[tool.id]: e.detail === 'checked'
+							[internetSearchTool.id]: e.detail === 'checked'
 						};
 					}}
 				/>
@@ -51,13 +54,13 @@
 				<div class="py-0.5 text-sm">
 					<Tooltip
 						content={marked.parse(
-							`${$i18n.t(tool.meta?.description ?? tool.name)}${tool.meta?.available === false ? `\n\n${$i18n.t('Currently disabled at the system level.')}` : ''}`
+							`${$i18n.t(internetSearchTool.meta?.description ?? internetSearchTool.name)}${internetSearchTool.meta?.available === false ? `\n\n${$i18n.t('Currently disabled at the system level.')}` : ''}`
 						)}
 					>
-						{$i18n.t(tool.name)}
+						{$i18n.t(internetSearchTool.name)}
 					</Tooltip>
 				</div>
 			</div>
-		{/each}
+		</div>
 	</div>
-</div>
+{/if}

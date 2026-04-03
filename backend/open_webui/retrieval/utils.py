@@ -53,6 +53,10 @@ from open_webui.config import (
 
 log = logging.getLogger(__name__)
 
+_SQL_VECTOR_DB_TYPES = {"pgvector", "opengauss", "mariadb_vector"}
+_QUERY_COLLECTION_MAX_DB_WORKERS = 4
+_QUERY_COLLECTION_MAX_NON_DB_WORKERS = 8
+
 
 from typing import Any
 
@@ -456,7 +460,15 @@ async def query_collection(
         f"query_collection: processing {len(queries)} queries across {len(collection_names)} collections"
     )
 
-    with ThreadPoolExecutor() as executor:
+    total_tasks = max(1, len(query_embeddings) * len(collection_names))
+    max_workers = (
+        _QUERY_COLLECTION_MAX_DB_WORKERS
+        if VECTOR_DB in _SQL_VECTOR_DB_TYPES
+        else _QUERY_COLLECTION_MAX_NON_DB_WORKERS
+    )
+    max_workers = max(1, min(total_tasks, max_workers))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_results = []
         for query_embedding in query_embeddings:
             for collection_name in collection_names:

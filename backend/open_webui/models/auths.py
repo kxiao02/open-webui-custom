@@ -139,12 +139,6 @@ class AuthsTable:
 
                 id = str(uuid.uuid4())
 
-                auth = AuthModel(
-                    **{"id": id, "email": email, "password": password, "active": True}
-                )
-                result = Auth(**auth.model_dump())
-                db.add(result)
-
                 user = Users.insert_new_user(
                     id,
                     name,
@@ -159,6 +153,12 @@ class AuthsTable:
                     db.rollback()
                     return None
 
+                auth = AuthModel(
+                    **{"id": id, "email": email, "password": password, "active": True}
+                )
+                result = Auth(**auth.model_dump())
+                db.add(result)
+
                 if role == "admin":
                     Users.ensure_primary_admin(id, db=db, commit=False)
 
@@ -170,6 +170,7 @@ class AuthsTable:
 
                 return Users.get_user_by_id(id, db=db)
             except Exception:
+                log.exception("Failed to insert auth for %s", email)
                 db.rollback()
                 return None
 

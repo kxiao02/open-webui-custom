@@ -2,7 +2,7 @@ import { browser, dev } from '$app/environment';
 import { env } from '$env/dynamic/public';
 // import { version } from '../../package.json';
 
-export const APP_NAME = 'Open WebUI';
+export const APP_NAME = '中电慧语';
 
 const CONFIGURED_WEBUI_BASE_URL = (env.PUBLIC_WEBUI_BASE_URL || '').replace(/\/+$/, '');
 const DEFAULT_WEBUI_BASE_URL = browser && dev ? `http://${location.hostname}:8080` : '';

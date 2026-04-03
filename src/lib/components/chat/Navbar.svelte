@@ -47,6 +47,7 @@
 	import Knobs from '../icons/Knobs.svelte';
 	import Document from '../icons/Document.svelte';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
+	import { hasGeneratedFilesInHistory } from '$lib/utils/generated-files';
 
 	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
@@ -156,29 +157,7 @@
 	};
 
 	const hasFilePreviewData = (historyData: any) => {
-		if (!historyData?.messages || typeof historyData.messages !== 'object') {
-			return false;
-		}
-
-		for (const message of Object.values(historyData.messages) as Array<Record<string, any>>) {
-			if (Array.isArray(message?.files) && message.files.length > 0) {
-				return true;
-			}
-			if (typeof message?.content === 'string' && message.content.trim()) {
-				const content = message.content;
-				if (content.includes('/v1/files/')) {
-					return true;
-				}
-				if (
-					content.includes('type="tool_calls"') &&
-					(content.includes(' files="') || content.includes('generated_files'))
-				) {
-					return true;
-				}
-			}
-		}
-
-		return false;
+		return hasGeneratedFilesInHistory(historyData);
 	};
 
 	$: previewAvailable = hasFilePreviewData(history);
@@ -354,7 +333,7 @@
 					{/if}
 
 					{#if previewAvailable}
-						<Tooltip content={$i18n.t('File Preview')}>
+						<Tooltip content="文件预览">
 							<button
 								class="flex cursor-pointer px-2 py-2 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-850 transition"
 								on:click={async () => {
@@ -365,7 +344,7 @@
 									await showFilePreview.set(true);
 									await showControls.set(true);
 								}}
-								aria-label={$i18n.t('File Preview')}
+								aria-label="文件预览"
 							>
 								<div class="m-auto self-center">
 									<Document className="size-4.5" />

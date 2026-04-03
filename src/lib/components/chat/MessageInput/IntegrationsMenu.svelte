@@ -1,34 +1,20 @@
 <script lang="ts">
 	import { DropdownMenu } from 'bits-ui';
-	import { getContext, onMount, tick } from 'svelte';
-	import { fly } from 'svelte/transition';
+	import { getContext, tick } from 'svelte';
 	import { flyAndScale } from '$lib/utils/transitions';
 
-	import {
-		config,
-		user,
-		tools as _tools,
-		mobile,
-		settings,
-		toolServers,
-		terminalServers
-	} from '$lib/stores';
-
-	import { getOAuthClientAuthorizationUrl } from '$lib/apis/configs';
 	import { getTools } from '$lib/apis/tools';
+	import { user, tools } from '$lib/stores';
 
 	import Knobs from '$lib/components/icons/Knobs.svelte';
-	import Dropdown from '$lib/components/common/Dropdown.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Switch from '$lib/components/common/Switch.svelte';
-	import Spinner from '$lib/components/common/Spinner.svelte';
-	import Wrench from '$lib/components/icons/Wrench.svelte';
+	import Dropdown from '$lib/components/common/Dropdown.svelte';
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
 	import GlobeAlt from '$lib/components/icons/GlobeAlt.svelte';
 	import Photo from '$lib/components/icons/Photo.svelte';
 	import Terminal from '$lib/components/icons/Terminal.svelte';
-	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
-	import ChevronLeft from '$lib/components/icons/ChevronLeft.svelte';
+	import Wrench from '$lib/components/icons/Wrench.svelte';
 
 	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
@@ -54,53 +40,39 @@
 	export let closeOnOutsideClick = true;
 
 	let show = false;
-	let tab = '';
 
-	let tools = null;
+	const getAvailableTools = () =>
+		($tools ?? [])
+			.filter((tool) => !tool?.id?.startsWith('server:'))
+			.sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '', undefined, { sensitivity: 'base' }));
+
+	const getToolActionLabel = (tool: { id?: string; name?: string }) =>
+		selectedToolIds.includes(tool?.id ?? '')
+			? $i18n.t('Disable {{name}}', { name: tool?.name ?? tool?.id ?? '' })
+			: $i18n.t('Enable {{name}}', { name: tool?.name ?? tool?.id ?? '' });
+
+	const toggleToolSelection = (toolId: string) => {
+		if (lockedToolIds.includes(toolId)) {
+			return;
+		}
+
+		if (selectedToolIds.includes(toolId)) {
+			selectedToolIds = selectedToolIds.filter((id) => id !== toolId);
+			return;
+		}
+
+		selectedToolIds = [...new Set([...selectedToolIds, toolId])];
+	};
 
 	$: if (show) {
 		init();
 	}
 
-	let fileUploadEnabled = true;
-	$: fileUploadEnabled =
-		fileUploadCapableModels.length === selectedModels.length &&
-		($user?.role === 'admin' || ($user?.permissions?.chat?.file_upload ?? true));
-
 	const init = async () => {
-		if ($_tools === null) {
-			await _tools.set(await getTools(localStorage.token));
+		if ($tools === null) {
+			tools.set(await getTools(localStorage.token));
 		}
-
-		if ($_tools) {
-			tools = $_tools.reduce((a, tool, i, arr) => {
-				a[tool.id] = {
-					name: tool.name,
-					description: tool.meta.description,
-					enabled: selectedToolIds.includes(tool.id),
-					...tool
-				};
-				return a;
-			}, {});
-		}
-
-		if ($toolServers) {
-			for (const serverIdx in $toolServers) {
-				const server = $toolServers[serverIdx];
-				if (server.info) {
-					tools[`direct_server:${serverIdx}`] = {
-						name: server?.info?.title ?? server.url,
-						description: server.info.description ?? '',
-						enabled: selectedToolIds.includes(`direct_server:${serverIdx}`)
-					};
-				}
-			}
-		}
-
-		selectedToolIds = selectedToolIds.filter((id) => Object.keys(tools).includes(id));
 	};
-
-	const isToolLocked = (toolId: string) => lockedToolIds.includes(toolId);
 </script>
 
 <Dropdown
@@ -123,34 +95,69 @@
 			align="start"
 			transition={flyAndScale}
 		>
-			{#if tab === ''}
-				<div in:fly={{ x: -20, duration: 150 }}>
-					{#if tools}
-						{#if Object.keys(tools).length > 0}
-							<button
-								class="flex w-full justify-between gap-2 items-center px-3 py-1.5 text-sm cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800/50"
-								on:click={() => {
-									tab = 'tools';
-								}}
-							>
-								<Wrench />
-
-								<div class="flex items-center w-full justify-between">
-									<div class=" line-clamp-1">
-										{$i18n.t('Tools')}
-										<span class="ml-0.5 text-gray-500">{Object.keys(tools).length}</span>
-									</div>
-
-									<div class="text-gray-500">
-										<ChevronRight />
-									</div>
-								</div>
-							</button>
-						{/if}
-					{:else}
-						<div class="py-4">
-							<Spinner />
+			<div in:fly={{ x: -20, duration: 150 }}>
+					{#if getAvailableTools().length > 0}
+						<div class="px-3 py-2 text-xs text-gray-500 dark:text-gray-400">
+							{$i18n.t(
+								'Tool selection here affects this chat only. To keep a tool in your account, add it from Workspace.'
+							)}
 						</div>
+						<div class="mx-3 my-1 h-px bg-gray-100 dark:bg-gray-800"></div>
+					{/if}
+
+					{#if getAvailableTools().length > 0}
+						{#each getAvailableTools() as tool (tool.id)}
+							<Tooltip content={tool?.meta?.description ?? tool?.id} placement="top-start">
+								<button
+									class="flex w-full justify-between gap-2 items-center px-3 py-1.5 text-sm cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800/50"
+									aria-pressed={selectedToolIds.includes(tool.id)}
+									aria-label={getToolActionLabel(tool)}
+									on:click={() => {
+										toggleToolSelection(tool.id);
+									}}
+								>
+									<div class="flex-1 truncate">
+										<div class="flex flex-1 gap-2 items-center">
+											<div class="shrink-0">
+												<Wrench className="size-4" strokeWidth="1.75" />
+											</div>
+
+											<div class="truncate">{getToolActionLabel(tool)}</div>
+										</div>
+									</div>
+
+									{#if tool?.has_user_valves && selectedToolIds.includes(tool.id) && ($user?.role === 'admin' || ($user?.permissions?.chat?.valves ?? true))}
+										<div class="shrink-0">
+											<Tooltip content={$i18n.t('Valves')}>
+												<button
+													class="self-center w-fit text-sm text-gray-600 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 transition rounded-full"
+													type="button"
+													on:click={(e) => {
+														e.stopPropagation();
+														e.preventDefault();
+														onShowValves({
+															type: 'tool',
+															id: tool.id
+														});
+													}}
+												>
+													<Knobs />
+												</button>
+											</Tooltip>
+										</div>
+									{/if}
+
+									<div class="shrink-0 {lockedToolIds.includes(tool.id) ? 'pointer-events-none opacity-60' : ''}">
+										<Switch
+											state={selectedToolIds.includes(tool.id)}
+											on:change={async () => {
+												await tick();
+											}}
+										/>
+									</div>
+								</button>
+							</Tooltip>
+						{/each}
 					{/if}
 
 					{#if toggleFilters && toggleFilters.length > 0}
@@ -321,99 +328,6 @@
 						</Tooltip>
 					{/if}
 				</div>
-			{:else if tab === 'tools' && tools}
-				<div in:fly={{ x: 20, duration: 150 }}>
-					<button
-						class="flex w-full justify-between gap-2 items-center px-3 py-1.5 text-sm cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800/50"
-						on:click={() => {
-							tab = '';
-						}}
-					>
-						<ChevronLeft />
-
-						<div class="flex items-center w-full justify-between">
-							<div>
-								{$i18n.t('Tools')}
-								<span class="ml-0.5 text-gray-500">{Object.keys(tools).length}</span>
-							</div>
-						</div>
-					</button>
-
-					{#each Object.keys(tools) as toolId}
-						<button
-							class="relative flex w-full justify-between gap-2 items-center px-3 py-1.5 text-sm cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800/50"
-							on:click={async (e) => {
-								if (!(tools[toolId]?.authenticated ?? true)) {
-									e.preventDefault();
-
-									let parts = toolId.split(':');
-									let serverId = parts?.at(-1) ?? toolId;
-
-									const authUrl = getOAuthClientAuthorizationUrl(serverId, 'mcp');
-									window.open(authUrl, '_self', 'noopener');
-								} else {
-									if (isToolLocked(toolId) && tools[toolId]?.enabled) {
-										return;
-									}
-
-									tools[toolId].enabled = !tools[toolId].enabled;
-
-									const state = tools[toolId].enabled;
-									await tick();
-
-									if (state) {
-										selectedToolIds = [...selectedToolIds, toolId];
-									} else {
-										selectedToolIds = selectedToolIds.filter((id) => id !== toolId);
-									}
-								}
-							}}
-						>
-							{#if !(tools[toolId]?.authenticated ?? true)}
-								<!-- make it slighly darker and not clickable -->
-								<div class="absolute inset-0 opacity-50 rounded-xl cursor-pointer z-10" />
-							{/if}
-							<div class="flex-1 truncate">
-								<div class="flex flex-1 gap-2 items-center">
-									<Tooltip content={tools[toolId]?.name ?? ''} placement="top">
-										<div class="shrink-0">
-											<Wrench />
-										</div>
-									</Tooltip>
-									<Tooltip content={tools[toolId]?.description ?? ''} placement="top-start">
-										<div class=" truncate">{tools[toolId].name}</div>
-									</Tooltip>
-								</div>
-							</div>
-
-							{#if tools[toolId]?.has_user_valves && ($user?.role === 'admin' || ($user?.permissions?.chat?.valves ?? true))}
-								<div class=" shrink-0">
-									<Tooltip content={$i18n.t('Valves')}>
-										<button
-											class="self-center w-fit text-sm text-gray-600 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 transition rounded-full"
-											type="button"
-											on:click={(e) => {
-												e.stopPropagation();
-												e.preventDefault();
-												onShowValves({
-													type: 'tool',
-													id: toolId
-												});
-											}}
-										>
-											<Knobs />
-										</button>
-									</Tooltip>
-								</div>
-							{/if}
-
-							<div class=" shrink-0">
-								<Switch state={tools[toolId].enabled} />
-							</div>
-						</button>
-					{/each}
-				</div>
-			{/if}
 		</DropdownMenu.Content>
 	</div>
 </Dropdown>

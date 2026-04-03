@@ -427,6 +427,9 @@ from open_webui.config import (
     ENTERPRISE_OAUTH_ACCOUNT_NO_PATH,
     ENTERPRISE_OAUTH_EMAIL_CLAIM,
     ENTERPRISE_OAUTH_EMAIL_DOMAIN,
+    PORTAL_SSO_APP_INITIATED_ENABLED,
+    PORTAL_SSO_ENABLED,
+    PORTAL_SSO_PROVIDER_NAME,
     # WebUI (LDAP)
     ENABLE_LDAP,
     LDAP_SERVER_LABEL,
@@ -546,7 +549,11 @@ from open_webui.utils.middleware import (
     process_chat_payload,
     process_chat_response,
 )
-from open_webui.utils.tools import set_tool_servers, set_terminal_servers
+from open_webui.utils.tools import (
+    is_image_generation_tool_available,
+    set_terminal_servers,
+    set_tool_servers,
+)
 
 from open_webui.utils.auth import (
     get_license_data,
@@ -565,6 +572,7 @@ from open_webui.utils.oauth import (
     OAuthClientManager,
     OAuthClientInformationFull,
 )
+from open_webui.utils.portal_sso import PortalSSOManager
 from open_webui.utils.security_headers import SecurityHeadersMiddleware
 from open_webui.utils.redis import get_redis_connection
 
@@ -574,6 +582,8 @@ from open_webui.tasks import (
     create_task,
     stop_task,
     list_tasks,
+    redis_mark_instance_alive,
+    task_instance_heartbeat,
 )  # Import from tasks.py
 
 from open_webui.utils.redis import get_sentinels_from_env
@@ -690,8 +700,12 @@ async def lifespan(app: FastAPI):
     )
 
     if app.state.redis is not None:
+        await redis_mark_instance_alive(app.state.redis, app.state.instance_id)
         app.state.redis_task_command_listener = asyncio.create_task(
             redis_task_command_listener(app)
+        )
+        app.state.redis_task_instance_heartbeat = asyncio.create_task(
+            task_instance_heartbeat(app.state.redis, app.state.instance_id)
         )
 
     if THREAD_POOL_SIZE and THREAD_POOL_SIZE > 0:
@@ -763,6 +777,8 @@ async def lifespan(app: FastAPI):
 
     if hasattr(app.state, "redis_task_command_listener"):
         app.state.redis_task_command_listener.cancel()
+    if hasattr(app.state, "redis_task_instance_heartbeat"):
+        app.state.redis_task_instance_heartbeat.cancel()
 
 
 def _should_prewarm_retrieval(app: FastAPI) -> bool:
@@ -816,6 +832,8 @@ app = FastAPI(
 # For Open WebUI OIDC/OAuth2
 oauth_manager = OAuthManager(app)
 app.state.oauth_manager = oauth_manager
+portal_sso_manager = PortalSSOManager(app)
+app.state.portal_sso_manager = portal_sso_manager
 
 # For Integrations
 oauth_client_manager = OAuthClientManager(app)
@@ -1850,13 +1868,12 @@ async def chat_completion(
         default_model_params = (
             getattr(request.app.state.config, "DEFAULT_MODEL_PARAMS", None) or {}
         )
+        model_params = (
+            model_info.params.model_dump() if model_info and model_info.params else {}
+        )
         model_info_params = {
             **default_model_params,
-            **(
-                model_info.params.model_dump()
-                if model_info and model_info.params
-                else {}
-            ),
+            **model_params,
         }
 
         # Check base model existence for custom models
@@ -1891,8 +1908,34 @@ async def chat_completion(
         reasoning_tags = form_data.get("params", {}).get("reasoning_tags")
 
         # Model Params
-        if model_info_params.get("stream_response") is not None:
-            form_data["stream"] = model_info_params.get("stream_response")
+        stream_response_override = None
+        client_requested_stream = "stream" in form_data
+        if (
+            "stream_response" in model_params
+            and model_params.get("stream_response") is not None
+            and not client_requested_stream
+        ):
+            stream_response_override = model_params.get("stream_response")
+        elif (
+            "stream_response" in default_model_params
+            and default_model_params.get("stream_response") is not None
+            and not client_requested_stream
+        ):
+            stream_response_override = default_model_params.get("stream_response")
+
+        if stream_response_override is not None:
+            form_data["stream"] = stream_response_override
+
+        # If the client did not supply a stream flag, derive it from params or UI capabilities.
+        if "stream" not in form_data:
+            stream_candidate = None
+            params_payload = form_data.get("params")
+            if isinstance(params_payload, dict):
+                stream_candidate = params_payload.get("stream_response")
+            if stream_candidate is not None:
+                form_data["stream"] = bool(stream_candidate)
+            elif form_data.get("session_id") or form_data.get("client_capabilities"):
+                form_data["stream"] = True
 
         if model_info_params.get("stream_delta_chunk_size"):
             stream_delta_chunk_size = model_info_params.get("stream_delta_chunk_size")
@@ -1976,7 +2019,53 @@ async def chat_completion(
         )
 
     async def process_chat(request, form_data, user, metadata, model):
+        async def emit_waiting_status():
+            if (
+                metadata.get("waiting_status_active")
+                or not metadata.get("chat_id")
+                or not metadata.get("message_id")
+            ):
+                return
+
+            event_emitter = get_event_emitter(metadata)
+            if not event_emitter:
+                return
+
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "chat",
+                        "description": "处理中",
+                        "done": False,
+                    },
+                }
+            )
+            metadata["waiting_status_active"] = True
+
+        async def clear_waiting_status():
+            if not metadata.get("waiting_status_active"):
+                return
+
+            metadata["waiting_status_active"] = False
+            event_emitter = get_event_emitter(metadata)
+            if not event_emitter:
+                return
+
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "chat",
+                        "description": "处理中",
+                        "done": True,
+                        "hidden": True,
+                    },
+                }
+            )
+
         try:
+            await emit_waiting_status()
             form_data, metadata, events = await process_chat_payload(
                 request, form_data, user, metadata, model
             )
@@ -2004,6 +2093,7 @@ async def chat_completion(
         except asyncio.CancelledError:
             log.info("Chat processing was cancelled")
             try:
+                await clear_waiting_status()
                 event_emitter = get_event_emitter(metadata)
                 await asyncio.shield(
                     event_emitter(
@@ -2019,6 +2109,7 @@ async def chat_completion(
             if metadata.get("chat_id") and metadata.get("message_id"):
                 # Update the chat message with the error
                 try:
+                    await clear_waiting_status()
                     if not metadata["chat_id"].startswith("local:"):
                         Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata["chat_id"],
@@ -2043,6 +2134,10 @@ async def chat_completion(
                 except Exception:
                     pass
         finally:
+            try:
+                await clear_waiting_status()
+            except Exception as e:
+                log.debug(f"Error clearing chat waiting status: {e}")
             try:
                 if mcp_clients := metadata.get("mcp_clients"):
                     for client in reversed(mcp_clients.values()):
@@ -2071,6 +2166,7 @@ async def chat_completion(
             request.app.state.redis,
             process_chat(request, form_data, user, metadata, model),
             id=metadata["chat_id"],
+            instance_id=request.app.state.instance_id,
         )
         # Emit chat:active=true when task starts
         event_emitter = get_event_emitter(metadata, update_db=False)
@@ -2199,7 +2295,11 @@ async def stop_task_endpoint(
 
 @app.get("/api/tasks")
 async def list_tasks_endpoint(request: Request, user=Depends(get_verified_user)):
-    return {"tasks": await list_tasks(request.app.state.redis)}
+    return {
+        "tasks": await list_tasks(
+            request.app.state.redis, request.app.state.instance_id
+        )
+    }
 
 
 @app.get("/api/tasks/chat/{chat_id}")
@@ -2210,7 +2310,9 @@ async def list_tasks_by_chat_id_endpoint(
     if chat is None or chat.user_id != user.id:
         return {"task_ids": []}
 
-    task_ids = await list_task_ids_by_item_id(request.app.state.redis, chat_id)
+    task_ids = await list_task_ids_by_item_id(
+        request.app.state.redis, chat_id, request.app.state.instance_id
+    )
 
     log.debug(f"Task IDs for chat {chat_id}: {task_ids}")
     return {"task_ids": task_ids}
@@ -2267,6 +2369,11 @@ async def get_app_config(request: Request):
                 for name, config in OAUTH_PROVIDERS.items()
             }
         },
+        "portal_sso": {
+            "enabled": PORTAL_SSO_ENABLED.value,
+            "app_initiated_enabled": PORTAL_SSO_APP_INITIATED_ENABLED.value,
+            "provider_name": PORTAL_SSO_PROVIDER_NAME.value,
+        },
         "features": {
             "auth": WEBUI_AUTH,
             "auth_trusted_header": bool(app.state.AUTH_TRUSTED_EMAIL_HEADER),
@@ -2290,7 +2397,9 @@ async def get_app_config(request: Request):
                     "enable_web_search": app.state.config.ENABLE_WEB_SEARCH,
                     "enable_code_execution": app.state.config.ENABLE_CODE_EXECUTION,
                     "enable_code_interpreter": app.state.config.ENABLE_CODE_INTERPRETER,
-                    "enable_image_generation": app.state.config.ENABLE_IMAGE_GENERATION,
+                    "enable_image_generation": is_image_generation_tool_available(
+                        app.state.config
+                    ),
                     "enable_autocomplete_generation": app.state.config.ENABLE_AUTOCOMPLETE_GENERATION,
                     "enable_community_sharing": app.state.config.ENABLE_COMMUNITY_SHARING,
                     "enable_message_rating": app.state.config.ENABLE_MESSAGE_RATING,
@@ -2422,6 +2531,7 @@ async def get_app_version():
     return {
         "version": VERSION,
         "deployment_id": DEPLOYMENT_ID,
+        "build_hash": WEBUI_BUILD_HASH,
     }
 
 
@@ -2657,6 +2767,19 @@ async def oauth_client_callback(
 @app.get("/oauth/{provider}/login")
 async def oauth_login(provider: str, request: Request):
     return await oauth_manager.handle_login(request, provider)
+
+
+@app.get("/sso/portal/login")
+async def portal_sso_login(request: Request):
+    return await portal_sso_manager.handle_login(request)
+
+
+@app.get("/sso/portal/callback")
+async def portal_sso_callback(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    return await portal_sso_manager.handle_callback(request, db=db)
 
 
 # OAuth login logic is as follows:

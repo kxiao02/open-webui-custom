@@ -722,6 +722,15 @@
 				StarterKit.configure({
 					link: link,
 					code: false, // Disabled in favor of FixedCode (see workaround above)
+					...(richText
+						? {
+								codeBlock: false,
+								bulletList: false,
+								orderedList: false,
+								listItem: false,
+								listKeymap: false
+							}
+						: {}),
 					// When rich text is off, disable Strike from StarterKit so we can
 					// re-add it below without its Mod-Shift-s shortcut (which conflicts
 					// with the Toggle Sidebar shortcut). When rich text is on, the user

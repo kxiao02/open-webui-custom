@@ -33,10 +33,11 @@
 		tags: [],
 		published: false,
 		category: '',
-		visibility: 'public',
+		visibility: 'hidden',
 		dependencies: [],
 		is_default: false
 	};
+	let canSharePublic = false;
 
 	let accessGrants = [];
 	let showAccessControlModal = false;
@@ -82,6 +83,25 @@
 		hasManualDescription = true;
 	}
 
+	$: canSharePublic = $user?.role === 'admin' || !!$user?.permissions?.sharing?.public_skills;
+
+	$: if (!canSharePublic && meta?.visibility === 'public') {
+		meta = {
+			...meta,
+			visibility: 'hidden'
+		};
+	}
+
+	$: meta = {
+		tags: [],
+		published: false,
+		category: '',
+		visibility: canSharePublic ? 'public' : 'hidden',
+		dependencies: [],
+		is_default: false,
+		...meta
+	};
+
 	const submitHandler = async () => {
 		if (disabled) {
 			toast.error($i18n.t('You do not have permission to edit this skill.'));
@@ -113,7 +133,7 @@
 				tags: [],
 				published: false,
 				category: '',
-				visibility: 'public',
+				visibility: canSharePublic ? 'public' : 'hidden',
 				dependencies: [],
 				is_default: false,
 				...(skill.meta || {})
@@ -168,12 +188,12 @@
 						</div>
 
 						<div class="flex-1">
-							<Tooltip content={$i18n.t('e.g. Code Review Guidelines')} placement="top-start">
+						<Tooltip content="例如：代码审查指南" placement="top-start">
 								<input
 									class="w-full text-2xl bg-transparent outline-hidden"
 									type="text"
-									placeholder={$i18n.t('Skill Name')}
-									aria-label={$i18n.t('Skill Name')}
+									placeholder="技能名称"
+									aria-label="技能名称"
 									bind:value={name}
 									on:input={handleNameInput}
 									required
@@ -191,14 +211,12 @@
 								>
 									<LockClosed strokeWidth="2.5" className="size-3.5" />
 
-									<div class="text-sm font-medium shrink-0">
-										{$i18n.t('Access')}
-									</div>
+									<div class="text-sm font-medium shrink-0">权限</div>
 								</button>
 							{:else}
 								<span
 									class="text-xs text-gray-500 bg-gray-100 dark:bg-gray-800 px-2 py-1 rounded-full"
-									>{$i18n.t('Read Only')}</span
+									>只读</span
 								>
 							{/if}
 						</div>
@@ -212,14 +230,14 @@
 						{:else}
 							<Tooltip
 								className="w-full"
-								content={$i18n.t('e.g. code-review-guidelines')}
+								content="例如：code-review-guidelines"
 								placement="top-start"
 							>
 								<input
 									class="w-full text-sm disabled:text-gray-500 bg-transparent outline-hidden"
 									type="text"
-									placeholder={$i18n.t('Skill ID')}
-									aria-label={$i18n.t('Skill ID')}
+									placeholder="技能 ID"
+									aria-label="技能 ID"
 									bind:value={id}
 									on:input={handleIdInput}
 									required
@@ -230,14 +248,14 @@
 
 						<Tooltip
 							className="w-full self-center items-center flex"
-							content={$i18n.t('e.g. Step-by-step instructions for code reviews')}
+							content="例如：用于代码审查的分步说明"
 							placement="top-start"
 						>
 							<input
 								class="w-full text-sm bg-transparent outline-hidden"
 								type="text"
-								placeholder={$i18n.t('Skill Description')}
-								aria-label={$i18n.t('Skill Description')}
+								placeholder="技能描述"
+								aria-label="技能描述"
 								bind:value={description}
 								on:input={handleDescriptionInput}
 								{disabled}
@@ -246,39 +264,38 @@
 					</div>
 
 					<div class="grid gap-2 px-1 pt-2 md:grid-cols-2">
-						<Tooltip content={$i18n.t('Optional grouping shown in the catalog')} placement="top-start">
+						<Tooltip content="可选分类，用于在目录中分组显示" placement="top-start">
 							<input
 								class="w-full text-sm bg-transparent outline-hidden"
 								type="text"
-								placeholder={$i18n.t('Category')}
-								aria-label={$i18n.t('Category')}
+								placeholder="分类"
+								aria-label="分类"
 								bind:value={meta.category}
 								{disabled}
 							/>
 						</Tooltip>
 
 						<label class="flex items-center gap-2 text-sm text-gray-500">
-							<span>{$i18n.t('Visibility')}</span>
+							<span>可见性</span>
 							<select
 								class="flex-1 rounded-lg border border-gray-200 bg-white px-2 py-1 text-sm dark:border-gray-800 dark:bg-gray-900"
 								bind:value={meta.visibility}
 								disabled={disabled}
 							>
-								<option value="public">{$i18n.t('Public')}</option>
-								<option value="restricted">{$i18n.t('Restricted')}</option>
-								<option value="hidden">{$i18n.t('Hidden')}</option>
+								{#if canSharePublic || meta.visibility === 'public'}
+									<option value="public">公开</option>
+								{/if}
+								<option value="restricted">受限</option>
+								<option value="hidden">仅自己可见</option>
 							</select>
 						</label>
 
-						<Tooltip
-							content={$i18n.t('Comma-separated skill IDs that should be bundled with this skill')}
-							placement="top-start"
-						>
+						<Tooltip content="需要与该技能一起启用的技能 ID，使用逗号分隔" placement="top-start">
 							<input
 								class="w-full text-sm bg-transparent outline-hidden"
 								type="text"
-								placeholder={$i18n.t('Dependencies')}
-								aria-label={$i18n.t('Dependencies')}
+								placeholder="依赖项"
+								aria-label="依赖项"
 								value={(meta.dependencies ?? []).join(', ')}
 								disabled={disabled}
 								on:input={(event) => {
@@ -293,12 +310,12 @@
 						<div class="flex items-center gap-4 text-sm text-gray-500">
 							<label class="flex items-center gap-2">
 								<Switch bind:state={meta.published} />
-								<span>{$i18n.t('Published')}</span>
+								<span>已发布</span>
 							</label>
 
 							<label class="flex items-center gap-2">
 								<Switch bind:state={meta.is_default} />
-								<span>{$i18n.t('Default')}</span>
+								<span>默认</span>
 							</label>
 						</div>
 					</div>
@@ -317,8 +334,8 @@
 								<textarea
 									class="w-full flex-1 text-xs bg-transparent outline-hidden resize-none font-mono px-4 py-3"
 									bind:value={content}
-									placeholder={$i18n.t('Enter skill instructions in markdown...')}
-									aria-label={$i18n.t('Skill Instructions')}
+									placeholder="请输入 Markdown 格式的技能说明..."
+									aria-label="技能说明"
 									required
 								/>
 							{/if}
@@ -333,7 +350,7 @@
 							type="submit"
 							disabled={loading}
 						>
-							{$i18n.t(edit ? 'Save' : 'Save & Create')}
+							{edit ? '保存' : '保存并创建'}
 							{#if loading}
 								<span class="shrink-0">
 									<Spinner />

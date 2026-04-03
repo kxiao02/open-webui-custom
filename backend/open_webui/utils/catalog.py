@@ -81,6 +81,9 @@ def is_skill_catalog_visible(
     if getattr(user, "role", None) == "admin":
         return True
 
+    if getattr(skill, "user_id", None) == getattr(user, "id", None):
+        return True
+
     if require_active and not getattr(skill, "is_active", False):
         return False
 

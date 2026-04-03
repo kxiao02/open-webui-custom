@@ -1,5 +1,6 @@
 import logging
 import json
+import re
 import time
 import uuid
 from typing import Optional
@@ -9,6 +10,7 @@ from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.models.tags import TagModel, Tag, Tags
 from open_webui.models.folders import Folders
 from open_webui.models.chat_messages import ChatMessage, ChatMessages
+from open_webui.models.files import Files
 from open_webui.utils.misc import sanitize_data_for_db, sanitize_text_for_db
 
 from pydantic import BaseModel, ConfigDict
@@ -35,6 +37,287 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CHAT_TAIL_MESSAGES = 50
 MAX_CHAT_TAIL_MESSAGES = 200
+LEAKED_VISION_SPECIALIST_KEYS = {"observations", "uncertainties", "summary"}
+COLLAPSIBLE_DOCUMENT_FILE_EXTENSIONS = {"pdf", "docx", "pptx", "xlsx"}
+
+
+def _normalize_message_file_ref(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    lowered = normalized.lower()
+    if lowered in {"null", "undefined"}:
+        return ""
+    return normalized
+
+
+def _infer_message_file_name(file_item: dict) -> str:
+    for key in ("name", "filename", "fileName"):
+        value = _normalize_message_file_ref(file_item.get(key))
+        if value:
+            return value
+
+    for key in ("url", "path", "output_path", "target_path", "id"):
+        value = _normalize_message_file_ref(file_item.get(key))
+        if not value:
+            continue
+        basename = value.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        if basename:
+            return basename
+
+    return ""
+
+
+def _collapsible_message_file_key(file_item: dict) -> str:
+    name = _infer_message_file_name(file_item).strip().lower()
+    if "." not in name:
+        return ""
+
+    extension = name.rsplit(".", 1)[-1]
+    if extension not in COLLAPSIBLE_DOCUMENT_FILE_EXTENSIONS:
+        return ""
+
+    return name
+
+
+def _message_file_size(file_item: dict) -> Optional[int]:
+    value = file_item.get("size", file_item.get("size_bytes"))
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _collapse_assistant_generated_file_variants(files: list[dict]) -> list[dict]:
+    collapsed: list[dict] = []
+    index_by_key: dict[str, int] = {}
+
+    for file_item in files:
+        key = _collapsible_message_file_key(file_item)
+        if not key:
+            collapsed.append(file_item)
+            continue
+
+        existing_index = index_by_key.get(key)
+        if existing_index is None:
+            index_by_key[key] = len(collapsed)
+            collapsed.append(file_item)
+            continue
+
+        existing = collapsed[existing_index]
+        existing_size = _message_file_size(existing)
+        incoming_size = _message_file_size(file_item)
+
+        if (
+            existing_size is not None
+            and incoming_size is not None
+            and existing_size > incoming_size
+        ):
+            continue
+
+        collapsed[existing_index] = file_item
+
+    return collapsed
+
+
+def _extract_leading_json_block(text: str) -> tuple[object, int]:
+    if not isinstance(text, str):
+        return None, 0
+
+    stripped = text.lstrip()
+    leading_whitespace = len(text) - len(stripped)
+    if not stripped:
+        return None, 0
+
+    if stripped.startswith("```"):
+        match = re.match(
+            r"^```(?:json)?\s*\n(?P<body>[\s\S]*?)\n```",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None, 0
+        try:
+            payload = json.loads(match.group("body").strip())
+        except json.JSONDecodeError:
+            return None, 0
+        return payload, leading_whitespace + match.end()
+
+    if not stripped.startswith("{"):
+        return None, 0
+
+    try:
+        payload, end_index = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None, 0
+
+    return payload, leading_whitespace + end_index
+
+
+def _looks_like_leaked_vision_specialist_payload(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    keys = {str(key).strip() for key in payload.keys()}
+    if not keys or not keys.issubset(LEAKED_VISION_SPECIALIST_KEYS):
+        return False
+    if "summary" not in keys or not (keys & {"observations", "uncertainties"}):
+        return False
+
+    summary = payload.get("summary")
+    observations = payload.get("observations")
+    uncertainties = payload.get("uncertainties")
+
+    if not isinstance(summary, str) or not summary.strip():
+        return False
+    if observations is not None and not isinstance(observations, list):
+        return False
+    if uncertainties is not None and not isinstance(uncertainties, list):
+        return False
+
+    return True
+
+
+def _strip_leaked_vision_specialist_prefix(text: object) -> object:
+    if not isinstance(text, str):
+        return text
+
+    payload, end_index = _extract_leading_json_block(text)
+    if not _looks_like_leaked_vision_specialist_payload(payload):
+        return text
+
+    remainder = text[end_index:].lstrip()
+    if not remainder:
+        return text
+    if remainder.startswith(("```", "{", "[")):
+        return text
+
+    return remainder
+
+
+def _extract_text_from_output_parts(parts: object) -> str:
+    if not isinstance(parts, list):
+        return ""
+
+    chunks: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        text_value = part.get("text")
+        if text_value is None:
+            continue
+        chunks.append(text_value if isinstance(text_value, str) else str(text_value))
+
+    return "".join(chunks)
+
+
+def _sanitize_message_output(output: object) -> tuple[object, bool]:
+    if not isinstance(output, list):
+        return output, False
+
+    changed = False
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message" or item.get("role") != "assistant":
+            continue
+
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+
+        updated_content = []
+        item_changed = False
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") in {"text", "input_text", "output_text"}
+            ):
+                original_text = part.get("text")
+                sanitized_text = _strip_leaked_vision_specialist_prefix(original_text)
+                if sanitized_text != original_text:
+                    updated_content.append({**part, "text": sanitized_text})
+                    item_changed = True
+                    continue
+            updated_content.append(part)
+
+        if item_changed:
+            item["content"] = updated_content
+            changed = True
+
+    return output, changed
+
+
+def _serialize_message_output_content(output: object, fallback_content: object) -> str:
+    if isinstance(output, list):
+        blocks: list[str] = []
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            blocks.append(_extract_text_from_output_parts(item.get("content")))
+        content = "\n".join(block for block in blocks if block).strip()
+        if content:
+            return content
+    if isinstance(fallback_content, str):
+        return _strip_leaked_vision_specialist_prefix(fallback_content).strip()
+    return ""
+
+
+def _sanitize_assistant_message(message: object) -> tuple[object, bool]:
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return message, False
+
+    changed = False
+    output = message.get("output")
+    if isinstance(output, list):
+        _, output_changed = _sanitize_message_output(output)
+        if output_changed:
+            message["output"] = output
+            message["content"] = _serialize_message_output_content(
+                output, message.get("content", "")
+            )
+            changed = True
+
+    content = message.get("content")
+    if isinstance(content, str):
+        sanitized_content = _strip_leaked_vision_specialist_prefix(content)
+        if sanitized_content != content:
+            message["content"] = sanitized_content
+            changed = True
+
+    return message, changed
+
+
+def _sanitize_chat_history_specialist_leaks(chat_payload: object) -> tuple[object, bool]:
+    if not isinstance(chat_payload, dict):
+        return chat_payload, False
+
+    history = chat_payload.get("history")
+    if not isinstance(history, dict):
+        return chat_payload, False
+
+    messages = history.get("messages")
+    if not isinstance(messages, dict):
+        return chat_payload, False
+
+    changed = False
+    for message_id, message in messages.items():
+        sanitized_message, message_changed = _sanitize_assistant_message(message)
+        if message_changed:
+            messages[message_id] = sanitized_message
+            changed = True
+
+    return chat_payload, changed
 
 
 class Chat(Base):
@@ -402,11 +685,436 @@ class ChatTable:
         if chat_item.chat:
             cleaned = self._clean_null_bytes(chat_item.chat)
             cleaned, file_refs_changed = self._sanitize_chat_file_refs(cleaned)
-            if file_refs_changed or cleaned != chat_item.chat:
+            cleaned, specialist_leak_changed = _sanitize_chat_history_specialist_leaks(
+                cleaned
+            )
+            if file_refs_changed or specialist_leak_changed or cleaned != chat_item.chat:
                 chat_item.chat = cleaned
                 changed = True
 
         return changed
+
+    def _extract_chat_message_id(self, chat_id: str, composite_id: object) -> Optional[str]:
+        if not isinstance(chat_id, str) or not isinstance(composite_id, str):
+            return None
+
+        prefix = f"{chat_id}-"
+        if not composite_id.startswith(prefix):
+            return None
+
+        message_id = composite_id[len(prefix) :].strip()
+        return message_id or None
+
+    def _message_file_key(self, file_item: object) -> str:
+        if isinstance(file_item, str):
+            return self._normalize_file_ref(file_item) or ""
+
+        if not isinstance(file_item, dict):
+            return ""
+
+        refs = [
+            self._normalize_file_ref(file_item.get("id")),
+            self._normalize_file_ref(file_item.get("url")),
+            self._normalize_file_ref(
+                file_item.get("path")
+                or file_item.get("output_path")
+                or file_item.get("target_path")
+                or file_item.get("file_path")
+            ),
+            self._normalize_file_ref(
+                file_item.get("name")
+                or file_item.get("filename")
+                or file_item.get("fileName")
+            ),
+        ]
+        size = _message_file_size(file_item)
+        refs.append(str(size) if size is not None else "")
+        return "||".join(item or "" for item in refs)
+
+    def _message_file_from_file_model(self, file_model) -> dict:
+        file_meta = file_model.meta or {}
+        content_type = (
+            str(file_meta.get("content_type") or "application/octet-stream").strip()
+            or "application/octet-stream"
+        )
+        name = str(file_meta.get("name") or file_model.filename or "").strip()
+
+        file_item = {
+            "type": "image" if content_type.startswith("image/") else "file",
+            "id": file_model.id,
+            "url": f"/api/v1/files/{file_model.id}/content",
+            "name": name or file_model.id,
+            "filename": str(file_model.filename or name or file_model.id),
+            "content_type": content_type,
+            "status": "uploaded",
+            "error": "",
+            "file": {
+                "id": file_model.id,
+                "user_id": file_model.user_id,
+                "hash": file_model.hash,
+                "filename": file_model.filename,
+                "data": file_model.data,
+                "meta": file_meta,
+                "created_at": file_model.created_at,
+                "updated_at": file_model.updated_at,
+            },
+        }
+
+        size = file_meta.get("size")
+        if isinstance(size, bool):
+            size = None
+        elif isinstance(size, float):
+            size = int(size)
+        elif isinstance(size, str):
+            try:
+                size = int(size)
+            except ValueError:
+                size = None
+
+        if size is not None:
+            file_item["size"] = size
+
+        return file_item
+
+    def _merge_message_files(
+        self, existing_files: object, supplemental_files: list[dict], role: object
+    ) -> list:
+        merged_candidates: list = []
+
+        if isinstance(existing_files, list):
+            merged_candidates.extend(existing_files)
+        if isinstance(supplemental_files, list):
+            merged_candidates.extend(supplemental_files)
+
+        sanitized_files, _ = self._sanitize_files_list(merged_candidates)
+
+        merged_files: list = []
+        seen_keys: set[str] = set()
+        for file_item in sanitized_files:
+            dedupe_key = self._message_file_key(file_item)
+            if dedupe_key and dedupe_key in seen_keys:
+                continue
+            if dedupe_key:
+                seen_keys.add(dedupe_key)
+            merged_files.append(file_item)
+
+        if (
+            str(role or "").strip().lower() == "assistant"
+            and merged_files
+            and all(isinstance(item, dict) for item in merged_files)
+        ):
+            merged_files = _collapse_assistant_generated_file_variants(merged_files)
+
+        return merged_files
+
+    def _message_output_item_key(self, item: object) -> str:
+        if not isinstance(item, dict):
+            return ""
+
+        item_type = str(item.get("type") or "").strip()
+        if not item_type:
+            return ""
+
+        call_id = str(item.get("call_id") or "").strip()
+        if call_id:
+            return f"{item_type}:{call_id}"
+
+        item_id = str(item.get("id") or "").strip()
+        if item_id:
+            return f"{item_type}:{item_id}"
+
+        return ""
+
+    def _message_output_has_structured_items(self, output: object) -> bool:
+        if not isinstance(output, list):
+            return False
+
+        return any(
+            isinstance(item, dict) and item.get("type") != "message" for item in output
+        )
+
+    def _merge_message_output_items(
+        self, existing_item: object, incoming_item: object
+    ) -> object:
+        if not isinstance(existing_item, dict):
+            return incoming_item
+        if not isinstance(incoming_item, dict):
+            return existing_item
+
+        merged_item = {**existing_item, **incoming_item}
+
+        existing_status = str(existing_item.get("status") or "").strip().lower()
+        incoming_status = str(incoming_item.get("status") or "").strip().lower()
+        if existing_status in {"completed", "success", "error", "timeout"} and (
+            not incoming_status or incoming_status == "in_progress"
+        ):
+            merged_item["status"] = existing_item.get("status")
+
+        for key in ("content", "output", "summary"):
+            existing_value = existing_item.get(key)
+            incoming_value = incoming_item.get(key)
+            if incoming_value in (None, "", []):
+                if existing_value not in (None, "", []):
+                    merged_item[key] = existing_value
+            elif isinstance(existing_value, list) and isinstance(incoming_value, list):
+                if len(existing_value) > len(incoming_value):
+                    merged_item[key] = existing_value
+
+        existing_files = existing_item.get("files")
+        incoming_files = incoming_item.get("files")
+        if isinstance(existing_files, list) or isinstance(incoming_files, list):
+            merged_item["files"] = self._merge_message_files(
+                existing_files,
+                incoming_files if isinstance(incoming_files, list) else [],
+                "assistant",
+            )
+
+        return merged_item
+
+    def _merge_message_output(
+        self,
+        existing_output: object,
+        incoming_output: object,
+        fallback_content: object = "",
+    ) -> object:
+        if not isinstance(existing_output, list):
+            return incoming_output
+        if not isinstance(incoming_output, list):
+            return existing_output
+
+        merged_output = json.loads(json.dumps(existing_output, ensure_ascii=False))
+        incoming_messages: list[dict] = []
+        existing_index_by_key: dict[str, int] = {}
+
+        for index, item in enumerate(merged_output):
+            key = self._message_output_item_key(item)
+            if key:
+                existing_index_by_key[key] = index
+
+        for item in incoming_output:
+            if not isinstance(item, dict):
+                continue
+
+            if item.get("type") == "message" and item.get("role") == "assistant":
+                incoming_messages.append(item)
+                continue
+
+            key = self._message_output_item_key(item)
+            if key and key in existing_index_by_key:
+                target_index = existing_index_by_key[key]
+                merged_output[target_index] = self._merge_message_output_items(
+                    merged_output[target_index], item
+                )
+                continue
+
+            merged_output.append(json.loads(json.dumps(item, ensure_ascii=False)))
+            if key:
+                existing_index_by_key[key] = len(merged_output) - 1
+
+        if incoming_messages:
+            latest_message = json.loads(
+                json.dumps(incoming_messages[-1], ensure_ascii=False)
+            )
+            existing_message_index = next(
+                (
+                    index
+                    for index in range(len(merged_output) - 1, -1, -1)
+                    if isinstance(merged_output[index], dict)
+                    and merged_output[index].get("type") == "message"
+                    and merged_output[index].get("role") == "assistant"
+                ),
+                None,
+            )
+            if existing_message_index is None:
+                merged_output.append(latest_message)
+            else:
+                merged_output[existing_message_index] = self._merge_message_output_items(
+                    merged_output[existing_message_index], latest_message
+                )
+        elif (
+            self._message_output_has_structured_items(existing_output)
+            and not self._message_output_has_structured_items(incoming_output)
+        ):
+            fallback_text = _serialize_message_output_content(
+                incoming_output, fallback_content
+            )
+            if fallback_text:
+                existing_message_index = next(
+                    (
+                        index
+                        for index in range(len(merged_output) - 1, -1, -1)
+                        if isinstance(merged_output[index], dict)
+                        and merged_output[index].get("type") == "message"
+                        and merged_output[index].get("role") == "assistant"
+                    ),
+                    None,
+                )
+                if existing_message_index is not None:
+                    merged_output[existing_message_index]["content"] = [
+                        {"type": "output_text", "text": fallback_text}
+                    ]
+
+        return merged_output
+
+    def _merge_message_payload(
+        self, existing_message: object, incoming_message: object
+    ) -> object:
+        if not isinstance(existing_message, dict):
+            return incoming_message
+        if not isinstance(incoming_message, dict):
+            return existing_message
+
+        merged_message = {**existing_message, **incoming_message}
+        role = incoming_message.get("role", existing_message.get("role"))
+
+        if isinstance(existing_message.get("files"), list) or isinstance(
+            incoming_message.get("files"), list
+        ):
+            merged_message["files"] = self._merge_message_files(
+                existing_message.get("files"),
+                incoming_message.get("files")
+                if isinstance(incoming_message.get("files"), list)
+                else [],
+                role,
+            )
+
+        if isinstance(existing_message.get("output"), list) or isinstance(
+            incoming_message.get("output"), list
+        ):
+            merged_message["output"] = self._merge_message_output(
+                existing_message.get("output"),
+                incoming_message.get("output"),
+                incoming_message.get("content", existing_message.get("content", "")),
+            )
+            merged_message["content"] = _serialize_message_output_content(
+                merged_message.get("output"),
+                incoming_message.get("content", existing_message.get("content", "")),
+            )
+
+        if existing_message.get("done") is True and incoming_message.get("done") is not True:
+            merged_message["done"] = True
+
+        return merged_message
+
+    def _hydrate_chat_message_files(
+        self, chat_payload: dict, chat_id: str, db: Optional[Session] = None
+    ) -> tuple[dict, bool]:
+        if not isinstance(chat_payload, dict):
+            return chat_payload, False
+
+        history = chat_payload.get("history")
+        if not isinstance(history, dict):
+            return chat_payload, False
+
+        messages = history.get("messages")
+        if not isinstance(messages, dict) or not messages:
+            return chat_payload, False
+
+        message_files: dict[str, list[dict]] = {}
+
+        with get_db_context(db) as db:
+            try:
+                chat_messages = ChatMessages.get_messages_by_chat_id(chat_id, db=db)
+                for chat_message in chat_messages:
+                    message_id = self._extract_chat_message_id(chat_id, chat_message.id)
+                    if not message_id or not isinstance(chat_message.files, list):
+                        continue
+                    if not chat_message.files:
+                        continue
+                    message_files.setdefault(message_id, []).extend(chat_message.files)
+            except Exception as e:
+                log.warning(
+                    "Failed to load chat_message files for chat %s: %s", chat_id, e
+                )
+
+            try:
+                chat_file_rows = (
+                    db.query(ChatFile)
+                    .filter_by(chat_id=chat_id)
+                    .filter(ChatFile.message_id.isnot(None))
+                    .order_by(ChatFile.created_at.asc())
+                    .all()
+                )
+
+                file_ids = []
+                for row in chat_file_rows:
+                    file_id = str(row.file_id or "").strip()
+                    if file_id:
+                        file_ids.append(file_id)
+
+                file_models_by_id = {
+                    file_model.id: file_model
+                    for file_model in Files.get_files_by_ids(list(set(file_ids)), db=db)
+                }
+
+                for row in chat_file_rows:
+                    message_id = str(row.message_id or "").strip()
+                    if not message_id:
+                        continue
+
+                    file_model = file_models_by_id.get(str(row.file_id or "").strip())
+                    if file_model is None:
+                        continue
+
+                    message_files.setdefault(message_id, []).append(
+                        self._message_file_from_file_model(file_model)
+                    )
+            except Exception as e:
+                log.warning(
+                    "Failed to load chat_file attachments for chat %s: %s", chat_id, e
+                )
+
+        if not message_files:
+            return chat_payload, False
+
+        hydrated_messages: Optional[dict] = None
+        changed = False
+
+        for message_id, supplemental_files in message_files.items():
+            message = messages.get(message_id)
+            if not isinstance(message, dict) or not supplemental_files:
+                continue
+
+            merged_files = self._merge_message_files(
+                message.get("files"), supplemental_files, message.get("role")
+            )
+            if merged_files == message.get("files"):
+                continue
+
+            if hydrated_messages is None:
+                hydrated_messages = dict(messages)
+
+            hydrated_messages[message_id] = {**message, "files": merged_files}
+            changed = True
+
+        if not changed or hydrated_messages is None:
+            return chat_payload, False
+
+        return {
+            **chat_payload,
+            "history": {
+                **history,
+                "messages": hydrated_messages,
+            },
+        }, True
+
+    def _prepare_chat_row_for_read(
+        self, chat_item: Chat, db: Session
+    ) -> Chat:
+        changed = self._sanitize_chat_row(chat_item)
+
+        hydrated_chat, hydrated_changed = self._hydrate_chat_message_files(
+            chat_item.chat, chat_item.id, db=db
+        )
+        if hydrated_changed:
+            chat_item.chat = hydrated_chat
+            changed = True
+
+        if changed:
+            db.commit()
+            db.refresh(chat_item)
+
+        return chat_item
 
     def _resolve_history_current_id(self, history: dict) -> Optional[str]:
         messages = history.get("messages") if isinstance(history, dict) else None
@@ -800,10 +1508,10 @@ class ChatTable:
         history = chat.get("history", {})
 
         if message_id in history.get("messages", {}):
-            history["messages"][message_id] = {
-                **history["messages"][message_id],
-                **message,
-            }
+            history["messages"][message_id] = self._merge_message_payload(
+                history["messages"][message_id],
+                message,
+            )
         else:
             history["messages"][message_id] = message
 
@@ -850,6 +1558,7 @@ class ChatTable:
             if chat is None:
                 return None
 
+            user_id = chat.user_id
             chat = chat.chat
             history = chat.get("history", {})
 
@@ -859,22 +1568,137 @@ class ChatTable:
             for item in files or []:
                 if not isinstance(item, dict):
                     continue
-                ref = item.get("url")
-                if not (isinstance(ref, str) and ref.strip() and ref.strip().lower() not in {"null", "undefined"}):
-                    ref = item.get("id")
-                if not (isinstance(ref, str) and ref.strip() and ref.strip().lower() not in {"null", "undefined"}):
+
+                def _normalized_ref(*keys: str) -> str:
+                    for key in keys:
+                        value = item.get(key)
+                        if not isinstance(value, str):
+                            continue
+                        normalized = value.strip()
+                        if normalized and normalized.lower() not in {"null", "undefined"}:
+                            return normalized
+                    return ""
+
+                url_ref = _normalized_ref(
+                    "url",
+                    "bridge_url",
+                    "generated_file_url",
+                    "download_url",
+                    "downloadUrl",
+                )
+                id_ref = _normalized_ref(
+                    "id",
+                    "bridge_file_id",
+                    "file_id",
+                    "fileId",
+                )
+                path_ref = _normalized_ref(
+                    "path",
+                    "output_path",
+                    "target_path",
+                    "file_path",
+                )
+
+                if not any((url_ref, id_ref, path_ref)):
                     continue
+
                 normalized = {**item}
-                normalized["url"] = ref.strip()
+
+                if url_ref:
+                    normalized["url"] = url_ref
+                elif id_ref:
+                    normalized["url"] = id_ref
+                else:
+                    normalized["path"] = path_ref
+
+                if id_ref:
+                    normalized["id"] = id_ref
+                elif path_ref:
+                    normalized["id"] = path_ref
+
                 sanitized_files.append(normalized)
 
+            def _file_key(file_item: dict) -> str:
+                if not isinstance(file_item, dict):
+                    return ""
+                return "||".join(
+                    [
+                        str(file_item.get("id") or "").strip(),
+                        str(file_item.get("url") or "").strip(),
+                        str(file_item.get("path") or "").strip(),
+                        str(file_item.get("name") or file_item.get("filename") or "").strip(),
+                        str(file_item.get("size") or "").strip(),
+                    ]
+                )
+
             if message_id in history.get("messages", {}):
-                message_files = history["messages"][message_id].get("files", [])
-                message_files = message_files + sanitized_files
+                existing_files = history["messages"][message_id].get("files", [])
+                message_files = []
+                seen_file_keys: set[str] = set()
+
+                for file_item in [*(existing_files or []), *sanitized_files]:
+                    if not isinstance(file_item, dict):
+                        continue
+                    dedupe_key = _file_key(file_item)
+                    if dedupe_key and dedupe_key in seen_file_keys:
+                        continue
+                    if dedupe_key:
+                        seen_file_keys.add(dedupe_key)
+                    message_files.append(file_item)
+
+                role = str(history["messages"][message_id].get("role") or "").strip().lower()
+                if role == "assistant":
+                    message_files = _collapse_assistant_generated_file_variants(
+                        message_files
+                    )
+
                 history["messages"][message_id]["files"] = message_files
+            elif sanitized_files:
+                message_files = []
+                seen_file_keys: set[str] = set()
+
+                for file_item in sanitized_files:
+                    if not isinstance(file_item, dict):
+                        continue
+                    dedupe_key = _file_key(file_item)
+                    if dedupe_key and dedupe_key in seen_file_keys:
+                        continue
+                    if dedupe_key:
+                        seen_file_keys.add(dedupe_key)
+                    message_files.append(file_item)
+
+                message_files = _collapse_assistant_generated_file_variants(message_files)
+
+                history.setdefault("messages", {})[message_id] = {
+                    "role": "assistant",
+                    "content": "",
+                    "files": message_files,
+                    "done": False,
+                    "timestamp": int(time.time()),
+                }
+                if not history.get("currentId"):
+                    history["currentId"] = message_id
 
             chat["history"] = history
             self.update_chat_by_id(id, chat, db=db)
+
+            if message_files:
+                try:
+                    message_payload = (
+                        history.get("messages", {}).get(message_id) or {"files": message_files}
+                    )
+                    if "files" not in message_payload:
+                        message_payload = {**message_payload, "files": message_files}
+                    ChatMessages.upsert_message(
+                        message_id=message_id,
+                        chat_id=id,
+                        user_id=user_id,
+                        data=message_payload,
+                        db=db,
+                    )
+                except Exception as e:
+                    log.warning(f"Failed to write message files to chat_message table: {e}")
+
             return message_files
 
     def insert_shared_chat_by_chat_id(
@@ -1264,9 +2088,7 @@ class ChatTable:
                 if chat_item is None:
                     return None
 
-                if self._sanitize_chat_row(chat_item):
-                    db.commit()
-                    db.refresh(chat_item)
+                chat_item = self._prepare_chat_row_for_read(chat_item, db)
 
                 chat = ChatModel.model_validate(chat_item)
                 if history_tail is not None:
@@ -1304,9 +2126,7 @@ class ChatTable:
                 if chat is None:
                     return None
 
-                if self._sanitize_chat_row(chat):
-                    db.commit()
-                    db.refresh(chat)
+                chat = self._prepare_chat_row_for_read(chat, db)
 
                 chat_model = ChatModel.model_validate(chat)
                 if history_tail is not None:

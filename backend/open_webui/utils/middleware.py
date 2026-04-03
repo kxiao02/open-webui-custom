@@ -17,6 +17,7 @@ import html
 import inspect
 import re
 import ast
+from urllib.parse import urlparse
 
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
@@ -553,6 +554,157 @@ def is_opening_code_block(content):
     return len(backtick_segments) > 1 and len(backtick_segments) % 2 == 0
 
 
+TOOL_RESULT_PREVIEW_LIMIT = 900
+TOOL_RESULT_ERROR_LIMIT = 600
+TOOL_RESULT_WEBPAGE_LIMIT = 280
+TOOL_RESULT_SEARCH_ITEMS_LIMIT = 5
+TOOL_RESULT_BASE64ISH_CHUNK_RE = re.compile(r"[A-Za-z0-9+/=_-]{160,}")
+
+
+def _collapse_preview_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _truncate_preview_text(value: str, limit: int) -> str:
+    text = _collapse_preview_whitespace(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(limit - 1, 0)].rstrip()}…"
+
+
+def _extract_tool_result_message(parsed_result: Any) -> str:
+    if not isinstance(parsed_result, dict):
+        return ""
+
+    for key in ("message", "detail", "error", "content"):
+        value = parsed_result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return ""
+
+
+def _infer_tool_result_status(result_text: str, parsed_result: Any) -> str:
+    if isinstance(parsed_result, dict):
+        status = str(parsed_result.get("status", "") or "").strip().lower()
+        if status in {"error", "failed"}:
+            return "error"
+        if status == "timeout":
+            return "timeout"
+        if parsed_result.get("success") is False or parsed_result.get("ok") is False:
+            return "error"
+
+        error_text = _extract_tool_result_message(parsed_result)
+        if error_text:
+            lowered_error = error_text.lower()
+            if "timeout" in lowered_error:
+                return "timeout"
+            if any(
+                marker in lowered_error
+                for marker in (
+                    "error",
+                    "exception",
+                    "traceback",
+                    "failed",
+                    "connection refused",
+                )
+            ):
+                return "error"
+
+    lowered = str(result_text or "").strip().lower()
+    if not lowered:
+        return "success"
+    if "timeout" in lowered:
+        return "timeout"
+    if lowered.startswith("error"):
+        return "error"
+    if any(
+        marker in lowered
+        for marker in (
+            "error fetching",
+            "exception",
+            "traceback",
+            "failed to ",
+            "connection refused",
+        )
+    ):
+        return "error"
+    return "success"
+
+
+def _build_tool_result_preview(
+    tool_name: str,
+    result_text: str,
+    parsed_result: Any,
+    result_status: str,
+) -> str:
+    message = _extract_tool_result_message(parsed_result)
+    if result_status in {"error", "timeout"}:
+        return _truncate_preview_text(message or result_text, TOOL_RESULT_ERROR_LIMIT)
+
+    normalized_tool_name = str(tool_name or "").strip().lower()
+
+    if normalized_tool_name in {"internet_search", "search_web"} and isinstance(
+        parsed_result, dict
+    ):
+        results = parsed_result.get("results")
+        if isinstance(results, list):
+            preview: dict[str, Any] = {
+                "query": str(parsed_result.get("query", "") or "").strip(),
+                "count": len(results),
+            }
+            items = []
+            for result in results[:TOOL_RESULT_SEARCH_ITEMS_LIMIT]:
+                if not isinstance(result, dict):
+                    continue
+                title = str(result.get("title", "") or result.get("url", "")).strip()
+                url = str(result.get("url", "") or "").strip()
+                if title and url:
+                    items.append({"title": title, "url": url})
+                elif title:
+                    items.append({"title": title})
+            if items:
+                preview["items"] = items
+            return json.dumps(preview, ensure_ascii=False)
+
+    if normalized_tool_name in {"visit_webpage", "fetch_url"}:
+        if isinstance(parsed_result, dict):
+            url = str(parsed_result.get("url", "") or "").strip()
+            snippet = _extract_tool_result_message(parsed_result)
+            if snippet and not TOOL_RESULT_BASE64ISH_CHUNK_RE.search(snippet):
+                preview = _truncate_preview_text(snippet, TOOL_RESULT_WEBPAGE_LIMIT)
+                if url:
+                    return json.dumps(
+                        {"url": url, "snippet": preview}, ensure_ascii=False
+                    )
+                return preview
+            if url:
+                return json.dumps(
+                    {"url": url, "message": "网页内容已读取并用于后续回答。"},
+                    ensure_ascii=False,
+                )
+            return "网页内容已读取并用于后续回答。"
+
+        collapsed = _collapse_preview_whitespace(result_text)
+        if collapsed and not TOOL_RESULT_BASE64ISH_CHUNK_RE.search(collapsed):
+            return _truncate_preview_text(collapsed, TOOL_RESULT_WEBPAGE_LIMIT)
+        return "网页内容已读取并用于后续回答。"
+
+    if isinstance(parsed_result, (dict, list)):
+        serialized = json.dumps(parsed_result, ensure_ascii=False)
+        return _truncate_preview_text(serialized, TOOL_RESULT_PREVIEW_LIMIT)
+
+    return _truncate_preview_text(result_text, TOOL_RESULT_PREVIEW_LIMIT)
+
+
+def _tool_call_summary_label(result_status: str) -> str:
+    if result_status == "error":
+        return "Tool Failed"
+    if result_status == "timeout":
+        return "Tool Timed Out"
+    return "Tool Executed"
+
+
 def serialize_output(output: list) -> str:
     """
     Convert OR-aligned output items to HTML for display.
@@ -597,12 +749,20 @@ def serialize_output(output: list) -> str:
                             if not isinstance(output_text, str)
                             else output_text
                         )
+                parsed_result = _parse_nested_json_value(result_text)
+                result_status = _infer_tool_result_status(result_text, parsed_result)
+                preview_result = _build_tool_result_preview(
+                    name,
+                    result_text,
+                    parsed_result,
+                    result_status,
+                )
                 files = result_item.get("files")
                 embeds = result_item.get("embeds", "")
 
-                content += f'<details type="tool_calls" done="true" id="{call_id}" name="{name}" arguments="{html.escape(json.dumps(arguments))}" result="{html.escape(json.dumps(result_text, ensure_ascii=False))}" files="{html.escape(json.dumps(files)) if files else ""}" embeds="{html.escape(json.dumps(embeds))}">\n<summary>Tool Executed</summary>\n</details>\n'
+                content += f'<details type="tool_calls" done="true" status="{result_status}" id="{call_id}" name="{name}" arguments="{html.escape(json.dumps(arguments))}" result="{html.escape(json.dumps(preview_result, ensure_ascii=False))}" files="{html.escape(json.dumps(files)) if files else ""}" embeds="{html.escape(json.dumps(embeds))}">\n<summary>{_tool_call_summary_label(result_status)}</summary>\n</details>\n'
             else:
-                content += f'<details type="tool_calls" done="false" id="{call_id}" name="{name}" arguments="{html.escape(json.dumps(arguments))}">\n<summary>Executing...</summary>\n</details>\n'
+                content += f'<details type="tool_calls" done="false" status="running" id="{call_id}" name="{name}" arguments="{html.escape(json.dumps(arguments))}">\n<summary>Executing...</summary>\n</details>\n'
 
         elif item_type == "function_call_output":
             # Already handled inline with function_call above
@@ -687,6 +847,224 @@ def serialize_output(output: list) -> str:
     return content.strip()
 
 
+def _extract_text_from_output_parts(parts: Any) -> str:
+    if not isinstance(parts, list):
+        return ""
+
+    chunks: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+
+        text_value = part.get("text")
+        if text_value is None:
+            continue
+
+        chunks.append(text_value if isinstance(text_value, str) else str(text_value))
+
+    return "".join(chunks)
+
+
+_LEAKED_VISION_SPECIALIST_KEYS = {"observations", "uncertainties", "summary"}
+
+
+def _extract_leading_json_block(text: str) -> tuple[Any, int]:
+    if not isinstance(text, str):
+        return None, 0
+
+    stripped = text.lstrip()
+    leading_whitespace = len(text) - len(stripped)
+    if not stripped:
+        return None, 0
+
+    if stripped.startswith("```"):
+        match = re.match(
+            r"^```(?:json)?\s*\n(?P<body>[\s\S]*?)\n```",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None, 0
+        try:
+            payload = json.loads(match.group("body").strip())
+        except json.JSONDecodeError:
+            return None, 0
+        return payload, leading_whitespace + match.end()
+
+    if not stripped.startswith("{"):
+        return None, 0
+
+    try:
+        payload, end_index = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None, 0
+
+    return payload, leading_whitespace + end_index
+
+
+def _looks_like_leaked_vision_specialist_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    keys = {str(key).strip() for key in payload.keys()}
+    if not keys or not keys.issubset(_LEAKED_VISION_SPECIALIST_KEYS):
+        return False
+    if "summary" not in keys or not (keys & {"observations", "uncertainties"}):
+        return False
+
+    summary = payload.get("summary")
+    observations = payload.get("observations")
+    uncertainties = payload.get("uncertainties")
+
+    if not isinstance(summary, str) or not summary.strip():
+        return False
+    if observations is not None and not isinstance(observations, list):
+        return False
+    if uncertainties is not None and not isinstance(uncertainties, list):
+        return False
+
+    return True
+
+
+def _strip_leaked_vision_specialist_prefix(text: Any) -> Any:
+    if not isinstance(text, str):
+        return text
+
+    payload, end_index = _extract_leading_json_block(text)
+    if not _looks_like_leaked_vision_specialist_payload(payload):
+        return text
+
+    remainder = text[end_index:].lstrip()
+    if not remainder:
+        return text
+    if remainder.startswith(("```", "{", "[")):
+        return text
+
+    return remainder
+
+
+def _normalize_output_for_chat(output: list) -> list:
+    if not isinstance(output, list):
+        return []
+
+    normalized_output = copy.deepcopy(output)
+    terminal_status_by_call_id: dict[str, str] = {}
+
+    for item in normalized_output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "function_call_output":
+            continue
+
+        call_id = str(item.get("call_id") or "").strip()
+        output_text = _extract_text_from_output_parts(item.get("output"))
+        parsed_output = _parse_nested_json_value(output_text)
+        inferred_status = _infer_tool_result_status(output_text, parsed_output)
+        output_status = str(item.get("status") or "").strip().lower()
+
+        if output_status not in {"success", "completed", "error", "timeout"}:
+            if inferred_status in {"success", "error", "timeout"}:
+                item["status"] = inferred_status
+                output_status = inferred_status
+
+        terminal_status = None
+        if output_status in {"success", "completed"}:
+            terminal_status = "completed"
+        elif output_status in {"error", "timeout"}:
+            terminal_status = output_status
+        elif inferred_status in {"success", "error", "timeout"}:
+            terminal_status = "completed" if inferred_status == "success" else inferred_status
+
+        if call_id and terminal_status:
+            terminal_status_by_call_id[call_id] = terminal_status
+
+    for item in normalized_output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "function_call":
+            continue
+
+        call_id = str(item.get("call_id") or item.get("id") or "").strip()
+        terminal_status = terminal_status_by_call_id.get(call_id)
+        if not terminal_status:
+            continue
+
+        current_status = str(item.get("status") or "").strip().lower()
+        if current_status in {"completed", "error", "timeout"}:
+            continue
+
+        item["status"] = terminal_status
+
+    for item in normalized_output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message" or item.get("role") != "assistant":
+            continue
+
+        content = item.get("content")
+        if isinstance(content, list):
+            updated_content = []
+            changed = False
+            for part in content:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") in {"text", "input_text", "output_text"}
+                ):
+                    original_text = part.get("text")
+                    sanitized_text = _strip_leaked_vision_specialist_prefix(
+                        original_text
+                    )
+                    if sanitized_text != original_text:
+                        updated_content.append({**part, "text": sanitized_text})
+                        changed = True
+                        continue
+                updated_content.append(part)
+            if changed:
+                item["content"] = updated_content
+        elif isinstance(content, str):
+            item["content"] = _strip_leaked_vision_specialist_prefix(content)
+
+    return normalized_output
+
+
+def _serialize_output_for_chat_content(
+    output: list,
+    *,
+    fallback_content: str = "",
+) -> str:
+    message_blocks: list[str] = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+
+        message_text = _extract_text_from_output_parts(item.get("content"))
+        message_text = _strip_bridge_details_blocks(message_text).strip()
+        message_text = _strip_leaked_vision_specialist_prefix(message_text).strip()
+        if message_text:
+            message_blocks.append(message_text)
+
+    content = "\n".join(message_blocks).strip()
+    if not content and isinstance(fallback_content, str):
+        content = _strip_bridge_details_blocks(fallback_content).strip()
+
+    return content
+
+
+def _build_chat_completion_payload(
+    output: list,
+    *,
+    fallback_content: str = "",
+) -> tuple[list, dict]:
+    normalized_output = _normalize_output_for_chat(output)
+    return normalized_output, {
+        "content": _serialize_output_for_chat_content(
+            normalized_output,
+            fallback_content=fallback_content,
+        ),
+        "output": normalized_output,
+    }
+
+
 def deep_merge(target, source):
     """
     Merge source into target recursively (returning new structure).
@@ -706,6 +1084,31 @@ def deep_merge(target, source):
         return target + source
     else:
         return source
+
+
+def _resolve_output_item_index(
+    current_output: list,
+    *,
+    output_index: int | None = None,
+    item: dict | None = None,
+) -> int | None:
+    if output_index is not None and 0 <= output_index < len(current_output):
+        return output_index
+
+    if not isinstance(item, dict):
+        return None
+
+    item_id = item.get("id")
+    call_id = item.get("call_id")
+    for index, current_item in enumerate(current_output):
+        if not isinstance(current_item, dict):
+            continue
+        if item_id and current_item.get("id") == item_id:
+            return index
+        if call_id and current_item.get("call_id") == call_id:
+            return index
+
+    return None
 
 
 def handle_responses_streaming_event(
@@ -729,6 +1132,16 @@ def handle_responses_streaming_event(
     # We will shallow copy only if we need to modify the list structure or items.
 
     event_type = data.get("type", "")
+
+    def output_has_tool_items(items: Any) -> bool:
+        if not isinstance(items, list):
+            return False
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") in {"function_call", "function_call_output"}:
+                return True
+        return False
 
     if event_type == "response.output_item.added":
         item = data.get("item", {})
@@ -1002,10 +1415,14 @@ def handle_responses_streaming_event(
     elif event_type == "response.output_item.done":
         # Delta Event: Output item complete
         item = data.get("item")
-        output_index = data.get("output_index", len(current_output) - 1)
+        output_index = _resolve_output_item_index(
+            current_output,
+            output_index=data.get("output_index"),
+            item=item,
+        )
 
         new_output = list(current_output)
-        if item and 0 <= output_index < len(current_output):
+        if item and output_index is not None:
             new_output[output_index] = item
         elif item:
             new_output.append(item)
@@ -1016,7 +1433,16 @@ def handle_responses_streaming_event(
         response_data = data.get("response", {})
         final_output = response_data.get("output")
 
-        new_output = final_output if final_output is not None else current_output
+        if isinstance(final_output, list):
+            # Prefer accumulated streaming output when the completed payload omits tool items.
+            if current_output and output_has_tool_items(current_output) and not output_has_tool_items(final_output):
+                new_output = current_output
+            elif current_output and not final_output:
+                new_output = current_output
+            else:
+                new_output = final_output
+        else:
+            new_output = current_output
 
         # Ensure reasoning items are marked as completed in the final output
         if new_output:
@@ -1118,6 +1544,18 @@ BRIDGE_GENERATED_FILE_TOOLS = {
     "replace_file_content",
     "write_structured_file",
 }
+BRIDGE_BINARY_GENERATED_FILE_TOOLS = {
+    "gotenberg_convert",
+    "pdf_create_document",
+    "pdf_inspect_form",
+    "pdf_fill_form_tool",
+    "pdf_reformat_document",
+    "docx_export_document",
+    "pptx_export_presentation",
+    "xlsx_create_workbook",
+    "xlsx_add_column_tool",
+    "xlsx_insert_row_tool",
+}
 TERMINAL_GENERATED_FILE_PATH_KEYS = (
     "path",
     "output_path",
@@ -1138,6 +1576,7 @@ BRIDGE_TOOL_CALL_BLOCK_RE = re.compile(
     re.IGNORECASE,
 )
 BRIDGE_TOOL_CALL_ATTR_RE = re.compile(r'([A-Za-z_:][\w:.-]*)="([^"]*)"')
+BRIDGE_DETAILS_TYPE_RE = re.compile(r'\btype\s*=\s*"([^"]+)"', re.IGNORECASE)
 BRIDGE_TEXTUAL_CONTENT_KEYS = ("content", "text", "body")
 BRIDGE_FILE_PATH_KEYS = ("path", "file_path", "file", "output_path", "target_path")
 BRIDGE_TEXTUAL_MIME_TYPES = {
@@ -1150,7 +1589,7 @@ BRIDGE_TEXTUAL_MIME_TYPES = {
     "application/x-yaml",
     "application/yaml",
 }
-CLIENT_CAPABILITIES_SCHEMA_VERSION = 1
+CLIENT_CAPABILITIES_SCHEMA_VERSION = 2
 CLIENT_CAPABILITIES_PREVIEW_TYPES = (
     "image",
     "pdf",
@@ -1159,6 +1598,37 @@ CLIENT_CAPABILITIES_PREVIEW_TYPES = (
     "markdown",
     "code",
 )
+
+
+def _normalize_bridge_output_events(raw: Any) -> list[dict]:
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    return []
+
+
+def _strip_bridge_details_blocks(
+    content: str,
+    *,
+    types: Optional[set[str]] = None,
+) -> str:
+    if not isinstance(content, str) or "<details" not in content:
+        return content
+    type_filter = {t.lower() for t in (types or {"tool_calls", "reasoning"})}
+
+    def replace_block(match: re.Match[str]) -> str:
+        attrs_text = match.group("attrs") or ""
+        type_match = BRIDGE_DETAILS_TYPE_RE.search(attrs_text)
+        if not type_match:
+            return match.group(0)
+        if type_match.group(1).strip().lower() in type_filter:
+            return ""
+        return match.group(0)
+
+    return BRIDGE_TOOL_CALL_BLOCK_RE.sub(replace_block, content)
 
 
 def _tool_result_explicitly_failed(tool_result: Any) -> bool:
@@ -1739,30 +2209,38 @@ async def terminal_event_handler(
 
 def strip_leading_message_output_before_tool_call(output: list) -> list:
     """
-    Remove assistant message items that appear before the first tool call.
+    Remove assistant message items that appear before the last tool call.
 
     Some tool-using models emit a short planning/progress sentence before the
-    first `tool_calls` delta (for example, "我来为您查询..."). That text is
+    next `tool_calls` delta (for example, "我来为您查询..."). That text is
     part of the execution flow and should not remain in the persisted final
-    answer once the tool workflow begins.
+    answer once the tool workflow continues.
     """
-    first_tool_call_index = next(
+    last_tool_call_index = next(
         (
             index
-            for index, item in enumerate(output)
+            for index, item in reversed(list(enumerate(output)))
             if item.get("type") == "function_call"
         ),
         None,
     )
-    if first_tool_call_index is None:
+    if last_tool_call_index is None:
         return output
 
-    prefix = output[:first_tool_call_index]
-    if not any(item.get("type") == "message" for item in prefix):
+    if not any(
+        item.get("type") == "message"
+        for index, item in enumerate(output)
+        if index < last_tool_call_index
+    ):
         return output
 
-    cleaned_prefix = [item for item in prefix if item.get("type") != "message"]
-    return cleaned_prefix + output[first_tool_call_index:]
+    cleaned_output = []
+    for index, item in enumerate(output):
+        if item.get("type") == "message" and index < last_tool_call_index:
+            continue
+        cleaned_output.append(item)
+
+    return cleaned_output
 
 
 async def chat_completion_tools_handler(
@@ -2272,10 +2750,13 @@ def _normalize_generated_file_entry(item: Any) -> Optional[dict]:
         ),
         "",
     )
-    if not ref:
+    inline_content = str(
+        item.get("content_base64") or item.get("contentBase64") or ""
+    ).strip()
+    if not ref and not inline_content:
         return None
 
-    normalized = {"url": ref}
+    normalized = {"url": ref} if ref else {}
 
     file_id = item.get("id")
     if isinstance(file_id, str) and file_id.strip():
@@ -2293,9 +2774,16 @@ def _normalize_generated_file_entry(item: Any) -> Optional[dict]:
     if isinstance(content_type, str) and content_type.strip():
         normalized["content_type"] = content_type.strip()
 
-    file_size = item.get("bytes")
+    file_size = item.get("bytes", item.get("size"))
     if isinstance(file_size, (int, float)) and file_size >= 0:
         normalized["size"] = int(file_size)
+
+    call_id = item.get("call_id") or item.get("tool_call_id") or item.get("toolCallId")
+    if isinstance(call_id, str) and call_id.strip():
+        normalized["call_id"] = call_id.strip()
+
+    if inline_content:
+        normalized["content_base64"] = inline_content
 
     return normalized
 
@@ -2308,7 +2796,251 @@ def _generated_file_ref_key(item: dict) -> str:
         normalized_ref = ref.strip()
         if normalized_ref:
             return normalized_ref
+    inline_content = item.get("content_base64")
+    if isinstance(inline_content, str) and inline_content.strip():
+        inline_name = str(item.get("name") or item.get("filename") or "generated-file").strip()
+        inline_size = item.get("size")
+        return f"inline:{inline_name}:{inline_size}:{len(inline_content.strip())}"
     return ""
+
+
+def _upload_inline_generated_file(
+    request: Request,
+    file_item: dict,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> Optional[dict]:
+    if user is None or not isinstance(metadata, dict):
+        return None
+
+    content_base64 = str(file_item.get("content_base64") or "").strip()
+    if not content_base64:
+        return None
+
+    filename = str(
+        file_item.get("name") or file_item.get("filename") or "generated-file"
+    ).strip()
+    if not filename:
+        filename = "generated-file"
+
+    content_type = str(
+        file_item.get("content_type")
+        or mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    ).strip()
+
+    try:
+        content_bytes = base64.b64decode(content_base64, validate=True)
+    except Exception as exc:
+        log.warning("Failed to decode inline generated file %s: %s", filename, exc)
+        return None
+
+    upload = UploadFile(
+        file=io.BytesIO(content_bytes),
+        filename=filename,
+        headers={"content-type": content_type},
+    )
+
+    file_metadata = {
+        "source": "bridge_generated_file",
+        "chat_id": metadata.get("chat_id"),
+        "message_id": metadata.get("message_id"),
+        "session_id": metadata.get("session_id"),
+    }
+    file_metadata = {
+        key: value for key, value in file_metadata.items() if value not in (None, "")
+    }
+
+    try:
+        uploaded = upload_file_handler(
+            request,
+            file=upload,
+            metadata=file_metadata,
+            process=False,
+            user=user,
+        )
+    except Exception as exc:
+        log.warning("Failed to upload inline generated file %s: %s", filename, exc)
+        return None
+
+    file_id = str(getattr(uploaded, "id", "") or "").strip()
+    if not file_id:
+        return None
+
+    file_meta = getattr(uploaded, "meta", {}) or {}
+    return {
+        "id": file_id,
+        "url": str(request.app.url_path_for("get_file_content_by_id", id=file_id)),
+        "name": str(file_meta.get("name") or getattr(uploaded, "filename", filename)),
+        "filename": str(getattr(uploaded, "filename", filename)),
+        "type": "image" if content_type.startswith("image/") else "file",
+        "content_type": str(file_meta.get("content_type") or content_type),
+        "size": file_meta.get("size", len(content_bytes)),
+    }
+
+
+def _materialize_generated_files(
+    request: Request,
+    files: list[dict],
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> list[dict]:
+    materialized: list[dict] = []
+    seen_refs: set[str] = set()
+
+    for item in files or []:
+        candidate = item
+        if isinstance(item, dict) and item.get("content_base64"):
+            uploaded = _upload_inline_generated_file(request, item, metadata, user)
+            if not uploaded:
+                continue
+            candidate = uploaded
+        elif isinstance(item, dict):
+            download_ref = (
+                item.get("bridge_download_url")
+                or item.get("bridgeDownloadUrl")
+                or item.get("download_url")
+                or item.get("downloadUrl")
+                or item.get("bridge_url")
+                or item.get("bridgeUrl")
+                or item.get("url")
+            )
+            download_url = _normalize_bridge_download_url(request, download_ref)
+            if download_url and not _is_openwebui_file_ref(download_ref):
+                # Keep bridge-owned generated files on the existing OpenAI proxy path so
+                # completion delivery is not blocked by download-and-reupload work.
+                proxied_url = _build_openai_proxy_download_url(
+                    download_ref if isinstance(download_ref, str) and download_ref.strip() else download_url
+                )
+                if proxied_url:
+                    candidate = {
+                        **item,
+                        "url": proxied_url,
+                        "download_url": proxied_url,
+                    }
+                else:
+                    uploaded = _upload_bridge_downloaded_file(
+                        request,
+                        str(item.get("tool_name") or "bridge_generated_file"),
+                        item,
+                        download_url,
+                        metadata,
+                        user,
+                    )
+                    if uploaded:
+                        candidate = uploaded
+
+        if not isinstance(candidate, dict):
+            continue
+
+        if isinstance(item, dict):
+            for binding_key in ("call_id", "tool_call_id", "toolCallId"):
+                binding_value = item.get(binding_key)
+                if isinstance(binding_value, str) and binding_value.strip():
+                    candidate.setdefault("call_id", binding_value.strip())
+                    break
+
+        ref_key = _generated_file_ref_key(candidate)
+        if ref_key and ref_key in seen_refs:
+            continue
+        if ref_key:
+            seen_refs.add(ref_key)
+        materialized.append(candidate)
+
+    return materialized
+
+
+def _merge_generated_file_entries(*groups: Any) -> list[dict]:
+    merged_files: list[dict] = []
+    index_by_ref: dict[str, int] = {}
+
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for item in group:
+            normalized = _normalize_generated_file_entry(item)
+            if not normalized:
+                continue
+            ref_key = _generated_file_ref_key(normalized)
+            if ref_key and ref_key in index_by_ref:
+                existing = merged_files[index_by_ref[ref_key]]
+                merged_files[index_by_ref[ref_key]] = {
+                    **existing,
+                    **{
+                        key: value
+                        for key, value in normalized.items()
+                        if value not in (None, "", [], {})
+                    },
+                }
+                continue
+            if ref_key:
+                index_by_ref[ref_key] = len(merged_files)
+            merged_files.append(normalized)
+
+    return merged_files
+
+
+def _collect_generated_files_from_output_items(output: Any) -> list[dict]:
+    if not isinstance(output, list):
+        return []
+
+    collected_files: list[dict] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if not isinstance(item.get("files"), list):
+            continue
+        collected_files.extend(item.get("files"))
+
+    return _merge_generated_file_entries(collected_files)
+
+
+def _attach_generated_files_to_output(output: list, files: list[dict]) -> list:
+    if not isinstance(output, list) or not output or not isinstance(files, list) or not files:
+        return output
+
+    normalized_files = _merge_generated_file_entries(files)
+    if not normalized_files:
+        return output
+
+    enriched_output = copy.deepcopy(output)
+    scoped_files_by_call_id: dict[str, list[dict]] = {}
+    unscoped_files: list[dict] = []
+
+    for file_item in normalized_files:
+        call_id = str(file_item.get("call_id") or "").strip()
+        if call_id:
+            scoped_files_by_call_id.setdefault(call_id, []).append(file_item)
+        else:
+            unscoped_files.append(file_item)
+
+    target_index = None
+    for index, item in enumerate(enriched_output):
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            continue
+        target_index = index
+        call_id = str(item.get("call_id") or "").strip()
+        if not call_id or call_id not in scoped_files_by_call_id:
+            continue
+
+        existing_files = item.get("files")
+        item["files"] = _merge_generated_file_entries(
+            existing_files if isinstance(existing_files, list) else [],
+            scoped_files_by_call_id.pop(call_id),
+        )
+
+    remaining_files = _merge_generated_file_entries(
+        unscoped_files,
+        *scoped_files_by_call_id.values(),
+    )
+    if remaining_files and target_index is not None:
+        existing_files = enriched_output[target_index].get("files")
+        enriched_output[target_index]["files"] = _merge_generated_file_entries(
+            existing_files if isinstance(existing_files, list) else [],
+            remaining_files,
+        )
+
+    return enriched_output
 
 
 def _extract_generated_files_from_choices(choices: Any) -> list[dict]:
@@ -2385,6 +3117,16 @@ def _default_client_capabilities(
             "mode": "inline_or_modal",
             "types": list(CLIENT_CAPABILITIES_PREVIEW_TYPES),
         },
+        "workspace_tool_draft": {
+            "enabled": True,
+            "mode": "confirm_then_edit",
+            "format": "python_tool_class",
+        },
+        "workspace_skill_draft": {
+            "enabled": True,
+            "mode": "confirm_then_edit",
+            "format": "markdown_skill",
+        },
     }
 
 
@@ -2402,7 +3144,13 @@ def _resolve_client_capabilities(
     resolved = deep_update(copy.deepcopy(defaults), incoming)
     resolved["schema_version"] = CLIENT_CAPABILITIES_SCHEMA_VERSION
 
-    for key in ("generated_file_download", "chat_share", "file_preview"):
+    for key in (
+        "generated_file_download",
+        "chat_share",
+        "file_preview",
+        "workspace_tool_draft",
+        "workspace_skill_draft",
+    ):
         default_enabled = bool((defaults.get(key) or {}).get("enabled"))
         requested_enabled = bool((resolved.get(key) or {}).get("enabled"))
         resolved.setdefault(key, {})
@@ -2432,10 +3180,14 @@ def _build_client_capabilities_system_prompt(client_capabilities: Optional[dict]
     generated_file_download = client_capabilities.get("generated_file_download") or {}
     chat_share = client_capabilities.get("chat_share") or {}
     file_preview = client_capabilities.get("file_preview") or {}
+    workspace_tool_draft = client_capabilities.get("workspace_tool_draft") or {}
+    workspace_skill_draft = client_capabilities.get("workspace_skill_draft") or {}
 
     download_enabled = bool(generated_file_download.get("enabled"))
     share_enabled = bool(chat_share.get("enabled"))
     preview_enabled = bool(file_preview.get("enabled"))
+    tool_draft_enabled = bool(workspace_tool_draft.get("enabled"))
+    skill_draft_enabled = bool(workspace_skill_draft.get("enabled"))
     preview_types = ", ".join(file_preview.get("types") or [])
 
     lines = [
@@ -2443,11 +3195,18 @@ def _build_client_capabilities_system_prompt(client_capabilities: Optional[dict]
         f"- generated_file_download.enabled={'true' if download_enabled else 'false'}：当 assistant 消息已附带标准文件引用时，界面会显示可下载文件链接。",
         f"- chat_share.enabled={'true' if share_enabled else 'false'}：{'当前会话可通过界面分享链接共享' if share_enabled else '当前会话不应向用户承诺可直接分享'}。",
         f"- file_preview.enabled={'true' if preview_enabled else 'false'}：{'界面可预览这些类型：' + preview_types if preview_enabled and preview_types else '不要承诺界面预览能力'}。",
+        f"- workspace_tool_draft.enabled={'true' if tool_draft_enabled else 'false'}：{'当用户要求创建新工具时，你可以在回答中给出 1 个完整的工具草稿代码块；界面会提供确认创建入口，确认后再进入工具编辑器。' if tool_draft_enabled else '不要承诺可以在聊天中起草并创建工具'}",
+        f"- workspace_skill_draft.enabled={'true' if skill_draft_enabled else 'false'}：{'当用户要求创建新技能时，你可以在回答中给出 1 个完整的技能草稿代码块；界面会提供确认创建入口，确认后再进入技能编辑器。' if skill_draft_enabled else '不要承诺可以在聊天中起草并创建技能'}",
         "回答规则：",
         "1. 不要在 generated_file_download.enabled=true 的情况下说“不能下载”或“只能保存到本地”。",
         "2. 只有在对应 capability enabled=true 时，才能告诉用户界面支持该操作。",
         "3. 不要编造下载地址、分享链接或前端按钮状态；若链接由界面生成，只说明“可在界面直接下载/分享”。",
         "4. 若文件尚未生成或尚未作为标准文件引用返回，应明确说明需要先完成生成或上传步骤。",
+        "5. 当 workspace_tool_draft.enabled=true 或 workspace_skill_draft.enabled=true 时，不要把“不能自动静默创建”误说成“完全不能创建”。更准确的说法是：你可以先在聊天中起草，用户确认后再创建到工作区。",
+        "6. 不要声称工具或技能已经创建、安装、启用，除非用户已确认创建且创建结果已成功返回。",
+        "7. 工具草稿格式：返回 1 个 ```python 代码块，内容必须包含 `class Tools:`；如需元信息，可在代码开头使用三引号 frontmatter，例如 `title:`、`description:`、`requirements:`、`required_open_webui_version:`。",
+        "8. 技能草稿格式：返回 1 个 ```markdown 代码块，内容使用 `---` frontmatter，至少包含 `name`，可附带 `description`、`visibility`、`published`、`dependencies`，其后紧跟技能正文。",
+        "9. 当用户要求生成、导出、填写、转换或提供 Excel/PDF/DOCX/PPTX/表格模板等可下载文件时，必须先调用对应文档工具；只有本轮消息已经返回标准文件引用时，才能说“已生成”“可下载”或“界面已提供文件”。若本轮没有返回文件引用，必须明确说明文件尚未生成成功，不能假装文件已经在界面中。",
     ]
 
     return "\n".join(lines)
@@ -2605,6 +3364,245 @@ def _upload_bridge_generated_file(
     }
 
 
+def _resolve_bridge_api_base_url(request: Request) -> str:
+    base_urls = getattr(request.app.state.config, "OPENAI_API_BASE_URLS", []) or []
+    if isinstance(base_urls, str):
+        base_urls = [base_urls]
+    if not isinstance(base_urls, (list, tuple)) or not base_urls:
+        return ""
+    base_url = str(base_urls[0] or "").strip()
+    if base_url.endswith("/"):
+        base_url = base_url[:-1]
+    return base_url
+
+
+def _resolve_bridge_api_key(request: Request) -> str:
+    api_keys = getattr(request.app.state.config, "OPENAI_API_KEYS", []) or []
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+    if not isinstance(api_keys, (list, tuple)) or not api_keys:
+        return ""
+    return str(api_keys[0] or "").strip()
+
+
+def _normalize_bridge_download_url(request: Request, value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip()
+    if not candidate or candidate.lower() in {"null", "undefined"}:
+        return ""
+
+    base_url = _resolve_bridge_api_base_url(request)
+    if candidate.startswith(("http://", "https://")):
+        if base_url and candidate.startswith(base_url):
+            return candidate
+        return ""
+
+    if not base_url:
+        return ""
+
+    if not candidate.startswith("/"):
+        candidate = f"/{candidate}"
+    if base_url.endswith("/v1") and candidate.startswith("/v1/"):
+        return base_url[:-3] + candidate
+    return f"{base_url}{candidate}"
+
+
+def _build_openai_proxy_download_url(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+
+    candidate = value.strip()
+    if not candidate or candidate.lower() in {"null", "undefined"}:
+        return ""
+
+    parsed = urlparse(candidate)
+    if parsed.scheme and parsed.netloc:
+        candidate = parsed.path or ""
+        if parsed.query:
+            candidate = f"{candidate}?{parsed.query}"
+
+    if not candidate:
+        return ""
+    if candidate.startswith("/openai/"):
+        return candidate
+    if not candidate.startswith("/"):
+        candidate = f"/{candidate}"
+    return f"/openai{candidate}"
+
+
+def _is_openwebui_file_ref(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip()
+    if not normalized:
+        return False
+    if normalized.startswith(
+        (
+            "/api/v1/files/",
+            "/openai/v1/files/",
+            "/v1/files/",
+            "/api/v1/generated-files/",
+            "/openai/v1/generated-files/",
+            "/v1/generated-files/",
+        )
+    ):
+        return True
+    return bool(
+        re.search(
+            r"/(?:api/v1|openai/v1|v1)/(?:files|generated-files)/[^/?#]+",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _download_bridge_generated_file(
+    request: Request,
+    download_url: str,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> Optional[dict]:
+    if not download_url:
+        return None
+
+    headers: dict[str, str] = {}
+    api_key = _resolve_bridge_api_key(request)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user is not None:
+        headers = include_user_info_headers(headers, user)
+        if isinstance(metadata, dict):
+            chat_id = metadata.get("chat_id")
+            message_id = metadata.get("message_id")
+            if chat_id:
+                headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = str(chat_id)
+            if message_id:
+                headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = str(message_id)
+
+    try:
+        response = requests.get(
+            download_url,
+            headers=headers,
+            timeout=(10, 300),
+            allow_redirects=False,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        log.warning("Failed to download bridge generated file from %s: %s", download_url, exc)
+        return None
+
+    filename = _extract_filename_from_content_disposition(
+        response.headers.get("Content-Disposition", "")
+    ) or os.path.basename(download_url.split("?", 1)[0].rstrip("/"))
+    if not filename:
+        filename = "generated-file"
+
+    content_type = (
+        response.headers.get("Content-Type")
+        or mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    )
+
+    return {
+        "content": response.content,
+        "filename": filename,
+        "content_type": content_type,
+    }
+
+
+def _upload_bridge_downloaded_file(
+    request: Request,
+    tool_id: str,
+    candidate: dict,
+    download_url: str,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> Optional[dict]:
+    if user is None or not isinstance(metadata, dict):
+        return None
+
+    download = _download_bridge_generated_file(request, download_url, metadata, user)
+    if not download or not isinstance(download.get("content"), (bytes, bytearray)):
+        return None
+
+    content_bytes = download["content"]
+    if not content_bytes:
+        return None
+
+    filename = str(
+        candidate.get("name")
+        or candidate.get("filename")
+        or download.get("filename")
+        or "generated-file"
+    ).strip()
+    if not filename:
+        filename = "generated-file"
+
+    content_type = str(
+        candidate.get("content_type")
+        or candidate.get("contentType")
+        or download.get("content_type")
+        or mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    ).strip()
+
+    upload = UploadFile(
+        file=io.BytesIO(content_bytes),
+        filename=filename,
+        headers={"content-type": content_type},
+    )
+
+    file_metadata = {
+        "source": "bridge_generated_file",
+        "tool_name": tool_id,
+        "bridge_url": download_url,
+        "chat_id": metadata.get("chat_id"),
+        "message_id": metadata.get("message_id"),
+        "session_id": metadata.get("session_id"),
+    }
+    file_metadata = {
+        key: value for key, value in file_metadata.items() if value not in (None, "")
+    }
+
+    try:
+        file_item = upload_file_handler(
+            request,
+            file=upload,
+            metadata=file_metadata,
+            process=False,
+            user=user,
+        )
+    except Exception as exc:
+        log.warning("Failed to upload bridge generated file %s: %s", filename, exc)
+        return None
+
+    if not file_item:
+        return None
+
+    file_meta = getattr(file_item, "meta", {}) or {}
+    file_id = str(getattr(file_item, "id", "") or "").strip()
+    if not file_id:
+        return None
+
+    content_path = request.app.url_path_for("get_file_content_by_id", id=file_id)
+    normalized_content_type = (
+        str(file_meta.get("content_type") or content_type).strip()
+        or "application/octet-stream"
+    )
+
+    return {
+        "id": file_id,
+        "url": str(content_path),
+        "name": str(file_meta.get("name") or getattr(file_item, "filename", filename)),
+        "filename": str(getattr(file_item, "filename", filename)),
+        "type": "image" if normalized_content_type.startswith("image/") else "file",
+        "content_type": normalized_content_type,
+        "size": file_meta.get("size", len(content_bytes)),
+    }
+
+
 def _set_tool_call_block_files_attr(block: str, files: list[dict]) -> str:
     if not block or not files:
         return block
@@ -2626,6 +3624,114 @@ def _set_tool_call_block_files_attr(block: str, files: list[dict]) -> str:
         count=1,
         flags=re.IGNORECASE,
     )
+
+
+def _extract_bridge_binary_file_candidates(parsed_result: Any) -> list[Any]:
+    if not isinstance(parsed_result, dict):
+        return []
+
+    candidates: list[Any] = []
+    for key in (
+        "bridge_download_url",
+        "bridgeDownloadUrl",
+        "download_url",
+        "downloadUrl",
+        "bridge_url",
+        "bridgeUrl",
+    ):
+        value = parsed_result.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(parsed_result)
+            break
+
+    for key in (
+        "bridge_generated_files",
+        "bridgeGeneratedFiles",
+        "generated_files",
+        "generatedFiles",
+        "bridge_files",
+        "bridgeFiles",
+    ):
+        items = parsed_result.get(key)
+        if isinstance(items, list):
+            candidates.extend(items)
+
+    for key in (
+        "bridge_generated_file",
+        "bridgeGeneratedFile",
+        "generated_file",
+        "generatedFile",
+        "bridge_file",
+        "bridgeFile",
+    ):
+        item = parsed_result.get(key)
+        if item is not None:
+            candidates.append(item)
+
+    return candidates
+
+
+def _collect_bridge_binary_generated_files(
+    request: Request,
+    tool_id: str,
+    parsed_result: Any,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> list[dict]:
+    if user is None or not isinstance(metadata, dict):
+        return []
+
+    candidates = _extract_bridge_binary_file_candidates(parsed_result)
+    if not candidates:
+        return []
+
+    uploaded_files: list[dict] = []
+    for candidate in candidates:
+        normalized = _normalize_generated_file_entry(candidate)
+        if not normalized:
+            continue
+
+        if normalized.get("content_base64"):
+            uploaded = _upload_inline_generated_file(request, normalized, metadata, user)
+            if uploaded:
+                uploaded_files.append(uploaded)
+            continue
+
+        download_ref = None
+        if isinstance(candidate, dict):
+            download_ref = (
+                candidate.get("bridge_download_url")
+                or candidate.get("bridgeDownloadUrl")
+                or candidate.get("download_url")
+                or candidate.get("downloadUrl")
+                or candidate.get("bridge_url")
+                or candidate.get("bridgeUrl")
+                or candidate.get("url")
+            )
+        elif isinstance(candidate, str):
+            download_ref = candidate
+
+        if not download_ref and isinstance(normalized.get("url"), str):
+            download_ref = normalized.get("url")
+
+        download_url = _normalize_bridge_download_url(request, download_ref)
+        if not download_url:
+            if _is_openwebui_file_ref(normalized.get("url")):
+                uploaded_files.append(normalized)
+            continue
+
+        uploaded = _upload_bridge_downloaded_file(
+            request,
+            tool_id,
+            normalized,
+            download_url,
+            metadata,
+            user,
+        )
+        if uploaded:
+            uploaded_files.append(uploaded)
+
+    return uploaded_files
 
 
 def _collect_bridge_generated_files_from_content(
@@ -2655,7 +3761,10 @@ def _collect_bridge_generated_files_from_content(
             return block
 
         tool_id = _normalize_tool_call_tool_id(attrs)
-        if tool_id not in BRIDGE_GENERATED_FILE_TOOLS:
+        if (
+            tool_id not in BRIDGE_GENERATED_FILE_TOOLS
+            and tool_id not in BRIDGE_BINARY_GENERATED_FILE_TOOLS
+        ):
             return block
 
         parsed_result = _parse_nested_json_value(attrs.get("result", ""))
@@ -2663,75 +3772,313 @@ def _collect_bridge_generated_files_from_content(
             return block
 
         parsed_args = _parse_nested_json_value(attrs.get("arguments", ""))
-        if not isinstance(parsed_args, dict):
+        uploaded_files: list[dict] = []
+
+        if tool_id in BRIDGE_GENERATED_FILE_TOOLS and isinstance(parsed_args, dict):
+            file_path = _extract_bridge_file_path(parsed_args)
+            file_content = _extract_bridge_text_content(parsed_args)
+            if file_path and file_content is not None:
+                uploaded = _upload_bridge_generated_file(
+                    request,
+                    tool_id,
+                    file_path,
+                    file_content,
+                    metadata,
+                    user,
+                )
+                if uploaded:
+                    uploaded_files.append(uploaded)
+
+        if tool_id in BRIDGE_BINARY_GENERATED_FILE_TOOLS:
+            uploaded_files.extend(
+                _collect_bridge_binary_generated_files(
+                    request,
+                    tool_id,
+                    parsed_result,
+                    metadata,
+                    user,
+                )
+            )
+
+        if not uploaded_files:
             return block
 
-        file_path = _extract_bridge_file_path(parsed_args)
-        file_content = _extract_bridge_text_content(parsed_args)
-        if not file_path or file_content is None:
-            return block
-
-        uploaded = _upload_bridge_generated_file(
-            request,
-            tool_id,
-            file_path,
-            file_content,
-            metadata,
-            user,
-        )
-        if not uploaded:
-            return block
-
-        generated_files.append(uploaded)
-        return _set_tool_call_block_files_attr(block, [uploaded])
+        generated_files.extend(uploaded_files)
+        return _set_tool_call_block_files_attr(block, uploaded_files)
 
     updated_content = BRIDGE_TOOL_CALL_BLOCK_RE.sub(replace_block, content)
     return updated_content, generated_files
 
 
-def add_file_context(messages: list, chat_id: str, user) -> list:
+async def _finalize_bridge_generated_files_from_output(
+    request: Request,
+    output: list,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> None:
+    if not output or user is None or not isinstance(metadata, dict):
+        return
+
+    chat_id = str(metadata.get("chat_id") or "").strip()
+    message_id = str(metadata.get("message_id") or "").strip()
+    if not chat_id or not message_id:
+        return
+
+    try:
+        final_output, final_payload = _build_chat_completion_payload(output)
+
+        serialized_markup = await asyncio.to_thread(serialize_output, final_output)
+        _updated_content, bridge_generated_files = await asyncio.to_thread(
+            _collect_bridge_generated_files_from_content,
+            request,
+            serialized_markup,
+            metadata,
+            user,
+        )
+
+        combined_generated_files = _merge_generated_file_entries(
+            _collect_generated_files_from_output_items(final_output),
+            bridge_generated_files,
+        )
+
+        emitted_files = None
+        if combined_generated_files:
+            message_files = await asyncio.to_thread(
+                Chats.add_message_files_by_id_and_message_id,
+                chat_id,
+                message_id,
+                combined_generated_files,
+            )
+            emitted_files = (
+                message_files
+                if isinstance(message_files, list) and message_files
+                else combined_generated_files
+            )
+            final_output = _attach_generated_files_to_output(final_output, emitted_files)
+            final_output, final_payload = _build_chat_completion_payload(final_output)
+
+        await asyncio.to_thread(
+            Chats.upsert_message_to_chat_by_id_and_message_id,
+            chat_id,
+            message_id,
+            {
+                "role": "assistant",
+                "content": final_payload.get("content", ""),
+                "output": final_output,
+                **({"files": emitted_files} if isinstance(emitted_files, list) else {}),
+            },
+        )
+
+        event_emitter = get_event_emitter(metadata, update_db=False)
+        if event_emitter and isinstance(emitted_files, list) and emitted_files:
+            await event_emitter(
+                {
+                    "type": "files",
+                    "data": {
+                        "files": emitted_files,
+                    },
+                }
+            )
+            await event_emitter(
+                {
+                    "type": "chat:completion",
+                    "data": {
+                        "files": emitted_files,
+                        "metadata": {
+                            "generated_files": emitted_files,
+                        },
+                    },
+                }
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "Failed to finalize bridge generated files for chat %s message %s",
+            chat_id,
+            message_id,
+        )
+
+
+def _resolve_file_context_url(file_item: dict) -> str:
+    if not isinstance(file_item, dict):
+        return ""
+
+    raw_url = str(file_item.get("url") or "").strip()
+    file_id = str(file_item.get("id") or "").strip()
+
+    if raw_url and not raw_url.startswith("data:"):
+        if raw_url.startswith(("http://", "https://", "/")):
+            return raw_url
+        if raw_url.startswith(("api/", "openai/", "v1/")):
+            return f"/{raw_url}"
+        if "/" in raw_url:
+            return f"/{raw_url.lstrip('/')}"
+        return f"/api/v1/files/{raw_url}/content"
+
+    if file_id:
+        return f"/api/v1/files/{file_id}/content"
+
+    return ""
+
+
+def _file_context_key(file_item: dict) -> str:
+    if not isinstance(file_item, dict):
+        return ""
+
+    for key in ("id", "url", "name"):
+        value = str(file_item.get(key) or "").strip()
+        if value:
+            return f"{key}:{value}"
+
+    return ""
+
+
+def _get_stored_chat_messages(
+    chat_id: str,
+    user: UserModel,
+    message_id: Optional[str] = None,
+) -> list[dict]:
+    if not chat_id or chat_id.startswith("local:"):
+        return []
+
+    chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+    if not chat:
+        return []
+
+    history = chat.chat.get("history", {})
+    target_message_id = message_id or history.get("currentId")
+    return get_message_list(history.get("messages", {}), target_message_id)
+
+
+def _collect_stored_message_files(stored_messages: list[dict]) -> list[dict]:
+    collected: list[dict] = []
+    seen_keys: set[str] = set()
+
+    for stored_message in stored_messages:
+        # Carry forward prior user-provided context, not assistant-generated artifacts.
+        if str(stored_message.get("role") or "").strip().lower() != "user":
+            continue
+        for file_item in stored_message.get("files", []):
+            if not isinstance(file_item, dict):
+                continue
+            if not _resolve_file_context_url(file_item):
+                continue
+            file_key = _file_context_key(file_item)
+            if file_key and file_key in seen_keys:
+                continue
+            if file_key:
+                seen_keys.add(file_key)
+            collected.append(file_item)
+
+    return collected
+
+
+def _prepend_file_context_to_message(message: dict, files: list[dict]) -> None:
+    def format_file_tag(file_item: dict) -> str:
+        attrs = f'type="{html.escape(str(file_item.get("type", "file")), quote=True)}"'
+
+        file_url = _resolve_file_context_url(file_item)
+        if file_url:
+            attrs += f' url="{html.escape(file_url, quote=True)}"'
+
+        content_type = str(file_item.get("content_type") or "").strip()
+        if content_type:
+            attrs += f' content_type="{html.escape(content_type, quote=True)}"'
+
+        file_name = str(file_item.get("name") or file_item.get("filename") or "").strip()
+        if file_name:
+            attrs += f' name="{html.escape(file_name, quote=True)}"'
+
+        file_id = str(file_item.get("id") or "").strip()
+        if file_id:
+            attrs += f' id="{html.escape(file_id, quote=True)}"'
+
+        return f"<file {attrs}/>"
+
+    normalized_files = []
+    for file_item in files:
+        if not isinstance(file_item, dict):
+            continue
+        if not _resolve_file_context_url(file_item):
+            continue
+        normalized_files.append(file_item)
+
+    if not normalized_files:
+        return
+
+    file_tags = [format_file_tag(file_item) for file_item in normalized_files]
+    file_context = (
+        "<attached_files>\n" + "\n".join(file_tags) + "\n</attached_files>\n\n"
+    )
+
+    content = message.get("content", "")
+    if isinstance(content, list):
+        message["content"] = [{"type": "text", "text": file_context}] + content
+    else:
+        message["content"] = file_context + content
+
+
+def add_file_context(
+    messages: list,
+    chat_id: str,
+    user,
+    request_files: Optional[list[dict]] = None,
+    message_id: Optional[str] = None,
+) -> list:
     """
     Add file URLs to messages for native function calling.
     """
     if not chat_id or chat_id.startswith("local:"):
         return messages
 
-    chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
-    if not chat:
+    stored_messages = _get_stored_chat_messages(chat_id, user, message_id)
+    if not stored_messages:
         return messages
 
-    history = chat.chat.get("history", {})
-    stored_messages = get_message_list(
-        history.get("messages", {}), history.get("currentId")
-    )
+    injected_file_keys = set()
 
-    def format_file_tag(file):
-        attrs = f'type="{file.get("type", "file")}" url="{file["url"]}"'
-        if file.get("content_type"):
-            attrs += f' content_type="{file["content_type"]}"'
-        if file.get("name"):
-            attrs += f' name="{file["name"]}"'
-        return f"<file {attrs}/>"
+    request_user_messages = [message for message in messages if message.get("role") == "user"]
+    stored_user_messages = [
+        stored_message
+        for stored_message in stored_messages
+        if str(stored_message.get("role") or "").strip().lower() == "user"
+    ]
 
-    for message, stored_message in zip(messages, stored_messages):
-        files_with_urls = [
-            file
-            for file in stored_message.get("files", [])
-            if file.get("url") and not file.get("url").startswith("data:")
-        ]
-        if not files_with_urls:
+    for message, stored_message in zip(request_user_messages, stored_user_messages):
+        files_for_message = []
+        for file_item in stored_message.get("files", []):
+            if not _resolve_file_context_url(file_item):
+                continue
+            files_for_message.append(file_item)
+            file_key = _file_context_key(file_item)
+            if file_key:
+                injected_file_keys.add(file_key)
+
+        if not files_for_message:
             continue
 
-        file_tags = [format_file_tag(file) for file in files_with_urls]
-        file_context = (
-            "<attached_files>\n" + "\n".join(file_tags) + "\n</attached_files>\n\n"
-        )
+        _prepend_file_context_to_message(message, files_for_message)
 
-        content = message.get("content", "")
-        if isinstance(content, list):
-            message["content"] = [{"type": "text", "text": file_context}] + content
-        else:
-            message["content"] = file_context + content
+    pending_request_files = []
+    for file_item in request_files or []:
+        if not isinstance(file_item, dict):
+            continue
+        file_key = _file_context_key(file_item)
+        if file_key and file_key in injected_file_keys:
+            continue
+        if not _resolve_file_context_url(file_item):
+            continue
+        pending_request_files.append(file_item)
+        if file_key:
+            injected_file_keys.add(file_key)
+
+    if pending_request_files:
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            _prepend_file_context_to_message(message, pending_request_files)
+            break
 
     return messages
 
@@ -2937,8 +4284,37 @@ async def chat_completion_files_handler(
 ) -> tuple[dict, dict[str, list]]:
     __event_emitter__ = extra_params["__event_emitter__"]
     sources = []
+    performed_retrieval = False
 
-    if files := body.get("metadata", {}).get("files", None):
+    metadata = body.setdefault("metadata", {})
+    files = metadata.get("files", None)
+
+    chat_id = metadata.get("chat_id")
+    parent_message_id = metadata.get("parent_message_id")
+    if isinstance(chat_id, str) and chat_id and not chat_id.startswith("local:"):
+        stored_messages = _get_stored_chat_messages(chat_id, user, parent_message_id)
+        if stored_messages:
+            history_files = _collect_stored_message_files(stored_messages)
+            if history_files:
+                merged_files: list[dict] = []
+                seen_keys: set[str] = set()
+                for file_item in [*(files or []), *history_files]:
+                    if not isinstance(file_item, dict):
+                        continue
+                    file_key = _file_context_key(file_item)
+                    if file_key and file_key in seen_keys:
+                        continue
+                    if file_key:
+                        seen_keys.add(file_key)
+                    merged_files.append(file_item)
+                files = merged_files
+                metadata["files"] = files
+                if body.get("files") is not None:
+                    body["files"] = files
+                if body.get("attachments") is not None:
+                    body["attachments"] = files
+
+    if files:
         files, inline_sources, retrieval_files = await _prepare_chat_files_for_retrieval(
             request, files, user
         )
@@ -2957,7 +4333,7 @@ async def chat_completion_files_handler(
         )
 
         queries = []
-        if not all_full_context:
+        if retrieval_files and not all_full_context:
             try:
                 queries_response = await generate_queries(
                     request,
@@ -2998,11 +4374,12 @@ async def chat_completion_files_handler(
                 }
             )
 
-        if len(queries) == 0:
+        if retrieval_files and len(queries) == 0:
             queries = [get_last_user_message(body["messages"])]
 
         if retrieval_files:
             try:
+                performed_retrieval = True
                 ensure_retrieval_runtime(request.app)
                 # Directly await async get_sources_from_items (no thread needed - fully async now)
                 retrieved_sources = await get_sources_from_items(
@@ -3054,18 +4431,19 @@ async def chat_completion_files_handler(
                 )
                 unique_ids.add(_id)
 
-        sources_count = len(unique_ids)
-        await __event_emitter__(
-            {
-                "type": "status",
-                "data": {
-                    "action": "sources_retrieved",
-                    "count": sources_count,
-                    "hidden": sources_count == 0,
-                    "done": True,
-                },
-            }
-        )
+        if performed_retrieval:
+            sources_count = len(unique_ids)
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "sources_retrieved",
+                        "count": sources_count,
+                        "hidden": sources_count == 0,
+                        "done": True,
+                    },
+                }
+            )
 
     return body, {"sources": sources}
 
@@ -3116,8 +4494,36 @@ def _prepare_chat_file_sync(
         file_meta = file.meta or {}
         content = str(file_data.get("content") or "").strip()
         status = str(file_data.get("status") or "").strip().lower()
+        collection_name = str(file_meta.get("collection_name") or "").strip()
 
-        if not content and status not in {"processing", "uploading"}:
+        if content and status == "failed" and not collection_name:
+            retrieval_error = str(
+                file_data.get("retrieval_error")
+                or file_data.get("error")
+                or "Document content was extracted, but retrieval indexing failed."
+            ).strip()
+            Files.update_file_data_by_id(
+                file.id,
+                {
+                    "status": "completed",
+                    "error": None,
+                    "retrieval_status": "failed",
+                    "retrieval_error": retrieval_error,
+                },
+                db=db,
+            )
+            file = (
+                Files.get_file_by_id(file_id, db=db)
+                if user.role == "admin"
+                else Files.get_file_by_id_and_user_id(file_id, user.id, db=db)
+            )
+            if file is not None:
+                file_data = file.data or {}
+                file_meta = file.meta or {}
+                content = str(file_data.get("content") or "").strip()
+                status = str(file_data.get("status") or "").strip().lower()
+
+        if not content and status not in {"processing", "uploading", "failed"}:
             try:
                 process_file(
                     request,
@@ -3313,10 +4719,28 @@ def load_messages_from_db(chat_id: str, message_id: str) -> Optional[list[dict]]
     if not db_messages:
         return None
 
-    return [
+    messages = [
         {k: v for k, v in msg.items() if k in ("role", "content", "output", "files")}
         for msg in db_messages
     ]
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+
+        output = message.get("output")
+        fallback_content = message.get("content", "")
+        if isinstance(output, list):
+            normalized_output = _normalize_output_for_chat(output)
+            message["output"] = normalized_output
+            message["content"] = _serialize_output_for_chat_content(
+                normalized_output,
+                fallback_content=(
+                    fallback_content if isinstance(fallback_content, str) else ""
+                ),
+            )
+            continue
+
+    return messages
 
 
 def process_messages_with_output(messages: list[dict]) -> list[dict]:
@@ -3991,7 +5415,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             # Add file context to user messages
             chat_id = metadata.get("chat_id")
             form_data["messages"] = add_file_context(
-                form_data.get("messages", []), chat_id, user
+                form_data.get("messages", []),
+                chat_id,
+                user,
+                form_data.get("files", []),
+                metadata.get("parent_message_id"),
             )
             builtin_tools = get_builtin_tools(
                 request,
@@ -4401,6 +5829,19 @@ async def background_tasks_handler(ctx):
                             pass
 
 
+async def _run_background_tasks_detached(ctx):
+    try:
+        await background_tasks_handler(ctx)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Detached chat background tasks failed")
+
+
+def schedule_background_tasks(ctx):
+    asyncio.create_task(_run_background_tasks_detached(ctx))
+
+
 async def non_streaming_chat_response_handler(response, ctx):
     request = ctx["request"]
 
@@ -4449,105 +5890,149 @@ async def non_streaming_chat_response_handler(response, ctx):
                 )
 
             choices = response_data.get("choices", [])
-            if choices and choices[0].get("message", {}).get("content"):
-                content = response_data["choices"][0]["message"]["content"]
+            if choices and isinstance(choices[0].get("message"), dict):
+                message = response_data["choices"][0]["message"]
+                content = message.get("content")
+                bridge_generated_files = []
+                message_files = None
 
                 if content:
-                    content, bridge_generated_files = (
-                        _collect_bridge_generated_files_from_content(
-                            request,
-                            content,
-                            metadata,
-                            user,
-                        )
+                    content, bridge_generated_files = _collect_bridge_generated_files_from_content(
+                        request,
+                        content,
+                        metadata,
+                        user,
                     )
-                    response_data["choices"][0]["message"]["content"] = content
+                    message["content"] = content
 
-                    if bridge_generated_files:
-                        message_files = Chats.add_message_files_by_id_and_message_id(
-                            metadata["chat_id"],
-                            metadata["message_id"],
-                            bridge_generated_files,
-                        )
-                        await event_emitter(
-                            {
-                                "type": "files",
-                                "data": {
-                                    "files": (
-                                        message_files
-                                        if isinstance(message_files, list)
-                                        else bridge_generated_files
-                                    )
-                                },
-                            }
-                        )
+                for file_item in _extract_generated_files_from_choices([{"message": message}]):
+                    ref_key = _generated_file_ref_key(file_item)
+                    if ref_key and any(
+                        _generated_file_ref_key(existing) == ref_key
+                        for existing in bridge_generated_files
+                    ):
+                        continue
+                    bridge_generated_files.append(file_item)
 
+                if bridge_generated_files:
+                    bridge_generated_files = _materialize_generated_files(
+                        request,
+                        bridge_generated_files,
+                        metadata,
+                        user,
+                    )
+                    message_metadata = message.get("metadata")
+                    if not isinstance(message_metadata, dict):
+                        message_metadata = {}
+                        message["metadata"] = message_metadata
+                    message_metadata["generated_files"] = bridge_generated_files
+
+                if bridge_generated_files:
+                    message_files = Chats.add_message_files_by_id_and_message_id(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        bridge_generated_files,
+                    )
+                    if not isinstance(message_files, list) or not message_files:
+                        message_files = bridge_generated_files
                     await event_emitter(
                         {
-                            "type": "chat:completion",
-                            "data": response_data,
-                        }
-                    )
-
-                    title = Chats.get_chat_title_by_id(metadata["chat_id"])
-
-                    # Use output from backend if provided (OR-compliant backends),
-                    # otherwise generate from response content
-                    response_output = response_data.get("output")
-                    if not response_output:
-                        response_output = [
-                            {
-                                "type": "message",
-                                "id": output_id("msg"),
-                                "status": "completed",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": content}],
-                            }
-                        ]
-
-                    await event_emitter(
-                        {
-                            "type": "chat:completion",
+                            "type": "files",
                             "data": {
-                                "done": True,
-                                "content": content,
-                                "output": response_output,
-                                "title": title,
+                                "files": (
+                                    message_files
+                                    if isinstance(message_files, list)
+                                    else bridge_generated_files
+                                )
                             },
                         }
                     )
 
-                    # Save message in the database
-                    usage = normalize_usage(response_data.get("usage", {}) or {})
+                await event_emitter(
+                    {
+                        "type": "chat:completion",
+                        "data": response_data,
+                    }
+                )
 
-                    Chats.upsert_message_to_chat_by_id_and_message_id(
-                        metadata["chat_id"],
-                        metadata["message_id"],
+                # Use output from backend if provided (OR-compliant backends),
+                # otherwise generate from response content when available.
+                response_output = response_data.get("output")
+                if response_output is None and isinstance(message, dict):
+                    response_output = message.get("output")
+                if response_output is None and content:
+                    response_output = [
                         {
+                            "type": "message",
+                            "id": output_id("msg"),
+                            "status": "completed",
                             "role": "assistant",
-                            "content": content,
-                            "output": response_output,
-                            **({"usage": usage} if usage else {}),
+                            "content": [{"type": "output_text", "text": content}],
+                        }
+                    ]
+                if response_output is None:
+                    response_output = []
+
+                title = Chats.get_chat_title_by_id(metadata["chat_id"])
+
+                await event_emitter(
+                    {
+                        "type": "chat:completion",
+                        "data": {
+                            "done": True,
+                            "content": content or "",
+                            "output": response_output or [],
+                            **(
+                                {"files": message_files}
+                                if bridge_generated_files and isinstance(message_files, list)
+                                else {}
+                            ),
+                            **(
+                                {"metadata": {"generated_files": bridge_generated_files}}
+                                if bridge_generated_files
+                                else {}
+                            ),
+                            "title": title,
                         },
-                    )
+                    }
+                )
 
-                    # Send a webhook notification if the user is not active
-                    if not Users.is_user_active(user.id):
-                        webhook_url = Users.get_user_webhook_url_by_id(user.id)
-                        if webhook_url:
-                            await post_webhook(
-                                request.app.state.WEBUI_NAME,
-                                webhook_url,
-                                f"{title} - {request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}\n\n{content}",
-                                {
-                                    "action": "chat",
-                                    "message": content,
-                                    "title": title,
-                                    "url": f"{request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}",
-                                },
-                            )
+                # Save message in the database
+                usage = normalize_usage(response_data.get("usage", {}) or {})
 
-                    await background_tasks_handler(ctx)
+                Chats.upsert_message_to_chat_by_id_and_message_id(
+                    metadata["chat_id"],
+                    metadata["message_id"],
+                    {
+                        "role": "assistant",
+                        "content": content or "",
+                        "output": response_output or [],
+                        **(
+                            {"files": message_files}
+                            if bridge_generated_files and isinstance(message_files, list)
+                            else {}
+                        ),
+                        **({"usage": usage} if usage else {}),
+                    },
+                )
+
+                # Send a webhook notification if the user is not active
+                if not Users.is_user_active(user.id):
+                    webhook_url = Users.get_user_webhook_url_by_id(user.id)
+                    if webhook_url:
+                        await post_webhook(
+                            request.app.state.WEBUI_NAME,
+                            webhook_url,
+                            f"{title} - {request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}\n\n{content or ''}",
+                            {
+                                "action": "chat",
+                                "message": content or "",
+                                "title": title,
+                                "url": f"{request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}",
+                            },
+                        )
+
+                schedule_background_tasks(ctx)
 
             response = build_response_object(
                 response, merge_events_into_response(response_data, events)
@@ -4878,7 +6363,11 @@ async def streaming_chat_response_handler(response, ctx):
             # Initialize output: use existing from message if continuing, else create new
             existing_output = message.get("output") if message else None
             if existing_output:
-                output = existing_output
+                output = _normalize_output_for_chat(existing_output)
+                content = _serialize_output_for_chat_content(
+                    output,
+                    fallback_content=content,
+                )
             else:
                 # Only create an initial message item if there is content to initialize with
                 if content:
@@ -4895,6 +6384,15 @@ async def streaming_chat_response_handler(response, ctx):
                     output = []
 
             usage = None
+            stream_done = False
+            has_visible_status_event = any(
+                isinstance(event, dict)
+                and event.get("type") == "status"
+                and not bool((event.get("data") or {}).get("hidden"))
+                for event in events
+            )
+            waiting_status_emitted = bool(metadata.get("waiting_status_active"))
+            waiting_status_cleared = False
 
             reasoning_tags_param = metadata.get("params", {}).get("reasoning_tags")
             DETECT_REASONING_TAGS = reasoning_tags_param is not False
@@ -4914,7 +6412,43 @@ async def streaming_chat_response_handler(response, ctx):
                 else:
                     reasoning_tags = DEFAULT_REASONING_TAGS
 
+            async def emit_waiting_status_if_needed():
+                nonlocal waiting_status_emitted
+                if waiting_status_emitted or has_visible_status_event or content or output:
+                    return
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "chat",
+                            "description": "处理中",
+                            "done": False,
+                        },
+                    }
+                )
+                waiting_status_emitted = True
+                metadata["waiting_status_active"] = True
+
+            async def clear_waiting_status():
+                nonlocal waiting_status_cleared
+                if not waiting_status_emitted or waiting_status_cleared:
+                    return
+                waiting_status_cleared = True
+                metadata["waiting_status_active"] = False
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "chat",
+                            "description": "处理中",
+                            "done": True,
+                            "hidden": True,
+                        },
+                    }
+                )
+
             try:
+                await emit_waiting_status_if_needed()
                 for event in events:
                     await event_emitter(
                         {
@@ -4936,6 +6470,7 @@ async def streaming_chat_response_handler(response, ctx):
                     nonlocal content
                     nonlocal usage
                     nonlocal output
+                    nonlocal stream_done
 
                     response_tool_calls = []
 
@@ -4949,6 +6484,41 @@ async def streaming_chat_response_handler(response, ctx):
                     )
                     last_delta_data = None
                     emitted_generated_file_refs: set[str] = set()
+
+                    async def apply_bridge_output_events(raw_events: Any) -> bool:
+                        nonlocal output
+                        nonlocal delta_count
+                        nonlocal last_delta_data
+                        events = _normalize_bridge_output_events(raw_events)
+                        if not events:
+                            return False
+                        applied_any = False
+                        for event in events:
+                            if not isinstance(event, dict):
+                                continue
+                            applied_any = True
+                            if str(event.get("type", "")).startswith("response."):
+                                event_payload = event
+                            else:
+                                event_payload = {
+                                    "type": "response.output_item.added",
+                                    "item": event,
+                                }
+                            output, response_metadata = handle_responses_streaming_event(
+                                event_payload, output
+                            )
+                            output, data = _build_chat_completion_payload(
+                                output,
+                                fallback_content=content,
+                            )
+                            if response_metadata:
+                                data.update(response_metadata)
+                            last_delta_data = data
+                            delta_count += 1
+                            # Bridge-owned tool/process events should stay visibly ordered.
+                            await clear_waiting_status()
+                            await flush_pending_delta_data(1)
+                        return applied_any
 
                     async def flush_pending_delta_data(threshold: int = 0):
                         nonlocal delta_count
@@ -4964,27 +6534,87 @@ async def streaming_chat_response_handler(response, ctx):
                             delta_count = 0
                             last_delta_data = None
 
-                    async for line in response.body_iterator:
-                        line = (
-                            line.decode("utf-8", "replace")
-                            if isinstance(line, bytes)
-                            else line
+                    stream_content_type = str(
+                        response.headers.get("Content-Type", "") or ""
+                    ).lower()
+
+                    def build_sse_data_payload(event_lines: list[str]) -> Optional[str]:
+                        data_lines = []
+                        for line in event_lines:
+                            if not line or line.startswith(":"):
+                                continue
+                            if ":" in line:
+                                field, value = line.split(":", 1)
+                                if value.startswith(" "):
+                                    value = value[1:]
+                            else:
+                                field = line
+                                value = ""
+                            if field == "data":
+                                data_lines.append(value)
+
+                        if not data_lines:
+                            return None
+
+                        return "\n".join(data_lines)
+
+                    async def iter_stream_payloads():
+                        buffer = ""
+                        is_ndjson_stream = (
+                            "application/x-ndjson" in stream_content_type
                         )
-                        data = line
+                        event_lines: list[str] = []
 
-                        # Skip empty lines
-                        if not data.strip():
+                        async for chunk in response.body_iterator:
+                            text = (
+                                chunk.decode("utf-8", "replace")
+                                if isinstance(chunk, bytes)
+                                else str(chunk)
+                            )
+                            if not text:
+                                continue
+
+                            text = text.replace("\r\n", "\n").replace("\r", "\n")
+                            buffer += text
+
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                if is_ndjson_stream:
+                                    line = line.strip()
+                                    if line:
+                                        yield line
+                                    continue
+
+                                if line == "":
+                                    data_payload = build_sse_data_payload(event_lines)
+                                    if data_payload is not None:
+                                        yield data_payload
+                                    event_lines = []
+                                    continue
+
+                                event_lines.append(line)
+
+                        if is_ndjson_stream:
+                            trailing_line = buffer.strip()
+                            if trailing_line:
+                                yield trailing_line
+                            return
+
+                        if buffer:
+                            event_lines.append(buffer)
+                        if event_lines:
+                            data_payload = build_sse_data_payload(event_lines)
+                            if data_payload is not None:
+                                yield data_payload
+
+                    async for data_payload in iter_stream_payloads():
+                        data_payload_stripped = data_payload.strip()
+                        if data_payload_stripped == "[DONE]":
+                            stream_done = True
                             continue
-
-                        # "data:" is the prefix for each event
-                        if not data.startswith("data:"):
-                            continue
-
-                        # Remove the prefix
-                        data = data[len("data:") :].strip()
 
                         try:
-                            data = json.loads(data)
+                            data = json.loads(data_payload)
 
                             data, _ = await process_filter_functions(
                                 request=request,
@@ -5021,10 +6651,12 @@ async def streaming_chat_response_handler(response, ctx):
                                         handle_responses_streaming_event(data, output)
                                     )
 
-                                    processed_data = {
-                                        "output": output,
-                                        "content": serialize_output(output),
-                                    }
+                                    output, processed_data = (
+                                        _build_chat_completion_payload(
+                                            output,
+                                            fallback_content=content,
+                                        )
+                                    )
 
                                     # print(data)
                                     # print(processed_data)
@@ -5033,6 +6665,8 @@ async def streaming_chat_response_handler(response, ctx):
                                     if response_metadata:
                                         processed_data.update(response_metadata)
 
+                                    if processed_data.get("content") or processed_data.get("output"):
+                                        await clear_waiting_status()
                                     await event_emitter(
                                         {
                                             "type": "chat:completion",
@@ -5080,6 +6714,7 @@ async def streaming_chat_response_handler(response, ctx):
                                     if not choices:
                                         error = data.get("error", {})
                                         if error:
+                                            await clear_waiting_status()
                                             await event_emitter(
                                                 {
                                                     "type": "chat:completion",
@@ -5096,8 +6731,8 @@ async def streaming_chat_response_handler(response, ctx):
                                             [{"delta": delta}]
                                         )
                                     )
+                                    new_generated_files = []
                                     if delta_generated_files:
-                                        new_generated_files = []
                                         for file_item in delta_generated_files:
                                             ref_key = _generated_file_ref_key(file_item)
                                             if ref_key and ref_key in emitted_generated_file_refs:
@@ -5107,23 +6742,60 @@ async def streaming_chat_response_handler(response, ctx):
                                             new_generated_files.append(file_item)
 
                                         if new_generated_files:
-                                            message_files = Chats.add_message_files_by_id_and_message_id(
-                                                metadata["chat_id"],
-                                                metadata["message_id"],
+                                            new_generated_files = _materialize_generated_files(
+                                                request,
                                                 new_generated_files,
+                                                metadata,
+                                                user,
                                             )
-                                            await event_emitter(
-                                                {
-                                                    "type": "files",
-                                                    "data": {
-                                                        "files": (
-                                                            message_files
-                                                            if isinstance(message_files, list)
-                                                            else new_generated_files
-                                                        )
-                                                    },
-                                                }
+                                            delta_metadata = delta.get("metadata")
+                                            if isinstance(delta_metadata, dict):
+                                                delta_metadata["generated_files"] = (
+                                                    new_generated_files
+                                                )
+
+                                    if new_generated_files:
+                                        await clear_waiting_status()
+                                        output = _attach_generated_files_to_output(
+                                            output,
+                                            new_generated_files,
+                                        )
+                                        message_files = Chats.add_message_files_by_id_and_message_id(
+                                            metadata["chat_id"],
+                                            metadata["message_id"],
+                                            new_generated_files,
+                                        )
+                                        if (
+                                            not isinstance(message_files, list)
+                                            or not message_files
+                                        ):
+                                            message_files = new_generated_files
+                                        await event_emitter(
+                                            {
+                                                "type": "files",
+                                                "data": {
+                                                    "files": (
+                                                        message_files
+                                                        if isinstance(message_files, list)
+                                                        else new_generated_files
+                                                    )
+                                                },
+                                            }
+                                        )
+
+                                    delta_metadata = delta.get("metadata")
+                                    bridge_events_seen = False
+                                    if isinstance(delta_metadata, dict):
+                                        raw_bridge_events = (
+                                            delta_metadata.get("bridge_output_events")
+                                            or delta_metadata.get("bridgeOutputEvents")
+                                        )
+                                        if raw_bridge_events:
+                                            bridge_events_seen = await apply_bridge_output_events(
+                                                raw_bridge_events
                                             )
+                                            if last_delta_data:
+                                                data = last_delta_data
 
                                     # Handle delta annotations
                                     annotations = delta.get("annotations")
@@ -5221,6 +6893,7 @@ async def streaming_chat_response_handler(response, ctx):
                                         # Emit pending tool calls in real-time
                                         if response_tool_calls:
                                             # Flush any pending text first
+                                            await clear_waiting_status()
                                             await flush_pending_delta_data()
                                             output = (
                                                 strip_leading_message_output_before_tool_call(
@@ -5254,11 +6927,10 @@ async def streaming_chat_response_handler(response, ctx):
                                             await event_emitter(
                                                 {
                                                     "type": "chat:completion",
-                                                    "data": {
-                                                        "content": serialize_output(
-                                                            pending_output
-                                                        ),
-                                                    },
+                                                    "data": _build_chat_completion_payload(
+                                                        pending_output,
+                                                        fallback_content=content,
+                                                    )[1],
                                                 }
                                             )
 
@@ -5266,6 +6938,7 @@ async def streaming_chat_response_handler(response, ctx):
                                         delta.get("images", []), request, metadata, user
                                     )
                                     if image_urls:
+                                        await clear_waiting_status()
                                         image_file_list = [
                                             {"type": "image", "url": url}
                                             for url in image_urls
@@ -5286,6 +6959,8 @@ async def streaming_chat_response_handler(response, ctx):
                                         )
 
                                     value = delta.get("content")
+                                    if isinstance(value, str):
+                                        value = _strip_bridge_details_blocks(value)
 
                                     reasoning_content = (
                                         delta.get("reasoning_content")
@@ -5293,6 +6968,7 @@ async def streaming_chat_response_handler(response, ctx):
                                         or delta.get("thinking")
                                     )
                                     if reasoning_content:
+                                        await clear_waiting_status()
                                         if (
                                             not output
                                             or output[-1].get("type") != "reasoning"
@@ -5329,9 +7005,13 @@ async def streaming_chat_response_handler(response, ctx):
                                                 }
                                             ]
 
-                                        data = {"content": serialize_output(output)}
+                                        output, data = _build_chat_completion_payload(
+                                            output,
+                                            fallback_content=content,
+                                        )
 
                                     if value:
+                                        await clear_waiting_status()
                                         if (
                                             output
                                             and output[-1].get("type") == "reasoning"
@@ -5488,7 +7168,7 @@ async def streaming_chat_response_handler(response, ctx):
                                                     }
                                                 ]
 
-                                        if DETECT_REASONING_TAGS:
+                                        if DETECT_REASONING_TAGS and not bridge_events_seen:
                                             output, _ = tag_output_handler(
                                                 "reasoning",
                                                 reasoning_tags,
@@ -5501,7 +7181,7 @@ async def streaming_chat_response_handler(response, ctx):
                                                 output,
                                             )
 
-                                        if DETECT_CODE_INTERPRETER:
+                                        if DETECT_CODE_INTERPRETER and not bridge_events_seen:
                                             output, end = tag_output_handler(
                                                 "code_interpreter",
                                                 DEFAULT_CODE_INTERPRETER_TAGS,
@@ -5513,18 +7193,23 @@ async def streaming_chat_response_handler(response, ctx):
 
                                         if ENABLE_REALTIME_CHAT_SAVE:
                                             # Save message in the database
+                                            output, persisted_data = _build_chat_completion_payload(
+                                                output,
+                                                fallback_content=content,
+                                            )
                                             Chats.upsert_message_to_chat_by_id_and_message_id(
                                                 metadata["chat_id"],
                                                 metadata["message_id"],
                                                 {
-                                                    "content": serialize_output(output),
-                                                    "output": output,
+                                                    "role": "assistant",
+                                                    **persisted_data,
                                                 },
                                             )
                                         else:
-                                            data = {
-                                                "content": serialize_output(output),
-                                            }
+                                            output, data = _build_chat_completion_payload(
+                                                output,
+                                                fallback_content=content,
+                                            )
 
                                 if delta:
                                     delta_count += 1
@@ -5539,12 +7224,8 @@ async def streaming_chat_response_handler(response, ctx):
                                         }
                                     )
                         except Exception as e:
-                            done = "data: [DONE]" in line
-                            if done:
-                                pass
-                            else:
-                                log.debug(f"Error: {e}")
-                                continue
+                            log.debug(f"Error: {e}")
+                            continue
                     await flush_pending_delta_data()
 
                     if output:
@@ -5638,10 +7319,10 @@ async def streaming_chat_response_handler(response, ctx):
                     await event_emitter(
                         {
                             "type": "chat:completion",
-                            "data": {
-                                "content": serialize_output(output),
-                                "output": output,
-                            },
+                            "data": _build_chat_completion_payload(
+                                output,
+                                fallback_content=content,
+                            )[1],
                         }
                     )
 
@@ -5917,10 +7598,10 @@ async def streaming_chat_response_handler(response, ctx):
                     await event_emitter(
                         {
                             "type": "chat:completion",
-                            "data": {
-                                "content": serialize_output(output),
-                                "output": output,
-                            },
+                            "data": _build_chat_completion_payload(
+                                output,
+                                fallback_content=content,
+                            )[1],
                         }
                     )
 
@@ -5963,10 +7644,10 @@ async def streaming_chat_response_handler(response, ctx):
                         await event_emitter(
                             {
                                 "type": "chat:completion",
-                                "data": {
-                                    "content": serialize_output(output),
-                                    "output": output,
-                                },
+                                "data": _build_chat_completion_payload(
+                                    output,
+                                    fallback_content=content,
+                                )[1],
                             }
                         )
 
@@ -6102,10 +7783,10 @@ async def streaming_chat_response_handler(response, ctx):
                         await event_emitter(
                             {
                                 "type": "chat:completion",
-                                "data": {
-                                    "content": serialize_output(output),
-                                    "output": output,
-                                },
+                                "data": _build_chat_completion_payload(
+                                    output,
+                                    fallback_content=content,
+                                )[1],
                             }
                         )
 
@@ -6135,46 +7816,35 @@ async def streaming_chat_response_handler(response, ctx):
                             log.debug(e)
                             break
 
-                # Mark all in-progress items as completed
-                for item in output:
-                    if item.get("status") == "in_progress":
-                        item["status"] = "completed"
+                if stream_done:
+                    for item in output:
+                        if item.get("status") != "in_progress":
+                            continue
+                        item_type = item.get("type")
+                        if item_type in {"message", "reasoning"}:
+                            item["status"] = "completed"
+                            if item_type == "reasoning" and item.get("ended_at") is None:
+                                ended_at = time.time()
+                                started_at = item.get("started_at") or ended_at
+                                item["ended_at"] = ended_at
+                                item["duration"] = int(ended_at - started_at)
+                        elif (
+                            item_type == "open_webui:code_interpreter"
+                            and item.get("output") is not None
+                        ):
+                            item["status"] = "completed"
 
                 output = strip_leading_message_output_before_tool_call(output)
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
-                serialized_content = serialize_output(output)
-                serialized_content, bridge_generated_files = (
-                    _collect_bridge_generated_files_from_content(
-                        request,
-                        serialized_content,
-                        metadata,
-                        user,
-                    )
+                output, final_payload = _build_chat_completion_payload(
+                    output,
+                    fallback_content=content,
                 )
-
-                if bridge_generated_files:
-                    message_files = Chats.add_message_files_by_id_and_message_id(
-                        metadata["chat_id"],
-                        metadata["message_id"],
-                        bridge_generated_files,
-                    )
-                    await event_emitter(
-                        {
-                            "type": "files",
-                            "data": {
-                                "files": (
-                                    message_files
-                                    if isinstance(message_files, list)
-                                    else bridge_generated_files
-                                )
-                            },
-                        }
-                    )
 
                 data = {
                     "done": True,
-                    "content": serialized_content,
+                    "content": final_payload["content"],
                     "output": output,
                     "title": title,
                 }
@@ -6185,7 +7855,8 @@ async def streaming_chat_response_handler(response, ctx):
                         metadata["chat_id"],
                         metadata["message_id"],
                         {
-                            "content": serialized_content,
+                            "role": "assistant",
+                            "content": final_payload["content"],
                             "output": output,
                             **({"usage": usage} if usage else {}),
                         },
@@ -6204,10 +7875,10 @@ async def streaming_chat_response_handler(response, ctx):
                         await post_webhook(
                             request.app.state.WEBUI_NAME,
                             webhook_url,
-                            f"{title} - {request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}\n\n{content}",
+                            f"{title} - {request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}\n\n{final_payload['content']}",
                             {
                                 "action": "chat",
-                                "message": content,
+                                "message": final_payload["content"],
                                 "title": title,
                                 "url": f"{request.app.state.config.WEBUI_URL}/c/{metadata['chat_id']}",
                             },
@@ -6220,7 +7891,16 @@ async def streaming_chat_response_handler(response, ctx):
                     }
                 )
 
-                await background_tasks_handler(ctx)
+                if output:
+                    asyncio.create_task(
+                        _finalize_bridge_generated_files_from_output(
+                            request,
+                            copy.deepcopy(output),
+                            dict(metadata),
+                            user,
+                        )
+                    )
+                schedule_background_tasks(ctx)
             except asyncio.CancelledError:
                 log.warning("Task was cancelled!")
                 await event_emitter({"type": "chat:tasks:cancel"})
@@ -6231,8 +7911,11 @@ async def streaming_chat_response_handler(response, ctx):
                         metadata["chat_id"],
                         metadata["message_id"],
                         {
-                            "content": serialize_output(output),
-                            "output": output,
+                            "role": "assistant",
+                            **_build_chat_completion_payload(
+                                output,
+                                fallback_content=content,
+                            )[1],
                         },
                     )
 

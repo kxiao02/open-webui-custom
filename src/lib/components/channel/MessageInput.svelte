@@ -314,44 +314,6 @@
 	$: showCommands = ['/'].includes(command?.charAt(0));
 	let suggestions = null;
 
-	const screenCaptureHandler = async () => {
-		try {
-			// Request screen media
-			const mediaStream = await navigator.mediaDevices.getDisplayMedia({
-				video: { cursor: 'never' },
-				audio: false
-			});
-			// Once the user selects a screen, temporarily create a video element
-			const video = document.createElement('video');
-			video.srcObject = mediaStream;
-			// Ensure the video loads without affecting user experience or tab switching
-			await video.play();
-			// Set up the canvas to match the video dimensions
-			const canvas = document.createElement('canvas');
-			canvas.width = video.videoWidth;
-			canvas.height = video.videoHeight;
-			// Grab a single frame from the video stream using the canvas
-			const context = canvas.getContext('2d');
-			context.drawImage(video, 0, 0, canvas.width, canvas.height);
-			// Stop all video tracks (stop screen sharing) after capturing the image
-			mediaStream.getTracks().forEach((track) => track.stop());
-
-			// bring back focus to this current tab, so that the user can see the screen capture
-			window.focus();
-
-			// Convert the canvas to a Base64 image URL
-			const imageUrl = canvas.toDataURL('image/png');
-			const blob = await (await fetch(imageUrl)).blob();
-			const file = new File([blob], `screen-capture-${Date.now()}.png`, { type: 'image/png' });
-			inputFilesHandler([file]);
-			// Clean memory: Clear video srcObject
-			video.srcObject = null;
-		} catch (error) {
-			// Handle any errors (e.g., user cancels screen sharing)
-			console.error('Error capturing screen:', error);
-		}
-	};
-
 	const inputFilesHandler = async (inputFiles) => {
 		inputFiles.forEach(async (file) => {
 			console.info('Processing file:', {
@@ -965,17 +927,16 @@
 
 							<div class=" flex justify-between mb-2.5 mx-0.5">
 								<div class="ml-1 self-end flex space-x-1 flex-1">
-									<slot name="menu">
-										{#if acceptFiles}
-											<InputMenu
-												{screenCaptureHandler}
-												uploadFilesHandler={() => {
-													filesInputElement.click();
-												}}
-											>
-												<button
-													id="input-menu-button"
-													class="bg-transparent hover:bg-white/80 text-gray-800 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-1.5 outline-hidden focus:outline-hidden"
+										<slot name="menu">
+											{#if acceptFiles}
+												<InputMenu
+													uploadFilesHandler={() => {
+														filesInputElement.click();
+													}}
+												>
+													<button
+														id="input-menu-button"
+														class="bg-transparent hover:bg-white/80 text-gray-800 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-1.5 outline-hidden focus:outline-hidden"
 													type="button"
 													aria-label="More"
 												>
@@ -988,11 +949,11 @@
 														<path
 															d="M10.75 4.75a.75.75 0 0 0-1.5 0v4.5h-4.5a.75.75 0 0 0 0 1.5h4.5v4.5a.75.75 0 0 0 1.5 0v-4.5h4.5a.75.75 0 0 0 0-1.5h-4.5v-4.5Z"
 														/>
-													</svg>
-												</button>
-											</InputMenu>
-										{/if}
-									</slot>
+														</svg>
+													</button>
+												</InputMenu>
+											{/if}
+										</slot>
 								</div>
 
 								<div class="self-end flex space-x-1 mr-1">

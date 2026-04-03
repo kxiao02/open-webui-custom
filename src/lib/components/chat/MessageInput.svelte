@@ -122,7 +122,7 @@
 	$: selectedModelIds = atSelectedModel !== undefined ? [atSelectedModel.id] : selectedModels;
 
 	export let history;
-	export let taskIds = null;
+	export let hasBlockingGeneration = false;
 
 	export let prompt = '';
 	export let files = [];
@@ -178,6 +178,23 @@
 		codeInterpreterEnabled,
 		thinkingModeEnabled
 	});
+
+	const dispatchSubmit = (promptOverride: string = prompt) => {
+		dispatch('submit', {
+			prompt: promptOverride,
+			requestContext: {
+				thinkingModeEnabled,
+				selectedToolIds: [...selectedToolIds],
+				selectedFilterIds: [...selectedFilterIds],
+				selectedTerminalId: $selectedTerminalId ?? null,
+				featureToggles: {
+					imageGenerationEnabled,
+					webSearchEnabled,
+					codeInterpreterEnabled
+				}
+			}
+		});
+	};
 
 	const inputVariableHandler = async (text: string): Promise<string> => {
 		inputVariables = extractInputVariables(text);
@@ -498,7 +515,9 @@
 		.reduce((acc, filters) => acc.filter((f1) => filters.some((f2) => f2.id === f1.id)));
 
 	let showToolsButton = false;
-	$: showToolsButton = ($tools ?? []).length > 0 || ($toolServers ?? []).length > 0;
+	$: showToolsButton =
+		(($tools ?? []).filter((tool) => !tool?.id?.startsWith('server:')).length > 0) ||
+		(selectedToolIds ?? []).length > 0;
 
 	let showWebSearchButton = false;
 	$: showWebSearchButton =
@@ -533,44 +552,6 @@
 			top: element.scrollHeight,
 			behavior: 'smooth'
 		});
-	};
-
-	const screenCaptureHandler = async () => {
-		try {
-			// Request screen media
-			const mediaStream = await navigator.mediaDevices.getDisplayMedia({
-				video: { cursor: 'never' },
-				audio: false
-			});
-			// Once the user selects a screen, temporarily create a video element
-			const video = document.createElement('video');
-			video.srcObject = mediaStream;
-			// Ensure the video loads without affecting user experience or tab switching
-			await video.play();
-			// Set up the canvas to match the video dimensions
-			const canvas = document.createElement('canvas');
-			canvas.width = video.videoWidth;
-			canvas.height = video.videoHeight;
-			// Grab a single frame from the video stream using the canvas
-			const context = canvas.getContext('2d');
-			context.drawImage(video, 0, 0, canvas.width, canvas.height);
-			// Stop all video tracks (stop screen sharing) after capturing the image
-			mediaStream.getTracks().forEach((track) => track.stop());
-
-			// bring back focus to this current tab, so that the user can see the screen capture
-			window.focus();
-
-			// Convert the canvas to a Base64 image URL
-			const imageUrl = canvas.toDataURL('image/png');
-			const blob = await (await fetch(imageUrl)).blob();
-			const file = new File([blob], `screen-capture-${Date.now()}.png`, { type: 'image/png' });
-			inputFilesHandler([file]);
-			// Clean memory: Clear video srcObject
-			video.srcObject = null;
-		} catch (error) {
-			// Handle any errors (e.g., user cancels screen sharing)
-			console.error('Error capturing screen:', error);
-		}
 	};
 
 	const uploadFileHandler = async (file, process = false, itemData = {}) => {
@@ -1168,7 +1149,7 @@
 								document.getElementById('chat-input')?.focus();
 
 								if ($settings?.speechAutoSend ?? false) {
-									dispatch('submit', prompt);
+									dispatchSubmit();
 								}
 							}}
 						/>
@@ -1180,7 +1161,7 @@
 									toast.error($i18n.t('Please wait until all files are uploaded.'));
 									return;
 								}
-								dispatch('submit', prompt);
+								dispatchSubmit();
 							}}
 						>
 						<button
@@ -1433,13 +1414,7 @@
 															document.getElementById('suggestions-container');
 
 														if (e.key === 'Escape') {
-															const hasActiveGeneration = Boolean(
-																generating ||
-																	(taskIds && taskIds.length > 0) ||
-																	(history.currentId &&
-																		history.messages[history.currentId]?.done != true)
-															);
-															if (hasActiveGeneration) {
+															if (hasBlockingGeneration) {
 																stopResponse();
 															}
 														}
@@ -1492,7 +1467,7 @@
 																			return;
 																		}
 																		if (prompt !== '' || files.length > 0) {
-																			dispatch('submit', prompt);
+																			dispatchSubmit();
 																		}
 																	}
 															}
@@ -1587,58 +1562,56 @@
 											</button>
 										</Tooltip>
 
-										<InputMenu
-										bind:files
-										selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
-										{fileUploadCapableModels}
-										{screenCaptureHandler}
-										{inputFilesHandler}
-										uploadFilesHandler={() => {
-											filesInputElement.click();
-										}}
-										uploadGoogleDriveHandler={async () => {
-											try {
-												const fileData = await createPicker();
-												if (fileData) {
-													const file = new File([fileData.blob], fileData.name, {
-														type: fileData.blob.type
-													});
-													await uploadFileHandler(file);
-												} else {
-													console.log('No file was selected from Google Drive');
-												}
-											} catch (error) {
-												console.error('Google Drive Error:', error);
-												toast.error(
-													$i18n.t('Error accessing Google Drive: {{error}}', {
-														error: error.message
-													})
-												);
-											}
-										}}
-										uploadOneDriveHandler={async (authorityType) => {
-											try {
-												const fileData = await pickAndDownloadFile(authorityType);
-												if (fileData) {
-													const file = new File([fileData.blob], fileData.name, {
-														type: fileData.blob.type || 'application/octet-stream'
-													});
-													await uploadFileHandler(file);
-												} else {
-													console.log('No file was selected from OneDrive');
-												}
-											} catch (error) {
-												console.error('OneDrive Error:', error);
-											}
-										}}
-										{onUpload}
-										onClose={async () => {
-											await tick();
+											<InputMenu
+												bind:files
+												selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
+												{fileUploadCapableModels}
+												uploadFilesHandler={() => {
+													filesInputElement.click();
+												}}
+												uploadGoogleDriveHandler={async () => {
+													try {
+														const fileData = await createPicker();
+														if (fileData) {
+															const file = new File([fileData.blob], fileData.name, {
+																type: fileData.blob.type
+															});
+															await uploadFileHandler(file);
+														} else {
+															console.log('No file was selected from Google Drive');
+														}
+													} catch (error) {
+														console.error('Google Drive Error:', error);
+														toast.error(
+															$i18n.t('Error accessing Google Drive: {{error}}', {
+																error: error.message
+															})
+														);
+													}
+												}}
+												uploadOneDriveHandler={async (authorityType) => {
+													try {
+														const fileData = await pickAndDownloadFile(authorityType);
+														if (fileData) {
+															const file = new File([fileData.blob], fileData.name, {
+																type: fileData.blob.type || 'application/octet-stream'
+															});
+															await uploadFileHandler(file);
+														} else {
+															console.log('No file was selected from OneDrive');
+														}
+													} catch (error) {
+														console.error('OneDrive Error:', error);
+													}
+												}}
+												{onUpload}
+												onClose={async () => {
+													await tick();
 
-											const chatInput = document.getElementById('chat-input');
-											chatInput?.focus();
-										}}
-									>
+													const chatInput = document.getElementById('chat-input');
+													chatInput?.focus();
+												}}
+											>
 										<div
 											id="input-menu-button"
 											class="bg-transparent hover:bg-gray-100 text-gray-700 dark:text-white dark:hover:bg-gray-800 rounded-full size-8 flex justify-center items-center outline-hidden focus:outline-hidden"
@@ -1708,15 +1681,15 @@
 									{/if}
 
 									<div class="ml-1 flex gap-1.5">
-										{#if (selectedToolIds ?? []).length > 0}
+										{#if showToolsButton && (selectedToolIds ?? []).length > 0}
 											<Tooltip
-												content={$i18n.t('{{COUNT}} Available Tools', {
+												content={$i18n.t('{{COUNT}} Enabled Tools', {
 													COUNT: (selectedToolIds ?? []).length
 												})}
 											>
 												<button
 													class="translate-y-[0.5px] px-1 flex gap-1 items-center text-gray-600 dark:text-gray-300 hover:text-gray-700 dark:hover:text-gray-200 rounded-lg self-center transition"
-													aria-label="Available Tools"
+													aria-label={`${$i18n.t('Enabled')} ${$i18n.t('Tools')}`}
 													type="button"
 													on:click={() => {
 														showTools = !showTools;
@@ -1833,7 +1806,7 @@
 								</div>
 
 								<div class="self-end flex space-x-1 mr-1 shrink-0 gap-[0.5px]">
-									{#if (taskIds && taskIds.length > 0) || (history.currentId && history.messages[history.currentId]?.done != true) || generating}
+									{#if hasBlockingGeneration}
 										<div class=" flex items-center">
 											<Tooltip content={$i18n.t('Stop')}>
 												<button
@@ -1876,7 +1849,7 @@
 											</Tooltip>
 										{/if}
 
-										{#if !history?.currentId || history.messages[history.currentId]?.done == true}
+										{#if !hasBlockingGeneration}
 											<!-- Terminal Server Selector -->
 											{#if ($terminalServers ?? []).length > 0 || ($settings?.terminalServers ?? []).some((s) => s.url)}
 												<TerminalMenu bind:show={showTerminalMenu} />

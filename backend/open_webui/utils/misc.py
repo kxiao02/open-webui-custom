@@ -155,6 +155,7 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
     messages = []
     pending_tool_calls = []
     pending_content = []
+    tool_name_by_call_id: dict[str, str] = {}
 
     def flush_pending():
         nonlocal pending_content, pending_tool_calls
@@ -190,9 +191,12 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
             # Ensure arguments is always a JSON string
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments)
+            call_id = item.get("call_id", "")
+            if call_id:
+                tool_name_by_call_id[call_id] = str(item.get("name", "") or "")
             pending_tool_calls.append(
                 {
-                    "id": item.get("call_id", ""),
+                    "id": call_id,
                     "type": "function",
                     "function": {
                         "name": item.get("name", ""),
@@ -222,6 +226,11 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
                     "role": "tool",
                     "tool_call_id": item.get("call_id", ""),
                     "content": content,
+                    **(
+                        {"name": tool_name_by_call_id.get(item.get("call_id", ""), "")}
+                        if tool_name_by_call_id.get(item.get("call_id", ""), "")
+                        else {}
+                    ),
                 }
             )
 

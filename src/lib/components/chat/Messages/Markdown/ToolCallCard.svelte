@@ -19,7 +19,9 @@
 	import {
 		type GeneratedFileItem,
 		collectGeneratedFilesFromValue,
-		parseNestedJSON
+		parseNestedJSON,
+		triggerGeneratedFileDownload,
+		resolveToolCallStatus
 	} from '$lib/utils/generated-files';
 	import { openGeneratedFilePreview } from '$lib/utils/generated-file-preview';
 	import Spinner from '$lib/components/common/Spinner.svelte';
@@ -32,11 +34,66 @@
 	import { resolveToolDisplay } from '$lib/utils/tool-display';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
+	const TOOL_FILE_LIST_SUPPRESSED_TOOL_IDS = new Set([
+		'write_file',
+		'replace_file_content',
+		'display_file',
+		'write_structured_file',
+		'gotenberg_convert',
+		'pdf_create_document',
+		'pdf_inspect_form',
+		'pdf_fill_form_tool',
+		'pdf_reformat_document',
+		'xlsx_add_column_tool',
+		'xlsx_insert_row_tool'
+	]);
 
 	export let token: any;
 
 	type ToolFileItem = GeneratedFileItem;
 	type ActiveTerminal = { url: string; key: string } | null;
+	type ToolRunStatus = 'running' | 'success' | 'error' | 'timeout';
+
+	const TOOL_STATUS_DISPLAY: Record<
+		ToolRunStatus,
+		{
+			summary: string;
+			badgeLabel: string;
+			badgeClass: string;
+			dotClass: string;
+			spinnerClass?: string;
+		}
+	> = {
+		running: {
+			summary: '执行中',
+			badgeLabel: 'Running',
+			badgeClass:
+				'border-blue-200 bg-blue-100 text-blue-700 dark:border-blue-900 dark:bg-blue-950/60 dark:text-blue-300',
+			dotClass: 'bg-blue-500',
+			spinnerClass: 'text-blue-600 dark:text-blue-400'
+		},
+		success: {
+			summary: '已完成',
+			badgeLabel: 'Completed',
+			badgeClass:
+				'border-emerald-200 bg-emerald-100 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-300',
+			dotClass: 'bg-emerald-500'
+		},
+		error: {
+			summary: '执行失败',
+			badgeLabel: 'Error',
+			badgeClass:
+				'border-rose-200 bg-rose-100 text-rose-700 dark:border-rose-900 dark:bg-rose-950/60 dark:text-rose-300',
+			dotClass: 'bg-rose-500'
+		},
+		timeout: {
+			summary: '执行超时',
+			badgeLabel: 'Timeout',
+			badgeClass:
+				'border-amber-200 bg-amber-100 text-amber-700 dark:border-amber-900 dark:bg-amber-950/60 dark:text-amber-300',
+			dotClass: 'bg-amber-500'
+		}
+	};
 
 	const parseAttr = (value: unknown): unknown => {
 		if (typeof value !== 'string') return value;
@@ -74,12 +131,6 @@
 		}
 	};
 
-	const toBool = (value: unknown): boolean => {
-		if (typeof value === 'boolean') return value;
-		if (typeof value === 'string') return value.toLowerCase() === 'true';
-		return !!value;
-	};
-
 	const normalizeFiles = (rawFiles: unknown): ToolFileItem[] => {
 		return collectGeneratedFilesFromValue(rawFiles, 'tool');
 	};
@@ -100,6 +151,7 @@
 		const displayName = resolved.toolName;
 		if (category === 'web') {
 			return {
+				toolId: resolved.toolId,
 				icon: Search,
 				label: displayName,
 				iconClass: 'text-blue-600 dark:text-blue-400',
@@ -108,6 +160,7 @@
 		}
 		if (category === 'file') {
 			return {
+				toolId: resolved.toolId,
 				icon: Document,
 				label: displayName,
 				iconClass: 'text-emerald-600 dark:text-emerald-400',
@@ -116,6 +169,7 @@
 		}
 		if (category === 'code') {
 			return {
+				toolId: resolved.toolId,
 				icon: CommandLine,
 				label: displayName,
 				iconClass: 'text-purple-600 dark:text-purple-400',
@@ -123,6 +177,7 @@
 			};
 		}
 		return {
+			toolId: resolved.toolId,
 			icon: Wrench,
 			label: displayName,
 			iconClass: 'text-gray-600 dark:text-gray-300',
@@ -130,12 +185,20 @@
 		};
 	};
 
+	const getToolStatus = (value: any): ToolRunStatus => {
+		const attrs = (value?.attributes ?? {}) as Record<string, string>;
+		return resolveToolCallStatus(attrs);
+	};
+
 	let open = false;
 	let systemTerminal: any = null;
 	let directTerminal: any = null;
 	let activeTerminal: ActiveTerminal = null;
-	$: done = toBool(token?.attributes?.done);
-	$: summary = token?.summary || (done ? '已完成' : '执行中');
+	let showFilesSection = false;
+	$: status = getToolStatus(token);
+	$: statusDisplay = TOOL_STATUS_DISPLAY[status];
+	$: done = status !== 'running';
+	$: summary = status === 'success' ? token?.summary || statusDisplay.summary : statusDisplay.summary;
 
 	$: argumentsParsed = parseAttr(token?.attributes?.arguments);
 	$: resultParsed = parseNestedJSON(parseAttr(token?.attributes?.result));
@@ -163,8 +226,10 @@
 	$: argumentsText = prettyValue(argumentsParsed);
 	$: resultText = prettyValue(resultParsed);
 	$: embedsText = prettyValue(embedsParsed);
+	$: showFilesSection =
+		filesParsed.length > 0 && !TOOL_FILE_LIST_SUPPRESSED_TOOL_IDS.has(meta?.toolId ?? '');
 
-	$: hasBody = !!argumentsText || !!resultText || filesParsed.length > 0 || !!embedsText;
+	$: hasBody = !!argumentsText || !!resultText || showFilesSection || !!embedsText;
 	$: if (!hasBody) {
 		open = false;
 	}
@@ -207,7 +272,7 @@
 		}
 
 		if (file.url) {
-			window.open(file.url, '_blank', 'noopener,noreferrer');
+			await triggerGeneratedFileDownload(file.url, file.name);
 		}
 	};
 </script>
@@ -226,15 +291,13 @@
 		<div class="relative mt-0.5 shrink-0">
 			<div class={`flex size-7 items-center justify-center rounded-full ${meta.bgClass}`}>
 				{#if !done}
-					<Spinner className="size-3.5 text-blue-600 dark:text-blue-400" />
+					<Spinner className={`size-3.5 ${statusDisplay.spinnerClass ?? ''}`} />
 				{:else}
 					<svelte:component this={meta.icon} className={`size-3.5 ${meta.iconClass}`} />
 				{/if}
 			</div>
 			<span
-				class={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-white dark:border-gray-900 ${
-					done ? 'bg-emerald-500' : 'bg-blue-500'
-				}`}
+				class={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-white dark:border-gray-900 ${statusDisplay.dotClass}`}
 			></span>
 		</div>
 
@@ -246,14 +309,8 @@
 		</div>
 
 		<div class="flex items-center gap-2">
-			<span
-				class={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${
-					done
-						? 'border-emerald-200 bg-emerald-100 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-300'
-						: 'border-blue-200 bg-blue-100 text-blue-700 dark:border-blue-900 dark:bg-blue-950/60 dark:text-blue-300'
-				}`}
-			>
-				{done ? $i18n.t('Completed') : $i18n.t('Running')}
+			<span class={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${statusDisplay.badgeClass}`}>
+				{$i18n.t(statusDisplay.badgeLabel)}
 			</span>
 
 			{#if hasBody}
@@ -297,7 +354,7 @@
 				</div>
 			{/if}
 
-			{#if filesParsed.length > 0}
+			{#if showFilesSection}
 				<div
 					class="rounded-lg border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-950/70"
 				>

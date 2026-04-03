@@ -35,7 +35,7 @@ export const TOOL_DISPLAY_DEFINITIONS: ToolDisplayDefinition[] = [
 	{
 		toolId: 'tool_self_check',
 		toolName: '工具自检',
-		aliases: ['工具自检', 'self_check'],
+		aliases: ['工具自检', 'self_check', 'self_tool_check'],
 		category: 'utility'
 	},
 	{
@@ -182,10 +182,11 @@ export const resolveToolDisplay = ({
 } => {
 	const normalizedToolId =
 		normalizeToolId(toolId) || normalizeToolId(legacyName) || inferToolIdFromArgs(parsedArgs);
+	const localizedToolName = normalizedToolId ? TOOL_NAME_BY_ID[normalizedToolId] : '';
 	const fallbackName = (legacyName ?? '').trim();
 	const resolvedToolName =
+		localizedToolName ||
 		(toolName ?? '').trim() ||
-		(normalizedToolId ? TOOL_NAME_BY_ID[normalizedToolId] : '') ||
 		fallbackName ||
 		'工具调用';
 	const definition = TOOL_DISPLAY_DEFINITIONS.find((item) => item.toolId === normalizedToolId);

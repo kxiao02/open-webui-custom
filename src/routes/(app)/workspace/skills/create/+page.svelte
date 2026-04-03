@@ -31,7 +31,7 @@
 		if (res) {
 			toast.success($i18n.t('Skill created successfully'));
 			await skills.set(await getSkills(localStorage.token));
-			await goto('/workspace/skills');
+			await goto(`/workspace/skills/edit?id=${encodeURIComponent(res.id)}`);
 		}
 	};
 

@@ -42,11 +42,21 @@
 	export let accessGrants = [];
 
 	let _content = '';
+	let canSharePublic = false;
 
 	$: if ($user?.role !== 'admin' && meta?.is_default) {
 		meta = {
 			...meta,
 			is_default: false
+		};
+	}
+
+	$: canSharePublic = $user?.role === 'admin' || !!$user?.permissions?.sharing?.public_tools;
+
+	$: if (!canSharePublic && meta?.visibility === 'public') {
+		meta = {
+			...meta,
+			visibility: 'restricted'
 		};
 	}
 
@@ -66,7 +76,7 @@
 		description: '',
 		published: false,
 		category: '',
-		visibility: 'public',
+		visibility: canSharePublic ? 'public' : 'restricted',
 		dependencies: [],
 		is_default: false,
 		...meta
@@ -82,102 +92,97 @@ class Tools:
     def __init__(self):
         pass
 
-    # Add your custom tools using pure Python code here, make sure to add type hints and descriptions
+    # 在这里添加自定义工具代码，并尽量补充类型标注和说明
 	
     def get_user_name_and_email_and_id(self, __user__: dict = {}) -> str:
         """
-        Get the user name, Email and ID from the user object.
+        获取当前用户的名称、邮箱和 ID。
         """
 
-        # Do not include a descrption for __user__ as it should not be shown in the tool's specification
-        # The session user object will be passed as a parameter when the function is called
+        # 不要为 __user__ 添加 description，否则它会出现在工具规范中
+        # 调用工具时，系统会自动注入当前会话用户信息
 
         print(__user__)
         result = ""
 
         if "name" in __user__:
-            result += f"User: {__user__['name']}"
+            result += f"用户：{__user__['name']}"
         if "id" in __user__:
-            result += f" (ID: {__user__['id']})"
+            result += f"（ID：{__user__['id']}）"
         if "email" in __user__:
-            result += f" (Email: {__user__['email']})"
+            result += f"（邮箱：{__user__['email']}）"
 
         if result == "":
-            result = "User: Unknown"
+            result = "用户：未知"
 
         return result
 
     def get_current_time(self) -> str:
         """
-        Get the current time in a more human-readable format.
+        获取当前时间，并返回更适合阅读的格式。
         """
 
         now = datetime.now()
-        current_time = now.strftime("%I:%M:%S %p")  # Using 12-hour format with AM/PM
-        current_date = now.strftime(
-            "%A, %B %d, %Y"
-        )  # Full weekday, month name, day, and year
+        current_time = now.strftime("%H:%M:%S")
+        current_date = now.strftime("%A, %B %d, %Y")
 
-        return f"Current Date and Time = {current_date}, {current_time}"
+        return f"当前日期时间：{current_date} {current_time}"
 
     def calculator(
         self,
         equation: str = Field(
-            ..., description="The mathematical equation to calculate."
+            ..., description="要计算的数学表达式。"
         ),
     ) -> str:
         """
-        Calculate the result of an equation.
+        计算表达式结果。
         """
 
-        # Avoid using eval in production code
-        # https://nedbatchelder.com/blog/201206/eval_really_is_dangerous.html
+        # 生产环境中应避免直接使用 eval
         try:
             result = eval(equation)
             return f"{equation} = {result}"
         except Exception as e:
             print(e)
-            return "Invalid equation"
+            return "表达式无效"
 
     def get_current_weather(
         self,
         city: str = Field(
-            "New York, NY", description="Get the current weather for a given city."
+            "北京", description="获取指定城市的当前天气。"
         ),
     ) -> str:
         """
-        Get the current weather for a given city.
+        获取指定城市的当前天气。
         """
 
         api_key = os.getenv("OPENWEATHER_API_KEY")
         if not api_key:
-            return (
-                "API key is not set in the environment variable 'OPENWEATHER_API_KEY'."
-            )
+            return "环境变量 OPENWEATHER_API_KEY 未设置。"
 
         base_url = "http://api.openweathermap.org/data/2.5/weather"
         params = {
             "q": city,
             "appid": api_key,
-            "units": "metric",  # Optional: Use 'imperial' for Fahrenheit
+            "units": "metric",
         }
 
         try:
             response = requests.get(base_url, params=params)
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx and 5xx)
+            response.raise_for_status()
             data = response.json()
 
             if data.get("cod") != 200:
-                return f"Error fetching weather data: {data.get('message')}"
+                return f"获取天气失败：{data.get('message')}"
 
             weather_description = data["weather"][0]["description"]
             temperature = data["main"]["temp"]
             humidity = data["main"]["humidity"]
             wind_speed = data["wind"]["speed"]
 
-            return f"Weather in {city}: {temperature}°C"
+            return f"{city}天气：{weather_description}，温度 {temperature}°C，湿度 {humidity}%，风速 {wind_speed} m/s"
         except requests.RequestException as e:
-            return f"Error fetching weather data: {str(e)}"
+            return f"获取天气失败：{str(e)}"
 `;
 
 	const saveHandler = async () => {
@@ -262,12 +267,12 @@ class Tools:
 						</div>
 
 						<div class="flex-1">
-							<Tooltip content={$i18n.t('e.g. My Tools')} placement="top-start">
+							<Tooltip content="例如：我的工具" placement="top-start">
 								<input
 									class="w-full text-2xl bg-transparent outline-hidden"
 									type="text"
-									placeholder={$i18n.t('Tool Name')}
-									aria-label={$i18n.t('Tool Name')}
+									placeholder="工具名称"
+									aria-label="工具名称"
 									bind:value={name}
 									required
 								/>
@@ -284,9 +289,7 @@ class Tools:
 							>
 								<LockClosed strokeWidth="2.5" className="size-3.5" />
 
-								<div class="text-sm font-medium shrink-0">
-									{$i18n.t('Access')}
-								</div>
+								<div class="text-sm font-medium shrink-0">权限</div>
 							</button>
 						</div>
 					</div>
@@ -297,12 +300,12 @@ class Tools:
 								{id}
 							</div>
 						{:else}
-							<Tooltip className="w-full" content={$i18n.t('e.g. my_tools')} placement="top-start">
+							<Tooltip className="w-full" content="例如：my_tools" placement="top-start">
 								<input
 									class="w-full text-sm disabled:text-gray-500 bg-transparent outline-hidden"
 									type="text"
-									placeholder={$i18n.t('Tool ID')}
-									aria-label={$i18n.t('Tool ID')}
+									placeholder="工具 ID"
+									aria-label="工具 ID"
 									bind:value={id}
 									required
 									disabled={edit}
@@ -312,14 +315,14 @@ class Tools:
 
 						<Tooltip
 							className="w-full self-center items-center flex"
-							content={$i18n.t('e.g. Tools for performing various operations')}
+							content="例如：用于执行各种操作的工具"
 							placement="top-start"
 						>
 							<input
 								class="w-full text-sm bg-transparent outline-hidden"
 								type="text"
-								placeholder={$i18n.t('Tool Description')}
-								aria-label={$i18n.t('Tool Description')}
+								placeholder="工具描述"
+								aria-label="工具描述"
 								bind:value={meta.description}
 								required
 							/>
@@ -327,40 +330,36 @@ class Tools:
 					</div>
 
 					<div class="grid gap-2 px-1 pt-2 md:grid-cols-2">
-						<Tooltip
-							content={$i18n.t('Optional grouping shown in the catalog')}
-							placement="top-start"
-						>
+						<Tooltip content="可选分类，用于在目录中分组显示" placement="top-start">
 							<input
 								class="w-full text-sm bg-transparent outline-hidden"
 								type="text"
-								placeholder={$i18n.t('Category')}
-								aria-label={$i18n.t('Category')}
+								placeholder="分类"
+								aria-label="分类"
 								bind:value={meta.category}
 							/>
 						</Tooltip>
 
 						<label class="flex items-center gap-2 text-sm text-gray-500">
-							<span>{$i18n.t('Visibility')}</span>
+							<span>可见性</span>
 							<select
 								class="flex-1 rounded-lg border border-gray-200 bg-white px-2 py-1 text-sm dark:border-gray-800 dark:bg-gray-900"
 								bind:value={meta.visibility}
 							>
-								<option value="public">{$i18n.t('Public')}</option>
-								<option value="restricted">{$i18n.t('Restricted')}</option>
-								<option value="hidden">{$i18n.t('Hidden')}</option>
+								{#if canSharePublic || meta.visibility === 'public'}
+									<option value="public">公开</option>
+								{/if}
+								<option value="restricted">受限</option>
+								<option value="hidden">仅自己可见</option>
 							</select>
 						</label>
 
-						<Tooltip
-							content={$i18n.t('Comma-separated tool IDs that should also be enabled')}
-							placement="top-start"
-						>
+						<Tooltip content="需要同时启用的工具 ID，使用逗号分隔" placement="top-start">
 							<input
 								class="w-full text-sm bg-transparent outline-hidden"
 								type="text"
-								placeholder={$i18n.t('Dependencies')}
-								aria-label={$i18n.t('Dependencies')}
+								placeholder="依赖项"
+								aria-label="依赖项"
 								value={(meta.dependencies ?? []).join(', ')}
 								on:input={(event) => {
 									meta.dependencies = event.currentTarget.value
@@ -374,13 +373,13 @@ class Tools:
 						<div class="flex items-center gap-4 text-sm text-gray-500">
 							<label class="flex items-center gap-2">
 								<Switch bind:state={meta.published} />
-								<span>{$i18n.t('Published')}</span>
+								<span>已发布</span>
 							</label>
 
 							{#if $user?.role === 'admin'}
 								<label class="flex items-center gap-2">
 									<Switch bind:state={meta.is_default} />
-									<span>{$i18n.t('Default')}</span>
+									<span>默认</span>
 								</label>
 							{/if}
 						</div>

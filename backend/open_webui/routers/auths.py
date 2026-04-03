@@ -607,10 +607,12 @@ async def signin(
             detail=ERROR_MESSAGES.ACTION_PROHIBITED,
         )
 
-    if WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
-        if WEBUI_AUTH_TRUSTED_EMAIL_HEADER not in request.headers:
-            raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_TRUSTED_HEADER)
-
+    # Allow trusted-header SSO on selected routes without disabling
+    # password login for every other request path.
+    if (
+        WEBUI_AUTH_TRUSTED_EMAIL_HEADER
+        and WEBUI_AUTH_TRUSTED_EMAIL_HEADER in request.headers
+    ):
         email = request.headers[WEBUI_AUTH_TRUSTED_EMAIL_HEADER].lower()
         name = email
 

@@ -5,10 +5,10 @@
 	import { getContext, onMount, tick } from 'svelte';
 
 	import { formatFileSize, getLineCount } from '$lib/utils';
-	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import { settings } from '$lib/stores';
 	import { getKnowledgeById } from '$lib/apis/knowledge';
 	import { getFileById, getFileContentById } from '$lib/apis/files';
+	import { extractOpenWebUiFileId, normalizeOpenWebUiFileUrl } from '$lib/utils/generated-files';
 
 	import CodeBlock from '$lib/components/chat/Messages/CodeBlock.svelte';
 	import Markdown from '$lib/components/chat/Messages/Markdown.svelte';
@@ -51,6 +51,7 @@
 	let excelError = '';
 	let rowCount = 0;
 	let itemRef: string | null = null;
+	let itemUrl: string | null = null;
 
 	const normalizeFileRef = (value: unknown): string | null => {
 		if (typeof value !== 'string') {
@@ -70,7 +71,12 @@
 		return normalized;
 	};
 
-	$: itemRef = normalizeFileRef(item?.url) ?? normalizeFileRef(item?.id);
+	$: {
+		const rawUrl = normalizeFileRef(item?.url);
+		const rawId = normalizeFileRef(item?.id);
+		itemUrl = rawUrl ? normalizeOpenWebUiFileUrl(rawUrl) : rawId ? normalizeOpenWebUiFileUrl(rawId) : null;
+		itemRef = extractOpenWebUiFileId(rawUrl ?? '') ?? extractOpenWebUiFileId(rawId ?? '') ?? rawId;
+	}
 
 	// DOCX state
 	let docxHtml = '';
@@ -211,7 +217,7 @@
 		try {
 			docxError = '';
 			const [arrayBuffer, mammoth] = await Promise.all([
-				getFileContentById(item.id),
+				getFileContentById(itemRef ?? item.id),
 				import('mammoth')
 			]);
 			const result = await mammoth.convertToHtml({ arrayBuffer });
@@ -226,7 +232,7 @@
 		try {
 			pptxError = '';
 			const [arrayBuffer, { pptxToImages }] = await Promise.all([
-				getFileContentById(item.id),
+				getFileContentById(itemRef ?? item.id),
 				import('$lib/utils/pptxToHtml')
 			]);
 			const result = await pptxToImages(arrayBuffer);
@@ -272,7 +278,7 @@
 						item.id = itemRef;
 					}
 					if (!item.url) {
-						item.url = itemRef;
+						item.url = itemUrl ?? itemRef;
 					}
 				}
 
@@ -319,13 +325,9 @@
 								href="#"
 								class="hover:underline line-clamp-1"
 								on:click|preventDefault={() => {
-									if (!isPDF && itemRef) {
+									if (!isPDF && itemUrl) {
 										window.open(
-											item.type === 'file'
-												? itemRef.startsWith('http')
-													? itemRef
-													: `${WEBUI_API_BASE_URL}/files/${itemRef}/content`
-												: itemRef,
+											item.type === 'file' ? itemUrl ?? '' : itemRef ?? '',
 											'_blank'
 										);
 									}
@@ -483,7 +485,7 @@
 						</div>
 						<div use:initImagePanzoom>
 							<img
-								src={`${WEBUI_API_BASE_URL}/files/${item.id}/content`}
+								src={itemUrl ?? ''}
 								alt={item?.name ?? 'Image'}
 								class="w-full object-contain rounded-lg"
 								loading="lazy"
@@ -562,14 +564,14 @@
 						<div class="text-gray-500 text-sm p-4">{$i18n.t('File reference is unavailable.')}</div>
 					{:else if isAudio}
 						<audio
-							src={`${WEBUI_API_BASE_URL}/files/${itemRef}/content`}
+							src={itemUrl ?? ''}
 							class="w-full border-0 rounded-lg mb-2"
 							controls
 							playsinline
 						/>
 					{:else if isPDF}
 						<PDFViewer
-							url={`${WEBUI_API_BASE_URL}/files/${itemRef}/content`}
+							url={itemUrl ?? ''}
 							className="w-full h-[70vh] border-0 rounded-lg"
 						/>
 					{:else if isExcel}

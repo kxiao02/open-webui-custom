@@ -12,6 +12,7 @@ from open_webui.config import (
     get_config,
     save_config,
     is_enterprise_oauth_deployment_managed,
+    _enterprise_oauth_missing_fields,
 )
 from open_webui.config import BannerModel
 
@@ -205,11 +206,35 @@ class EnterpriseOAuthConfigForm(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-@router.get("/enterprise_oauth", response_model=EnterpriseOAuthConfigForm)
+class EnterpriseOAuthConfigResponse(EnterpriseOAuthConfigForm):
+    ENTERPRISE_OAUTH_DEPLOYMENT_MANAGED: Optional[bool] = Field(
+        None, alias="DEPLOYMENT_MANAGED"
+    )
+    ENTERPRISE_OAUTH_MISSING_REQUIRED_ENV: Optional[list[str]] = Field(
+        None, alias="MISSING_REQUIRED_ENV"
+    )
+    ENTERPRISE_OAUTH_EFFECTIVE_REDIRECT_URI: Optional[str] = Field(
+        None, alias="EFFECTIVE_REDIRECT_URI"
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+@router.get("/enterprise_oauth", response_model=EnterpriseOAuthConfigResponse)
 async def get_enterprise_oauth_config(
     request: Request, user=Depends(get_admin_user)
 ):
-    return EnterpriseOAuthConfigForm(
+    deployment_managed = is_enterprise_oauth_deployment_managed()
+    missing_required_env = _enterprise_oauth_missing_fields(deployment_managed)
+    effective_redirect_uri = request.app.state.config.ENTERPRISE_OAUTH_REDIRECT_URI
+    if not effective_redirect_uri:
+        webui_url = request.app.state.config.WEBUI_URL
+        if webui_url:
+            effective_redirect_uri = (
+                f"{webui_url.rstrip('/')}/oauth/enterprise/callback"
+            )
+
+    return EnterpriseOAuthConfigResponse(
         ENTERPRISE_OAUTH_ENABLED=request.app.state.config.ENTERPRISE_OAUTH_ENABLED,
         ENTERPRISE_OAUTH_PROVIDER_NAME=request.app.state.config.ENTERPRISE_OAUTH_PROVIDER_NAME,
         ENTERPRISE_OAUTH_CLIENT_ID=request.app.state.config.ENTERPRISE_OAUTH_CLIENT_ID,
@@ -226,6 +251,9 @@ async def get_enterprise_oauth_config(
         ENTERPRISE_OAUTH_ACCOUNT_NO_PATH=request.app.state.config.ENTERPRISE_OAUTH_ACCOUNT_NO_PATH,
         ENTERPRISE_OAUTH_EMAIL_CLAIM=request.app.state.config.ENTERPRISE_OAUTH_EMAIL_CLAIM,
         ENTERPRISE_OAUTH_EMAIL_DOMAIN=request.app.state.config.ENTERPRISE_OAUTH_EMAIL_DOMAIN,
+        ENTERPRISE_OAUTH_DEPLOYMENT_MANAGED=deployment_managed,
+        ENTERPRISE_OAUTH_MISSING_REQUIRED_ENV=missing_required_env,
+        ENTERPRISE_OAUTH_EFFECTIVE_REDIRECT_URI=effective_redirect_uri or None,
     ).model_dump(by_alias=True)
 
 

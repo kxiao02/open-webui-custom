@@ -1,12 +1,10 @@
-# tasks.py
 import asyncio
-from typing import Dict
-from uuid import uuid4
 import json
 import logging
-from redis.asyncio import Redis
-from fastapi import Request
 from typing import Dict, List, Optional
+from uuid import uuid4
+
+from redis.asyncio import Redis
 
 from open_webui.env import REDIS_KEY_PREFIX
 
@@ -20,6 +18,49 @@ item_tasks = {}
 REDIS_TASKS_KEY = f"{REDIS_KEY_PREFIX}:tasks"
 REDIS_ITEM_TASKS_KEY = f"{REDIS_KEY_PREFIX}:tasks:item"
 REDIS_PUBSUB_CHANNEL = f"{REDIS_KEY_PREFIX}:tasks:commands"
+REDIS_TASK_INSTANCE_KEY = f"{REDIS_KEY_PREFIX}:tasks:instance"
+
+TASK_INSTANCE_HEARTBEAT_TTL_SECS = 120
+TASK_INSTANCE_HEARTBEAT_INTERVAL_SECS = 30
+
+
+def _decode_redis_value(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _serialize_task_record(item_id: Optional[str], instance_id: Optional[str]) -> str:
+    return json.dumps(
+        {
+            "item_id": item_id or "",
+            "instance_id": instance_id or "",
+        }
+    )
+
+
+def _deserialize_task_record(value) -> dict[str, str]:
+    raw_value = _decode_redis_value(value)
+
+    try:
+        payload = json.loads(raw_value)
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        return {
+            "item_id": str(payload.get("item_id") or ""),
+            "instance_id": str(payload.get("instance_id") or ""),
+        }
+
+    return {
+        "item_id": raw_value,
+        "instance_id": "",
+    }
+
+
+def _instance_task_heartbeat_key(instance_id: str) -> str:
+    return f"{REDIS_TASK_INSTANCE_KEY}:{instance_id}"
 
 
 async def redis_task_command_listener(app):
@@ -46,9 +87,11 @@ async def redis_task_command_listener(app):
 ### ------------------------------
 
 
-async def redis_save_task(redis: Redis, task_id: str, item_id: Optional[str]):
+async def redis_save_task(
+    redis: Redis, task_id: str, item_id: Optional[str], instance_id: Optional[str] = None
+):
     pipe = redis.pipeline()
-    pipe.hset(REDIS_TASKS_KEY, task_id, item_id or "")
+    pipe.hset(REDIS_TASKS_KEY, task_id, _serialize_task_record(item_id, instance_id))
     if item_id:
         pipe.sadd(f"{REDIS_ITEM_TASKS_KEY}:{item_id}", task_id)
     await pipe.execute()
@@ -57,11 +100,17 @@ async def redis_save_task(redis: Redis, task_id: str, item_id: Optional[str]):
 async def redis_cleanup_task(redis: Redis, task_id: str, item_id: Optional[str]):
     pipe = redis.pipeline()
     pipe.hdel(REDIS_TASKS_KEY, task_id)
-    if item_id:
-        pipe.srem(f"{REDIS_ITEM_TASKS_KEY}:{item_id}", task_id)
-        if (await pipe.scard(f"{REDIS_ITEM_TASKS_KEY}:{item_id}").execute())[-1] == 0:
-            pipe.delete(f"{REDIS_ITEM_TASKS_KEY}:{item_id}")  # Remove if empty set
-    await pipe.execute()
+    if not item_id:
+        await pipe.execute()
+        return
+
+    item_tasks_key = f"{REDIS_ITEM_TASKS_KEY}:{item_id}"
+    pipe.srem(item_tasks_key, task_id)
+    pipe.scard(item_tasks_key)
+    results = await pipe.execute()
+    remaining_tasks = int(results[-1] or 0)
+    if remaining_tasks == 0:
+        await redis.delete(item_tasks_key)
 
 
 async def redis_list_tasks(redis: Redis) -> List[str]:
@@ -70,6 +119,100 @@ async def redis_list_tasks(redis: Redis) -> List[str]:
 
 async def redis_list_item_tasks(redis: Redis, item_id: str) -> List[str]:
     return list(await redis.smembers(f"{REDIS_ITEM_TASKS_KEY}:{item_id}"))
+
+
+async def redis_mark_instance_alive(redis: Redis, instance_id: str):
+    await redis.set(
+        _instance_task_heartbeat_key(instance_id),
+        "1",
+        ex=TASK_INSTANCE_HEARTBEAT_TTL_SECS,
+    )
+
+
+async def redis_remove_instance(redis: Redis, instance_id: str):
+    await redis.delete(_instance_task_heartbeat_key(instance_id))
+
+
+async def redis_list_active_instances(redis: Redis) -> List[str]:
+    instance_ids: List[str] = []
+    async for key in redis.scan_iter(match=f"{REDIS_TASK_INSTANCE_KEY}:*"):
+        decoded_key = _decode_redis_value(key)
+        _, _, instance_id = decoded_key.rpartition(":")
+        if instance_id:
+            instance_ids.append(instance_id)
+    return instance_ids
+
+
+async def redis_is_instance_alive(
+    redis: Redis, instance_id: str, active_instance_ids: Optional[List[str]] = None
+) -> bool:
+    if not instance_id:
+        return False
+
+    if active_instance_ids is not None:
+        return instance_id in active_instance_ids
+
+    return bool(await redis.exists(_instance_task_heartbeat_key(instance_id)))
+
+
+async def prune_stale_task_metadata(
+    redis: Redis, task_ids: List[str], current_instance_id: Optional[str] = None
+) -> List[str]:
+    if not task_ids:
+        return []
+
+    active_instance_ids = await redis_list_active_instances(redis)
+    survivors: List[str] = []
+
+    for task_id in task_ids:
+        raw_record = await redis.hget(REDIS_TASKS_KEY, task_id)
+        if raw_record is None:
+            continue
+
+        record = _deserialize_task_record(raw_record)
+        item_id = record["item_id"] or None
+        owner_instance_id = record["instance_id"]
+
+        if owner_instance_id:
+            owner_alive = await redis_is_instance_alive(
+                redis, owner_instance_id, active_instance_ids
+            )
+            if not owner_alive:
+                await redis_cleanup_task(redis, task_id, item_id)
+                continue
+
+            if current_instance_id and owner_instance_id == current_instance_id:
+                local_task = tasks.get(task_id)
+                if local_task is None or local_task.done():
+                    await redis_cleanup_task(redis, task_id, item_id)
+                    continue
+        elif current_instance_id:
+            local_task = tasks.get(task_id)
+            only_current_instance_active = not active_instance_ids or (
+                len(active_instance_ids) == 1
+                and current_instance_id in active_instance_ids
+            )
+            if only_current_instance_active and (
+                local_task is None or local_task.done()
+            ):
+                await redis_cleanup_task(redis, task_id, item_id)
+                continue
+
+        survivors.append(task_id)
+
+    return survivors
+
+
+async def task_instance_heartbeat(redis: Redis, instance_id: str):
+    try:
+        while True:
+            await redis_mark_instance_alive(redis, instance_id)
+            await asyncio.sleep(TASK_INSTANCE_HEARTBEAT_INTERVAL_SECS)
+    except asyncio.CancelledError:
+        try:
+            await redis_remove_instance(redis, instance_id)
+        finally:
+            raise
 
 
 async def redis_send_command(redis: Redis, command: dict):
@@ -87,18 +230,21 @@ async def cleanup_task(redis, task_id: str, id=None):
     Remove a completed or canceled task from the global `tasks` dictionary.
     """
     if redis:
-        await redis_cleanup_task(redis, task_id, id)
+        try:
+            await redis_cleanup_task(redis, task_id, id)
+        except Exception as exc:
+            log.warning("Failed to clean Redis metadata for task %s: %s", task_id, exc)
 
     tasks.pop(task_id, None)  # Remove the task if it exists
 
     # If an ID is provided, remove the task from the item_tasks dictionary
-    if id and task_id in item_tasks.get(id, []):
+    if id is not None and task_id in item_tasks.get(id, []):
         item_tasks[id].remove(task_id)
         if not item_tasks[id]:  # If no tasks left for this ID, remove the entry
             item_tasks.pop(id, None)
 
 
-async def create_task(redis, coroutine, id=None):
+async def create_task(redis, coroutine, id=None, instance_id: Optional[str] = None):
     """
     Create a new asyncio task and add it to the global task dictionary.
     """
@@ -112,32 +258,40 @@ async def create_task(redis, coroutine, id=None):
     tasks[task_id] = task
 
     # If an ID is provided, associate the task with that ID
-    if item_tasks.get(id):
-        item_tasks[id].append(task_id)
-    else:
-        item_tasks[id] = [task_id]
+    if id is not None:
+        if item_tasks.get(id):
+            item_tasks[id].append(task_id)
+        else:
+            item_tasks[id] = [task_id]
 
     if redis:
-        await redis_save_task(redis, task_id, id)
+        try:
+            await redis_save_task(redis, task_id, id, instance_id)
+        except Exception as exc:
+            log.warning("Failed to persist Redis metadata for task %s: %s", task_id, exc)
 
     return task_id, task
 
 
-async def list_tasks(redis):
+async def list_tasks(redis, current_instance_id: Optional[str] = None):
     """
     List all currently active task IDs.
     """
     if redis:
-        return await redis_list_tasks(redis)
+        task_ids = [_decode_redis_value(task_id) for task_id in await redis_list_tasks(redis)]
+        return await prune_stale_task_metadata(redis, task_ids, current_instance_id)
     return list(tasks.keys())
 
 
-async def list_task_ids_by_item_id(redis, id):
+async def list_task_ids_by_item_id(redis, id, current_instance_id: Optional[str] = None):
     """
     List all tasks associated with a specific ID.
     """
     if redis:
-        return await redis_list_item_tasks(redis, id)
+        task_ids = [
+            _decode_redis_value(task_id) for task_id in await redis_list_item_tasks(redis, id)
+        ]
+        return await prune_stale_task_metadata(redis, task_ids, current_instance_id)
     return item_tasks.get(id, [])
 
 

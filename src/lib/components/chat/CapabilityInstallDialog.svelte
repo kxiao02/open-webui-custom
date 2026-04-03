@@ -47,7 +47,7 @@
 			: $i18n.t('Add skill to your account?'));
 	$: fallbackMessage =
 		message ||
-		$i18n.t('{{name}} can be installed to your account or enabled only for this chat.', {
+		$i18n.t('{{name}} can be added to your account, or enabled for this chat only.', {
 			name:
 				resourceName ||
 				(resourceType === 'tool' ? $i18n.t('This tool') : $i18n.t('This skill'))
@@ -75,7 +75,7 @@
 				class="w-full rounded-3xl bg-gradient-to-r from-[#ef5b6d] to-[#4a87ff] px-4 py-2 text-sm font-medium text-white transition hover:from-[#e45166] hover:to-[#3f79f1]"
 				on:click={() => selectDecision('install')}
 			>
-				{installLabel || $i18n.t('Install to My Account')}
+				{installLabel || $i18n.t('Add to My Account')}
 			</button>
 
 			<button
@@ -83,7 +83,7 @@
 				class="w-full rounded-3xl bg-gray-100 px-4 py-2 text-sm font-medium text-gray-800 transition hover:bg-gray-200 dark:bg-gray-850 dark:text-gray-100 dark:hover:bg-gray-800"
 				on:click={() => selectDecision('session')}
 			>
-				{sessionLabel || $i18n.t('Only This Chat')}
+				{sessionLabel || $i18n.t('Enable for This Chat')}
 			</button>
 
 			<button

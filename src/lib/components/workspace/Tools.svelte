@@ -39,7 +39,6 @@
 	import ViewSelector from './common/ViewSelector.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
 
-	let shiftKey = false;
 	let loaded = false;
 
 	let toolsImportInputElement: HTMLInputElement;
@@ -57,20 +56,22 @@
 	let installActionToolId: string | null = null;
 
 	let tools = [];
+	let workspaceTools = [];
 	let filteredItems = [];
 
 	let tagsContainerElement: HTMLDivElement;
 	let viewOption = '';
 	let toolViewOptions = [
 		{ value: '', label: $i18n.t('All') },
-		{ value: 'installed', label: $i18n.t('Installed') },
-		{ value: 'available', label: $i18n.t('Available') },
+		{ value: 'installed', label: $i18n.t('In My Account') },
+		{ value: 'available', label: $i18n.t('Not in My Account') },
 		{ value: 'created', label: $i18n.t('Created by you') },
 		{ value: 'shared', label: $i18n.t('Shared with you') }
 	];
 	const TOOLS_VIEW_OPTION_STORAGE_KEY = 'workspaceToolsViewOption';
 
 	let installedCount = 0;
+	let installableCount = 0;
 
 	$: if (query !== undefined) {
 		clearTimeout(searchDebounceTimer);
@@ -79,18 +80,30 @@
 		}, 300);
 	}
 
-	$: if (tools && viewOption !== undefined) {
+	const isDefaultWorkspaceTool = (tool) =>
+		!!tool?.meta?.is_default || isCoreCatalogTool(tool);
+
+	$: workspaceTools = tools.filter((tool) => !isDefaultWorkspaceTool(tool));
+
+	$: if (workspaceTools && viewOption !== undefined) {
 		setFilteredItems();
 	}
 
-	$: installedCount = tools.filter((tool) => tool.installed).length;
+	$: installedCount = workspaceTools.filter(
+		(tool) => tool.installed && tool.installable !== false
+	).length;
+	$: installableCount = workspaceTools.filter((tool) => tool.installable !== false).length;
 
 	const isServerTool = (tool) => typeof tool?.id === 'string' && tool.id.startsWith('server:');
-	const canUseValves = (tool) => !isServerTool(tool);
-	const canUseToolMenu = (tool) => !isServerTool(tool);
+	const isCoreCatalogTool = (tool) => tool?.catalog_kind === 'core';
+	const canUseValves = (tool) => !isServerTool(tool) && !isCoreCatalogTool(tool);
+	const canUseToolMenu = (tool) => !isServerTool(tool) && !isCoreCatalogTool(tool);
 	const getToolOwnerLabel = (tool) => {
 		if (isServerTool(tool)) {
 			return $i18n.t('Server Tool');
+		}
+		if (isCoreCatalogTool(tool)) {
+			return $i18n.t('System Tool');
 		}
 
 		return capitalizeFirstLetter(tool?.user?.name ?? tool?.user?.email ?? $i18n.t('Deleted User'));
@@ -99,22 +112,27 @@
 		if (isServerTool(tool)) {
 			return tool.id;
 		}
+		if (isCoreCatalogTool(tool)) {
+			return tool.id;
+		}
 
 		return tool?.user?.email ?? $i18n.t('Deleted User');
 	};
 
 	const matchesViewOption = (tool) => {
 		if (viewOption === '') return true;
-		if (viewOption === 'installed') return !!tool.installed;
-		if (viewOption === 'available') return !tool.installed;
-		if (viewOption === 'created') return tool.user_id === $user?.id && !isServerTool(tool);
-		if (viewOption === 'shared') return tool.user_id !== $user?.id && !isServerTool(tool);
+		if (viewOption === 'installed') return tool.installable !== false && !!tool.installed;
+		if (viewOption === 'available') return tool.installable !== false && !tool.installed;
+		if (viewOption === 'created')
+			return tool.installable !== false && tool.user_id === $user?.id && !isServerTool(tool);
+		if (viewOption === 'shared')
+			return tool.installable !== false && tool.user_id !== $user?.id && !isServerTool(tool);
 
 		return true;
 	};
 
 	const setFilteredItems = () => {
-		filteredItems = tools.filter((t) => {
+		filteredItems = workspaceTools.filter((t) => {
 			const lowerQuery = query.toLowerCase();
 			const matchesQuery =
 				lowerQuery === '' ||
@@ -218,31 +236,8 @@
 			loaded = true;
 		}
 
-		const onKeyDown = (event) => {
-			if (event.key === 'Shift') {
-				shiftKey = true;
-			}
-		};
-
-		const onKeyUp = (event) => {
-			if (event.key === 'Shift') {
-				shiftKey = false;
-			}
-		};
-
-		const onBlur = () => {
-			shiftKey = false;
-		};
-
-		window.addEventListener('keydown', onKeyDown);
-		window.addEventListener('keyup', onKeyUp);
-		window.addEventListener('blur-sm', onBlur);
-
 		return () => {
 			clearTimeout(searchDebounceTimer);
-			window.removeEventListener('keydown', onKeyDown);
-			window.removeEventListener('keyup', onKeyUp);
-			window.removeEventListener('blur-sm', onBlur);
 		};
 	});
 
@@ -271,7 +266,7 @@
 			}}
 		/>
 
-		<div class="flex justify-between items-center">
+		<div class="flex items-center gap-3">
 			<div class="flex items-center md:self-center text-xl font-medium px-0.5 gap-2 shrink-0">
 				<div>
 					{$i18n.t('Tools')}
@@ -282,14 +277,14 @@
 				</div>
 			</div>
 
-			<div class="hidden md:flex items-center gap-2 ml-3">
-				<Badge type="success" content={$i18n.t('Installed')} />
-				<div class="text-xs text-gray-500 dark:text-gray-400">
-					{installedCount} / {tools.length}
+			<div class="hidden md:flex items-center gap-2 ml-3 shrink-0 whitespace-nowrap">
+				<Badge type="success" content={$i18n.t('In My Account')} />
+				<div class="text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">
+					{installedCount} / {installableCount}
 				</div>
 			</div>
 
-			<div class="flex w-full justify-end gap-1.5">
+			<div class="ml-auto flex justify-end gap-1.5 shrink-0">
 				{#if $user?.role === 'admin' || $user?.permissions?.workspace?.tools_import}
 					<button
 						class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
@@ -303,7 +298,7 @@
 					</button>
 				{/if}
 
-				{#if tools.length && ($user?.role === 'admin' || $user?.permissions?.workspace?.tools_export)}
+				{#if workspaceTools.length && ($user?.role === 'admin' || $user?.permissions?.workspace?.tools_export)}
 					<button
 						class="flex text-xs items-center space-x-1 px-3 py-1.5 rounded-xl bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 dark:text-gray-200 transition"
 						on:click={async () => {
@@ -332,13 +327,14 @@
 							goto('/workspace/tools/create');
 						}}
 					>
-						<div
-							class=" px-2 py-1.5 rounded-xl bg-black text-white dark:bg-white dark:text-black transition font-medium text-sm flex items-center"
+						<button
+							type="button"
+							class="px-2 py-1.5 rounded-xl bg-black text-white hover:bg-gray-900 dark:bg-white dark:text-black dark:hover:bg-gray-100 transition font-medium text-sm flex items-center"
 						>
 							<Plus className="size-3" strokeWidth="2.5" />
 
 							<div class=" hidden md:block md:ml-1 text-xs">{$i18n.t('New Tool')}</div>
-						</div>
+						</button>
 					</AddToolMenu>
 				{/if}
 			</div>
@@ -404,7 +400,7 @@
 		{#if (filteredItems ?? []).length !== 0}
 			<div class=" my-2 gap-2 grid px-3 lg:grid-cols-2">
 				{#each filteredItems as tool}
-					{@const canEdit = tool.write_access && !isServerTool(tool)}
+					{@const canEdit = tool.write_access && !isServerTool(tool) && !isCoreCatalogTool(tool)}
 					<Tooltip content={tool?.meta?.description ?? tool?.id}>
 						<div
 							class="flex space-x-4 text-left w-full px-3 py-2.5 transition rounded-2xl dark:hover:bg-gray-850/50 hover:bg-gray-50"
@@ -437,7 +433,10 @@
 														{tool.name}
 													</div>
 													{#if tool.installed}
-														<Badge type="success" content={$i18n.t('Installed')} />
+														<Badge type="success" content={$i18n.t('In My Account')} />
+													{/if}
+													{#if isCoreCatalogTool(tool)}
+														<Badge type="muted" content={$i18n.t('Core')} />
 													{/if}
 													{#if !tool?.meta?.published}
 														<Badge type="muted" content={$i18n.t('Draft')} />
@@ -480,36 +479,40 @@
 								</div>
 							</div>
 							<div class="flex flex-row gap-1 self-center">
-								<Tooltip
-									content={tool.installed ? $i18n.t('Remove') : $i18n.t('Install to My Account')}
-								>
-									<button
-										class="self-center min-w-[88px] text-xs px-3 py-2 rounded-xl transition font-medium {tool.installed
-											? 'bg-green-500/15 text-green-700 hover:bg-green-500/20 dark:text-green-200'
-											: 'bg-gray-100 text-gray-800 hover:bg-gray-200 dark:bg-gray-850 dark:text-gray-100 dark:hover:bg-gray-800'}"
-										type="button"
-										disabled={installActionToolId === tool.id}
-										aria-label={tool.installed
-											? $i18n.t('Remove')
-											: $i18n.t('Install to My Account')}
-										on:click|stopPropagation={() => {
-											toggleInstallHandler(tool);
-										}}
+								{#if tool.installable !== false}
+									<Tooltip
+										content={tool.installed
+											? $i18n.t('Remove from My Account')
+											: $i18n.t('Add to My Account')}
 									>
-										{#if installActionToolId === tool.id}
-											<div class="flex justify-center">
-												<Spinner className="size-3.5" />
-											</div>
-										{:else if tool.installed}
-											{$i18n.t('Remove')}
-										{:else}
-											{$i18n.t('Install')}
-										{/if}
-									</button>
-								</Tooltip>
+										<button
+											class="self-center min-w-[88px] text-xs px-3 py-2 rounded-xl transition font-medium {tool.installed
+												? 'bg-green-500/15 text-green-700 hover:bg-green-500/20 dark:text-green-200'
+												: 'bg-gray-100 text-gray-800 hover:bg-gray-200 dark:bg-gray-850 dark:text-gray-100 dark:hover:bg-gray-800'}"
+											type="button"
+											disabled={installActionToolId === tool.id}
+											aria-label={tool.installed
+												? $i18n.t('Remove from My Account')
+												: $i18n.t('Add to My Account')}
+											on:click|stopPropagation={() => {
+												toggleInstallHandler(tool);
+											}}
+										>
+											{#if installActionToolId === tool.id}
+												<div class="flex justify-center">
+													<Spinner className="size-3.5" />
+												</div>
+											{:else if tool.installed}
+												{$i18n.t('Remove')}
+											{:else}
+												{$i18n.t('Add')}
+											{/if}
+										</button>
+									</Tooltip>
+								{/if}
 
 								<div class="flex flex-row gap-0.5 self-center">
-									{#if shiftKey && canEdit}
+									{#if canEdit}
 										<Tooltip content={$i18n.t('Delete')}>
 											<button
 												class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
@@ -522,85 +525,85 @@
 												<GarbageBin />
 											</button>
 										</Tooltip>
-									{:else}
-										{#if tool?.meta?.manifest?.funding_url ?? false}
-											<Tooltip content="Support">
-												<button
-													class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-													type="button"
-													aria-label={$i18n.t('Support')}
-													on:click|stopPropagation={() => {
-														selectedTool = tool;
-														showManifestModal = true;
-													}}
-												>
-													<Heart />
-												</button>
-											</Tooltip>
-										{/if}
+									{/if}
 
-										{#if canUseValves(tool)}
-											<Tooltip content={$i18n.t('Valves')}>
-												<button
-													class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-													type="button"
-													aria-label={$i18n.t('Valves')}
-													on:click|stopPropagation={() => {
-														selectedTool = tool;
-														showValvesModal = true;
-													}}
-												>
-													<svg
-														xmlns="http://www.w3.org/2000/svg"
-														fill="none"
-														viewBox="0 0 24 24"
-														stroke-width="1.5"
-														stroke="currentColor"
-														class="size-4"
-													>
-														<path
-															stroke-linecap="round"
-															stroke-linejoin="round"
-															d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z"
-														/>
-														<path
-															stroke-linecap="round"
-															stroke-linejoin="round"
-															d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"
-														/>
-													</svg>
-												</button>
-											</Tooltip>
-										{/if}
-
-										{#if canUseToolMenu(tool)}
-											<ToolMenu
-												writeAccess={tool.write_access}
-												isDefault={tool?.meta?.is_default ?? false}
-												editHandler={() => {
-													goto(`/workspace/tools/edit?id=${encodeURIComponent(tool.id)}`);
-												}}
-												cloneHandler={() => {
-													cloneHandler(tool);
-												}}
-												exportHandler={() => {
-													exportHandler(tool);
-												}}
-												deleteHandler={async () => {
+									{#if tool?.meta?.manifest?.funding_url ?? false}
+										<Tooltip content="Support">
+											<button
+												class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+												type="button"
+												aria-label={$i18n.t('Support')}
+												on:click|stopPropagation={() => {
 													selectedTool = tool;
-													showDeleteConfirm = true;
+													showManifestModal = true;
 												}}
-												onClose={() => {}}
 											>
-												<button
-													class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-													type="button"
-													on:click|stopPropagation
+												<Heart />
+											</button>
+										</Tooltip>
+									{/if}
+
+									{#if canUseValves(tool)}
+										<Tooltip content={$i18n.t('Valves')}>
+											<button
+												class="self-center w-fit text-sm px-2 py-2 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+												type="button"
+												aria-label={$i18n.t('Valves')}
+												on:click|stopPropagation={() => {
+													selectedTool = tool;
+													showValvesModal = true;
+												}}
+											>
+												<svg
+													xmlns="http://www.w3.org/2000/svg"
+													fill="none"
+													viewBox="0 0 24 24"
+													stroke-width="1.5"
+													stroke="currentColor"
+													class="size-4"
 												>
-													<EllipsisHorizontal className="size-5" />
-												</button>
-											</ToolMenu>
-										{/if}
+													<path
+														stroke-linecap="round"
+														stroke-linejoin="round"
+														d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z"
+													/>
+													<path
+														stroke-linecap="round"
+														stroke-linejoin="round"
+														d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"
+													/>
+												</svg>
+											</button>
+										</Tooltip>
+									{/if}
+
+									{#if canUseToolMenu(tool)}
+										<ToolMenu
+											writeAccess={tool.write_access}
+											isDefault={tool?.meta?.is_default ?? false}
+											editHandler={() => {
+												goto(`/workspace/tools/edit?id=${encodeURIComponent(tool.id)}`);
+											}}
+											cloneHandler={() => {
+												cloneHandler(tool);
+											}}
+											exportHandler={() => {
+												exportHandler(tool);
+											}}
+											deleteHandler={async () => {
+												selectedTool = tool;
+												showDeleteConfirm = true;
+											}}
+											onClose={() => {}}
+										>
+											<button
+												class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+												type="button"
+												on:click|stopPropagation
+											>
+												<EllipsisHorizontal className="size-5" />
+											</button>
+										</ToolMenu>
 									{/if}
 								</div>
 							</div>

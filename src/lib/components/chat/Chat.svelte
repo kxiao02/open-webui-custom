@@ -45,6 +45,8 @@
 		pinnedChats,
 		showEmbeds,
 		showFilePreview,
+		showOverview,
+		selectedGeneratedFilePreviewId,
 		selectedTerminalId,
 		showFileNavPath,
 		showFileNavDir
@@ -67,6 +69,10 @@
 	} from '$lib/utils';
 	import { getClientCapabilities } from '$lib/utils/client-capabilities';
 	import { AudioQueue } from '$lib/utils/audio';
+	import {
+		collectGeneratedFilesFromResponseOutput,
+		normalizeToolCallContent
+	} from '$lib/utils/generated-files';
 
 	import {
 		archiveChatById,
@@ -174,13 +180,29 @@
 		selectedModelIds = selectedModels;
 	}
 
-	let thinkingModeEnabled = false;
+	const DEFAULT_THINKING_MODE_ENABLED = false;
+	const normalizeThinkingModeEnabled = (value: unknown): boolean => {
+		if (typeof value === 'boolean') {
+			return value;
+		}
+
+		if (typeof value === 'string') {
+			const normalizedValue = value.trim().toLowerCase();
+			if (normalizedValue === 'true') {
+				return true;
+			}
+			if (normalizedValue === 'false') {
+				return false;
+			}
+		}
+
+		return DEFAULT_THINKING_MODE_ENABLED;
+	};
+
+	let thinkingModeEnabled = DEFAULT_THINKING_MODE_ENABLED;
 
 	let thinkingModelId: string | null = null;
 	$: thinkingModelId = selectedModelIds[0] ?? null;
-	$: if (!thinkingModelId) {
-		thinkingModeEnabled = false;
-	}
 
 	let selectedToolIds: string[] = [];
 	let lockedToolIds: string[] = [];
@@ -214,6 +236,7 @@
 	let historyFullLoadPromise: Promise<boolean> | null = null;
 	let loadingHistoryMore = false;
 	let pendingArtifactRefresh = false;
+	let pendingTaskIdsLoad: Promise<string[]> | null = null;
 	let lastTaskRefreshAt = 0;
 
 	let taskIds: any[] | null = null;
@@ -227,6 +250,28 @@
 	let lastMessageCountId: string | null = null;
 	let hasCustomBackground = false;
 	let showLandingAmbientBackground = false;
+
+	type ChatRequestContext = {
+		thinkingModeEnabled: boolean;
+		selectedToolIds: string[];
+		selectedFilterIds: string[];
+		sessionSkillIds: string[];
+		selectedTerminalId: string | number | null;
+		featureToggles: {
+			imageGenerationEnabled: boolean;
+			webSearchEnabled: boolean;
+			codeInterpreterEnabled: boolean;
+		};
+	};
+
+	type QueuedMessage = {
+		id: string;
+		prompt: string;
+		files: any[];
+		requestContext: ChatRequestContext;
+	};
+
+	const responseRequestContexts = new Map<string, ChatRequestContext>();
 
 	const updateMessageCount = (currentId: string | null) => {
 		if (!currentId) {
@@ -267,19 +312,150 @@
 		return normalized;
 	};
 
+	const normalizeConversationId = (value: unknown): string | null => {
+		if (typeof value !== 'string') {
+			return null;
+		}
+		const normalized = value.trim();
+		if (normalized === '' || normalized === 'null' || normalized === 'undefined') {
+			return null;
+		}
+		return normalized;
+	};
+
+	const getMessageConversationId = (message: any): string | null =>
+		normalizeConversationId(message?.conversationId ?? message?.conversation_id);
+
+	const resolveResponseConversationId = ({
+		historyData,
+		chatId,
+		userMessageId,
+		responseMessageId,
+		forkBranch
+	}: {
+		historyData: any;
+		chatId: string | null | undefined;
+		userMessageId: string | null | undefined;
+		responseMessageId: string;
+		forkBranch: boolean;
+	}): string | null => {
+		const normalizedUserMessageId = normalizeConversationId(userMessageId);
+		const userMessage = normalizedUserMessageId ? historyData?.messages?.[normalizedUserMessageId] : null;
+		const parentAssistantId = normalizeConversationId(userMessage?.parentId);
+		const parentAssistant = parentAssistantId ? historyData?.messages?.[parentAssistantId] : null;
+		const baseConversationId =
+			getMessageConversationId(parentAssistant) ?? normalizeConversationId(chatId);
+
+		if (!baseConversationId) {
+			return null;
+		}
+
+		if (!forkBranch) {
+			return baseConversationId;
+		}
+
+		// Multi-response fan-out must fork the backend thread identity so
+		// concurrent assistant branches do not collide on the same bridge run lock.
+		return `${baseConversationId}::branch::${responseMessageId}`;
+	};
+
 	const sanitizeFilesList = (fileList: any[] = []) => {
 		if (!Array.isArray(fileList)) {
 			return [];
 		}
 
-		return fileList
+		const extractFileDownloadRef = (file: any): string | null =>
+			normalizeFileRef(file?.url) ??
+			normalizeFileRef(file?.bridge_url) ??
+			normalizeFileRef(file?.generated_file_url) ??
+			normalizeFileRef(file?.download_url) ??
+			normalizeFileRef(file?.downloadUrl);
+
+		const extractFileIdRef = (file: any): string | null =>
+			normalizeFileRef(file?.id) ??
+			normalizeFileRef(file?.bridge_file_id) ??
+			normalizeFileRef(file?.file_id) ??
+			normalizeFileRef(file?.fileId);
+
+		const extractFilePathRef = (file: any): string | null =>
+			normalizeFileRef(file?.path) ??
+			normalizeFileRef(file?.output_path) ??
+			normalizeFileRef(file?.target_path) ??
+			normalizeFileRef(file?.file_path);
+
+		const scoreFileLabel = (value: unknown): number => {
+			if (typeof value !== 'string') return 0;
+			const normalized = value.trim();
+			if (!normalized) return 0;
+			if (normalized === 'generated-file') return 1;
+			return normalized.length;
+		};
+
+		const buildFileDedupeKey = (file: any): string => {
+			const pathRef = extractFilePathRef(file);
+			if (pathRef) {
+				return `path::${pathRef}`;
+			}
+
+			return [
+				extractFileDownloadRef(file) ?? '',
+				extractFileIdRef(file) ?? '',
+				typeof file?.name === 'string' ? file.name.trim() : '',
+				typeof file?.filename === 'string' ? file.filename.trim() : '',
+				typeof file?.fileName === 'string' ? file.fileName.trim() : '',
+				typeof file?.content_type === 'string' ? file.content_type.trim() : '',
+				file?.size ?? file?.size_bytes ?? ''
+			].join('::');
+		};
+
+		const mergeDuplicateFiles = (existing: any, incoming: any) => {
+			const existingNameScore = Math.max(
+				scoreFileLabel(existing?.name),
+				scoreFileLabel(existing?.filename),
+				scoreFileLabel(existing?.fileName)
+			);
+			const incomingNameScore = Math.max(
+				scoreFileLabel(incoming?.name),
+				scoreFileLabel(incoming?.filename),
+				scoreFileLabel(incoming?.fileName)
+			);
+			const preferredDownloadRef =
+				extractFileDownloadRef(incoming) ?? extractFileDownloadRef(existing);
+			const preferredId = extractFileIdRef(incoming) ?? extractFileIdRef(existing);
+			const preferredPath = extractFilePathRef(incoming) ?? extractFilePathRef(existing);
+
+			return {
+				...existing,
+				...incoming,
+				url: preferredDownloadRef ?? incoming?.url ?? existing?.url,
+				id: preferredId ?? incoming?.id ?? existing?.id,
+				path: preferredPath ?? incoming?.path ?? existing?.path,
+				output_path: incoming?.output_path ?? existing?.output_path ?? preferredPath,
+				name:
+					incomingNameScore >= existingNameScore
+						? (incoming?.name ?? incoming?.filename ?? incoming?.fileName ?? existing?.name)
+						: (existing?.name ?? existing?.filename ?? existing?.fileName),
+				filename:
+					incomingNameScore >= existingNameScore
+						? (incoming?.filename ?? incoming?.name ?? existing?.filename)
+						: (existing?.filename ?? existing?.name),
+				fileName:
+					incomingNameScore >= existingNameScore
+						? (incoming?.fileName ?? incoming?.filename ?? incoming?.name ?? existing?.fileName)
+						: (existing?.fileName ?? existing?.filename ?? existing?.name)
+			};
+		};
+
+		const sanitizedFiles = fileList
 			.map((file) => {
 				if (!file || typeof file !== 'object') {
 					return null;
 				}
 
-				const fileRef = normalizeFileRef(file?.url) ?? normalizeFileRef(file?.id);
-				const normalizedId = normalizeFileRef(file?.id);
+				const downloadRef = extractFileDownloadRef(file);
+				const normalizedId = extractFileIdRef(file);
+				const pathRef = extractFilePathRef(file);
+				const fileRef = downloadRef ?? normalizedId ?? pathRef;
 				const hasInlineContent = typeof file?.content === 'string' && file.content.trim() !== '';
 
 				if (!fileRef && !hasInlineContent) {
@@ -288,13 +464,28 @@
 
 				const sanitized = { ...file };
 
-				if (fileRef) {
-					sanitized.url = fileRef;
+				if (downloadRef) {
+					sanitized.url = downloadRef;
+					if (pathRef) {
+						sanitized.path = pathRef;
+						sanitized.output_path = sanitized.output_path ?? pathRef;
+					}
 					if (normalizedId) {
 						sanitized.id = normalizedId;
-					} else if (!fileRef.startsWith('http') && !fileRef.startsWith('data:')) {
-						sanitized.id = fileRef;
+					} else if (!downloadRef.startsWith('http') && !downloadRef.startsWith('data:')) {
+						sanitized.id = downloadRef;
 					}
+				} else if (normalizedId) {
+					sanitized.url = normalizedId;
+					sanitized.id = normalizedId;
+					if (pathRef) {
+						sanitized.path = pathRef;
+						sanitized.output_path = sanitized.output_path ?? pathRef;
+					}
+				} else if (pathRef) {
+					sanitized.path = pathRef;
+					sanitized.id = pathRef;
+					delete sanitized.url;
 				} else {
 					delete sanitized.url;
 					delete sanitized.id;
@@ -303,7 +494,48 @@
 				return sanitized;
 			})
 			.filter(Boolean);
+
+		const dedupedFiles: any[] = [];
+		const dedupedIndexByKey = new Map<string, number>();
+
+		for (const file of sanitizedFiles) {
+			const dedupeKey = buildFileDedupeKey(file);
+			const existingIndex = dedupedIndexByKey.get(dedupeKey);
+			if (existingIndex === undefined) {
+				dedupedIndexByKey.set(dedupeKey, dedupedFiles.length);
+				dedupedFiles.push(file);
+				continue;
+			}
+			dedupedFiles[existingIndex] = mergeDuplicateFiles(dedupedFiles[existingIndex], file);
+		}
+
+		return dedupedFiles;
 	};
+
+	const mergeFilesLists = (...fileGroups: any[]) =>
+		sanitizeFilesList(
+			fileGroups.flatMap((group) =>
+				Array.isArray(group) ? group : group && typeof group === 'object' ? [group] : []
+			)
+		);
+
+	const collectGeneratedFilesFromCompletionData = (payload: any) =>
+		mergeFilesLists(
+			payload?.files,
+			payload?.generated_files,
+			payload?.generatedFiles,
+			payload?.metadata?.generated_files,
+			payload?.metadata?.generatedFiles,
+			collectGeneratedFilesFromResponseOutput(payload?.output),
+			payload?.choices?.[0]?.delta?.files,
+			payload?.choices?.[0]?.delta?.metadata?.generated_files,
+			payload?.choices?.[0]?.delta?.metadata?.generatedFiles,
+			collectGeneratedFilesFromResponseOutput(payload?.choices?.[0]?.delta?.output),
+			payload?.choices?.[0]?.message?.files,
+			payload?.choices?.[0]?.message?.metadata?.generated_files,
+			payload?.choices?.[0]?.message?.metadata?.generatedFiles,
+			collectGeneratedFilesFromResponseOutput(payload?.choices?.[0]?.message?.output)
+		);
 
 	const dedupeIds = (ids: string[] = []) => [
 		...new Set(
@@ -314,16 +546,160 @@
 		)
 	];
 
-	const getInstalledToolIds = () =>
-		dedupeIds(($tools ?? []).filter((tool) => tool.installed).map((tool) => tool.id));
-
 	const mergeToolIds = (...groups: string[][]) => dedupeIds(groups.flat());
 
 	const applySelectedToolIds = (toolIds: string[] = []) => {
-		selectedToolIds = mergeToolIds(getInstalledToolIds(), sessionToolIds, toolIds);
+		selectedToolIds = mergeToolIds(sessionToolIds, toolIds);
 	};
 
-	$: lockedToolIds = mergeToolIds(getInstalledToolIds(), sessionToolIds);
+	const normalizeRequestContext = (
+		requestContext: Partial<ChatRequestContext> | null | undefined,
+		fallbackRequestContext: ChatRequestContext | null = null
+	): ChatRequestContext => ({
+		thinkingModeEnabled: normalizeThinkingModeEnabled(
+			requestContext?.thinkingModeEnabled ?? fallbackRequestContext?.thinkingModeEnabled
+		),
+		selectedToolIds: dedupeIds(
+			Array.isArray(requestContext?.selectedToolIds)
+				? requestContext.selectedToolIds
+				: (fallbackRequestContext?.selectedToolIds ?? [])
+		),
+		selectedFilterIds: dedupeIds(
+			Array.isArray(requestContext?.selectedFilterIds)
+				? requestContext.selectedFilterIds
+				: (fallbackRequestContext?.selectedFilterIds ?? [])
+		),
+		sessionSkillIds: dedupeIds(
+			Array.isArray(requestContext?.sessionSkillIds)
+				? requestContext.sessionSkillIds
+				: (fallbackRequestContext?.sessionSkillIds ?? [])
+		),
+		selectedTerminalId:
+			typeof requestContext?.selectedTerminalId === 'number' ||
+			(typeof requestContext?.selectedTerminalId === 'string' &&
+				requestContext.selectedTerminalId.trim() !== '')
+				? requestContext.selectedTerminalId
+				: (fallbackRequestContext?.selectedTerminalId ?? null),
+		featureToggles: {
+			imageGenerationEnabled: Boolean(
+				requestContext?.featureToggles?.imageGenerationEnabled ??
+					fallbackRequestContext?.featureToggles?.imageGenerationEnabled
+			),
+			webSearchEnabled: Boolean(
+				requestContext?.featureToggles?.webSearchEnabled ??
+					fallbackRequestContext?.featureToggles?.webSearchEnabled
+			),
+			codeInterpreterEnabled: Boolean(
+				requestContext?.featureToggles?.codeInterpreterEnabled ??
+					fallbackRequestContext?.featureToggles?.codeInterpreterEnabled
+			)
+		}
+	});
+
+	const normalizeQueuedMessage = (
+		queuedMessage: any,
+		fallbackRequestContext: ChatRequestContext | null = null
+	): QueuedMessage | null => {
+		if (!queuedMessage || typeof queuedMessage !== 'object') {
+			return null;
+		}
+
+		const prompt =
+			typeof queuedMessage.prompt === 'string' ? queuedMessage.prompt : String(queuedMessage.prompt ?? '');
+		const queuedFiles = sanitizeFilesList(
+			Array.isArray(queuedMessage.files) ? queuedMessage.files : []
+		);
+		if (prompt.trim() === '' && queuedFiles.length === 0) {
+			return null;
+		}
+
+		return {
+			id:
+				typeof queuedMessage.id === 'string' && queuedMessage.id.trim() !== ''
+					? queuedMessage.id
+					: uuidv4(),
+			prompt,
+			files: queuedFiles,
+			requestContext: normalizeRequestContext(
+				queuedMessage.requestContext,
+				fallbackRequestContext
+			)
+		};
+	};
+
+	const normalizeMessageQueue = (
+		queueData: any,
+		fallbackRequestContext: ChatRequestContext | null = null
+	): QueuedMessage[] => {
+		if (!Array.isArray(queueData)) {
+			return [];
+		}
+
+		return queueData
+			.map((queuedMessage) => normalizeQueuedMessage(queuedMessage, fallbackRequestContext))
+			.filter((queuedMessage): queuedMessage is QueuedMessage => queuedMessage !== null);
+	};
+
+	const serializeRequestContext = (requestContext: ChatRequestContext): string =>
+		JSON.stringify(normalizeRequestContext(requestContext));
+
+	const dequeueMessageBatch = (
+		queueData: QueuedMessage[]
+	): { batch: QueuedMessage[]; remaining: QueuedMessage[] } => {
+		if (queueData.length === 0) {
+			return { batch: [], remaining: [] };
+		}
+
+		const firstRequestContextKey = serializeRequestContext(queueData[0].requestContext);
+		let batchLength = 1;
+
+		while (
+			batchLength < queueData.length &&
+			serializeRequestContext(queueData[batchLength].requestContext) === firstRequestContextKey
+		) {
+			batchLength += 1;
+		}
+
+		return {
+			batch: queueData.slice(0, batchLength),
+			remaining: queueData.slice(batchLength)
+		};
+	};
+
+	const restoreQueuedComposerState = (requestContext: ChatRequestContext | null | undefined) => {
+		if (!requestContext) {
+			return;
+		}
+
+	applySelectedToolIds(requestContext.selectedToolIds);
+	selectedFilterIds = [...requestContext.selectedFilterIds];
+	sessionSkillIds = [...requestContext.sessionSkillIds];
+	imageGenerationEnabled = requestContext.featureToggles.imageGenerationEnabled;
+	webSearchEnabled = requestContext.featureToggles.webSearchEnabled;
+	codeInterpreterEnabled = requestContext.featureToggles.codeInterpreterEnabled;
+	thinkingModeEnabled = requestContext.thinkingModeEnabled;
+	selectedTerminalId.set(
+		requestContext.selectedTerminalId == null ? null : `${requestContext.selectedTerminalId}`
+	);
+};
+
+	const submitQueuedMessages = async (queueData: QueuedMessage[]) => {
+		const normalizedQueue = normalizeMessageQueue(queueData);
+		if (normalizedQueue.length === 0) {
+			return;
+		}
+
+		const { batch, remaining } = dequeueMessageBatch(normalizedQueue);
+		messageQueue = remaining;
+
+		files = sanitizeFilesList(batch.flatMap((item) => item.files));
+		await tick();
+		await submitPrompt(batch.map((item) => item.prompt).join('\n\n'), {
+			requestContext: batch[0].requestContext
+		});
+	};
+
+	$: lockedToolIds = mergeToolIds(sessionToolIds);
 
 	const getChatSessionMeta = () => ({
 		session_tool_ids: dedupeIds(sessionToolIds),
@@ -532,6 +908,81 @@
 			.map((id) => (typeof id === 'string' ? id.trim() : ''))
 			.filter((id) => id !== '' && id !== 'null' && id !== 'undefined');
 
+	const hasRenderableAssistantPayload = (message: any): boolean => {
+		if (!message || message.role !== 'assistant') {
+			return false;
+		}
+
+		if (typeof message.content === 'string' && message.content.trim() !== '') {
+			return true;
+		}
+
+		if (Array.isArray(message.content) && message.content.length > 0) {
+			return true;
+		}
+
+		if (Array.isArray(message.output) && message.output.length > 0) {
+			return true;
+		}
+
+		return Boolean(message.error);
+	};
+
+	const mergeHistoryMessage = (existingMessage: any, nextMessage: any) => {
+		const previousContent = existingMessage?.content;
+
+		return {
+			...(existingMessage ?? {}),
+			...(previousContent !== undefined && previousContent !== nextMessage.content
+				? { originalContent: previousContent }
+				: {}),
+			...nextMessage
+		};
+	};
+
+	const hasBlockingAssistantResponse = (historyData: any): boolean => {
+		const messages = historyData?.messages;
+		if (!messages || typeof messages !== 'object') {
+			return false;
+		}
+
+		const currentId =
+			typeof historyData?.currentId === 'string' ? historyData.currentId.trim() : '';
+		if (!currentId || !messages[currentId]) {
+			return false;
+		}
+
+		const currentMessage = messages[currentId];
+		const hasUnfinishedAssistant = (messageId: string): boolean => {
+			const message = messages[messageId];
+			return Boolean(message && message.role === 'assistant' && message.done !== true);
+		};
+
+		if (currentMessage.role === 'assistant') {
+			if (currentMessage.done !== true) {
+				return true;
+			}
+
+			const parentMessage = currentMessage.parentId ? messages[currentMessage.parentId] : null;
+			const siblingIds: string[] = Array.isArray(parentMessage?.childrenIds)
+				? parentMessage.childrenIds
+				: [];
+			return siblingIds.some((messageId: string) => hasUnfinishedAssistant(messageId));
+		}
+
+		if (currentMessage.role === 'user') {
+			const childIds: string[] = Array.isArray(currentMessage.childrenIds)
+				? currentMessage.childrenIds
+				: [];
+			return childIds.some((messageId: string) => hasUnfinishedAssistant(messageId));
+		}
+
+		return false;
+	};
+
+	let hasBlockingGeneration = false;
+	$: hasBlockingGeneration = generating || hasBlockingAssistantResponse(history);
+
 	const resolveHistoryCurrentId = (historyData: any): string | null => {
 		const messages = historyData?.messages;
 		if (!messages || typeof messages !== 'object') {
@@ -570,20 +1021,28 @@
 		return candidates[0]?.[0] ?? null;
 	};
 
-	const markHistoryForRecoveredActiveTasks = (historyData: any) => {
+	const getCurrentBranchLastAssistantMessage = (historyData: any) => {
 		const currentMessageId = resolveHistoryCurrentId(historyData);
 		if (!currentMessageId || !historyData?.messages?.[currentMessageId]) {
-			return;
+			return null;
 		}
 
 		historyData.currentId = currentMessageId;
 
 		const branchMessages = createMessagesList(historyData, currentMessageId);
-		const lastAssistantMessage = [...branchMessages]
+		return (
+			[...branchMessages]
 			.reverse()
-			.find((message) => message?.role === 'assistant');
+			.find((message) => message?.role === 'assistant') ?? null
+		);
+	};
 
-		if (lastAssistantMessage) {
+	const markHistoryForRecoveredActiveTasks = (historyData: any) => {
+		const lastAssistantMessage = getCurrentBranchLastAssistantMessage(historyData);
+
+		// Preserve explicit completion. Active backend tasks may continue for follow-ups,
+		// title generation, or tags after the assistant answer has already finished.
+		if (lastAssistantMessage && lastAssistantMessage.done !== true) {
 			lastAssistantMessage.done = false;
 			historyData.messages[lastAssistantMessage.id] = lastAssistantMessage;
 		}
@@ -654,9 +1113,35 @@
 	};
 
 	const prepareHistory = (historyData: any) => {
+		return sanitizeHistoryForPersistence(historyData ?? { messages: {}, currentId: null });
+	};
+
+	const normalizeHistoryMessage = (message: any) => {
+		if (!message || typeof message !== 'object') {
+			return message;
+		}
+
+		if (message.role !== 'assistant' || typeof message.content !== 'string') {
+			return message;
+		}
+
+		return {
+			...message,
+			content: normalizeAssistantResponseContent(message.content)
+		};
+	};
+
+	const sanitizeHistoryForPersistence = (historyData: any) => {
 		const normalized = historyData ?? { messages: {}, currentId: null };
 		sanitizeHistoryFileRefs(normalized);
 		sanitizeHistoryModelRefs(normalized);
+
+		if (normalized.messages && typeof normalized.messages === 'object') {
+			for (const [id, message] of Object.entries(normalized.messages)) {
+				normalized.messages[id] = normalizeHistoryMessage(message);
+			}
+		}
+
 		normalized.currentId = resolveHistoryCurrentId(normalized);
 		return normalized;
 	};
@@ -664,9 +1149,10 @@
 	const mergeHistoryData = (target: any, incoming: any): number => {
 		if (!target?.messages || !incoming?.messages) return 0;
 		let added = 0;
-		for (const [id, msg] of Object.entries(incoming.messages)) {
+		for (const [id, rawMessage] of Object.entries(incoming.messages)) {
+			const message = normalizeHistoryMessage(rawMessage);
 			if (!target.messages[id]) {
-				target.messages[id] = msg;
+				target.messages[id] = message;
 				added += 1;
 			}
 		}
@@ -740,12 +1226,62 @@
 		if ((nextTaskIds?.length ?? 0) > 0) {
 			markHistoryForRecoveredActiveTasks(history);
 		} else if (history?.currentId) {
+			const lastAssistantMessage = getCurrentBranchLastAssistantMessage(history);
+			if (
+				lastAssistantMessage &&
+				(!hasRenderableAssistantPayload(lastAssistantMessage) ||
+					lastAssistantMessage.done !== true)
+			) {
+				await finalizeIdleChatAfterReload($chatId);
+			} else {
+				for (const message of Object.values(history.messages ?? {}) as any[]) {
+					if (message && message.role === 'assistant') {
+						message.done = true;
+					}
+				}
+			}
+		}
+	};
+
+	const isCurrentChatRequest = (requestedChatId: string | null | undefined) =>
+		Boolean(requestedChatId) && $chatId === requestedChatId && chatIdProp === requestedChatId;
+
+	const isVisibleChatTarget = (targetChatId: string | null | undefined) =>
+		Boolean(targetChatId) && ($chatId === targetChatId || chatIdProp === targetChatId);
+
+	const applyTaskIdsToHistory = (nextTaskIds: string[]) => {
+		taskIds = nextTaskIds;
+
+		if ((nextTaskIds?.length ?? 0) > 0) {
+			markHistoryForRecoveredActiveTasks(history);
+		} else if (history?.currentId) {
 			for (const message of Object.values(history.messages)) {
 				if (message && message.role === 'assistant') {
 					message.done = true;
 				}
 			}
 		}
+
+		history = history;
+	};
+
+	const finalizeIdleChatAfterReload = async (requestedChatId: string) => {
+		const reloaded = await refreshHistoryFromServer(requestedChatId);
+		if (!reloaded) {
+			applyTaskIdsToHistory([]);
+			return;
+		}
+
+		const refreshedLastAssistantMessage = getCurrentBranchLastAssistantMessage(history);
+		if (
+			refreshedLastAssistantMessage &&
+			hasRenderableAssistantPayload(refreshedLastAssistantMessage) &&
+			refreshedLastAssistantMessage.done === true
+		) {
+			return;
+		}
+
+		applyTaskIdsToHistory([]);
 	};
 
 	const loadMoreHistory = async () => {
@@ -793,7 +1329,7 @@
 	};
 
 	// Message queue for storing messages while generating
-	let messageQueue: { id: string; prompt: string; files: any[] }[] = [];
+	let messageQueue: QueuedMessage[] = [];
 	let navigateRunId = 0;
 
 	$: if (chatIdProp) {
@@ -803,10 +1339,28 @@
 	const isActiveChatNavigation = (runId: number, targetChatId: string | null | undefined) =>
 		runId === navigateRunId && chatIdProp === targetChatId;
 
+	const cancelPendingNewChatInit = () => {
+		initNewChatRunId += 1;
+	};
+
+	const canReuseVisibleHistoryForNavigation = (targetChatId: string | null | undefined) => {
+		if (!targetChatId || targetChatId !== $chatId) {
+			return false;
+		}
+
+		if (!history?.currentId) {
+			return false;
+		}
+
+		return Object.keys(history?.messages ?? {}).length > 0;
+	};
+
 	const navigateHandler = async () => {
 		const runId = ++navigateRunId;
 		const targetChatId = chatIdProp;
-		loading = true;
+		const preserveVisibleHistory = canReuseVisibleHistoryForNavigation(targetChatId);
+		loading = !preserveVisibleHistory;
+		await resetAuxiliaryPanels();
 
 		// Save current queue to sessionStorage before navigating away
 		if (messageQueue.length > 0 && $chatId) {
@@ -818,6 +1372,9 @@
 
 		files = [];
 		messageQueue = [];
+		tags = [];
+		taskIds = null;
+		pendingTaskIdsLoad = null;
 		sessionToolIds = [];
 		sessionSkillIds = [];
 		historyMeta = {
@@ -830,7 +1387,7 @@
 		selectedFilterIds = [];
 		webSearchEnabled = false;
 		imageGenerationEnabled = false;
-		thinkingModeEnabled = false;
+		thinkingModeEnabled = DEFAULT_THINKING_MODE_ENABLED;
 
 		const storageChatInput = sessionStorage.getItem(
 			`chat-input${targetChatId ? `-${targetChatId}` : ''}`
@@ -842,34 +1399,11 @@
 					return;
 				}
 
+				loading = false;
 				await tick();
 				window.setTimeout(() => scrollToBottom(), 0);
 
 				await tick();
-
-				// Restore queue from sessionStorage
-				const storedQueueData = sessionStorage.getItem(`chat-queue-${targetChatId}`);
-				if (storedQueueData) {
-					try {
-						const restoredQueue = JSON.parse(storedQueueData);
-
-						if (restoredQueue.length > 0) {
-							sessionStorage.removeItem(`chat-queue-${targetChatId}`);
-							// Check if there are pending tasks (still generating)
-							const hasPendingTask = taskIds !== null && taskIds.length > 0;
-							if (!hasPendingTask) {
-								// No pending tasks - process the queue
-								files = restoredQueue.flatMap((m) => m.files);
-								await tick();
-								const combinedPrompt = restoredQueue.map((m) => m.prompt).join('\n\n');
-								await submitPrompt(combinedPrompt);
-							} else {
-								// Has pending tasks - show as queued (chatCompletedHandler will process)
-								messageQueue = restoredQueue;
-							}
-						}
-					} catch (e) {}
-				}
 
 				if (storageChatInput) {
 					try {
@@ -883,11 +1417,39 @@
 							webSearchEnabled = input.webSearchEnabled;
 							imageGenerationEnabled = input.imageGenerationEnabled;
 							codeInterpreterEnabled = input.codeInterpreterEnabled;
-							thinkingModeEnabled = input.thinkingModeEnabled ?? false;
+							thinkingModeEnabled = normalizeThinkingModeEnabled(
+								input.thinkingModeEnabled
+							);
 						}
 					} catch (e) {}
 				} else {
 					await setDefaults();
+				}
+
+				// Restore queue from sessionStorage after input state is restored so older
+				// queue entries without per-request metadata still inherit the right toggles.
+				const storedQueueData = sessionStorage.getItem(`chat-queue-${targetChatId}`);
+				if (storedQueueData) {
+					try {
+						const restoredQueue = normalizeMessageQueue(
+							JSON.parse(storedQueueData),
+							captureRequestContext()
+						);
+
+						if (restoredQueue.length > 0) {
+							sessionStorage.removeItem(`chat-queue-${targetChatId}`);
+							if (pendingTaskIdsLoad) {
+								await pendingTaskIdsLoad;
+								await tick();
+							}
+							if (!hasBlockingAssistantResponse(history)) {
+								await submitQueuedMessages(restoredQueue);
+							} else {
+								// Has pending tasks - show as queued (chatCompletedHandler will process)
+								messageQueue = restoredQueue;
+							}
+						}
+					} catch (e) {}
 				}
 
 				const chatInput = document.getElementById('chat-input');
@@ -916,6 +1478,7 @@
 			// Handle prompt selection
 			messageInput?.setText(data, async () => {
 				if (!($settings?.insertSuggestionPrompt ?? false)) {
+					cancelPendingNewChatInit();
 					await tick();
 					submitPrompt(prompt);
 				}
@@ -977,7 +1540,7 @@
 		webSearchEnabled = false;
 		imageGenerationEnabled = false;
 		codeInterpreterEnabled = false;
-		thinkingModeEnabled = false;
+		thinkingModeEnabled = DEFAULT_THINKING_MODE_ENABLED;
 
 		if (selectedModelIds.filter((id) => id).length > 0) {
 			setDefaults();
@@ -1093,8 +1656,6 @@
 	};
 
 	const chatEventHandler = async (event, cb) => {
-		console.log(event);
-
 		if (event.chat_id === $chatId) {
 			await tick();
 			let message = history.messages[event.message_id];
@@ -1126,12 +1687,33 @@
 					} else if (targetMessageId && history.messages[targetMessageId]) {
 						history.messages[targetMessageId].done = true;
 					}
+				} else if (type === 'chat:active') {
+					if (data?.active === false) {
+						taskIds = null;
+						const targetMessageId =
+							event?.message_id && history.messages[event.message_id]
+								? event.message_id
+								: history.currentId;
+						const responseMessage = targetMessageId
+							? history.messages[targetMessageId]
+							: getCurrentBranchLastAssistantMessage(history);
+
+						if (
+							responseMessage?.role === 'assistant' &&
+							(!hasRenderableAssistantPayload(responseMessage) ||
+								responseMessage.done !== true)
+						) {
+							await finalizeIdleChatAfterReload(event.chat_id);
+						} else {
+							applyTaskIdsToHistory([]);
+						}
+					}
 				} else if (type === 'chat:message:delta' || type === 'message') {
 					message.content += data.content;
 				} else if (type === 'chat:message' || type === 'replace') {
 					message.content = data.content;
 				} else if (type === 'chat:message:files' || type === 'files') {
-					message.files = sanitizeFilesList(data?.files ?? []);
+					message.files = mergeFilesLists(message?.files ?? [], data?.files ?? []);
 				} else if (type === 'chat:message:embeds' || type === 'embeds') {
 					message.embeds = data.embeds;
 
@@ -1147,6 +1729,8 @@
 					message.error = data.error;
 				} else if (type === 'chat:message:follow_ups') {
 					message.followUps = data.follow_ups;
+					history.messages[message.id] = message;
+					history = history;
 
 					if (autoScroll) {
 						scrollToBottom('smooth');
@@ -1257,6 +1841,7 @@
 			console.debug(event.data.text);
 
 			if (prompt !== '') {
+				cancelPendingNewChatInit();
 				await tick();
 				submitPrompt(prompt);
 			}
@@ -1278,6 +1863,7 @@
 			console.debug(event.data.text);
 
 			if (event.data.text !== '') {
+				cancelPendingNewChatInit();
 				await tick();
 				submitPrompt(event.data.text);
 			}
@@ -1391,6 +1977,8 @@
 		);
 
 		const init = async () => {
+			await resetAuxiliaryPanels();
+
 			if (storageChatInput) {
 				prompt = '';
 				messageInput?.setText('');
@@ -1409,12 +1997,15 @@
 
 					if (!$temporaryChatEnabled) {
 						messageInput?.setText(input.prompt);
-						files = input.files;
+						files = sanitizeFilesList(input.files ?? []);
 						applySelectedToolIds(input.selectedToolIds ?? []);
 						selectedFilterIds = input.selectedFilterIds;
 						webSearchEnabled = input.webSearchEnabled;
 						imageGenerationEnabled = input.imageGenerationEnabled;
 						codeInterpreterEnabled = input.codeInterpreterEnabled;
+						thinkingModeEnabled = normalizeThinkingModeEnabled(
+							input.thinkingModeEnabled
+						);
 					}
 				} catch (e) {}
 			}
@@ -1711,6 +2302,19 @@
 		return runId === initNewChatRunId && $page.url.pathname === '/' && !chatIdProp;
 	};
 
+	const resetAuxiliaryPanels = async () => {
+		selectedGeneratedFilePreviewId.set(null);
+		selectedTerminalId.set(null);
+		showFileNavPath.set(null);
+		showFileNavDir.set(null);
+		await showOverview.set(false);
+		await showCallOverlay.set(false);
+		await showArtifacts.set(false);
+		await showEmbeds.set(false);
+		await showFilePreview.set(false);
+		await showControls.set(false);
+	};
+
 	const initNewChat = async () => {
 		if ($page.url.pathname !== '/') {
 			await goto('/', { replaceState: true, noScroll: true, keepFocus: true });
@@ -1827,13 +2431,7 @@
 			}
 		}
 
-		if ($mobile) {
-			await showControls.set(false);
-		}
-		await showCallOverlay.set(false);
-		await showArtifacts.set(false);
-		await showEmbeds.set(false);
-		await showFilePreview.set(false);
+		await resetAuxiliaryPanels();
 
 		if (!isActiveNewChatInit(runId)) {
 			return;
@@ -1944,9 +2542,12 @@
 		});
 
 		if (chat) {
-			tags = await getTagsById(localStorage.token, $chatId).catch(async (error) => {
-				return [];
-			});
+			const requestedChatId = $chatId;
+			const tagsPromise = getTagsById(localStorage.token, requestedChatId).catch(async () => []);
+			const taskIdsPromise = getTaskIdsByChatId(localStorage.token, requestedChatId)
+				.then((taskRes) => normalizeTaskIds(taskRes?.task_ids))
+				.catch(() => []);
+			pendingTaskIdsLoad = taskIdsPromise;
 
 			const chatContent = chat.chat;
 
@@ -1985,32 +2586,60 @@
 				params = chatContent?.params ?? {};
 				chatFiles = sanitizeFilesList(chatContent?.files ?? []);
 				applySelectedToolIds(selectedToolIds ?? []);
-
-				const taskRes = await getTaskIdsByChatId(localStorage.token, $chatId).catch((error) => {
-					return null;
+				void tagsPromise.then((nextTags) => {
+					if (isCurrentChatRequest(requestedChatId)) {
+						tags = nextTags;
+					}
 				});
-				taskIds = normalizeTaskIds(taskRes?.task_ids);
+				void taskIdsPromise.then((nextTaskIds) => {
+					if (pendingTaskIdsLoad === taskIdsPromise) {
+						pendingTaskIdsLoad = null;
+					}
+
+					if (!isCurrentChatRequest(requestedChatId)) {
+						return;
+					}
+
+					applyTaskIdsToHistory(nextTaskIds);
+				});
 
 				autoScroll = true;
-				await tick();
-
-				if ((taskIds?.length ?? 0) === 0 && history.currentId) {
-					for (const message of Object.values(history.messages)) {
-						if (message && message.role === 'assistant') {
-							message.done = true;
-						}
-					}
-				} else if ((taskIds?.length ?? 0) > 0) {
-					markHistoryForRecoveredActiveTasks(history);
-				}
-
-				await tick();
 
 				return true;
 			} else {
 				return null;
 			}
 		}
+	};
+
+	const refreshHistoryFromServer = async (requestedChatId: string) => {
+		if (!requestedChatId || requestedChatId.startsWith('local:')) {
+			return false;
+		}
+
+		const chatRes = await getChatById(
+			localStorage.token,
+			requestedChatId,
+			buildHistoryRequestParams(HISTORY_TAIL_DEFAULT)
+		).catch(() => null);
+
+		if (!chatRes?.chat || !isCurrentChatRequest(requestedChatId)) {
+			return false;
+		}
+
+		const chatContent = chatRes.chat;
+		history = prepareHistory(resolveHistoryFromChatContent(chatContent));
+		const metaFromResponse = normalizeHistoryMeta(chatRes.meta);
+		historyMeta =
+			metaFromResponse ?? {
+				truncated: false,
+				totalMessages: Object.keys(history?.messages ?? {}).length,
+				canLoadMore: false,
+				windowSize: Object.keys(history?.messages ?? {}).length
+			};
+		chatFiles = sanitizeFilesList(chatContent?.files ?? []);
+		chatTitle.set(chatContent.title);
+		return true;
 	};
 
 	const scrollToBottom = async (behavior = 'auto') => {
@@ -2035,13 +2664,143 @@
 	};
 
 	const TOOL_CALL_BLOCK_START_REGEX = /<details\b[^>]*\btype="tool_calls"[^>]*>/i;
+	const TOOL_CALL_BLOCK_REGEX = /<details\b[^>]*\btype="tool_calls"[^>]*>[\s\S]*?<\/details>/gim;
+	const TOOL_CALL_OPEN_TAG_REGEX = /^<details\b([^>]*)>/i;
+	const TOOL_CALL_ATTR_REGEX = /(\w+)="([^"]*)"/g;
 	const LEAKED_TOOL_ATTR_LINE_REGEX =
 		/(^|\n)\s*(?:type="tool_calls"|name="[^"\n]*"|tool_id="[^"\n]*"|tool_name="[^"\n]*"|arguments="[^"\n]*"|result="[^"\n]*"|done="(?:true|false)"\s+status="[^"\n]*")[^\n]*(?=\n|$)/gi;
 	const SOURCE_SECTION_LINE_REGEX = /(^|\n)\s*(参考来源|Sources)\s*:?\s*(?:\n|$)/i;
 	const SOURCE_SECTION_INLINE_REGEX = /(参考来源|Sources)\s*:?\s*(?:\[[^\]]+\][^\n\r]*)$/i;
 
+	const getToolCallAttrs = (block: string): Record<string, string> => {
+		const openTag = block.match(TOOL_CALL_OPEN_TAG_REGEX)?.[1] ?? '';
+		const attrs: Record<string, string> = {};
+		for (const item of openTag.matchAll(TOOL_CALL_ATTR_REGEX)) {
+			attrs[item[1]] = item[2];
+		}
+		return attrs;
+	};
+
+	const getToolCallSignature = (block: string, attrs: Record<string, string>): string => {
+		const callKey = (attrs.call_key || '').trim();
+		if (callKey) return `call_key:${callKey}`;
+
+		const id = (attrs.id || '').trim();
+		if (id) return `id:${id}`;
+
+		return `block:${block.trim()}`;
+	};
+
+	const isTerminalToolCall = (attrs: Record<string, string>): boolean => {
+		const status = (attrs.status || '').trim().toLowerCase();
+		return ['success', 'error', 'timeout'].includes(status) || attrs.done === 'true';
+	};
+
+	const collapseDuplicateToolCallBlocks = (content: string): string => {
+		if (!content || !content.includes('type="tool_calls"')) return content;
+
+		const matches = Array.from(content.matchAll(TOOL_CALL_BLOCK_REGEX));
+		if (matches.length <= 1) return content;
+
+		const blocks = matches.map((match, index) => {
+			const block = match[0] || '';
+			const attrs = getToolCallAttrs(block);
+			return {
+				block,
+				attrs,
+				start: match.index ?? -1,
+				end: (match.index ?? -1) + block.length,
+				index
+			};
+		});
+
+		const chosenBySignature = new Map<
+			string,
+			{ block: string; attrs: Record<string, string>; start: number; end: number; index: number }
+		>();
+
+		for (const item of blocks) {
+			if (item.start < 0) continue;
+
+			const signature = getToolCallSignature(item.block, item.attrs);
+			const existing = chosenBySignature.get(signature);
+			if (!existing) {
+				chosenBySignature.set(signature, item);
+				continue;
+			}
+
+			const existingTerminal = isTerminalToolCall(existing.attrs);
+			const nextTerminal = isTerminalToolCall(item.attrs);
+			if ((nextTerminal && !existingTerminal) || nextTerminal === existingTerminal) {
+				chosenBySignature.set(signature, item);
+			}
+		}
+
+		const keptBlocks = Array.from(chosenBySignature.values()).sort((a, b) => a.start - b.start);
+		let cursor = 0;
+		let normalized = '';
+		for (const item of keptBlocks) {
+			normalized += content.slice(cursor, item.start);
+			normalized += item.block;
+			cursor = item.end;
+		}
+		normalized += content.slice(cursor);
+
+		return normalized.replace(/\n{3,}/g, '\n\n').trim();
+	};
+
+	const stripInterstitialToolProgressText = (content: string) => {
+		if (!content || !content.includes('type="tool_calls"')) return content;
+
+		const matches = Array.from(content.matchAll(TOOL_CALL_BLOCK_REGEX));
+		if (matches.length < 2) return content;
+
+		let cursor = 0;
+		let normalized = '';
+
+		for (let index = 0; index < matches.length; index += 1) {
+			const match = matches[index];
+			const block = match[0] ?? '';
+			const start = match.index ?? -1;
+			if (start < 0) continue;
+
+			normalized += content.slice(cursor, start);
+			normalized += block;
+			cursor = start + block.length;
+
+			const nextMatch = matches[index + 1];
+			if (!nextMatch || nextMatch.index === undefined) {
+				continue;
+			}
+
+			const between = content.slice(cursor, nextMatch.index);
+			const collapsed = between.replace(/\s+/g, '');
+			if (!collapsed || between.includes('<details')) {
+				normalized += between;
+			}
+			cursor = nextMatch.index;
+		}
+
+		normalized += content.slice(cursor);
+		return normalized.replace(/\n{3,}/g, '\n\n').trim();
+	};
+
 	const normalizeAssistantResponseContent = (content: string) => {
 		if (!content) return content;
+
+		const needsStructuralNormalization =
+			content.includes('<details') ||
+			content.includes('type="tool_calls"') ||
+			content.includes('tool_id="') ||
+			content.includes('tool_name="') ||
+			content.includes('arguments="') ||
+			content.includes('result="') ||
+			content.includes('参考来源') ||
+			content.includes('Sources');
+
+		if (!needsStructuralNormalization) {
+			return content;
+		}
 
 		let normalized = content;
 		const toolCallStartIndex = normalized.search(TOOL_CALL_BLOCK_START_REGEX);
@@ -2052,6 +2811,9 @@
 			}
 		}
 
+		normalized = collapseDuplicateToolCallBlocks(normalized);
+		normalized = stripInterstitialToolProgressText(normalized);
+		normalized = normalizeToolCallContent(normalized);
 		normalized = normalized.replace(LEAKED_TOOL_ATTR_LINE_REGEX, '$1').replace(/\n{3,}/g, '\n\n');
 
 		normalized = normalized.replace(
@@ -2079,6 +2841,8 @@
 	};
 
 	const chatCompletedHandler = async (_chatId, modelId, responseMessageId, messages) => {
+		const requestContext =
+			responseRequestContexts.get(responseMessageId) ?? captureRequestContext();
 		const res = await chatCompleted(localStorage.token, {
 			model: modelId,
 			messages: messages.map((m) => ({
@@ -2090,7 +2854,10 @@
 				...(m.usage ? { usage: m.usage } : {}),
 				...(m.sources ? { sources: m.sources } : {})
 			})),
-			filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
+			filter_ids:
+				requestContext.selectedFilterIds.length > 0
+					? requestContext.selectedFilterIds
+					: undefined,
 			model_item: $models.find((m) => m.id === modelId),
 			chat_id: _chatId,
 			session_id: $socket?.id,
@@ -2104,28 +2871,27 @@
 
 		if (res !== null && res.messages) {
 			// Update chat history with the new messages
-			for (const message of res.messages) {
+			for (const rawMessage of res.messages) {
+				const message = normalizeHistoryMessage(rawMessage);
 				if (message?.id) {
-					// Add null check for message and message.id
-					history.messages[message.id] = {
-						...history.messages[message.id],
-						...(history.messages[message.id].content !== message.content
-							? { originalContent: history.messages[message.id].content }
-							: {}),
-						...message
-					};
+					history.messages[message.id] = mergeHistoryMessage(
+						history.messages[message.id],
+						message
+					);
 				}
 			}
+			prepareHistory(history);
 		}
 
 		await tick();
 
 		if ($chatId == _chatId) {
 			if (!$temporaryChatEnabled) {
+				const historyToPersist = sanitizeHistoryForPersistence(structuredClone(history));
 				chat = await updateChatById(localStorage.token, _chatId, {
 					models: selectedModels,
-					messages: messages,
-					history: history,
+					messages: createMessagesList(historyToPersist, historyToPersist.currentId),
+					history: historyToPersist,
 					params: params,
 					files: chatFiles
 				});
@@ -2136,17 +2902,11 @@
 		}
 
 		taskIds = null;
+		responseRequestContexts.delete(responseMessageId);
 
-		// Process message queue - combine all queued messages and submit at once
+		// Drain the next compatible queue batch so per-message request toggles stay intact.
 		if (messageQueue.length > 0) {
-			const combinedPrompt = messageQueue.map((m) => m.prompt).join('\n\n');
-			const combinedFiles = messageQueue.flatMap((m) => m.files);
-			messageQueue = [];
-
-			// Set the files and submit
-			files = combinedFiles;
-			await tick();
-			await submitPrompt(combinedPrompt);
+			await submitQueuedMessages(messageQueue);
 		}
 	};
 
@@ -2176,31 +2936,24 @@
 
 		if (res !== null && res.messages) {
 			// Update chat history with the new messages
-			for (const message of res.messages) {
-				history.messages[message.id] = {
-					...history.messages[message.id],
-					...(history.messages[message.id].content !== message.content
-						? { originalContent: history.messages[message.id].content }
-						: {}),
-					...message
-				};
+			for (const rawMessage of res.messages) {
+				const message = normalizeHistoryMessage(rawMessage);
+				if (!message?.id) {
+					continue;
+				}
+				history.messages[message.id] = mergeHistoryMessage(
+					history.messages[message.id],
+					message
+				);
 			}
+			prepareHistory(history);
 		}
 
-		if ($chatId == _chatId) {
-			if (!$temporaryChatEnabled) {
-				chat = await updateChatById(localStorage.token, _chatId, {
-					models: selectedModels,
-					messages: messages,
-					history: history,
-					params: params,
-					files: chatFiles
-				});
-
-				currentChatPage.set(1);
-				await chats.set(await getChatList(localStorage.token, $currentChatPage));
-			}
-		}
+		await saveChatHandler(_chatId, history, {
+			ensureLoaded: false,
+			refreshList: true,
+			allowInactiveTarget: true
+		});
 	};
 
 	const getChatEventEmitter = async (modelId: string, chatId: string = '') => {
@@ -2344,10 +3097,17 @@
 
 	const chatCompletionEventHandler = async (data, message, chatId) => {
 		const { id, done, choices, content, output, sources, selected_model_id, error, usage } = data;
+		let hasVisibleResponseUpdate = false;
+		const completionFiles = collectGeneratedFilesFromCompletionData(data);
+
+		if (completionFiles.length > 0) {
+			message.files = mergeFilesLists(message?.files ?? [], completionFiles);
+		}
 
 		// Store raw OR-aligned output items from backend
 		if (output) {
 			message.output = output;
+			hasVisibleResponseUpdate = true;
 		}
 
 		if (error) {
@@ -2364,6 +3124,7 @@
 				// Non-stream response
 				message.content += choices[0]?.message?.content;
 				message.content = normalizeAssistantResponseContent(message.content);
+				hasVisibleResponseUpdate = true;
 			} else {
 				// Stream response
 				let value = choices[0]?.delta?.content ?? '';
@@ -2372,6 +3133,7 @@
 				} else {
 					message.content += value;
 					message.content = normalizeAssistantResponseContent(message.content);
+					hasVisibleResponseUpdate = true;
 
 					if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
 						navigator.vibrate(5);
@@ -2408,6 +3170,7 @@
 		if (content) {
 			// REALTIME_CHAT_SAVE is disabled
 			message.content = normalizeAssistantResponseContent(content);
+			hasVisibleResponseUpdate = true;
 
 			if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
 				navigator.vibrate(5);
@@ -2518,11 +3281,24 @@
 	// Chat functions
 	//////////////////////////
 
-	const submitPrompt = async (userPrompt, { _raw = false } = {}) => {
+	const submitPrompt = async (
+		userPrompt,
+		{
+			_raw = false,
+			requestContext: requestContextOverride = null
+		}: {
+			_raw?: boolean;
+			requestContext?: ChatRequestContext | null;
+		} = {}
+	) => {
 		console.log('submitPrompt', userPrompt, $chatId);
 		// Cancel any in-flight landing-page init so it cannot wipe the first message render.
-		initNewChatRunId += 1;
+		cancelPendingNewChatInit();
 		ensureSelectedModels();
+		const requestContext = normalizeRequestContext(
+			requestContextOverride,
+			captureRequestContext()
+		);
 
 		const _selectedModels = selectedModels.map((modelId) =>
 			$models.map((m) => m.id).includes(modelId) ? modelId : ''
@@ -2563,8 +3339,7 @@
 			return;
 		}
 
-		// Check if there are pending tasks (more reliable than lastMessage.done)
-		if (taskIds !== null && taskIds.length > 0) {
+		if (hasBlockingGeneration) {
 			if ($settings?.enableMessageQueue ?? true) {
 				// Queue the message
 				const _files = structuredClone(files);
@@ -2573,7 +3348,8 @@
 					{
 						id: uuidv4(),
 						prompt: userPrompt,
-						files: _files
+						files: _files,
+						requestContext
 					}
 				];
 				// Clear input
@@ -2653,7 +3429,7 @@
 
 		saveSessionSelectedModels();
 
-		await sendMessage(history, userMessageId, { newChat: true });
+		await sendMessage(history, userMessageId, { newChat: true, requestContext });
 	};
 
 	const sendMessage = async (
@@ -2663,12 +3439,14 @@
 			messages = null,
 			modelId = null,
 			modelIdx = null,
-			newChat = false
+			newChat = false,
+			requestContext = null
 		}: {
 			messages?: any[] | null;
 			modelId?: string | null;
 			modelIdx?: number | null;
 			newChat?: boolean;
+			requestContext?: ChatRequestContext | null;
 		} = {}
 	) => {
 		if (!newChat) {
@@ -2682,6 +3460,8 @@
 
 		let _chatId = JSON.parse(JSON.stringify($chatId));
 		let navigateToCreatedChat = false;
+		const isInitialNewChatMessage =
+			newChat && _history?.currentId ? _history.messages[_history.currentId]?.parentId === null : false;
 		_history = structuredClone(_history);
 
 		const responseMessageIds: Record<PropertyKey, string> = {};
@@ -2692,20 +3472,35 @@
 				? [atSelectedModel.id]
 				: selectedModels;
 
-		selectedModelIds = selectedModelIds.map(getEffectiveModelId);
+		const effectiveRequestContext = normalizeRequestContext(
+			requestContext,
+			captureRequestContext()
+		);
+
+		selectedModelIds = selectedModelIds.map((selectedModelId) =>
+			getEffectiveModelId(selectedModelId, effectiveRequestContext.thinkingModeEnabled)
+		);
 
 		// Create response messages for each selected model
+		const forkConversationBranch = selectedModelIds.length > 1;
 		for (const [_modelIdx, modelId] of selectedModelIds.entries()) {
 			const model = getModelById(modelId);
-
 			if (model) {
 				let responseMessageId = uuidv4();
+				const responseConversationId = resolveResponseConversationId({
+					historyData: history,
+					chatId: _chatId,
+					userMessageId: parentId,
+					responseMessageId,
+					forkBranch: forkConversationBranch
+				});
 				let responseMessage = {
 					parentId: parentId,
 					id: responseMessageId,
 					childrenIds: [],
 					role: 'assistant',
 					content: '',
+					...(responseConversationId ? { conversationId: responseConversationId } : {}),
 					model: model?.id ?? modelId,
 					modelName: model?.name ?? modelId,
 					modelIdx: modelIdx ? modelIdx : _modelIdx,
@@ -2726,15 +3521,17 @@
 				}
 
 				responseMessageIds[`${modelId}-${modelIdx ? modelIdx : _modelIdx}`] = responseMessageId;
+				responseRequestContexts.set(responseMessageId, effectiveRequestContext);
 			}
 		}
+
 		history = {
 			...history,
 			messages: { ...history.messages }
 		};
 
 		// Create new chat if newChat is true and first user message
-		if (newChat && _history.messages[_history.currentId].parentId === null) {
+		if (isInitialNewChatMessage) {
 			_chatId = await initChatHandler(_history);
 			navigateToCreatedChat =
 				!chatIdProp && $page.url.pathname === '/' && !_chatId.startsWith('local:');
@@ -2743,8 +3540,15 @@
 		await tick();
 
 		_history = structuredClone(history);
-		// Save chat after all messages have been created
-		await saveChatHandler(_chatId, _history);
+		// Persist the latest branch before sending, but do not block request dispatch
+		// on a large history save when the user is waiting for the next turn to start.
+		const preSendSavePromise = saveChatHandler(_chatId, _history, {
+			ensureLoaded: false,
+			refreshList: false,
+			allowInactiveTarget: true
+		}).catch((error) => {
+			console.error(error);
+		});
 
 		if (navigateToCreatedChat) {
 			await goto(`/c/${_chatId}`, { replaceState: true, noScroll: true, keepFocus: true });
@@ -2764,17 +3568,17 @@
 						)
 					);
 
-					if (
-						hasImages &&
-						!(model.info?.meta?.capabilities?.vision ?? true) &&
-						!imageGenerationEnabled
-					) {
-						toast.error(
-							$i18n.t('Model {{modelName}} is not vision capable', {
-								modelName: model.name ?? model.id
-							})
-						);
-					}
+						if (
+							hasImages &&
+							!(model.info?.meta?.capabilities?.vision ?? true) &&
+							!effectiveRequestContext.featureToggles.imageGenerationEnabled
+						) {
+							toast.error(
+								$i18n.t('Model {{modelName}} is not vision capable', {
+									modelName: model.name ?? model.id
+								})
+							);
+						}
 
 					let responseMessageId =
 						responseMessageIds[`${modelId}-${modelIdx ? modelIdx : _modelIdx}`];
@@ -2788,7 +3592,8 @@
 							: createMessagesList(_history, responseMessageId),
 						_history,
 						responseMessageId,
-						_chatId
+						_chatId,
+						effectiveRequestContext
 					);
 
 					if (chatEventEmitter) clearInterval(chatEventEmitter);
@@ -2798,11 +3603,56 @@
 			})
 		);
 
+		await preSendSavePromise;
+
 		currentChatPage.set(1);
 		chats.set(await getChatList(localStorage.token, $currentChatPage));
 	};
 
-	const getFeatures = () => {
+	const captureRequestContext = (): ChatRequestContext =>
+		normalizeRequestContext({
+			thinkingModeEnabled,
+			selectedToolIds: [...selectedToolIds],
+			selectedFilterIds: [...selectedFilterIds],
+			sessionSkillIds: [...sessionSkillIds],
+			selectedTerminalId: $selectedTerminalId ?? null,
+			featureToggles: {
+				imageGenerationEnabled,
+				webSearchEnabled,
+				codeInterpreterEnabled
+			}
+		});
+
+	const normalizeSubmitDetail = (
+		detail: unknown
+	): { prompt: string; requestContext: ChatRequestContext | null } => {
+		if (typeof detail === 'string') {
+			return { prompt: detail, requestContext: null };
+		}
+
+		if (!detail || typeof detail !== 'object') {
+			return { prompt: '', requestContext: null };
+		}
+
+		const candidate = detail as {
+			prompt?: unknown;
+			requestContext?: Partial<ChatRequestContext> | null;
+		};
+
+		return {
+			prompt: typeof candidate.prompt === 'string' ? candidate.prompt : '',
+			requestContext: candidate.requestContext
+				? normalizeRequestContext(candidate.requestContext, captureRequestContext())
+				: null
+		};
+	};
+
+	const getFeatures = (requestContext: ChatRequestContext | null = null) => {
+		const featureToggles = requestContext?.featureToggles ?? {
+			imageGenerationEnabled,
+			webSearchEnabled,
+			codeInterpreterEnabled
+		};
 		let features = {};
 
 		if ($config?.features)
@@ -2811,16 +3661,16 @@
 				image_generation:
 					$config?.features?.enable_image_generation &&
 					($user?.permissions?.features?.image_generation ?? true)
-						? imageGenerationEnabled
+						? featureToggles.imageGenerationEnabled
 						: false,
 				code_interpreter:
 					$config?.features?.enable_code_interpreter &&
 					($user?.role === 'admin' || $user?.permissions?.features?.code_interpreter)
-						? codeInterpreterEnabled
+						? featureToggles.codeInterpreterEnabled
 						: false,
 				web_search:
 					$config?.features?.enable_web_search && ($user?.permissions?.features?.web_search ?? true)
-						? webSearchEnabled
+						? featureToggles.webSearchEnabled
 						: false
 			};
 
@@ -2853,7 +3703,14 @@
 			.map((token) => decodeURIComponent(JSON.parse(`"${token.replace(/"/g, '\\"')}"`)));
 	};
 
-	const sendMessageSocket = async (model, _messages, _history, responseMessageId, _chatId) => {
+	const sendMessageSocket = async (
+		model,
+		_messages,
+		_history,
+		responseMessageId,
+		_chatId,
+		requestContext: ChatRequestContext
+	) => {
 		const responseMessage = _history.messages[responseMessageId];
 		const userMessage = _history.messages[responseMessage.parentId];
 
@@ -2901,8 +3758,8 @@
 
 		const stream =
 			model?.info?.params?.stream_response ??
-			$settings?.params?.stream_response ??
 			params?.stream_response ??
+			$settings?.params?.stream_response ??
 			true;
 
 		let messages = [
@@ -2953,10 +3810,9 @@
 		const toolIds = [];
 		const toolServerIds = [];
 
-		for (const toolId of mergeToolIds(selectedToolIds, sessionToolIds)) {
+		for (const toolId of dedupeIds(requestContext.selectedToolIds)) {
 			if (toolId.startsWith('direct_server:')) {
 				let serverId = toolId.replace('direct_server:', '');
-				// Check if serverId is a number
 				if (!isNaN(parseInt(serverId))) {
 					toolServerIds.push(parseInt(serverId));
 				} else {
@@ -2967,7 +3823,7 @@
 			}
 		}
 
-		const effectiveModelId = getEffectiveModelId(model.id);
+		const effectiveModelId = getEffectiveModelId(model.id, requestContext.thinkingModeEnabled);
 
 		// Parse skill mentions (<$skillId|label>) from user messages
 		const skillMentionRegex = /<\$([^|>]+)\|?[^>]*>/g;
@@ -3005,20 +3861,25 @@
 		}
 
 		// Use the user-selected terminal from the dropdown
-		const activeTerminalId = $selectedTerminalId ?? null;
-		const effectiveSkillIds = dedupeIds([...sessionSkillIds, ...skillIds]);
+		const activeTerminalId = requestContext.selectedTerminalId ?? null;
+		const effectiveSkillIds = dedupeIds([...requestContext.sessionSkillIds, ...skillIds]);
 		const clientCapabilities = getClientCapabilities({
-			chatId: $chatId,
+			chatId: _chatId,
 			temporaryChatEnabled: $temporaryChatEnabled,
 			canShareChat: $user?.role === 'admin' || ($user?.permissions?.chat?.share ?? true)
 		});
+		const requestConversationId =
+			getMessageConversationId(responseMessage) ?? normalizeConversationId(_chatId);
 
 		const res = await generateOpenAIChatCompletion(
 			localStorage.token,
 			{
 				stream: stream,
 				model: effectiveModelId,
-				thinking_mode_enabled: thinkingModeEnabled,
+				thinking_mode_enabled: requestContext.thinkingModeEnabled,
+				thinking: {
+					type: requestContext.thinkingModeEnabled ? 'enabled' : 'disabled'
+				},
 				messages: messages,
 				params: {
 					...$settings?.params,
@@ -3033,7 +3894,10 @@
 
 				files: (files?.length ?? 0) > 0 ? files : undefined,
 
-				filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
+				filter_ids:
+					requestContext.selectedFilterIds.length > 0
+						? requestContext.selectedFilterIds
+						: undefined,
 				tool_ids: toolIds.length > 0 ? toolIds : undefined,
 				skill_ids: effectiveSkillIds.length > 0 ? effectiveSkillIds : undefined,
 				terminal_id: activeTerminalId ?? undefined,
@@ -3044,7 +3908,7 @@
 					// Direct terminal servers — always included when enabled (not routed through selectedToolIds)
 					...($terminalServers ?? []).filter((t) => !t.id)
 				],
-				features: getFeatures(),
+				features: getFeatures(requestContext),
 				variables: {
 					...getPromptVariables(
 						$user?.name,
@@ -3056,7 +3920,8 @@
 				client_capabilities: clientCapabilities,
 
 				session_id: $socket?.id,
-				chat_id: $chatId,
+				chat_id: _chatId,
+				...(requestConversationId ? { conversation_id: requestConversationId } : {}),
 
 				id: responseMessageId,
 				parent_id: userMessage?.id ?? null,
@@ -3068,7 +3933,10 @@
 						(messages.length == 2 &&
 							messages.at(0)?.role === 'system' &&
 							messages.at(1)?.role === 'user')) &&
-					(getEffectiveModelId(selectedModels[0]) === effectiveModelId ||
+					(getEffectiveModelId(
+						selectedModels[0],
+						requestContext.thinkingModeEnabled
+					) === effectiveModelId ||
 						atSelectedModel !== undefined)
 						? {
 								title_generation: $settings?.title?.auto ?? true,
@@ -3305,12 +4173,14 @@
 			const model = getModelById(responseMessage?.selectedModelId ?? responseMessage.model);
 
 			if (model) {
+				const requestContext = captureRequestContext();
 				await sendMessageSocket(
 					model,
 					createMessagesList(history, responseMessage.id),
 					history,
 					responseMessage.id,
-					_chatId
+					_chatId,
+					requestContext
 				);
 			}
 		}
@@ -3395,9 +4265,7 @@
 			await chatId.set(_chatId);
 
 			await tick();
-
-			await chats.set(await getChatList(localStorage.token, $currentChatPage));
-			currentChatPage.set(1);
+			void refreshChatListPageOne();
 		} else {
 			_chatId = `local:${$socket?.id}`; // Use socket id for temporary chat
 			await chatId.set(_chatId);
@@ -3407,21 +4275,63 @@
 		return _chatId;
 	};
 
-	const saveChatHandler = async (_chatId: string, historyData: any) => {
-		if ($chatId == _chatId) {
-			if (!$temporaryChatEnabled) {
-				await ensureHistoryLoaded();
-				const historyToPersist = structuredClone(history);
-				chat = await updateChatById(localStorage.token, _chatId, {
-					models: selectedModels,
-					history: historyToPersist,
-					messages: createMessagesList(historyToPersist, historyToPersist.currentId),
-					params: params,
-					files: chatFiles
-				});
-				currentChatPage.set(1);
-				await chats.set(await getChatList(localStorage.token, $currentChatPage));
-			}
+	const refreshChatListPageOne = async () => {
+		currentChatPage.set(1);
+		const nextChats = await getChatList(localStorage.token, 1).catch((error) => {
+			console.error(error);
+			return null;
+		});
+
+		if (nextChats) {
+			await chats.set(nextChats);
+		}
+	};
+
+	const saveChatHandler = async (
+		_chatId: string,
+		historyData: any,
+		{
+			ensureLoaded = true,
+			refreshList = true,
+			allowInactiveTarget = false
+		}: {
+			ensureLoaded?: boolean;
+			refreshList?: boolean;
+			allowInactiveTarget?: boolean;
+		} = {}
+	) => {
+		if (!_chatId || _chatId.startsWith('local:') || $temporaryChatEnabled) {
+			return;
+		}
+
+		const bindVisibleChat = isVisibleChatTarget(_chatId);
+		if (!bindVisibleChat && !allowInactiveTarget) {
+			return;
+		}
+
+		if (ensureLoaded && $chatId === _chatId) {
+			await ensureHistoryLoaded();
+		}
+
+		const historyToPersist = sanitizeHistoryForPersistence(
+			structuredClone(historyData ?? history)
+		);
+		const updatedChat = await updateChatById(localStorage.token, _chatId, {
+			models: selectedModels,
+			history: historyToPersist,
+			messages: createMessagesList(historyToPersist, historyToPersist.currentId),
+			params: params,
+			files: chatFiles
+		});
+
+		if (bindVisibleChat && updatedChat) {
+			chat = updatedChat;
+		}
+
+		if (refreshList) {
+			await refreshChatListPageOne();
+		} else {
+			void refreshChatListPageOne();
 		}
 	};
 
@@ -3445,10 +4355,13 @@
 		}
 	};
 
-	const getEffectiveModelId = (modelId: string): string => {
+	const getEffectiveModelId = (
+		modelId: string,
+		thinkingModeEnabledOverride: boolean = thinkingModeEnabled
+	): string => {
 		const normalizedModelId = normalizeModelId(modelId);
 
-		if (!thinkingModeEnabled || !normalizedModelId) {
+		if (!thinkingModeEnabledOverride || !normalizedModelId) {
 			return normalizedModelId;
 		}
 
@@ -3709,7 +4622,7 @@
 								<MessageInput
 									bind:this={messageInput}
 									{history}
-									{taskIds}
+									{hasBlockingGeneration}
 									{selectedModels}
 									{thinkingModelId}
 									bind:files
@@ -3740,9 +4653,12 @@
 											await stopResponse();
 											await tick();
 											// Set files and submit
-											files = item.files;
+											restoreQueuedComposerState(item.requestContext);
+											files = sanitizeFilesList(structuredClone(item.files ?? []));
 											await tick();
-											await submitPrompt(item.prompt);
+											await submitPrompt(item.prompt, {
+												requestContext: item.requestContext
+											});
 										}
 									}}
 									onQueueEdit={(id) => {
@@ -3751,7 +4667,8 @@
 											// Remove from queue
 											messageQueue = messageQueue.filter((m) => m.id !== id);
 											// Set files and restore prompt to input
-											files = item.files;
+											files = sanitizeFilesList(structuredClone(item.files ?? []));
+											restoreQueuedComposerState(item.requestContext);
 											messageInput?.setText(item.prompt);
 										}
 									}}
@@ -3764,10 +4681,15 @@
 										}
 									}}
 									on:submit={async (e) => {
+										const { prompt: submittedPrompt, requestContext } =
+											normalizeSubmitDetail(e.detail);
 										clearDraft();
-										if (e.detail || files.length > 0) {
+										if (submittedPrompt || files.length > 0) {
+											cancelPendingNewChatInit();
 											await tick();
-											submitPrompt(e.detail.replaceAll('\n\n', '\n'));
+											submitPrompt(submittedPrompt.replaceAll('\n\n', '\n'), {
+												requestContext
+											});
 										}
 									}}
 								/>
@@ -3809,10 +4731,15 @@
 										}
 									}}
 									on:submit={async (e) => {
+										const { prompt: submittedPrompt, requestContext } =
+											normalizeSubmitDetail(e.detail);
 										clearDraft();
-										if (e.detail || files.length > 0) {
+										if (submittedPrompt || files.length > 0) {
+											cancelPendingNewChatInit();
 											await tick();
-											submitPrompt(e.detail.replaceAll('\n\n', '\n'));
+											submitPrompt(submittedPrompt.replaceAll('\n\n', '\n'), {
+												requestContext
+											});
 										}
 									}}
 								/>
