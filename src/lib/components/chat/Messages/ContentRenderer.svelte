@@ -48,25 +48,32 @@
 	$: getSourceIds(sources);
 
 	const getSourceIds = (sources) => {
+		const indexBySourceId = new Map();
 		const result = [];
 		for (const source of sources ?? []) {
 			for (let index = 0; index < (source.document ?? []).length; index++) {
+				const metadata = source.metadata?.[index];
+				const sourceId = String(metadata?.source ?? source?.source?.id ?? 'N/A');
+				if (indexBySourceId.has(sourceId)) {
+					continue;
+				}
+				indexBySourceId.set(sourceId, result.length);
+
 				if (model?.info?.meta?.capabilities?.citations == false) {
 					result.push('N/A');
 					continue;
 				}
-				const metadata = source.metadata?.[index];
-				const id = metadata?.source ?? 'N/A';
+
 				if (metadata?.name) {
 					result.push(metadata.name);
-				} else if (id.startsWith('http://') || id.startsWith('https://')) {
-					result.push(id);
+				} else if (sourceId.startsWith('http://') || sourceId.startsWith('https://')) {
+					result.push(sourceId);
 				} else {
-					result.push(source?.source?.name ?? id);
+					result.push(source?.source?.name ?? sourceId);
 				}
 			}
 		}
-		sourceIds = [...new Set(result)];
+		sourceIds = result;
 	};
 
 	const updateButtonPosition = (event) => {

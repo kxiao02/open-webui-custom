@@ -37,25 +37,36 @@
 		}
 		return title;
 	};
+
+	const getSourceTitleByIdentifier = (identifier: string | number) => {
+		const rawIndex =
+			typeof identifier === 'string' ? parseInt(identifier.split('#')[0], 10) : identifier;
+		if (!Number.isFinite(rawIndex) || rawIndex <= 0) return 'N/A';
+		return sourceIds[rawIndex - 1] ?? 'N/A';
+	};
 </script>
 
 {#if sourceIds}
 	{#if (token?.ids ?? []).length == 1}
 		{@const id = token.ids[0]}
-		{@const identifier = token.citationIdentifiers ? token.citationIdentifiers[0] : id - 1}
-		<Source id={identifier} title={sourceIds[id - 1]} {onClick} />
+		{@const identifier = token.citationIdentifiers ? token.citationIdentifiers[0] : id}
+		<Source id={identifier} title={getSourceTitleByIdentifier(identifier)} {onClick} />
 	{:else}
+		{@const firstIdentifier = token.citationIdentifiers
+			? token.citationIdentifiers[0]
+			: token.ids[0]}
+		{@const firstTitle = getSourceTitleByIdentifier(firstIdentifier)}
 		<LinkPreview.Root openDelay={0} bind:open={openPreview}>
 			<LinkPreview.Trigger>
 				<button
-					aria-label={`${getDisplayTitle(formattedTitle(decodeString(sourceIds[token.ids[0] - 1])))} +${(token?.ids ?? []).length - 1} more sources`}
+					aria-label={`${getDisplayTitle(formattedTitle(decodeString(firstTitle)))} +${(token?.ids ?? []).length - 1} more sources`}
 					class="text-[10px] w-fit translate-y-[2px] px-2 py-0.5 dark:bg-white/5 dark:text-white/80 dark:hover:text-white bg-gray-50 text-black/80 hover:text-black transition rounded-xl"
 					on:click={() => {
 						openPreview = !openPreview;
 					}}
 				>
 					<span class="line-clamp-1">
-						{getDisplayTitle(formattedTitle(decodeString(sourceIds[token.ids[0] - 1])))}
+						{getDisplayTitle(formattedTitle(decodeString(firstTitle)))}
 						<span class="dark:text-white/50 text-black/50">+{(token?.ids ?? []).length - 1}</span>
 					</span>
 				</button>
@@ -69,10 +80,8 @@
 			>
 				<div class="bg-gray-50 dark:bg-gray-850 rounded-xl p-1 cursor-pointer">
 					{#each token.citationIdentifiers ?? token.ids as identifier}
-						{@const id =
-							typeof identifier === 'string' ? parseInt(identifier.split('#')[0]) : identifier}
 						<div class="">
-							<Source id={identifier} title={sourceIds[id - 1]} {onClick} />
+							<Source id={identifier} title={getSourceTitleByIdentifier(identifier)} {onClick} />
 						</div>
 					{/each}
 				</div>

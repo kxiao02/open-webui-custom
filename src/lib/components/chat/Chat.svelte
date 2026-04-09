@@ -1736,6 +1736,22 @@
 					}
 				} else if (type === 'chat:active') {
 					if (data?.active === false) {
+						let activeTaskIds: string[] = [];
+						if (event?.chat_id && !event.chat_id.startsWith('local:')) {
+							const taskRes = await getTaskIdsByChatId(
+								localStorage.token,
+								event.chat_id
+							).catch((error) => {
+								console.error(error);
+								return null;
+							});
+							activeTaskIds = normalizeTaskIds(taskRes?.task_ids);
+						}
+						if (activeTaskIds.length > 0) {
+							applyTaskIdsToHistory(activeTaskIds);
+							return;
+						}
+
 						taskIds = null;
 						const targetMessageId =
 							event?.message_id && history.messages[event.message_id]
@@ -3144,6 +3160,7 @@
 
 	const chatCompletionEventHandler = async (data, message, chatId) => {
 		const { id, done, choices, content, output, sources, selected_model_id, error, usage } = data;
+		const hasContent = Object.prototype.hasOwnProperty.call(data ?? {}, 'content');
 		let hasVisibleResponseUpdate = false;
 		const completionFiles = collectGeneratedFilesFromCompletionData(data);
 
@@ -3214,9 +3231,9 @@
 			}
 		}
 
-		if (content) {
+		if (hasContent) {
 			// REALTIME_CHAT_SAVE is disabled
-			message.content = normalizeAssistantResponseContent(content);
+			message.content = normalizeAssistantResponseContent(content ?? '');
 			hasVisibleResponseUpdate = true;
 
 			if (navigator.vibrate && ($settings?.hapticFeedback ?? false)) {
