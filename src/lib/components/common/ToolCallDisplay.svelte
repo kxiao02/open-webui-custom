@@ -272,8 +272,7 @@
 		toolId: attributes?.tool_id,
 		toolName: attributes?.tool_name,
 		legacyName: attributes?.name,
-		parsedArgs,
-		parsedResult
+		parsedArgs
 	});
 	$: displayName = toolDisplay.toolName;
 	$: normalizedToolId = toolDisplay.toolId || normalizeToolId(attributes?.name);

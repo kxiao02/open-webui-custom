@@ -46,12 +46,12 @@
 		showCallOverlay,
 		showFilePreview
 	} from '$lib/stores';
-	import {
-		isFileGeneratingToolId,
-		normalizeOpenWebUiFileUrl as normalizeGeneratedFileUrl,
-		parseToolCallPayload,
-		resolveToolCallStatus
-	} from '$lib/utils/generated-files';
+import {
+	isFileGeneratingToolId,
+	normalizeOpenWebUiFileUrl as normalizeGeneratedFileUrl,
+	parseToolCallPayload,
+	resolveToolCallStatus
+} from '$lib/utils/generated-files';
 	import { resolveToolDisplay } from '$lib/utils/tool-display';
 
 	export let open = false;
@@ -290,47 +290,32 @@
 	};
 
 	const TOOL_ICONS: Record<string, string> = {
-		internet_search: '🔎',
-		visit_webpage: '🌐',
-		current_server_time: '🕒',
-		math_calculator: '🧮',
-		read_file: '📄',
-		display_file: '📄',
-		write_file: '✍️',
-		replace_file_content: '✍️',
-		edit_file: '✍️',
-		ls: '📁',
-		glob: '📁',
-		grep: '🔍',
-		execute: '⌨️',
-		read_structured_file: '📄',
-		write_structured_file: '✍️',
-		gotenberg_convert: '📘',
-		pdf_create_document: '📘',
-		pdf_inspect_form: '📘',
-		pdf_fill_form_tool: '📘',
-		pdf_reformat_document: '📘',
-		pdf_remove_pages: '📘',
-		pdf_add_pages: '📘',
-		pdf_locate_pages: '📘',
-		xlsx_read_workbook: '📊',
-		xlsx_validate_workbook: '📊',
-		xlsx_create_workbook: '📊',
-		xlsx_add_column_tool: '📊',
-		xlsx_insert_row_tool: '📊',
-		docx_export_document: '📄',
-		pptx_export_presentation: '🖼️',
-		write_todos: '🗂️'
+		网络搜索: '🔎',
+		网页读取: '🌐',
+		服务器时间: '🕒',
+		数学计算: '🧮',
+		读取文件: '📄',
+		查看文件: '📄',
+		写入文件: '✍️',
+		替换文件内容: '✍️',
+		编辑文件: '✍️',
+		列出目录: '📁',
+		文件匹配: '📁',
+		文本搜索: '🔍',
+		执行命令: '⌨️',
+		读取结构化文件: '📄',
+		写入结构化文件: '✍️',
+		'PDF 转换': '📘'
 	};
 
-	function asRecord(value: unknown): Record<string, unknown> {
+	function asRecord(value: any): Record<string, any> {
 		if (value && typeof value === 'object' && !Array.isArray(value)) {
-			return value as Record<string, unknown>;
+			return value;
 		}
 		return {};
 	}
 
-	function getStringArg(record: Record<string, unknown>, keys: string[]) {
+	function getStringArg(record: Record<string, any>, keys: string[]) {
 		for (const key of keys) {
 			const value = record?.[key];
 			if (typeof value === 'string' && value.trim()) {
@@ -344,42 +329,37 @@
 		rawToolId: string | undefined,
 		rawToolName: string | undefined,
 		legacyName: string | undefined,
-		args: Record<string, unknown>,
-		result: unknown = null
+		args: Record<string, any>
 	) {
-		const resolved = resolveToolDisplay({
+		const name = resolveToolDisplay({
 			toolId: rawToolId,
 			toolName: rawToolName,
 			legacyName,
-			parsedArgs: args,
-			parsedResult: result
-		});
-		const name = resolved.toolName;
-		const icon = TOOL_ICONS[resolved.toolId] || '🧩';
+			parsedArgs: args
+		}).toolName;
+		const icon = TOOL_ICONS[name] || '🧩';
 
-		if (resolved.toolId === 'internet_search') {
+		if (name === '网络搜索') {
 			const query = getStringArg(args, ['query', 'q']);
 			return {
 				label: name,
 				icon,
-				action: query ? `正在搜索：${query}` : '正在搜索网络信息',
+				action: query ? `正在检索：${query}` : '正在检索网络信息',
 				reason: '需要获取外部来源作为回答依据'
 			};
 		}
 
-		if (resolved.toolId === 'visit_webpage') {
-			const target =
-				getStringArg(args, ['title', 'name', 'siteName', 'site_name']) ||
-				getStringArg(args, ['url', 'href', 'link']);
+		if (name === '网页读取') {
+			const url = getStringArg(args, ['url', 'href', 'link']);
 			return {
 				label: name,
 				icon,
-				action: target ? `正在打开：${target}` : '正在打开网页',
+				action: url ? `正在读取：${url}` : '正在读取网页内容',
 				reason: '需要读取原始页面以补充细节'
 			};
 		}
 
-		if (resolved.toolId === 'read_structured_file') {
+		if (name === '读取结构化文件') {
 			const path = getStringArg(args, ['path', 'file_path', 'file']);
 			return {
 				label: name,
@@ -389,7 +369,7 @@
 			};
 		}
 
-		if (resolved.toolId === 'write_structured_file') {
+		if (name === '写入结构化文件') {
 			const path = getStringArg(args, ['path', 'file_path', 'file']);
 			return {
 				label: name,
@@ -399,7 +379,7 @@
 			};
 		}
 
-		if (resolved.toolId === 'gotenberg_convert') {
+		if (name === 'PDF 转换') {
 			return {
 				label: name,
 				icon,
@@ -494,8 +474,6 @@
 		{@const result = decode(attributes?.result ?? '')}
 		{@const files = parseJSONString(decode(attributes?.files ?? ''))}
 		{@const embeds = parseJSONString(decode(attributes?.embeds ?? ''))}
-		{@const parsedArgs = parseJSONString(args)}
-		{@const parsedResult = parseToolCallPayload(result)}
 
 		{#if embeds && Array.isArray(embeds) && embeds.length > 0}
 			<div class="py-1 w-full cursor-pointer">
@@ -504,9 +482,7 @@
 						{resolveToolDisplay({
 							toolId: attributes?.tool_id,
 							toolName: attributes?.tool_name,
-							legacyName: attributes?.name,
-							parsedArgs: asRecord(parsedArgs),
-							parsedResult
+							legacyName: attributes?.name
 						}).toolName}
 					</div>
 
@@ -525,6 +501,8 @@
 				</div>
 			</div>
 		{:else}
+			{@const parsedArgs = parseJSONString(args)}
+			{@const parsedResult = parseToolCallPayload(result)}
 			{@const argsRecord = asRecord(parsedArgs)}
 			{@const toolFiles = dedupeToolFiles([
 				...normalizeToolFiles(files),
@@ -549,8 +527,7 @@
 				attributes?.tool_id,
 				attributes?.tool_name,
 				attributes?.name,
-				argsRecord,
-				parsedResult
+				argsRecord
 			)}
 			{@const searchItems = normalizeSearchResultItems(parsedResult)}
 			{@const mergedCount = Number(attributes?.merged_count || 1)}

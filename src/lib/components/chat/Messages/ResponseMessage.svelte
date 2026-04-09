@@ -49,7 +49,7 @@
 		removeDetails,
 		removeAllDetails
 	} from '$lib/utils';
-import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
+	import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	import {
 		type GeneratedFileItem,
 		collectGeneratedFilesFromMessage,
@@ -58,7 +58,6 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		inferFileName,
 		isFileGeneratingToolId,
 		isDownloadRef,
-		parseToolCallPayload,
 		isPrimaryDocumentArtifact,
 		triggerGeneratedFileDownload,
 		resolveToolCallStatus,
@@ -70,8 +69,10 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		getToolVersionRequirement,
 		parseToolDraftFromMessageContent
 	} from '$lib/utils/tool-drafts';
-	import { type ParsedSkillDraft, parseSkillDraftFromMessageContent } from '$lib/utils/skill-drafts';
-	import { resolveToolDisplay } from '$lib/utils/tool-display';
+	import {
+		type ParsedSkillDraft,
+		parseSkillDraftFromMessageContent
+	} from '$lib/utils/skill-drafts';
 
 	import Name from './Name.svelte';
 	import ProfileImage from './ProfileImage.svelte';
@@ -85,6 +86,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	import WebSearchResults from './ResponseMessage/WebSearchResults.svelte';
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
+	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
+	import ChevronUp from '$lib/components/icons/ChevronUp.svelte';
+	import WrenchSolid from '$lib/components/icons/WrenchSolid.svelte';
 
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
@@ -96,13 +100,10 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
 	import FollowUps from './ResponseMessage/FollowUps.svelte';
 	import { fade } from 'svelte/transition';
-	import { flyAndScale } from '$lib/utils/transitions';
 	import RegenerateMenu from './ResponseMessage/RegenerateMenu.svelte';
-	import StatusHistory from './ResponseMessage/StatusHistory.svelte';
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
-	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
-	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
 	import AccessControl from '$lib/components/workspace/common/AccessControl.svelte';
+	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
 
 	interface MessageType {
 		id: string;
@@ -229,7 +230,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		const followUpsLength = Array.isArray((source as any).followUps)
 			? (source as any).followUps.length
 			: 0;
-		const sourcesLength = Array.isArray((source as any).sources) ? (source as any).sources.length : 0;
+		const sourcesLength = Array.isArray((source as any).sources)
+			? (source as any).sources.length
+			: 0;
 		const statusHistoryLength = Array.isArray((source as any).statusHistory)
 			? (source as any).statusHistory.length
 			: 0;
@@ -334,6 +337,7 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	let parsedContentKey = '';
 	let parsedGeneratedFilesKey = '';
 	let parsedOutputKey = '';
+	let parsedProcessStatusTick = -1;
 	let parsedSkillDraftKey = '';
 	let parsedSkillDraft: ParsedSkillDraft | null = null;
 	let editableSkillDraftKey = '';
@@ -580,10 +584,7 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		if (!normalized) return false;
 		if (normalized.includes('sandbox:/mnt/data/')) return true;
 		if (GENERATED_FILE_LINK_REGEX.test(normalized)) return true;
-		if (
-			isDownloadRef(normalized) &&
-			/(?:\/files\/|\/content(?:[?#].*)?$)/i.test(normalized)
-		) {
+		if (isDownloadRef(normalized) && /(?:\/files\/|\/content(?:[?#].*)?$)/i.test(normalized)) {
 			return true;
 		}
 		return false;
@@ -597,6 +598,13 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		);
 	};
 
+	const normalizeStructuredDetailsTags = (content: string): string => {
+		if (!content) return '';
+		return content
+			.replace(/<details(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)/gi, '<details ')
+			.replace(/<summary(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)/gi, '<summary ');
+	};
+
 	const TOOL_CALL_BLOCK_REGEX = /<details\b[^>]*\btype="tool_calls"[^>]*>[\s\S]*?<\/details>/gim;
 	const REASONING_BLOCK_REGEX = /<details\b[^>]*\btype="reasoning"[^>]*>[\s\S]*?<\/details>/gim;
 	const REASONING_OPEN_BLOCK_REGEX = /<details\b[^>]*\btype="reasoning"[^>]*>/gi;
@@ -604,28 +612,13 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	const REASONING_CLOSE_TAG = '</details>';
 
 	type ProcessToolCallItem = { key: string; attrs: Record<string, string> };
-	type ProcessToolCallGroup = {
-		key: string;
-		label: string;
-		count: number;
-		items: ProcessToolCallItem[];
-	};
 	type ProcessToolVisualTiming = { firstSeenAt: number };
-	type LiveThinkingDisplayItem = { id: number; text: string; fading: boolean };
 
 	const MIN_PROCESS_RUNNING_MS = 900;
-	const LIVE_THINKING_REMOVE_MS = 260;
 	const processToolVisualTimingByKeyByMessageId = new Map<
 		string,
 		Map<string, ProcessToolVisualTiming>
 	>();
-
-	const normalizeProcessToolStatus = (
-		attrs: Record<string, string>,
-		hasArtifacts?: boolean
-	): string => {
-		return resolveToolCallStatus(attrs, { promoteArtifactRunning: hasArtifacts !== false });
-	};
 
 	const upsertToolCallAttr = (openTag: string, name: string, value: string): string => {
 		const attrRegex = new RegExp(`\\s${name}="[^"]*"`, 'i');
@@ -652,7 +645,11 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 			}
 
 			const resolvedStatus = resolveToolCallStatus(attrs, { promoteArtifactRunning: false });
-			if (resolvedStatus === 'success' || resolvedStatus === 'error' || resolvedStatus === 'timeout') {
+			if (
+				resolvedStatus === 'success' ||
+				resolvedStatus === 'error' ||
+				resolvedStatus === 'timeout'
+			) {
 				return block;
 			}
 
@@ -720,7 +717,10 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 
 	const collectToolCallsFromOutput = (value: unknown): ProcessToolCallItem[] => {
 		if (!Array.isArray(value)) return [];
-		const grouped = new Map<string, { call?: Record<string, unknown>; output?: Record<string, unknown> }>();
+		const grouped = new Map<
+			string,
+			{ call?: Record<string, unknown>; output?: Record<string, unknown> }
+		>();
 
 		for (const entry of value) {
 			if (!entry || typeof entry !== 'object') continue;
@@ -742,13 +742,30 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		for (const [fallbackKey, group] of grouped.entries()) {
 			const callItem = group.call ?? {};
 			const outputItem = group.output ?? {};
-			const toolName = String(
-				(callItem.name ?? outputItem.name ?? 'tool') as string
-			).trim();
-			const statusValue = normalizeOutputToolStatus(
-				outputItem.status ?? callItem.status ?? ''
-			);
-			const done = statusValue && statusValue !== 'running' ? 'true' : 'false';
+			const toolName = String((callItem.name ?? outputItem.name ?? 'tool') as string).trim();
+			const statusValue = normalizeOutputToolStatus(outputItem.status ?? callItem.status ?? '');
+			const hasTerminalOutput =
+				group.output !== undefined &&
+				[
+					outputItem.output,
+					outputItem.result,
+					outputItem.files,
+					outputItem.embeds
+				].some((candidate) => {
+					if (candidate === null || candidate === undefined) return false;
+					if (typeof candidate === 'string') return candidate.trim().length > 0;
+					if (Array.isArray(candidate)) return candidate.length > 0;
+					if (typeof candidate === 'object') return Object.keys(candidate).length > 0;
+					return true;
+				});
+			const done =
+				statusValue === 'running'
+					? 'false'
+					: statusValue
+						? 'true'
+						: hasTerminalOutput
+							? 'true'
+							: 'false';
 			const attrs: Record<string, string> = {
 				type: 'tool_calls',
 				id: String(callItem.id ?? outputItem.id ?? ''),
@@ -768,6 +785,94 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		}
 
 		return items;
+	};
+
+	const outputHasStructuredAssistantItems = (value: unknown): boolean =>
+		Array.isArray(value) &&
+		value.some((item) => item && typeof item === 'object' && (item as Record<string, unknown>).type !== 'message');
+
+	const outputHasAssistantMessageItem = (value: unknown): boolean =>
+		Array.isArray(value) &&
+		value.some((item) => {
+			if (!item || typeof item !== 'object') return false;
+			const record = item as Record<string, unknown>;
+			return record.type === 'message' && record.role === 'assistant';
+		});
+
+	const getVisibleAssistantContent = (content: string, output: unknown): string => {
+		const outputMessageText = extractAssistantMessageTextFromOutput(output);
+		if (outputMessageText) return outputMessageText;
+		if (!content) return '';
+		if (!outputHasStructuredAssistantItems(output)) return content;
+		return outputHasAssistantMessageItem(output) ? content : '';
+	};
+
+	const getProcessToolCallStatus = (item: ProcessToolCallItem): string =>
+		resolveToolCallStatus(item.attrs ?? {}, {
+			promoteArtifactRunning: getToolCallArtifactEvidence(item.attrs ?? {})
+		});
+
+	const getProcessToolCallSectionStatus = (items: ProcessToolCallItem[]): string => {
+		if (items.some((item) => getProcessToolCallStatus(item) === 'running')) {
+			return 'running';
+		}
+		if (items.some((item) => getProcessToolCallStatus(item) === 'error')) {
+			return 'error';
+		}
+		if (items.some((item) => getProcessToolCallStatus(item) === 'timeout')) {
+			return 'timeout';
+		}
+		return items.length > 0 ? 'success' : '';
+	};
+
+	const getProcessToolCallSectionSummary = (items: ProcessToolCallItem[]): string => {
+		const count = items.length;
+		if (!count) return '';
+
+		const status = getProcessToolCallSectionStatus(items);
+		if (status === 'running') {
+			return `${count} 个工具执行中`;
+		}
+		if (status === 'error') {
+			return `${count} 个工具，包含失败`;
+		}
+		if (status === 'timeout') {
+			return `${count} 个工具，包含超时`;
+		}
+		return `${count} 个工具已完成`;
+	};
+
+	const getProcessToolCallSectionBadgeClass = (status: string): string => {
+		if (status === 'success') {
+			return 'border-emerald-200 bg-emerald-100 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-300';
+		}
+		if (status === 'error') {
+			return 'border-rose-200 bg-rose-100 text-rose-700 dark:border-rose-900 dark:bg-rose-950/60 dark:text-rose-300';
+		}
+		if (status === 'timeout') {
+			return 'border-amber-200 bg-amber-100 text-amber-700 dark:border-amber-900 dark:bg-amber-950/60 dark:text-amber-300';
+		}
+		return 'border-blue-200 bg-blue-100 text-blue-700 dark:border-blue-900 dark:bg-blue-950/60 dark:text-blue-300';
+	};
+
+	const getProcessToolCallSectionBadgeLabel = (status: string): string => {
+		if (status === 'success') return '已完成';
+		if (status === 'error') return '失败';
+		if (status === 'timeout') return '超时';
+		return '执行中';
+	};
+
+	const getProcessToolCallTimelineDotClass = (status: string): string => {
+		if (status === 'success') {
+			return 'bg-emerald-500 ring-emerald-100 dark:bg-emerald-400 dark:ring-emerald-950/80';
+		}
+		if (status === 'error') {
+			return 'bg-rose-500 ring-rose-100 dark:bg-rose-400 dark:ring-rose-950/80';
+		}
+		if (status === 'timeout') {
+			return 'bg-amber-500 ring-amber-100 dark:bg-amber-400 dark:ring-amber-950/80';
+		}
+		return 'bg-blue-500 ring-blue-100 dark:bg-blue-400 dark:ring-blue-950/80';
 	};
 
 	const mergeToolCallAttrs = (
@@ -864,64 +969,6 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 
 		out += content.slice(cursor);
 		return out.replace(/\n{3,}/g, '\n\n').trim();
-	};
-
-	const getProcessToolLabel = (attrs: Record<string, string>): string => {
-		const rawArgs = attrs.arguments || '';
-		const rawResult = attrs.result || '';
-		let parsedArgs: Record<string, unknown> | null = null;
-		if (rawArgs) {
-			try {
-				const parsed = JSON.parse(rawArgs);
-				if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-					parsedArgs = parsed as Record<string, unknown>;
-				}
-			} catch {
-				parsedArgs = null;
-			}
-		}
-		const parsedResult = rawResult ? parseToolCallPayload(rawResult) : null;
-
-		return resolveToolDisplay({
-			toolId: attrs.tool_id,
-			toolName: attrs.tool_name,
-			legacyName: attrs.name,
-			parsedArgs,
-			parsedResult
-		}).toolName;
-	};
-
-	const groupProcessToolCallItems = (items: ProcessToolCallItem[]): ProcessToolCallGroup[] => {
-		const groups: ProcessToolCallGroup[] = [];
-
-		for (const item of items) {
-			const label = getProcessToolLabel(item.attrs);
-			const lastGroup = groups.at(-1);
-
-			if (lastGroup && lastGroup.label === label) {
-				lastGroup.items = [...lastGroup.items, item];
-				lastGroup.count = lastGroup.items.length;
-				continue;
-			}
-
-			groups.push({
-				key: item.key,
-				label,
-				count: 1,
-				items: [item]
-			});
-		}
-
-		return groups;
-	};
-
-	const getProcessToolStatusMessage = (attrs: Record<string, string>): string => {
-		const label = getProcessToolLabel(attrs);
-		const status = normalizeProcessToolStatus(attrs);
-		if (status === 'success') return `最近一步：${label} · 已完成`;
-		if (status === 'timeout') return `最近一步：${label} · 已超时`;
-		if (status === 'error') return `最近一步：${label} · 运行失败`;
-		return `最近一步：${label} · 执行中`;
 	};
 
 	const getStandaloneGeneratedFileLineValue = (value: string): string => {
@@ -1029,6 +1076,27 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 			.replace(/>/g, '&gt;')
 			.replace(/"/g, '&quot;');
 
+	const serializeReasoningTextBlock = (
+		reasoningText: string,
+		options: { done: boolean; duration?: number }
+	): string => {
+		const text = reasoningText.trim();
+		if (!text) return '';
+
+		const display = escapeHtmlForStructuredBlock(
+			text
+				.split(/\r?\n/)
+				.map((line) => (line.startsWith('>') ? line : `> ${line}`))
+				.join('\n')
+		);
+
+		if (options.done) {
+			return `<details type="reasoning" done="true" duration="${options.duration ?? 0}">\n<summary>Thought for ${options.duration ?? 0} seconds</summary>\n${display}\n</details>`;
+		}
+
+		return `<details type="reasoning" done="false">\n<summary>Thinking...</summary>\n${display}\n</details>`;
+	};
+
 	const extractOutputTextParts = (value: unknown): string => {
 		if (!Array.isArray(value)) return '';
 
@@ -1043,6 +1111,26 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 			})
 			.filter(Boolean)
 			.join('');
+	};
+
+	const extractAssistantMessageTextFromOutput = (value: unknown): string => {
+		if (!Array.isArray(value)) return '';
+
+		for (let index = value.length - 1; index >= 0; index -= 1) {
+			const item = value[index];
+			if (!item || typeof item !== 'object') continue;
+
+			const record = item as Record<string, unknown>;
+			if (record.type !== 'message' || record.role !== 'assistant') continue;
+
+			const contentText = extractOutputTextParts(record.content);
+			if (contentText.trim()) return contentText.trim();
+
+			const summaryText = extractOutputTextParts(record.summary);
+			if (summaryText.trim()) return summaryText.trim();
+		}
+
+		return '';
 	};
 
 	const serializeReasoningOutputForDisplay = (value: unknown): string => {
@@ -1063,95 +1151,82 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 			const duration = typeof item.duration === 'number' ? item.duration : undefined;
 			const status = typeof item.status === 'string' ? item.status : '';
 			const isLastItem = index === value.length - 1;
-			const display = escapeHtmlForStructuredBlock(
-				reasoningText
-					.split(/\r?\n/)
-					.map((line) => (line.startsWith('>') ? line : `> ${line}`))
-					.join('\n')
-			);
 
 			if (status === 'completed' || duration !== undefined || !isLastItem) {
-				blocks.push(
-					`<details type="reasoning" done="true" duration="${duration ?? 0}">\n<summary>Thought for ${duration ?? 0} seconds</summary>\n${display}\n</details>`
-				);
+				blocks.push(serializeReasoningTextBlock(reasoningText, { done: true, duration }));
 				return;
 			}
 
-			blocks.push(
-				`<details type="reasoning" done="false">\n<summary>Thinking…</summary>\n${display}\n</details>`
-			);
+			blocks.push(serializeReasoningTextBlock(reasoningText, { done: false }));
 		});
 
 		return blocks.join('\n\n').trim();
 	};
 
+	const extractCompletedReasoningBlocks = (content: string): string[] => {
+		if (!content || !content.includes('type="reasoning"')) return [];
+		return Array.from(content.matchAll(REASONING_BLOCK_REGEX))
+			.map((match) => (match[0] || '').trim())
+			.filter(Boolean);
+	};
+
+	const extractReasoningBlocksFromMarkup = (markup: string): string[] => {
+		if (!markup || !markup.includes('type="reasoning"')) return [];
+		return Array.from(markup.matchAll(REASONING_BLOCK_REGEX))
+			.map((match) => (match[0] || '').trim())
+			.filter(Boolean);
+	};
+
+	const dedupeStructuredBlocks = (blocks: string[]): string[] => {
+		const seen = new Set<string>();
+		return blocks.filter((block) => {
+			const normalized = block.trim();
+			if (!normalized || seen.has(normalized)) return false;
+			seen.add(normalized);
+			return true;
+		});
+	};
+
 	const mergeOutputReasoningIntoContent = (content: string, output: unknown): string => {
-		if (!Array.isArray(output)) return content;
-		if (content.includes('type="reasoning"')) return content;
+		const normalizedContent = normalizeStructuredDetailsTags(content);
+		const completedContentBlocks = extractCompletedReasoningBlocks(normalizedContent);
+		const outputBlocks = extractReasoningBlocksFromMarkup(serializeReasoningOutputForDisplay(output));
+		const activeContentBlock =
+			outputBlocks.length === 0
+				? serializeReasoningTextBlock(extractActiveReasoningText(normalizedContent), {
+						done: false
+					})
+				: '';
+		const reasoningBlocks = dedupeStructuredBlocks([
+			...outputBlocks,
+			...completedContentBlocks,
+			activeContentBlock
+		]);
+		const reasoningMarkup = reasoningBlocks.join('\n\n').trim();
+		if (!reasoningMarkup) return normalizedContent;
 
-		const reasoningMarkup = serializeReasoningOutputForDisplay(output);
-		if (!reasoningMarkup) return content;
+		const contentWithoutReasoning = normalizedContent.includes('type="reasoning"')
+			? stripActiveReasoningBlock(normalizedContent)
+					.replace(REASONING_BLOCK_REGEX, '')
+					.replace(/\n{3,}/g, '\n\n')
+					.trim()
+			: normalizedContent.trim();
 
-		return content ? `${reasoningMarkup}\n\n${content}`.trim() : reasoningMarkup;
+		return contentWithoutReasoning
+			? `${reasoningMarkup}\n\n${contentWithoutReasoning}`.trim()
+			: reasoningMarkup;
 	};
 
-	const extractLatestReasoningFromOutput = (value: unknown): string => {
-		if (!Array.isArray(value)) return '';
-
-		for (let idx = value.length - 1; idx >= 0; idx -= 1) {
-			const entry = value[idx] as Record<string, unknown> | undefined;
-			if (!entry || entry.type !== 'reasoning') continue;
-			const sourceParts =
-				Array.isArray(entry.summary) && entry.summary.length > 0 ? entry.summary : entry.content;
-			const text = extractOutputTextParts(sourceParts).trim();
-			if (text) return text;
-		}
-
-		return '';
-	};
-
-	const extractLatestReasoningFromContent = (content: string): string => {
-		if (!content || !content.includes('type="reasoning"')) return '';
-		const matches = Array.from(content.matchAll(REASONING_BLOCK_REGEX));
-		if (!matches.length) return '';
-		const block = matches[matches.length - 1]?.[0] ?? '';
-		if (!block) return '';
-		return normalizeLeakedFormatting(
-			block
-				.replace(REASONING_SUMMARY_REGEX, '')
-				.replace(/<\/?[^>]+>/g, ' ')
-				.replace(/&nbsp;/gi, ' ')
-		)
-			.replace(/\n{3,}/g, '\n\n')
-			.trim();
-	};
-
-	const getStableReasoningText = (content: string, output: unknown): string => {
-		const outputText = extractLatestReasoningFromOutput(output);
-		if (outputText) return outputText;
-		return extractLatestReasoningFromContent(content);
-	};
-
-	let processContent = '';
 	let processToolCallItems: ProcessToolCallItem[] = [];
-	let processToolCallGroups: ProcessToolCallGroup[] = [];
-	let hasRunningProcessToolCalls = false;
-	let showProcessPane = false;
-	let processSummary = '';
-	let showProcessToolHistory = !message?.done;
-	let lastProcessDoneState = Boolean(message?.done);
 	let processStatusTick = 0;
 	let processStatusTimer: ReturnType<typeof setTimeout> | null = null;
 	let finalMessageContent = '';
 	let finalContentBeforeGeneratedFiles = '';
 	let finalContentAfterGeneratedFiles = '';
 	let placeInlineGeneratedFiles = false;
-	let liveThinkingStreaming = false;
-	let liveThinkingActive = false;
-	let liveThinkingUnits: string[] = [];
-	let liveThinkingVisibleItems: LiveThinkingDisplayItem[] = [];
-	let liveThinkingNextId = 0;
-	const liveThinkingRemovalTimers = new Map<number, ReturnType<typeof setTimeout>>();
+	let toolCallSectionOpen = false;
+	let toolCallSectionStateKey = '';
+	let toolCallSectionUserToggled = false;
 
 	const getLatestReasoningOpenBlock = (content: string): { start: number; end: number } | null => {
 		if (!content || !content.includes('type="reasoning"')) return null;
@@ -1169,22 +1244,11 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		};
 	};
 
-	const hasActiveReasoningBlock = (content: string): boolean => {
-		const latestBlock = getLatestReasoningOpenBlock(content);
-		if (!latestBlock) return false;
-		return content.indexOf(REASONING_CLOSE_TAG, latestBlock.end) === -1;
-	};
-
 	const stripActiveReasoningBlock = (content: string): string => {
 		const latestBlock = getLatestReasoningOpenBlock(content);
 		if (!latestBlock) return content;
 		if (content.indexOf(REASONING_CLOSE_TAG, latestBlock.end) !== -1) return content;
 		return content.slice(0, latestBlock.start).trimEnd();
-	};
-
-	const stripCompletedReasoningBlocks = (content: string): string => {
-		if (!content || !content.includes('type="reasoning"')) return content;
-		return content.replace(REASONING_BLOCK_REGEX, '').replace(/\n{3,}/g, '\n\n').trim();
 	};
 
 	const extractActiveReasoningText = (content: string): string => {
@@ -1201,160 +1265,6 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		)
 			.replace(/\n{3,}/g, '\n\n')
 			.trim();
-	};
-
-	const splitLiveThinkingUnits = (text: string): string[] => {
-		if (!text) return [];
-
-		const paragraphs = text
-			.replace(/\r\n/g, '\n')
-			.split(/\n{2,}/)
-			.map((segment) => segment.trim())
-			.filter(Boolean);
-		const units: string[] = [];
-
-		for (const paragraph of paragraphs) {
-			const sentences = Array.from(
-				paragraph.matchAll(/[^。！？!?\.]+(?:[。！？!?\.]+(?=\s|$)|$)/g)
-			)
-				.map((match) => match[0]?.trim() ?? '')
-				.filter(Boolean);
-
-			if (sentences.length > 1) {
-				units.push(...sentences);
-			} else {
-				units.push(paragraph);
-			}
-		}
-
-		return units;
-	};
-
-	const clearLiveThinkingRemovalTimer = (itemId: number) => {
-		const timer = liveThinkingRemovalTimers.get(itemId);
-		if (timer) {
-			clearTimeout(timer);
-			liveThinkingRemovalTimers.delete(itemId);
-		}
-	};
-
-	const clearAllLiveThinkingRemovalTimers = () => {
-		for (const itemId of Array.from(liveThinkingRemovalTimers.keys())) {
-			clearLiveThinkingRemovalTimer(itemId);
-		}
-	};
-
-	const scheduleLiveThinkingRemoval = (itemId: number) => {
-		clearLiveThinkingRemovalTimer(itemId);
-		const timer = setTimeout(() => {
-			liveThinkingRemovalTimers.delete(itemId);
-			liveThinkingVisibleItems = liveThinkingVisibleItems.filter((item) => item.id !== itemId);
-		}, LIVE_THINKING_REMOVE_MS);
-		liveThinkingRemovalTimers.set(itemId, timer);
-	};
-
-	const fadeOutPreviousLiveThinkingItems = (activeItemId: number | null = null) => {
-		let changed = false;
-		liveThinkingVisibleItems = liveThinkingVisibleItems.map((item) => {
-			if (item.id === activeItemId || item.fading) {
-				return item;
-			}
-			changed = true;
-			scheduleLiveThinkingRemoval(item.id);
-			return {
-				...item,
-				fading: true
-			};
-		});
-
-		if (!changed && activeItemId === null) {
-			liveThinkingVisibleItems = [...liveThinkingVisibleItems];
-		}
-	};
-
-	const showLatestLiveThinkingUnit = (unit: string) => {
-		const normalizedUnit = unit.trim();
-		if (!normalizedUnit) return;
-
-		const activeItem = liveThinkingVisibleItems.find((item) => !item.fading);
-		if (activeItem) {
-			fadeOutPreviousLiveThinkingItems(activeItem.id);
-		}
-
-		const nextItemId = ++liveThinkingNextId;
-		liveThinkingVisibleItems = [
-			...liveThinkingVisibleItems,
-			{ id: nextItemId, text: normalizedUnit, fading: false }
-		];
-	};
-
-	const updateLiveThinkingCurrentUnit = (unit: string) => {
-		const normalizedUnit = unit.trim();
-		if (!normalizedUnit) return;
-
-		const activeItem = liveThinkingVisibleItems.find((item) => !item.fading);
-		if (!activeItem) {
-			showLatestLiveThinkingUnit(normalizedUnit);
-			return;
-		}
-
-		if (activeItem.text === normalizedUnit) {
-			return;
-		}
-
-		liveThinkingVisibleItems = liveThinkingVisibleItems.map((item) =>
-			item.id === activeItem.id
-				? {
-						...item,
-						text: normalizedUnit
-					}
-				: item
-		);
-	};
-
-	const resetLiveThinkingDisplay = (units: string[]) => {
-		clearAllLiveThinkingRemovalTimers();
-		const latestUnit = units.at(-1)?.trim() ?? '';
-		liveThinkingVisibleItems = latestUnit
-			? [{ id: ++liveThinkingNextId, text: latestUnit, fading: false }]
-			: [];
-	};
-
-	const syncLiveThinkingDisplay = (units: string[]) => {
-		const normalizedUnits = units.map((unit) => unit.trim()).filter(Boolean);
-		const previousUnits = liveThinkingUnits;
-
-		if (normalizedUnits.length === 0) {
-			liveThinkingUnits = [];
-			fadeOutPreviousLiveThinkingItems();
-			return;
-		}
-
-		const previousComparablePrefix = previousUnits.slice(
-			0,
-			Math.max(0, previousUnits.length - 1)
-		);
-		const nextComparablePrefix = normalizedUnits.slice(
-			0,
-			Math.max(0, normalizedUnits.length - 1)
-		);
-		const stablePrefixChanged =
-			previousComparablePrefix.length > nextComparablePrefix.length ||
-			previousComparablePrefix.some((unit, index) => nextComparablePrefix[index] !== unit);
-
-		if (stablePrefixChanged) {
-			resetLiveThinkingDisplay(normalizedUnits);
-			liveThinkingUnits = normalizedUnits;
-			return;
-		}
-
-		if (normalizedUnits.length > previousUnits.length) {
-			showLatestLiveThinkingUnit(normalizedUnits.at(-1) ?? '');
-		} else {
-			updateLiveThinkingCurrentUnit(normalizedUnits.at(-1) ?? '');
-		}
-
-		liveThinkingUnits = normalizedUnits;
 	};
 
 	const clearProcessStatusTimer = () => {
@@ -1382,13 +1292,15 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		return timingMap;
 	};
 
-	const getEffectiveProcessSummaryAttrs = (
+	const getEffectiveProcessToolCallAttrs = (
 		item: ProcessToolCallItem | undefined
 	): Record<string, string> | null => {
 		if (!item) return null;
 
 		const hasArtifacts = getToolCallArtifactEvidence(item.attrs);
-		const rawStatus = normalizeProcessToolStatus(item.attrs, hasArtifacts);
+		const rawStatus = resolveToolCallStatus(item.attrs, {
+			promoteArtifactRunning: hasArtifacts
+		});
 		const now = Date.now();
 		const timingMap = getProcessTimingMapForMessage(message?.id);
 		let timing = timingMap.get(item.key);
@@ -1403,7 +1315,8 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		}
 
 		const elapsedMs = now - timing.firstSeenAt;
-		if (!hasArtifacts && elapsedMs < MIN_PROCESS_RUNNING_MS) {
+		// Keep fast successful tools briefly visible as running so progress remains perceptible.
+		if (rawStatus === 'success' && !hasArtifacts && elapsedMs < MIN_PROCESS_RUNNING_MS) {
 			scheduleProcessStatusRefresh(MIN_PROCESS_RUNNING_MS - elapsedMs);
 			return {
 				...item.attrs,
@@ -1417,22 +1330,15 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	};
 
 	const computeParsedContent = (rawContent: string, output: unknown) => {
-		const effectiveContent = mergeOutputReasoningIntoContent(rawContent, output);
+		const effectiveContent = mergeOutputReasoningIntoContent(
+			getVisibleAssistantContent(rawContent, output),
+			output
+		);
 		const normalizedContent = promoteFileGeneratingToolCallBlocks(
 			dedupeToolCallBlocks(normalizeSourcesHeading(effectiveContent)),
 			generatedFiles
 		);
-		const activeReasoningText = extractActiveReasoningText(normalizedContent);
-		const latestReasoningText = getStableReasoningText(normalizedContent, output);
-		liveThinkingStreaming = hasActiveReasoningBlock(normalizedContent);
-		const keepReasoningVisible =
-			!message?.done && (!liveThinkingStreaming || !activeReasoningText) && !!latestReasoningText;
-		const liveThinkingText = activeReasoningText || (keepReasoningVisible ? latestReasoningText : '');
-		syncLiveThinkingDisplay(splitLiveThinkingUnits(liveThinkingText));
-
-		const renderContent = stripActiveReasoningBlock(normalizedContent);
-		const { process, final } = splitToolCallSection(renderContent);
-		processContent = process;
+		const { process, final } = splitToolCallSection(normalizedContent);
 		const contentToolCallItems = Array.from(process.matchAll(TOOL_CALL_BLOCK_REGEX))
 			.map((match, index) => {
 				const block = match[0] || '';
@@ -1449,30 +1355,30 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 			})
 			.filter((item) => Object.keys(item.attrs).length > 0);
 		const outputToolCallItems = collectToolCallsFromOutput(output);
-		processToolCallItems = mergeProcessToolCalls(contentToolCallItems, outputToolCallItems);
-		hasRunningProcessToolCalls = processToolCallItems.some(
-			(item) =>
-				normalizeProcessToolStatus(item.attrs, getToolCallArtifactEvidence(item.attrs)) ===
-				'running'
+		const mergedProcessToolCallItems = mergeProcessToolCalls(
+			contentToolCallItems,
+			outputToolCallItems
 		);
 
 		const timingMap = getProcessTimingMapForMessage(message?.id);
-		const activeProcessKeys = new Set(processToolCallItems.map((item) => item.key));
+		const activeProcessKeys = new Set(mergedProcessToolCallItems.map((item) => item.key));
 		for (const key of Array.from(timingMap.keys())) {
 			if (!activeProcessKeys.has(key)) {
 				timingMap.delete(key);
 			}
 		}
 
-		processToolCallGroups = groupProcessToolCallItems(processToolCallItems);
+		processToolCallItems = mergedProcessToolCallItems.map((item) => ({
+			...item,
+			attrs: getEffectiveProcessToolCallAttrs(item) ?? item.attrs
+		}));
 
-		const cleanedFinal = normalizeLeakedFormatting(
-			stripDownloadSection(final, generatedFiles)
-		);
-		finalMessageContent = cleanedFinal;
+		const cleanedFinal = normalizeLeakedFormatting(stripDownloadSection(final, generatedFiles));
+		const renderedFinal = cleanedFinal;
+		finalMessageContent = renderedFinal;
 
-		if (cleanedFinal.includes(INLINE_GENERATED_FILES_MARKER)) {
-			const [before = '', after = ''] = cleanedFinal.split(INLINE_GENERATED_FILES_MARKER, 2);
+		if (renderedFinal.includes(INLINE_GENERATED_FILES_MARKER)) {
+			const [before = '', after = ''] = renderedFinal.split(INLINE_GENERATED_FILES_MARKER, 2);
 			finalContentBeforeGeneratedFiles = before.trim();
 			finalContentAfterGeneratedFiles = after.trim();
 			placeInlineGeneratedFiles = true;
@@ -1484,35 +1390,43 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	};
 
 	$: {
+		processStatusTick;
 		const rawContent = message?.content ?? '';
 		const outputKey = buildOutputSignature(message?.output);
 		if (
 			rawContent !== parsedContentKey ||
 			generatedFilesListKey !== parsedGeneratedFilesKey ||
-			outputKey !== parsedOutputKey
+			outputKey !== parsedOutputKey ||
+			processStatusTick !== parsedProcessStatusTick
 		) {
 			parsedContentKey = rawContent;
 			parsedGeneratedFilesKey = generatedFilesListKey;
 			parsedOutputKey = outputKey;
+			parsedProcessStatusTick = processStatusTick;
 			computeParsedContent(rawContent, message?.output);
 		}
 	}
 
 	$: {
-		const doneNow = Boolean(message?.done);
-		const hasProcessToolCalls = processToolCallItems.length > 0;
-		showProcessPane = hasProcessToolCalls && (doneNow || hasRunningProcessToolCalls);
-		if (!showProcessPane) {
-			showProcessToolHistory = false;
-		} else if (doneNow && !lastProcessDoneState) {
-			// Collapse the live process pane once execution completes so the footer actions
-			// stay in their stable post-run position without requiring a page refresh.
-			showProcessToolHistory = false;
-		}
-		lastProcessDoneState = doneNow;
-	}
+		const nextToolCallStateKey = `${message?.id ?? ''}::${processToolCallItems
+			.map((item) => `${item.key}:${getProcessToolCallStatus(item)}`)
+			.join('|')}`;
+		const messageKeyPrefix = `${message?.id ?? ''}::`;
+		const isNewMessage = !toolCallSectionStateKey.startsWith(messageKeyPrefix);
+		const hasRunningTool = processToolCallItems.some(
+			(item) => getProcessToolCallStatus(item) === 'running'
+		);
 
-	$: liveThinkingActive = liveThinkingStreaming || liveThinkingVisibleItems.length > 0;
+		if (nextToolCallStateKey !== toolCallSectionStateKey) {
+			if (isNewMessage) {
+				toolCallSectionOpen = hasRunningTool;
+				toolCallSectionUserToggled = false;
+			} else if (!toolCallSectionUserToggled && hasRunningTool) {
+				toolCallSectionOpen = true;
+			}
+			toolCallSectionStateKey = nextToolCallStateKey;
+		}
+	}
 
 	$: {
 		const nextKey = `${message?.done ? '1' : '0'}::${message?.content ?? ''}`;
@@ -1561,7 +1475,11 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	$: canSharePublicSkill = $user?.role === 'admin' || !!$user?.permissions?.sharing?.public_skills;
 	$: canSharePublicTool = $user?.role === 'admin' || !!$user?.permissions?.sharing?.public_tools;
 
-	$: if (editableSkillDraft && !canSharePublicSkill && editableSkillDraft.meta.visibility === 'public') {
+	$: if (
+		editableSkillDraft &&
+		!canSharePublicSkill &&
+		editableSkillDraft.meta.visibility === 'public'
+	) {
 		editableSkillDraft = {
 			...editableSkillDraft,
 			meta: {
@@ -1581,7 +1499,11 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		};
 	}
 
-	$: if (editableToolDraft && !canSharePublicTool && editableToolDraft.meta.visibility === 'public') {
+	$: if (
+		editableToolDraft &&
+		!canSharePublicTool &&
+		editableToolDraft.meta.visibility === 'public'
+	) {
 		editableToolDraft = {
 			...editableToolDraft,
 			meta: {
@@ -1599,15 +1521,6 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 				is_default: false
 			}
 		};
-	}
-
-	$: {
-		processStatusTick;
-		const summaryAttrs = getEffectiveProcessSummaryAttrs(processToolCallItems.at(-1));
-		processSummary =
-			summaryAttrs && processToolCallItems.length > 0
-				? getProcessToolStatusMessage(summaryAttrs)
-				: '';
 	}
 
 	const copyToClipboard = async (text) => {
@@ -1704,7 +1617,7 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		if (requiredVersion) {
 			toast.error(
 				$i18n.t(
-					'Open WebUI version (v{{OPEN_WEBUI_VERSION}}) is lower than required version (v{{REQUIRED_VERSION}})',
+					'Application version (v{{OPEN_WEBUI_VERSION}}) is lower than required version (v{{REQUIRED_VERSION}})',
 					{
 						OPEN_WEBUI_VERSION: WEBUI_VERSION,
 						REQUIRED_VERSION: requiredVersion
@@ -2149,7 +2062,6 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 
 	onDestroy(() => {
 		clearProcessStatusTimer();
-		clearAllLiveThinkingRemovalTimers();
 		if (message?.id) {
 			processToolVisualTimingByKeyByMessageId.delete(message.id);
 		}
@@ -2180,14 +2092,18 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	onConfirm={createSkillDraftHandler}
 >
 	{#if editableSkillDraft}
-		<div class="max-h-[60vh] space-y-4 overflow-y-auto pr-1 text-sm text-gray-600 dark:text-gray-300">
+		<div
+			class="max-h-[60vh] space-y-4 overflow-y-auto pr-1 text-sm text-gray-600 dark:text-gray-300"
+		>
 			<p>
-				This will create the skill in your workspace. You can keep chatting here and edit it
-				later from Workspace.
+				This will create the skill in your workspace. You can keep chatting here and edit it later
+				from Workspace.
 			</p>
 
 			<div class="grid gap-3 sm:grid-cols-2">
-				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<label
+					class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+				>
 					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
 						{$i18n.t('Name')}
 					</div>
@@ -2199,7 +2115,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 					/>
 				</label>
 
-				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<label
+					class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+				>
 					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
 						{$i18n.t('Skill ID')}
 					</div>
@@ -2214,7 +2132,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 					/>
 				</label>
 
-				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<label
+					class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+				>
 					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
 						{$i18n.t('Visibility')}
 					</div>
@@ -2230,7 +2150,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 					</select>
 				</label>
 
-				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<label
+					class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+				>
 					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
 						{$i18n.t('Category')}
 					</div>
@@ -2274,7 +2196,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 				/>
 			</label>
 
-			<div class="flex flex-wrap items-center gap-4 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+			<div
+				class="flex flex-wrap items-center gap-4 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+			>
 				<label class="flex items-center gap-2">
 					<Switch bind:state={editableSkillDraft.meta.published} />
 					<span>{$i18n.t('Published')}</span>
@@ -2288,7 +2212,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 				{/if}
 			</div>
 
-			<div class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+			<div
+				class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+			>
 				<div class="mb-3 flex items-center justify-between gap-3">
 					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
 						{$i18n.t('Permissions')}
@@ -2303,7 +2229,8 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 					accessRoles={['read', 'write']}
 					share={$user?.permissions?.sharing?.skills || $user?.role === 'admin'}
 					sharePublic={canSharePublicSkill}
-					shareUsers={($user?.permissions?.access_grants?.allow_users ?? true) || $user?.role === 'admin'}
+					shareUsers={($user?.permissions?.access_grants?.allow_users ?? true) ||
+						$user?.role === 'admin'}
 				/>
 			</div>
 
@@ -2330,14 +2257,18 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 	onConfirm={createToolDraftHandler}
 >
 	{#if editableToolDraft}
-		<div class="max-h-[60vh] space-y-4 overflow-y-auto pr-1 text-sm text-gray-600 dark:text-gray-300">
+		<div
+			class="max-h-[60vh] space-y-4 overflow-y-auto pr-1 text-sm text-gray-600 dark:text-gray-300"
+		>
 			<p>
-				This will create the tool in your workspace. You can keep chatting here and edit it
-				later from Workspace.
+				This will create the tool in your workspace. You can keep chatting here and edit it later
+				from Workspace.
 			</p>
 
 			<div class="grid gap-3 sm:grid-cols-2">
-				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<label
+					class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+				>
 					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
 						{$i18n.t('Name')}
 					</div>
@@ -2349,7 +2280,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 					/>
 				</label>
 
-				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<label
+					class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+				>
 					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
 						{$i18n.t('Tool ID')}
 					</div>
@@ -2364,7 +2297,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 					/>
 				</label>
 
-				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<label
+					class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+				>
 					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
 						{$i18n.t('Visibility')}
 					</div>
@@ -2380,7 +2315,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 					</select>
 				</label>
 
-				<label class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+				<label
+					class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+				>
 					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
 						{$i18n.t('Category')}
 					</div>
@@ -2424,7 +2361,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 				/>
 			</label>
 
-			<div class="flex flex-wrap items-center gap-4 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+			<div
+				class="flex flex-wrap items-center gap-4 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+			>
 				<label class="flex items-center gap-2">
 					<Switch bind:state={editableToolDraft.meta.published} />
 					<span>{$i18n.t('Published')}</span>
@@ -2438,7 +2377,9 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 				{/if}
 			</div>
 
-			<div class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80">
+			<div
+				class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 dark:border-gray-800 dark:bg-gray-900/80"
+			>
 				<div class="mb-3 flex items-center justify-between gap-3">
 					<div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">
 						{$i18n.t('Permissions')}
@@ -2453,7 +2394,8 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 					accessRoles={['read', 'write']}
 					share={$user?.permissions?.sharing?.tools || $user?.role === 'admin'}
 					sharePublic={canSharePublicTool}
-					shareUsers={($user?.permissions?.access_grants?.allow_users ?? true) || $user?.role === 'admin'}
+					shareUsers={($user?.permissions?.access_grants?.allow_users ?? true) ||
+						$user?.role === 'admin'}
 				/>
 			</div>
 
@@ -2516,10 +2458,6 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 			<div>
 				<div class="chat-{message.role} w-full min-w-full chat-markdown-prose">
 					<div>
-						{#if model?.info?.meta?.capabilities?.status_updates ?? true}
-							<StatusHistory statusHistory={message?.statusHistory} expand={true} />
-						{/if}
-
 						{#if visibleMessageFiles.length > 0}
 							<div
 								class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap"
@@ -2636,126 +2574,90 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 							class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
 							id="response-content-container"
 						>
-							{#if showProcessPane}
-								<div
-									class="mb-2 w-full overflow-hidden rounded-xl border border-gray-200/90 bg-gray-50/80 dark:border-gray-800 dark:bg-gray-900/70"
-								>
+							{#if processToolCallItems.length > 0}
+								{@const toolCallSectionStatus = getProcessToolCallSectionStatus(
+									processToolCallItems
+								)}
+								<div class="mb-3 w-full overflow-hidden rounded-2xl border border-gray-200/90 bg-gray-50/85 shadow-xs dark:border-gray-800 dark:bg-gray-900/80">
 									<button
 										type="button"
-										class="flex w-full items-center justify-between gap-2 border-b border-gray-200/80 px-3 py-2 text-left dark:border-gray-800"
+										class={`flex w-full items-center justify-between px-3 py-2 text-left transition hover:bg-gray-100/80 dark:hover:bg-gray-900 ${
+											toolCallSectionOpen
+												? 'border-b border-gray-200/90 dark:border-gray-800'
+												: ''
+										}`}
 										on:click={() => {
-											showProcessToolHistory = !showProcessToolHistory;
+											toolCallSectionUserToggled = true;
+											toolCallSectionOpen = !toolCallSectionOpen;
 										}}
 									>
-										<div class="min-w-0">
+										<div class="min-w-0 flex items-center gap-2.5">
 											<div
-												class="text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300"
+												class="flex size-7 shrink-0 items-center justify-center rounded-full bg-gray-200/70 text-gray-600 dark:bg-gray-800 dark:text-gray-200"
 											>
-												执行过程
+												<WrenchSolid className="size-3.5" />
 											</div>
-											{#if processSummary}
-												<div class="mt-0.5 line-clamp-1 text-xs text-gray-500 dark:text-gray-400">
-													{processSummary}
+											<div class="min-w-0">
+												<div class="text-sm font-medium text-gray-800 dark:text-gray-100">
+													工具调用
 												</div>
-											{/if}
+												<div class="line-clamp-1 text-xs text-gray-500 dark:text-gray-400">
+													{getProcessToolCallSectionSummary(processToolCallItems)}
+												</div>
+											</div>
 										</div>
 
-										<ChevronDown
-											className={`size-3.5 shrink-0 text-gray-500 transition-transform ${
-												showProcessToolHistory ? 'rotate-180' : ''
-											}`}
-										/>
+										<div class="ml-2 flex shrink-0 items-center gap-2">
+											<div
+												class={`rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${getProcessToolCallSectionBadgeClass(
+													toolCallSectionStatus
+												)}`}
+											>
+												{getProcessToolCallSectionBadgeLabel(toolCallSectionStatus)}
+											</div>
+											{#if toolCallSectionStatus === 'running'}
+												<Spinner className="size-3.5 text-blue-600 dark:text-blue-400" />
+											{/if}
+											<div class="text-gray-500 dark:text-gray-400">
+												{#if toolCallSectionOpen}
+													<ChevronUp className="size-3.5" strokeWidth="3" />
+												{:else}
+													<ChevronDown className="size-3.5" strokeWidth="3" />
+												{/if}
+											</div>
+										</div>
 									</button>
 
-									{#if showProcessToolHistory}
-										<div class="px-2 py-2">
-											{#each processToolCallGroups as group, idx (group.key)}
-												<div class="mb-1 flex items-stretch gap-2">
-													<div>
-														<div class="mb-1.5 px-1 pt-3">
-															<span
-																class="relative flex size-1.5 items-center justify-center rounded-full"
-															>
-																<span
-																	class="relative inline-flex size-1.5 rounded-full bg-gray-500 dark:bg-gray-400"
-																></span>
-															</span>
-														</div>
-														{#if idx !== processToolCallGroups.length - 1}
-															<div
-																class="ml-[6.5px] h-[calc(100%-14px)] w-[0.5px] bg-gray-300 dark:bg-gray-700"
-															/>
-														{/if}
+									{#if toolCallSectionOpen}
+										<div class="relative px-3 py-3">
+											<div
+												class="pointer-events-none absolute bottom-4 left-[1.05rem] top-4 w-px bg-gray-200 dark:bg-gray-800"
+											></div>
+											<div class="space-y-2.5">
+												{#each processToolCallItems as item (item.key)}
+													{@const itemStatus = getProcessToolCallStatus(item)}
+													<div class="relative pl-6">
+														<div
+															class={`absolute left-0 top-4 size-2.5 rounded-full ring-4 ${getProcessToolCallTimelineDotClass(
+																itemStatus
+															)}`}
+														></div>
+														<ToolCallDisplay
+															id={`${chatId}-${message.id}-${item.key}`}
+															attributes={item.attrs}
+															disableVisualStatusDelay={true}
+															embedded={true}
+															className="w-full"
+														/>
 													</div>
-
-													<div class="min-w-0 flex-1">
-														{#if group.count > 1}
-															<div
-																class="rounded-lg border border-gray-200/80 bg-white/70 p-2 dark:border-gray-800 dark:bg-gray-950/20"
-															>
-																<div class="mb-2 flex items-center justify-between px-1">
-																	<div
-																		class="text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-300"
-																	>
-																		{group.label}
-																	</div>
-																	<div class="text-[11px] text-gray-400 dark:text-gray-500">
-																		连续 {group.count} 次
-																	</div>
-																</div>
-
-																<div class="space-y-1.5">
-																	{#each group.items as item (item.key)}
-																		<ToolCallDisplay
-																			id={`${chatId}-${message.id}-process-${item.key}`}
-																			attributes={item.attrs}
-																			open={false}
-																			embedded={true}
-																			className="w-full"
-																		/>
-																	{/each}
-																</div>
-															</div>
-														{:else}
-															{#each group.items as item (item.key)}
-																<ToolCallDisplay
-																	id={`${chatId}-${message.id}-process-${item.key}`}
-																	attributes={item.attrs}
-																	open={false}
-																	embedded={true}
-																	className="w-full"
-																/>
-															{/each}
-														{/if}
-													</div>
-												</div>
-											{/each}
+												{/each}
+											</div>
 										</div>
 									{/if}
 								</div>
 							{/if}
 
-							{#if liveThinkingActive}
-								<div class="mb-3 overflow-hidden rounded-2xl border border-amber-200/80 bg-gradient-to-br from-amber-50/95 via-white to-orange-50/90 shadow-xs dark:border-amber-900/70 dark:from-gray-900 dark:via-gray-900 dark:to-amber-950/40">
-									<div class="flex items-center gap-2 px-3 py-2 text-sm font-medium text-amber-900 dark:text-amber-100">
-										<Spinner className="size-4" />
-										<span>{$i18n.t('Thinking...')}</span>
-									</div>
-									<div class="space-y-2 px-3 pb-3" aria-live="polite">
-										{#each liveThinkingVisibleItems as item (item.id)}
-											<div
-												class={`rounded-xl border border-white/70 bg-white/75 px-3 py-2 text-sm leading-6 text-gray-700 shadow-xs transition-opacity dark:border-gray-800/80 dark:bg-gray-900/70 dark:text-gray-200 ${item.fading ? 'opacity-45' : 'opacity-100'}`}
-												in:fade={{ duration: 180 }}
-												out:fade={{ duration: LIVE_THINKING_REMOVE_MS }}
-											>
-												{item.text}
-											</div>
-										{/each}
-									</div>
-								</div>
-							{/if}
-
-							{#if finalMessageContent === '' && processToolCallItems.length === 0 && !liveThinkingActive && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
+							{#if finalMessageContent === '' && processToolCallItems.length === 0 && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
 								<Skeleton />
 							{:else if finalMessageContent && message.error !== true}
 								<!-- always show message contents even if there's an error -->

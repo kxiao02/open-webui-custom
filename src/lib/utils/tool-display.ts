@@ -39,36 +39,6 @@ export const TOOL_DISPLAY_DEFINITIONS: ToolDisplayDefinition[] = [
 		category: 'utility'
 	},
 	{
-		toolId: 'xlsx_read_workbook',
-		toolName: '读取表格',
-		aliases: ['xlsx_read', 'excel_read', 'spreadsheet_read'],
-		category: 'file'
-	},
-	{
-		toolId: 'xlsx_validate_workbook',
-		toolName: '校验表格公式',
-		aliases: ['xlsx_validate', 'excel_validate', 'spreadsheet_validate'],
-		category: 'file'
-	},
-	{
-		toolId: 'xlsx_create_workbook',
-		toolName: '新建表格',
-		aliases: ['xlsx_create', 'excel_create', 'spreadsheet_create'],
-		category: 'file'
-	},
-	{
-		toolId: 'xlsx_add_column_tool',
-		toolName: '表格新增列',
-		aliases: ['xlsx_add_column', 'excel_add_column'],
-		category: 'file'
-	},
-	{
-		toolId: 'xlsx_insert_row_tool',
-		toolName: '表格插入行',
-		aliases: ['xlsx_insert_row', 'excel_insert_row'],
-		category: 'file'
-	},
-	{
 		toolId: 'read_structured_file',
 		toolName: '读取结构化文件',
 		aliases: ['读取结构化文件'],
@@ -84,60 +54,6 @@ export const TOOL_DISPLAY_DEFINITIONS: ToolDisplayDefinition[] = [
 		toolId: 'gotenberg_convert',
 		toolName: 'PDF 转换',
 		aliases: ['PDF转换', 'PDF 转换'],
-		category: 'file'
-	},
-	{
-		toolId: 'pdf_create_document',
-		toolName: '生成 PDF',
-		aliases: ['pdf_create', 'document_pdf_create'],
-		category: 'file'
-	},
-	{
-		toolId: 'pdf_inspect_form',
-		toolName: '检查 PDF 表单',
-		aliases: ['pdf_inspect_form_fields', 'pdf_form_inspect'],
-		category: 'file'
-	},
-	{
-		toolId: 'pdf_fill_form_tool',
-		toolName: '填写 PDF 表单',
-		aliases: ['pdf_fill_form', 'pdf_form_fill'],
-		category: 'file'
-	},
-	{
-		toolId: 'pdf_reformat_document',
-		toolName: '重排 PDF 文档',
-		aliases: ['pdf_reformat', 'document_pdf_reformat'],
-		category: 'file'
-	},
-	{
-		toolId: 'pdf_remove_pages',
-		toolName: '删除 PDF 页面',
-		aliases: ['pdf_delete_pages', 'pdf_page_remove'],
-		category: 'file'
-	},
-	{
-		toolId: 'pdf_add_pages',
-		toolName: '插入 PDF 页面',
-		aliases: ['pdf_insert_pages', 'pdf_page_add'],
-		category: 'file'
-	},
-	{
-		toolId: 'pdf_locate_pages',
-		toolName: '定位 PDF 页面',
-		aliases: ['pdf_find_pages', 'pdf_page_locate'],
-		category: 'file'
-	},
-	{
-		toolId: 'docx_export_document',
-		toolName: '导出 DOCX',
-		aliases: ['docx_export', 'word_export', 'markdown_docx'],
-		category: 'file'
-	},
-	{
-		toolId: 'pptx_export_presentation',
-		toolName: '导出 PPTX',
-		aliases: ['pptx_export', 'presentation_export', 'markdown_pptx'],
 		category: 'file'
 	},
 	{
@@ -199,12 +115,6 @@ export const TOOL_DISPLAY_DEFINITIONS: ToolDisplayDefinition[] = [
 		toolName: '委派任务',
 		aliases: ['delegate_task', 'subagent_task'],
 		category: 'utility'
-	},
-	{
-		toolId: 'write_todos',
-		toolName: '任务清单',
-		aliases: ['todo_list', 'task_list'],
-		category: 'utility'
 	}
 ];
 
@@ -258,7 +168,6 @@ export type ResolveToolDisplayInput = {
 	toolName?: string | null;
 	legacyName?: string | null;
 	parsedArgs?: Record<string, unknown> | null;
-	parsedResult?: unknown;
 };
 
 const MAX_DYNAMIC_LABEL_LENGTH = 48;
@@ -307,26 +216,19 @@ const getHostnameLabel = (urlValue: string): string => {
 	return '';
 };
 
-const getVisitWebsiteLabel = (
-	parsedArgs: Record<string, unknown> | null | undefined,
-	parsedResult: unknown
+const getSearchToolLabel = (
+	parsedArgs: Record<string, unknown> | null | undefined
 ): string => {
-	const resultRecord =
-		parsedResult && typeof parsedResult === 'object' && !Array.isArray(parsedResult)
-			? (parsedResult as Record<string, unknown>)
-			: null;
-	const resultTitle = getStringField(resultRecord, [
-		'title',
-		'name',
-		'pageTitle',
-		'page_title',
-		'pageName',
-		'page_name',
-		'siteName',
-		'site_name',
-		'websiteName',
-		'website_name'
-	]);
+	const query = truncateDisplayText(
+		getStringField(parsedArgs, ['query', 'q', 'keywords', 'keyword', 'search_query']),
+		56
+	);
+	return query ? `搜索 ${query}` : '搜索';
+};
+
+const getVisitWebsiteLabel = (
+	parsedArgs: Record<string, unknown> | null | undefined
+): string => {
 	const explicitTitle = getStringField(parsedArgs, [
 		'title',
 		'name',
@@ -338,34 +240,19 @@ const getVisitWebsiteLabel = (
 		'website_name'
 	]);
 	const urlValue = getStringField(parsedArgs, ['url', 'href', 'link', 'websiteUrl', 'website_url']);
-	const websiteLabel = truncateDisplayText(
-		explicitTitle || resultTitle || getHostnameLabel(urlValue),
-		40
-	);
-
+	const websiteLabel = truncateDisplayText(explicitTitle || getHostnameLabel(urlValue), 40);
 	return websiteLabel ? `打开 ${websiteLabel}` : '打开网页';
-};
-
-const getSearchToolLabel = (
-	parsedArgs: Record<string, unknown> | null | undefined
-): string => {
-	const query = truncateDisplayText(
-		getStringField(parsedArgs, ['query', 'q', 'keywords', 'keyword', 'search_query']),
-		56
-	);
-	return query ? `搜索 ${query}` : '搜索';
 };
 
 const getDynamicToolName = (
 	toolId: string,
-	parsedArgs: Record<string, unknown> | null | undefined,
-	parsedResult: unknown
+	parsedArgs: Record<string, unknown> | null | undefined
 ): string => {
 	if (toolId === 'internet_search') {
 		return getSearchToolLabel(parsedArgs);
 	}
 	if (toolId === 'visit_webpage') {
-		return getVisitWebsiteLabel(parsedArgs, parsedResult);
+		return getVisitWebsiteLabel(parsedArgs);
 	}
 	return '';
 };
@@ -374,12 +261,10 @@ export const resolveToolDisplay = ({
 	toolId,
 	toolName,
 	legacyName,
-	parsedArgs = null,
-	parsedResult = null
+	parsedArgs = null
 }: ResolveToolDisplayInput): {
 	toolId: string;
 	toolName: string;
-	baseToolName: string;
 	category: ToolDisplayCategory;
 } => {
 	const normalizedToolId =
@@ -389,19 +274,17 @@ export const resolveToolDisplay = ({
 		inferToolIdFromArgs(parsedArgs);
 	const localizedToolName = normalizedToolId ? TOOL_NAME_BY_ID[normalizedToolId] : '';
 	const fallbackName = (legacyName ?? '').trim();
-	const baseToolName =
+	const resolvedToolName =
+		getDynamicToolName(normalizedToolId, parsedArgs) ||
 		localizedToolName ||
 		(toolName ?? '').trim() ||
 		fallbackName ||
 		'工具调用';
-	const resolvedToolName =
-		getDynamicToolName(normalizedToolId, parsedArgs, parsedResult) || baseToolName;
 	const definition = TOOL_DISPLAY_DEFINITIONS.find((item) => item.toolId === normalizedToolId);
 
 	return {
 		toolId: normalizedToolId || fallbackName,
 		toolName: resolvedToolName,
-		baseToolName,
 		category:
 			definition?.category ??
 			(normalizedToolId === 'read_file' || normalizedToolId === 'write_file' ? 'file' : 'utility')
