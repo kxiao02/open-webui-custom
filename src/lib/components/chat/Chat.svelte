@@ -1528,6 +1528,7 @@
 		messageQueue = [];
 		tags = [];
 		taskIds = null;
+		pendingChatCompletion = null;
 		pendingTaskIdsLoad = null;
 		sessionToolIds = [];
 		sessionSkillIds = [];
@@ -2625,6 +2626,7 @@
 		chatFiles = [];
 		params = {};
 		taskIds = null;
+		pendingChatCompletion = null;
 		messageQueue = [];
 
 		if ($page.url.searchParams.get('youtube')) {
@@ -4200,6 +4202,7 @@
 			);
 			taskIds = null;
 		}
+		pendingChatCompletion = null;
 
 		const responseMessage = history.messages[history.currentId];
 		// Force-finish in-progress assistant messages for the current branch in UI.
