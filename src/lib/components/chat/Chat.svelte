@@ -240,6 +240,11 @@
 	let lastTaskRefreshAt = 0;
 
 	let taskIds: any[] | null = null;
+	type PendingChatCompletion = {
+		chatId: string;
+		messageId: string;
+	};
+	let pendingChatCompletion: PendingChatCompletion | null = null;
 
 	// Chat Input
 	let prompt = '';
@@ -955,6 +960,104 @@
 			.map((id) => (typeof id === 'string' ? id.trim() : ''))
 			.filter((id) => id !== '' && id !== 'null' && id !== 'undefined');
 
+	const resolveActiveTaskIds = async (requestedChatId: string | null | undefined) => {
+		let activeTaskIds = normalizeTaskIds(taskIds);
+		if (activeTaskIds.length > 0) {
+			return activeTaskIds;
+		}
+
+		if (!requestedChatId || requestedChatId.startsWith('local:')) {
+			return [];
+		}
+
+		const taskRes = await getTaskIdsByChatId(localStorage.token, requestedChatId).catch(
+			(error) => {
+				console.error(error);
+				return null;
+			}
+		);
+		activeTaskIds = normalizeTaskIds(taskRes?.task_ids);
+		return activeTaskIds;
+	};
+
+	const finalizeAssistantMessage = async (chatId: string, message: any) => {
+		message.done = true;
+
+		if ($settings.responseAutoCopy) {
+			copyToClipboard(
+				removeAllDetails(removeDetails(message.content, ['tool_calls'])).replace(/\n{3,}/g, '\n\n')
+			);
+		}
+
+		if ($settings.responseAutoPlayback && !$showCallOverlay) {
+			await tick();
+			document.getElementById(`speak-button-${message.id}`)?.click();
+		}
+
+		// Emit chat event for TTS (only when call overlay is active)
+		if ($showCallOverlay) {
+			const lastMessageContentPart =
+				getMessageContentParts(
+					removeAllDetails(message.content),
+					$config?.audio?.tts?.split_on ?? 'punctuation'
+				)?.at(-1) ?? '';
+			if (lastMessageContentPart) {
+				eventTarget.dispatchEvent(
+					new CustomEvent('chat', {
+						detail: { id: message.id, content: lastMessageContentPart }
+					})
+				);
+			}
+		}
+
+		eventTarget.dispatchEvent(
+			new CustomEvent('chat:finish', {
+				detail: {
+					id: message.id,
+					content: message.content
+				}
+			})
+		);
+
+		history.messages[message.id] = message;
+
+		await tick();
+		if (autoScroll) {
+			scrollToBottom();
+		}
+
+		await chatCompletedHandler(
+			chatId,
+			message.model,
+			message.id,
+			createMessagesList(history, message.id)
+		);
+	};
+
+	const flushPendingChatCompletion = async (
+		requestedChatId: string,
+		activeTaskIds: string[]
+	): Promise<boolean> => {
+		if (!pendingChatCompletion) {
+			return false;
+		}
+		if (pendingChatCompletion.chatId !== requestedChatId) {
+			return false;
+		}
+		if (activeTaskIds.length > 0) {
+			return false;
+		}
+
+		const pendingMessage = history.messages[pendingChatCompletion.messageId];
+		pendingChatCompletion = null;
+		if (!pendingMessage || pendingMessage.role !== 'assistant') {
+			return false;
+		}
+
+		await finalizeAssistantMessage(requestedChatId, pendingMessage);
+		return true;
+	};
+
 	const hasRenderableAssistantPayload = (message: any): boolean => {
 		if (!message || message.role !== 'assistant') {
 			return false;
@@ -1273,6 +1376,10 @@
 		if ((nextTaskIds?.length ?? 0) > 0) {
 			markHistoryForRecoveredActiveTasks(history);
 		} else if (history?.currentId) {
+			if (await flushPendingChatCompletion($chatId, nextTaskIds)) {
+				return;
+			}
+
 			const lastAssistantMessage = getCurrentBranchLastAssistantMessage(history);
 			if (
 				lastAssistantMessage &&
@@ -1721,6 +1828,7 @@
 					chatCompletionEventHandler(data, message, event.chat_id);
 				} else if (type === 'chat:tasks:cancel') {
 					taskIds = null;
+					pendingChatCompletion = null;
 					const targetMessageId =
 						event?.message_id && history.messages[event.message_id]
 							? event.message_id
@@ -1753,6 +1861,9 @@
 						}
 
 						taskIds = null;
+						if (await flushPendingChatCompletion(event.chat_id, activeTaskIds)) {
+							return;
+						}
 						const targetMessageId =
 							event?.message_id && history.messages[event.message_id]
 								? event.message_id
@@ -3278,59 +3389,15 @@
 		history.messages[message.id] = message;
 
 		if (done) {
-			message.done = true;
-
-			if ($settings.responseAutoCopy) {
-				copyToClipboard(
-					removeAllDetails(removeDetails(message.content, ['tool_calls'])).replace(
-						/\n{3,}/g,
-						'\n\n'
-					)
-				);
+			const activeTaskIds = await resolveActiveTaskIds(chatId);
+			if (activeTaskIds.length > 0) {
+				message.done = false;
+				history.messages[message.id] = message;
+				applyTaskIdsToHistory(activeTaskIds);
+				pendingChatCompletion = { chatId, messageId: message.id };
+			} else {
+				await finalizeAssistantMessage(chatId, message);
 			}
-
-			if ($settings.responseAutoPlayback && !$showCallOverlay) {
-				await tick();
-				document.getElementById(`speak-button-${message.id}`)?.click();
-			}
-
-			// Emit chat event for TTS (only when call overlay is active)
-			if ($showCallOverlay) {
-				let lastMessageContentPart =
-					getMessageContentParts(
-						removeAllDetails(message.content),
-						$config?.audio?.tts?.split_on ?? 'punctuation'
-					)?.at(-1) ?? '';
-				if (lastMessageContentPart) {
-					eventTarget.dispatchEvent(
-						new CustomEvent('chat', {
-							detail: { id: message.id, content: lastMessageContentPart }
-						})
-					);
-				}
-			}
-			eventTarget.dispatchEvent(
-				new CustomEvent('chat:finish', {
-					detail: {
-						id: message.id,
-						content: message.content
-					}
-				})
-			);
-
-			history.messages[message.id] = message;
-
-			await tick();
-			if (autoScroll) {
-				scrollToBottom();
-			}
-
-			await chatCompletedHandler(
-				chatId,
-				message.model,
-				message.id,
-				createMessagesList(history, message.id)
-			);
 		}
 
 		console.log(data);
