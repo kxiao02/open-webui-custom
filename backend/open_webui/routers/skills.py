@@ -22,8 +22,10 @@ from open_webui.models.resource_installations import ResourceInstallations
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_permission, filter_allowed_access_grants
 from open_webui.utils.catalog import (
+    filter_hidden_skill_ids,
     filter_visible_skills,
     get_user_group_ids,
+    is_catalog_runtime_activatable,
     is_skill_catalog_visible,
 )
 from open_webui.utils.skill_import import sync_minimax_document_skills
@@ -68,8 +70,13 @@ def _get_installed_skill_ids(
     skill_ids: Optional[list[str] | set[str] | tuple[str, ...]] = None,
     db=None,
 ) -> set[str]:
-    return ResourceInstallations.get_installed_resource_ids(
-        user_id, "skill", resource_ids=skill_ids, db=db
+    return set(
+        filter_hidden_skill_ids(
+            ResourceInstallations.get_installed_resource_ids(
+                user_id, "skill", resource_ids=skill_ids, db=db
+            ),
+            db=db,
+        )
     )
 
 
@@ -317,6 +324,14 @@ async def install_skill_by_id(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if not is_catalog_runtime_activatable(
+        getattr(skill, "meta", None), getattr(skill, "access_grants", [])
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
     user_group_ids = get_user_group_ids(user.id, db=db) if user.role != "admin" else set()

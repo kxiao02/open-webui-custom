@@ -546,11 +546,55 @@
 		)
 	];
 
-	const mergeToolIds = (...groups: string[][]) => dedupeIds(groups.flat());
+	const sameIds = (left: string[] = [], right: string[] = []) =>
+		left.length === right.length && left.every((id, index) => id === right[index]);
+
+	const isHiddenChatTool = (toolId: string) => {
+		if (toolId.startsWith('server:') || toolId.startsWith('direct_server:')) {
+			return false;
+		}
+
+		const tool = $tools?.find((entry) => entry?.id === toolId);
+		return tool?.meta?.visibility === 'hidden';
+	};
+
+	const isHiddenChatSkill = (skillId: string) => {
+		const skill = $skills?.find((entry) => entry?.id === skillId);
+		return skill?.meta?.visibility === 'hidden';
+	};
+
+	const sanitizeChatToolIds = (ids: string[] = []) =>
+		dedupeIds(ids).filter((toolId) => !isHiddenChatTool(toolId));
+
+	const sanitizeChatSkillIds = (ids: string[] = []) =>
+		dedupeIds(ids).filter((skillId) => !isHiddenChatSkill(skillId));
+
+	const mergeToolIds = (...groups: string[][]) => sanitizeChatToolIds(groups.flat());
 
 	const applySelectedToolIds = (toolIds: string[] = []) => {
 		selectedToolIds = mergeToolIds(sessionToolIds, toolIds);
 	};
+
+	$: {
+		const nextSessionToolIds = sanitizeChatToolIds(sessionToolIds);
+		if (!sameIds(nextSessionToolIds, sessionToolIds)) {
+			sessionToolIds = nextSessionToolIds;
+		}
+	}
+
+	$: {
+		const nextSessionSkillIds = sanitizeChatSkillIds(sessionSkillIds);
+		if (!sameIds(nextSessionSkillIds, sessionSkillIds)) {
+			sessionSkillIds = nextSessionSkillIds;
+		}
+	}
+
+	$: {
+		const nextSelectedToolIds = sanitizeChatToolIds(selectedToolIds);
+		if (!sameIds(nextSelectedToolIds, selectedToolIds)) {
+			selectedToolIds = nextSelectedToolIds;
+		}
+	}
 
 	const normalizeRequestContext = (
 		requestContext: Partial<ChatRequestContext> | null | undefined,
@@ -559,7 +603,7 @@
 		thinkingModeEnabled: normalizeThinkingModeEnabled(
 			requestContext?.thinkingModeEnabled ?? fallbackRequestContext?.thinkingModeEnabled
 		),
-		selectedToolIds: dedupeIds(
+		selectedToolIds: sanitizeChatToolIds(
 			Array.isArray(requestContext?.selectedToolIds)
 				? requestContext.selectedToolIds
 				: (fallbackRequestContext?.selectedToolIds ?? [])
@@ -569,7 +613,7 @@
 				? requestContext.selectedFilterIds
 				: (fallbackRequestContext?.selectedFilterIds ?? [])
 		),
-		sessionSkillIds: dedupeIds(
+		sessionSkillIds: sanitizeChatSkillIds(
 			Array.isArray(requestContext?.sessionSkillIds)
 				? requestContext.sessionSkillIds
 				: (fallbackRequestContext?.sessionSkillIds ?? [])
@@ -671,17 +715,17 @@
 			return;
 		}
 
-	applySelectedToolIds(requestContext.selectedToolIds);
-	selectedFilterIds = [...requestContext.selectedFilterIds];
-	sessionSkillIds = [...requestContext.sessionSkillIds];
-	imageGenerationEnabled = requestContext.featureToggles.imageGenerationEnabled;
-	webSearchEnabled = requestContext.featureToggles.webSearchEnabled;
-	codeInterpreterEnabled = requestContext.featureToggles.codeInterpreterEnabled;
-	thinkingModeEnabled = requestContext.thinkingModeEnabled;
-	selectedTerminalId.set(
-		requestContext.selectedTerminalId == null ? null : `${requestContext.selectedTerminalId}`
-	);
-};
+		applySelectedToolIds(requestContext.selectedToolIds);
+		selectedFilterIds = [...requestContext.selectedFilterIds];
+		sessionSkillIds = sanitizeChatSkillIds(requestContext.sessionSkillIds);
+		imageGenerationEnabled = requestContext.featureToggles.imageGenerationEnabled;
+		webSearchEnabled = requestContext.featureToggles.webSearchEnabled;
+		codeInterpreterEnabled = requestContext.featureToggles.codeInterpreterEnabled;
+		thinkingModeEnabled = requestContext.thinkingModeEnabled;
+		selectedTerminalId.set(
+			requestContext.selectedTerminalId == null ? null : `${requestContext.selectedTerminalId}`
+		);
+	};
 
 	const submitQueuedMessages = async (queueData: QueuedMessage[]) => {
 		const normalizedQueue = normalizeMessageQueue(queueData);
@@ -702,16 +746,16 @@
 	$: lockedToolIds = mergeToolIds(sessionToolIds);
 
 	const getChatSessionMeta = () => ({
-		session_tool_ids: dedupeIds(sessionToolIds),
-		session_skill_ids: dedupeIds(sessionSkillIds)
+		session_tool_ids: sanitizeChatToolIds(sessionToolIds),
+		session_skill_ids: sanitizeChatSkillIds(sessionSkillIds)
 	});
 
 	const persistSessionCapabilities = async (
 		toolIds: string[] = sessionToolIds,
 		skillIds: string[] = sessionSkillIds
 	) => {
-		const nextToolIds = dedupeIds(toolIds);
-		const nextSkillIds = dedupeIds(skillIds);
+		const nextToolIds = sanitizeChatToolIds(toolIds);
+		const nextSkillIds = sanitizeChatSkillIds(skillIds);
 
 		sessionToolIds = nextToolIds;
 		sessionSkillIds = nextSkillIds;
@@ -728,6 +772,9 @@
 
 		if (updatedChat) {
 			chat = updatedChat;
+			sessionToolIds = sanitizeChatToolIds(updatedChat?.meta?.session_tool_ids ?? nextToolIds);
+			sessionSkillIds = sanitizeChatSkillIds(updatedChat?.meta?.session_skill_ids ?? nextSkillIds);
+			applySelectedToolIds(selectedToolIds);
 		}
 
 		return updatedChat;
@@ -3866,7 +3913,9 @@
 		const clientCapabilities = getClientCapabilities({
 			chatId: _chatId,
 			temporaryChatEnabled: $temporaryChatEnabled,
-			canShareChat: $user?.role === 'admin' || ($user?.permissions?.chat?.share ?? true)
+			canShareChat: $user?.role === 'admin' || ($user?.permissions?.chat?.share ?? true),
+			canDraftTool: $user?.role === 'admin' || Boolean($user?.permissions?.workspace?.tools),
+			canDraftSkill: $user?.role === 'admin' || Boolean($user?.permissions?.workspace?.skills)
 		});
 		const requestConversationId =
 			getMessageConversationId(responseMessage) ?? normalizeConversationId(_chatId);

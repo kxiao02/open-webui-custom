@@ -39,11 +39,13 @@ from open_webui.socket.main import (
     get_event_emitter,
 )
 from open_webui.routers.tasks import (
+    build_fallback_chat_title,
     generate_queries,
     generate_title,
     generate_follow_ups,
     generate_image_prompt,
     generate_chat_tags,
+    resolve_generated_chat_title,
 )
 from open_webui.routers.retrieval import (
     process_web_search,
@@ -53,7 +55,7 @@ from open_webui.routers.retrieval import (
     process_file,
 )
 from open_webui.internal.db import SessionLocal
-from open_webui.models.files import Files
+from open_webui.models.files import Files, File
 from open_webui.utils.tools import get_builtin_tools
 from open_webui.routers.images import (
     image_generations,
@@ -115,11 +117,17 @@ from open_webui.utils.tools import (
 )
 from open_webui.utils.access_control import get_permissions, has_connection_access
 from open_webui.utils.plugin import load_function_module_by_id
+from open_webui.utils.skill_import import PHASE_NOTES as DOCUMENT_SKILL_PHASE_NOTES
 from open_webui.utils.filter import (
     get_sorted_filter_ids,
     process_filter_functions,
 )
-from open_webui.utils.catalog import filter_visible_skills
+from open_webui.utils.catalog import (
+    filter_hidden_skill_ids,
+    filter_hidden_tool_ids,
+    filter_visible_skills,
+    is_catalog_runtime_activatable,
+)
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.payload import apply_system_prompt_to_body
 from open_webui.utils.response import normalize_usage
@@ -1033,8 +1041,12 @@ def _serialize_output_for_chat_content(
     fallback_content: str = "",
 ) -> str:
     message_blocks: list[str] = []
+    has_structured_items = False
     for item in output:
-        if not isinstance(item, dict) or item.get("type") != "message":
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            has_structured_items = True
             continue
 
         message_text = _extract_text_from_output_parts(item.get("content"))
@@ -1044,7 +1056,16 @@ def _serialize_output_for_chat_content(
             message_blocks.append(message_text)
 
     content = "\n".join(message_blocks).strip()
-    if not content and isinstance(fallback_content, str):
+    if content:
+        return content
+
+    # When the response already carries structured tool/process items but no
+    # assistant message item, raw fallback text is usually transient pre-tool
+    # scaffolding rather than the real final answer.
+    if has_structured_items:
+        return ""
+
+    if isinstance(fallback_content, str):
         content = _strip_bridge_details_blocks(fallback_content).strip()
 
     return content
@@ -2788,6 +2809,38 @@ def _normalize_generated_file_entry(item: Any) -> Optional[dict]:
     return normalized
 
 
+_OPENWEBUI_FILE_REF_REGEX = re.compile(
+    r"/(?:api/v1|openai/v1|v1)/files/[^/?#]+", flags=re.IGNORECASE
+)
+_OPENWEBUI_GENERATED_FILE_REF_REGEX = re.compile(
+    r"/(?:api/v1|openai/v1|v1)/generated-files/[^/?#]+", flags=re.IGNORECASE
+)
+
+
+def _is_persisted_openwebui_file_entry(item: Any) -> bool:
+    normalized = _normalize_generated_file_entry(item)
+    if not normalized:
+        return False
+
+    url = str(normalized.get("url") or "").strip()
+    if not url:
+        return False
+
+    return bool(_OPENWEBUI_FILE_REF_REGEX.search(url))
+
+
+def _is_proxy_generated_file_entry(item: Any) -> bool:
+    normalized = _normalize_generated_file_entry(item)
+    if not normalized:
+        return False
+
+    ref = str(normalized.get("url") or normalized.get("id") or "").strip()
+    if not ref:
+        return False
+
+    return bool(_OPENWEBUI_GENERATED_FILE_REF_REGEX.search(ref))
+
+
 def _generated_file_ref_key(item: dict) -> str:
     if not isinstance(item, dict):
         return ""
@@ -2906,7 +2959,18 @@ def _materialize_generated_files(
                 or item.get("url")
             )
             download_url = _normalize_bridge_download_url(request, download_ref)
-            if download_url and not _is_openwebui_file_ref(download_ref):
+            if download_url and _is_proxy_generated_file_entry(item):
+                uploaded = _upload_bridge_downloaded_file(
+                    request,
+                    str(item.get("tool_name") or "bridge_generated_file"),
+                    item,
+                    download_url,
+                    metadata,
+                    user,
+                )
+                if uploaded:
+                    candidate = uploaded
+            elif download_url and not _is_openwebui_file_ref(download_ref):
                 # Keep bridge-owned generated files on the existing OpenAI proxy path so
                 # completion delivery is not blocked by download-and-reupload work.
                 proxied_url = _build_openai_proxy_download_url(
@@ -2993,6 +3057,90 @@ def _collect_generated_files_from_output_items(output: Any) -> list[dict]:
         collected_files.extend(item.get("files"))
 
     return _merge_generated_file_entries(collected_files)
+
+
+def _output_contains_proxy_generated_files(output: Any) -> bool:
+    return any(
+        _is_proxy_generated_file_entry(item)
+        for item in _collect_generated_files_from_output_items(output)
+    )
+
+
+def _strip_proxy_generated_files_from_output(output: list) -> list:
+    if not isinstance(output, list) or not output:
+        return output
+
+    cleaned_output = copy.deepcopy(output)
+    changed = False
+
+    for item in cleaned_output:
+        if not isinstance(item, dict):
+            continue
+
+        files = item.get("files")
+        if not isinstance(files, list):
+            continue
+
+        filtered_files = [
+            file_item for file_item in files if not _is_proxy_generated_file_entry(file_item)
+        ]
+        if len(filtered_files) == len(files):
+            continue
+
+        item["files"] = filtered_files
+        changed = True
+
+    return cleaned_output if changed else output
+
+
+def _stabilize_output_generated_files(
+    request: Request,
+    output: list,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> tuple[list, dict, list[dict]]:
+    final_output, final_payload = _build_chat_completion_payload(output)
+    if not output or user is None or not isinstance(metadata, dict):
+        return final_output, final_payload, []
+
+    serialized_markup = serialize_output(final_output)
+    _updated_content, bridge_generated_files = _collect_bridge_generated_files_from_content(
+        request,
+        serialized_markup,
+        metadata,
+        user,
+    )
+
+    existing_output_files = _collect_generated_files_from_output_items(final_output)
+    if not bridge_generated_files:
+        proxy_output_files = [
+            item for item in existing_output_files if _is_proxy_generated_file_entry(item)
+        ]
+        if proxy_output_files:
+            bridge_generated_files = _materialize_generated_files(
+                request,
+                proxy_output_files,
+                metadata,
+                user,
+            )
+
+    if bridge_generated_files:
+        final_output = _strip_proxy_generated_files_from_output(final_output)
+        existing_output_files = [
+            item
+            for item in existing_output_files
+            if not _is_proxy_generated_file_entry(item)
+        ]
+
+    stabilized_files = _merge_generated_file_entries(
+        existing_output_files,
+        bridge_generated_files,
+    )
+    if stabilized_files:
+        final_output = _attach_generated_files_to_output(final_output, stabilized_files)
+        final_output, final_payload = _build_chat_completion_payload(final_output)
+
+    return final_output, final_payload, stabilized_files
 
 
 def _attach_generated_files_to_output(output: list, files: list[dict]) -> list:
@@ -3088,15 +3236,29 @@ def _default_client_capabilities(
     metadata: Optional[dict],
 ) -> dict:
     share_enabled = False
+    tool_draft_enabled = False
+    skill_draft_enabled = False
     chat_id = ""
+    permissions = {}
     if isinstance(metadata, dict):
         chat_id = str(metadata.get("chat_id") or "").strip()
 
-    if user is not None and chat_id and not chat_id.startswith("local:"):
+    if user is not None:
         permissions = get_permissions(
             user.id,
             request.app.state.config.USER_PERMISSIONS,
         )
+
+        tool_draft_enabled = bool(
+            user.role == "admin"
+            or (permissions.get("workspace", {}) or {}).get("tools", False)
+        )
+        skill_draft_enabled = bool(
+            user.role == "admin"
+            or (permissions.get("workspace", {}) or {}).get("skills", False)
+        )
+
+    if user is not None and chat_id and not chat_id.startswith("local:"):
         share_enabled = bool(
             user.role == "admin" or (permissions.get("chat", {}) or {}).get("share", True)
         )
@@ -3118,12 +3280,12 @@ def _default_client_capabilities(
             "types": list(CLIENT_CAPABILITIES_PREVIEW_TYPES),
         },
         "workspace_tool_draft": {
-            "enabled": True,
+            "enabled": tool_draft_enabled,
             "mode": "confirm_then_edit",
             "format": "python_tool_class",
         },
         "workspace_skill_draft": {
-            "enabled": True,
+            "enabled": skill_draft_enabled,
             "mode": "confirm_then_edit",
             "format": "markdown_skill",
         },
@@ -3392,6 +3554,9 @@ def _normalize_bridge_download_url(request: Request, value: Any) -> str:
     if not candidate or candidate.lower() in {"null", "undefined"}:
         return ""
 
+    if candidate.startswith("/openai/"):
+        candidate = candidate[len("/openai") :]
+
     base_url = _resolve_bridge_api_base_url(request)
     if candidate.startswith(("http://", "https://")):
         if base_url and candidate.startswith(base_url):
@@ -3512,6 +3677,71 @@ def _download_bridge_generated_file(
     }
 
 
+def _find_existing_bridge_uploaded_file(
+    request: Request,
+    filename: str,
+    download_url: str,
+    metadata: Optional[dict],
+    user: Optional[UserModel],
+) -> Optional[dict]:
+    if user is None or not filename or not download_url or not isinstance(metadata, dict):
+        return None
+
+    chat_id = str(metadata.get("chat_id") or "").strip()
+    message_id = str(metadata.get("message_id") or "").strip()
+
+    try:
+        with SessionLocal() as db:
+            existing_files = (
+                db.query(File)
+                .filter_by(user_id=user.id, filename=filename)
+                .order_by(File.created_at.desc())
+                .limit(10)
+                .all()
+            )
+
+            for file_row in existing_files:
+                file_meta = getattr(file_row, "meta", {}) or {}
+                file_data = file_meta.get("data") or {}
+
+                if str(file_data.get("source") or "").strip() != "bridge_generated_file":
+                    continue
+                if str(file_data.get("bridge_url") or "").strip() != download_url:
+                    continue
+                if chat_id and str(file_data.get("chat_id") or "").strip() != chat_id:
+                    continue
+                if message_id and str(file_data.get("message_id") or "").strip() != message_id:
+                    continue
+
+                file_id = str(getattr(file_row, "id", "") or "").strip()
+                if not file_id:
+                    continue
+
+                content_type = (
+                    str(file_meta.get("content_type") or "").strip()
+                    or mimetypes.guess_type(filename)[0]
+                    or "application/octet-stream"
+                )
+
+                return {
+                    "id": file_id,
+                    "url": str(request.app.url_path_for("get_file_content_by_id", id=file_id)),
+                    "name": str(file_meta.get("name") or getattr(file_row, "filename", filename)),
+                    "filename": str(getattr(file_row, "filename", filename)),
+                    "type": "image" if content_type.startswith("image/") else "file",
+                    "content_type": content_type,
+                    "size": file_meta.get("size"),
+                }
+    except Exception as exc:
+        log.warning(
+            "Failed to look up existing bridge generated file %s: %s",
+            download_url,
+            exc,
+        )
+
+    return None
+
+
 def _upload_bridge_downloaded_file(
     request: Request,
     tool_id: str,
@@ -3523,6 +3753,25 @@ def _upload_bridge_downloaded_file(
     if user is None or not isinstance(metadata, dict):
         return None
 
+    filename = str(
+        candidate.get("name")
+        or candidate.get("filename")
+        or os.path.basename(download_url.split("?", 1)[0].rstrip("/"))
+        or "generated-file"
+    ).strip()
+    if not filename:
+        filename = "generated-file"
+
+    existing_file = _find_existing_bridge_uploaded_file(
+        request,
+        filename,
+        download_url,
+        metadata,
+        user,
+    )
+    if existing_file:
+        return existing_file
+
     download = _download_bridge_generated_file(request, download_url, metadata, user)
     if not download or not isinstance(download.get("content"), (bytes, bytearray)):
         return None
@@ -3530,15 +3779,6 @@ def _upload_bridge_downloaded_file(
     content_bytes = download["content"]
     if not content_bytes:
         return None
-
-    filename = str(
-        candidate.get("name")
-        or candidate.get("filename")
-        or download.get("filename")
-        or "generated-file"
-    ).strip()
-    if not filename:
-        filename = "generated-file"
 
     content_type = str(
         candidate.get("content_type")
@@ -3757,7 +3997,9 @@ def _collect_bridge_generated_files_from_content(
             return block
 
         existing_files = _parse_nested_json_value(attrs.get("files", ""))
-        if isinstance(existing_files, list) and existing_files:
+        if isinstance(existing_files, list) and any(
+            _is_persisted_openwebui_file_entry(item) for item in existing_files
+        ):
             return block
 
         tool_id = _normalize_tool_call_tool_id(attrs)
@@ -3803,6 +4045,16 @@ def _collect_bridge_generated_files_from_content(
         if not uploaded_files:
             return block
 
+        call_id = str(attrs.get("id") or "").strip()
+        if call_id:
+            uploaded_files = [
+                {
+                    **item,
+                    "call_id": str(item.get("call_id") or call_id),
+                }
+                for item in uploaded_files
+            ]
+
         generated_files.extend(uploaded_files)
         return _set_tool_call_block_files_attr(block, uploaded_files)
 
@@ -3825,20 +4077,12 @@ async def _finalize_bridge_generated_files_from_output(
         return
 
     try:
-        final_output, final_payload = _build_chat_completion_payload(output)
-
-        serialized_markup = await asyncio.to_thread(serialize_output, final_output)
-        _updated_content, bridge_generated_files = await asyncio.to_thread(
-            _collect_bridge_generated_files_from_content,
+        final_output, final_payload, combined_generated_files = await asyncio.to_thread(
+            _stabilize_output_generated_files,
             request,
-            serialized_markup,
+            output,
             metadata,
             user,
-        )
-
-        combined_generated_files = _merge_generated_file_entries(
-            _collect_generated_files_from_output_items(final_output),
-            bridge_generated_files,
         )
 
         emitted_files = None
@@ -3926,12 +4170,275 @@ def _file_context_key(file_item: dict) -> str:
     if not isinstance(file_item, dict):
         return ""
 
-    for key in ("id", "url", "name"):
+    file_type = str(file_item.get("type", "file") or "file").strip().lower()
+
+    for key in ("id", "url", "collection_name", "name", "filename"):
         value = str(file_item.get(key) or "").strip()
         if value:
-            return f"{key}:{value}"
+            return f"{file_type}:{key}:{value}"
+
+    collection_names = file_item.get("collection_names")
+    if isinstance(collection_names, list):
+        normalized_names = [str(item).strip() for item in collection_names if str(item).strip()]
+        if normalized_names:
+            return f"{file_type}:collection_names:{json.dumps(normalized_names, ensure_ascii=False)}"
 
     return ""
+
+
+_ADAPTIVE_FOCUS_ACTIVE = "active"
+_ADAPTIVE_FOCUS_REFERENCE = "reference"
+_ADAPTIVE_FOCUS_CURRENT_TURN = "current_turn"
+_ADAPTIVE_FOCUS_HISTORY = "history"
+_ADAPTIVE_FOCUS_DERIVED = "derived_context"
+_ADAPTIVE_FOCUS_FOLDER = "folder_knowledge"
+_ADAPTIVE_FOCUS_MODEL = "model_knowledge"
+_ADAPTIVE_FOCUS_METADATA_KEYS = {"focus_origin", "focus_tier"}
+_PRIOR_ATTACHMENT_REFERENCE_PATTERN = re.compile(
+    r"(previous|earlier|prior|older)\s+(uploaded\s+)?(file|attachment|document|pdf|doc|spreadsheet|sheet)"
+    r"|first\s+(uploaded\s+)?(file|attachment|document|pdf|doc|spreadsheet|sheet)"
+    r"|other\s+(file|attachment|document)"
+    r"|previous\s+upload|earlier\s+upload|prior\s+upload"
+    r"|上一个附件|前一个附件|上一个文件|前一个文件|之前的文件|之前的附件|前面的文件|前面的附件"
+    r"|先前的文件|之前上传的文件|前面上传的文件|旧文件|历史附件",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_adaptive_focus_tier(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == _ADAPTIVE_FOCUS_ACTIVE:
+        return _ADAPTIVE_FOCUS_ACTIVE
+    if normalized == _ADAPTIVE_FOCUS_REFERENCE:
+        return _ADAPTIVE_FOCUS_REFERENCE
+    return ""
+
+
+def _adaptive_focus_priority(file_item: Optional[dict]) -> int:
+    if not isinstance(file_item, dict):
+        return 0
+
+    if str(file_item.get("context") or "").strip().lower() == "full":
+        return 3
+
+    tier = _normalize_adaptive_focus_tier(file_item.get("focus_tier"))
+    if tier == _ADAPTIVE_FOCUS_ACTIVE:
+        return 2
+    if tier == _ADAPTIVE_FOCUS_REFERENCE:
+        return 1
+    return 0
+
+
+def _is_active_focus_file(file_item: Optional[dict]) -> bool:
+    return _adaptive_focus_priority(file_item) >= 2
+
+
+def _apply_adaptive_focus_metadata(
+    file_item: Any,
+    *,
+    origin: Optional[str] = None,
+    tier: Optional[str] = None,
+    force: bool = False,
+) -> Any:
+    if not isinstance(file_item, dict):
+        return file_item
+
+    prepared = copy.deepcopy(file_item)
+
+    if origin:
+        if force or not str(prepared.get("focus_origin") or "").strip():
+            prepared["focus_origin"] = origin
+
+    normalized_tier = _normalize_adaptive_focus_tier(tier)
+    if normalized_tier:
+        existing_priority = _adaptive_focus_priority(prepared)
+        candidate_priority = _adaptive_focus_priority(
+            {"focus_tier": normalized_tier, "context": prepared.get("context")}
+        )
+        if force or candidate_priority > existing_priority or not prepared.get("focus_tier"):
+            prepared["focus_tier"] = normalized_tier
+
+    return prepared
+
+
+def _apply_adaptive_focus_metadata_to_items(
+    file_items: Any,
+    *,
+    origin: Optional[str] = None,
+    tier: Optional[str] = None,
+    force: bool = False,
+) -> list[dict]:
+    prepared_items: list[dict] = []
+
+    if not isinstance(file_items, list):
+        return prepared_items
+
+    for file_item in file_items:
+        if not isinstance(file_item, dict):
+            continue
+        prepared_items.append(
+            _apply_adaptive_focus_metadata(
+                file_item,
+                origin=origin,
+                tier=tier,
+                force=force,
+            )
+        )
+
+    return prepared_items
+
+
+def _merge_file_context_items(existing: dict, incoming: dict) -> dict:
+    merged = deep_update(copy.deepcopy(existing), incoming)
+
+    existing_priority = _adaptive_focus_priority(existing)
+    incoming_priority = _adaptive_focus_priority(incoming)
+
+    stronger = incoming if incoming_priority > existing_priority else existing
+    stronger_tier = _normalize_adaptive_focus_tier(stronger.get("focus_tier"))
+    if stronger_tier:
+        merged["focus_tier"] = stronger_tier
+
+    stronger_origin = str(stronger.get("focus_origin") or "").strip()
+    if stronger_origin:
+        merged["focus_origin"] = stronger_origin
+    elif str(merged.get("focus_origin") or "").strip() == "":
+        fallback_origin = str(
+            existing.get("focus_origin") or incoming.get("focus_origin") or ""
+        ).strip()
+        if fallback_origin:
+            merged["focus_origin"] = fallback_origin
+
+    if (
+        str(existing.get("context") or "").strip().lower() == "full"
+        or str(incoming.get("context") or "").strip().lower() == "full"
+    ):
+        merged["context"] = "full"
+
+    return merged
+
+
+def _file_context_identity_key(file_item: Any) -> str:
+    if not isinstance(file_item, dict):
+        return ""
+
+    file_key = _file_context_key(file_item)
+    if file_key:
+        return file_key
+
+    normalized = {
+        key: value
+        for key, value in file_item.items()
+        if key not in _ADAPTIVE_FOCUS_METADATA_KEYS
+    }
+    return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+
+
+def _dedupe_file_context_items(file_items: list[dict]) -> list[dict]:
+    deduped: list[dict] = []
+    indexes: dict[str, int] = {}
+
+    for file_item in file_items:
+        if not isinstance(file_item, dict):
+            continue
+
+        identity_key = _file_context_identity_key(file_item)
+        if not identity_key:
+            deduped.append(file_item)
+            continue
+
+        if identity_key not in indexes:
+            indexes[identity_key] = len(deduped)
+            deduped.append(file_item)
+            continue
+
+        current_index = indexes[identity_key]
+        deduped[current_index] = _merge_file_context_items(
+            deduped[current_index], file_item
+        )
+
+    return deduped
+
+
+def _split_files_by_focus(file_items: list[dict]) -> tuple[list[dict], list[dict]]:
+    active_files: list[dict] = []
+    reference_files: list[dict] = []
+
+    for file_item in file_items:
+        if _is_active_focus_file(file_item):
+            active_files.append(file_item)
+        else:
+            reference_files.append(file_item)
+
+    return active_files, reference_files
+
+
+def _normalize_focus_match_text(value: Any) -> str:
+    normalized = os.path.basename(str(value or "").strip().lower())
+    normalized = re.sub(r"[\\/_\-.]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def _has_specific_focus_label(label: str) -> bool:
+    if not label:
+        return False
+    if re.search(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]", label):
+        return len(label) >= 2
+    return len(label) >= 3
+
+
+def _get_reference_label_variants(file_item: dict) -> set[str]:
+    labels: set[str] = set()
+
+    for key in ("name", "filename", "collection_name"):
+        value = str(file_item.get(key) or "").strip()
+        if value:
+            labels.add(value)
+
+    collection_names = file_item.get("collection_names")
+    if isinstance(collection_names, list):
+        for value in collection_names:
+            normalized_value = str(value or "").strip()
+            if normalized_value:
+                labels.add(normalized_value)
+
+    variants: set[str] = set()
+    for label in labels:
+        normalized = _normalize_focus_match_text(label)
+        if _has_specific_focus_label(normalized):
+            variants.add(normalized)
+
+        stem = _normalize_focus_match_text(os.path.splitext(label)[0])
+        if _has_specific_focus_label(stem):
+            variants.add(stem)
+
+    return variants
+
+
+def _prompt_mentions_reference_file(prompt: str, file_item: dict) -> bool:
+    normalized_prompt = _normalize_focus_match_text(prompt)
+    if not normalized_prompt:
+        return False
+
+    return any(
+        variant and variant in normalized_prompt
+        for variant in _get_reference_label_variants(file_item)
+    )
+
+
+def _prompt_requests_prior_attachments(prompt: str) -> bool:
+    return bool(_PRIOR_ATTACHMENT_REFERENCE_PATTERN.search(str(prompt or "").strip().lower()))
+
+
+def _has_usable_sources(sources: list[dict]) -> bool:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for document in source.get("document") or []:
+            if str(document or "").strip():
+                return True
+    return False
 
 
 def _get_stored_chat_messages(
@@ -3969,7 +4476,14 @@ def _collect_stored_message_files(stored_messages: list[dict]) -> list[dict]:
                 continue
             if file_key:
                 seen_keys.add(file_key)
-            collected.append(file_item)
+            collected.append(
+                _apply_adaptive_focus_metadata(
+                    file_item,
+                    origin=_ADAPTIVE_FOCUS_HISTORY,
+                    tier=_ADAPTIVE_FOCUS_REFERENCE,
+                    force=True,
+                )
+            )
 
     return collected
 
@@ -4063,6 +4577,8 @@ def add_file_context(
     pending_request_files = []
     for file_item in request_files or []:
         if not isinstance(file_item, dict):
+            continue
+        if not _is_active_focus_file(file_item):
             continue
         file_key = _file_context_key(file_item)
         if file_key and file_key in injected_file_keys:
@@ -4296,18 +4812,22 @@ async def chat_completion_files_handler(
         if stored_messages:
             history_files = _collect_stored_message_files(stored_messages)
             if history_files:
-                merged_files: list[dict] = []
-                seen_keys: set[str] = set()
-                for file_item in [*(files or []), *history_files]:
-                    if not isinstance(file_item, dict):
-                        continue
-                    file_key = _file_context_key(file_item)
-                    if file_key and file_key in seen_keys:
-                        continue
-                    if file_key:
-                        seen_keys.add(file_key)
-                    merged_files.append(file_item)
-                files = merged_files
+                current_files = [
+                    _apply_adaptive_focus_metadata(
+                        file_item,
+                        origin=(
+                            str(file_item.get("focus_origin") or "").strip()
+                            or _ADAPTIVE_FOCUS_DERIVED
+                        ),
+                        tier=(
+                            _normalize_adaptive_focus_tier(file_item.get("focus_tier"))
+                            or _ADAPTIVE_FOCUS_REFERENCE
+                        ),
+                    )
+                    for file_item in (files or [])
+                    if isinstance(file_item, dict)
+                ]
+                files = _dedupe_file_context_items([*current_files, *history_files])
                 metadata["files"] = files
                 if body.get("files") is not None:
                     body["files"] = files
@@ -4315,76 +4835,100 @@ async def chat_completion_files_handler(
                     body["attachments"] = files
 
     if files:
-        files, inline_sources, retrieval_files = await _prepare_chat_files_for_retrieval(
-            request, files, user
-        )
+        (
+            files,
+            active_inline_sources,
+            reference_inline_sources,
+            active_retrieval_files,
+            reference_retrieval_files,
+        ) = await _prepare_chat_files_for_retrieval(request, files, user)
         body.setdefault("metadata", {})["files"] = files
         if body.get("files") is not None:
             body["files"] = files
         if body.get("attachments") is not None:
             body["attachments"] = files
 
-        if inline_sources:
-            sources.extend(inline_sources)
+        queries_cache: Optional[list[str]] = None
+        query_status_emitted = False
 
-        # Check if all files are in full context mode
-        all_full_context = bool(retrieval_files) and all(
-            item.get("context") == "full" for item in retrieval_files
-        )
+        async def ensure_queries(retrieval_candidates: list[dict]) -> list[str]:
+            nonlocal queries_cache, query_status_emitted
 
-        queries = []
-        if retrieval_files and not all_full_context:
-            try:
-                queries_response = await generate_queries(
-                    request,
-                    {
-                        "model": body["model"],
-                        "messages": body["messages"],
-                        "type": "retrieval",
-                        "chat_id": body.get("metadata", {}).get("chat_id"),
-                    },
-                    user,
-                )
-                queries_response = queries_response["choices"][0]["message"]["content"]
+            if queries_cache is not None:
+                return queries_cache
 
-                try:
-                    bracket_start = queries_response.find("{")
-                    bracket_end = queries_response.rfind("}") + 1
-
-                    if bracket_start == -1 or bracket_end == -1:
-                        raise Exception("No JSON object found in the response")
-
-                    queries_response = queries_response[bracket_start:bracket_end]
-                    queries_response = json.loads(queries_response)
-                except Exception as e:
-                    queries_response = {"queries": [queries_response]}
-
-                queries = queries_response.get("queries", [])
-            except:
-                pass
-
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "action": "queries_generated",
-                        "queries": queries,
-                        "done": False,
-                    },
-                }
+            queries_cache = []
+            all_full_context = bool(retrieval_candidates) and all(
+                item.get("context") == "full" for item in retrieval_candidates
             )
 
-        if retrieval_files and len(queries) == 0:
-            queries = [get_last_user_message(body["messages"])]
+            if retrieval_candidates and not all_full_context:
+                try:
+                    queries_response = await generate_queries(
+                        request,
+                        {
+                            "model": body["model"],
+                            "messages": body["messages"],
+                            "type": "retrieval",
+                            "chat_id": body.get("metadata", {}).get("chat_id"),
+                        },
+                        user,
+                    )
+                    queries_response = queries_response["choices"][0]["message"][
+                        "content"
+                    ]
 
-        if retrieval_files:
+                    try:
+                        bracket_start = queries_response.find("{")
+                        bracket_end = queries_response.rfind("}") + 1
+
+                        if bracket_start == -1 or bracket_end == -1:
+                            raise Exception("No JSON object found in the response")
+
+                        queries_response = queries_response[bracket_start:bracket_end]
+                        queries_response = json.loads(queries_response)
+                    except Exception:
+                        queries_response = {"queries": [queries_response]}
+
+                    queries_cache = queries_response.get("queries", [])
+                except Exception:
+                    queries_cache = []
+
+            if retrieval_candidates and len(queries_cache) == 0:
+                queries_cache = [get_last_user_message(body["messages"])]
+
+            if not query_status_emitted and retrieval_candidates:
+                query_status_emitted = True
+                await __event_emitter__(
+                    {
+                        "type": "status",
+                        "data": {
+                            "action": "queries_generated",
+                            "queries": queries_cache,
+                            "done": False,
+                        },
+                    }
+                )
+
+            return queries_cache
+
+        async def retrieve_sources(retrieval_candidates: list[dict]) -> list[dict]:
+            nonlocal performed_retrieval
+
+            if not retrieval_candidates:
+                return []
+
+            performed_retrieval = True
+            ensure_retrieval_runtime(request.app)
+            queries = await ensure_queries(retrieval_candidates)
+            all_full_context = bool(retrieval_candidates) and all(
+                item.get("context") == "full" for item in retrieval_candidates
+            )
+
             try:
-                performed_retrieval = True
-                ensure_retrieval_runtime(request.app)
-                # Directly await async get_sources_from_items (no thread needed - fully async now)
-                retrieved_sources = await get_sources_from_items(
+                return await get_sources_from_items(
                     request=request,
-                    items=retrieval_files,
+                    items=retrieval_candidates,
                     queries=queries,
                     embedding_function=lambda query, prefix: request.app.state.EMBEDDING_FUNCTION(
                         query, prefix=prefix, user=user
@@ -4407,9 +4951,45 @@ async def chat_completion_files_handler(
                     or request.app.state.config.RAG_FULL_CONTEXT,
                     user=user,
                 )
-                sources.extend(retrieved_sources)
-            except Exception as e:
-                log.exception(e)
+            except Exception as exc:
+                log.exception(exc)
+                return []
+
+        active_sources = [*active_inline_sources]
+        active_sources.extend(await retrieve_sources(active_retrieval_files))
+        sources.extend(active_sources)
+
+        prompt = get_last_user_message(body["messages"]) or ""
+        request_prior_attachments = _prompt_requests_prior_attachments(prompt)
+
+        referenced_inline_sources: list[dict] = []
+        referenced_retrieval_files: list[dict] = []
+        remaining_inline_sources: list[dict] = []
+        remaining_retrieval_files: list[dict] = []
+
+        for file_item, inline_source in reference_inline_sources:
+            if request_prior_attachments or _prompt_mentions_reference_file(prompt, file_item):
+                referenced_inline_sources.append(inline_source)
+            else:
+                remaining_inline_sources.append(inline_source)
+
+        for file_item in reference_retrieval_files:
+            if request_prior_attachments or _prompt_mentions_reference_file(prompt, file_item):
+                referenced_retrieval_files.append(file_item)
+            else:
+                remaining_retrieval_files.append(file_item)
+
+        if referenced_inline_sources:
+            sources.extend(referenced_inline_sources)
+
+        if referenced_retrieval_files:
+            sources.extend(await retrieve_sources(referenced_retrieval_files))
+
+        if not _has_usable_sources(active_sources):
+            if remaining_inline_sources:
+                sources.extend(remaining_inline_sources)
+            if remaining_retrieval_files:
+                sources.extend(await retrieve_sources(remaining_retrieval_files))
 
         log.debug(f"rag_contexts:sources: {sources}")
 
@@ -4594,14 +5174,30 @@ async def _prepare_chat_files_for_retrieval(
     request: Request,
     files: list[dict],
     user: UserModel,
-) -> tuple[list[dict], list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[tuple[dict, dict]], list[dict], list[dict]]:
     prepared_files = []
-    inline_sources = []
-    retrieval_files = []
+    active_inline_sources: list[dict] = []
+    reference_inline_sources: list[tuple[dict, dict]] = []
+    active_retrieval_files: list[dict] = []
+    reference_retrieval_files: list[dict] = []
     for file_item in files:
         if not _should_prepare_chat_file(file_item):
-            prepared_files.append(file_item)
-            retrieval_files.append(file_item)
+            prepared_file = _apply_adaptive_focus_metadata(
+                file_item,
+                origin=(
+                    str(file_item.get("focus_origin") or "").strip()
+                    or _ADAPTIVE_FOCUS_DERIVED
+                ),
+                tier=(
+                    _normalize_adaptive_focus_tier(file_item.get("focus_tier"))
+                    or _ADAPTIVE_FOCUS_REFERENCE
+                ),
+            )
+            prepared_files.append(prepared_file)
+            if _is_active_focus_file(prepared_file):
+                active_retrieval_files.append(prepared_file)
+            else:
+                reference_retrieval_files.append(prepared_file)
             continue
 
         prepared_file, inline_source = await asyncio.to_thread(
@@ -4609,11 +5205,23 @@ async def _prepare_chat_files_for_retrieval(
         )
         prepared_files.append(prepared_file)
         if inline_source:
-            inline_sources.append(inline_source)
+            if _is_active_focus_file(prepared_file):
+                active_inline_sources.append(inline_source)
+            else:
+                reference_inline_sources.append((prepared_file, inline_source))
         else:
-            retrieval_files.append(prepared_file)
+            if _is_active_focus_file(prepared_file):
+                active_retrieval_files.append(prepared_file)
+            else:
+                reference_retrieval_files.append(prepared_file)
 
-    return prepared_files, inline_sources, retrieval_files
+    return (
+        prepared_files,
+        active_inline_sources,
+        reference_inline_sources,
+        active_retrieval_files,
+        reference_retrieval_files,
+    )
 
 
 def apply_params_to_form_data(form_data, model):
@@ -4862,6 +5470,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     events = []
     sources = []
 
+    current_turn_files = _apply_adaptive_focus_metadata_to_items(
+        form_data.get("files", []),
+        origin=_ADAPTIVE_FOCUS_CURRENT_TURN,
+        tier=_ADAPTIVE_FOCUS_ACTIVE,
+    )
+    if current_turn_files:
+        form_data["files"] = current_turn_files
+
     # Folder "Project" handling
     # Check if the request has chat_id and is inside of a folder
     # Uses lightweight column query — only fetches folder_id, not the full chat JSON blob
@@ -4877,15 +5493,19 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                         folder.data["system_prompt"], form_data, metadata, user
                     )
                 if "files" in folder.data:
+                    folder_files = _apply_adaptive_focus_metadata_to_items(
+                        folder.data["files"],
+                        origin=_ADAPTIVE_FOCUS_FOLDER,
+                        tier=_ADAPTIVE_FOCUS_REFERENCE,
+                    )
                     if metadata.get("params", {}).get("function_calling") != "native":
-                        form_data["files"] = [
-                            *folder.data["files"],
-                            *form_data.get("files", []),
-                        ]
+                        form_data["files"] = _dedupe_file_context_items(
+                            [*form_data.get("files", []), *folder_files]
+                        )
                     else:
                         # Native FC: skip RAG injection, builtin tools
                         # will read folder knowledge from metadata.
-                        metadata["folder_knowledge"] = folder.data["files"]
+                        metadata["folder_knowledge"] = folder_files
 
     # Model "Knowledge" handling
     user_message = get_last_user_message(form_data["messages"])
@@ -4928,9 +5548,15 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             else:
                 knowledge_files.append(item)
 
-        files = form_data.get("files", [])
-        files.extend(knowledge_files)
-        form_data["files"] = files
+        knowledge_files = _apply_adaptive_focus_metadata_to_items(
+            knowledge_files,
+            origin=_ADAPTIVE_FOCUS_MODEL,
+            tier=_ADAPTIVE_FOCUS_REFERENCE,
+        )
+
+        form_data["files"] = _dedupe_file_context_items(
+            [*form_data.get("files", []), *knowledge_files]
+        )
 
     variables = form_data.pop("variables", None)
 
@@ -5035,6 +5661,95 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     form_data["messages"],
                 )
 
+    def _extract_skill_routing_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+
+        if not isinstance(content, list):
+            return ""
+
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") not in {"text", "input_text", "output_text"}:
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+
+        return "\n".join(parts)
+
+    def _extract_latest_user_message_text(messages: Any) -> str:
+        if not isinstance(messages, list):
+            return ""
+
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = _extract_skill_routing_text(message.get("content"))
+            if text.strip():
+                return text.strip()
+
+        return ""
+
+    def _infer_document_skill_ids(messages: Any, available_skill_ids: set[str]) -> set[str]:
+        latest_user_text = _extract_latest_user_message_text(messages)
+        if not latest_user_text:
+            return set()
+
+        action_pattern = re.compile(
+            r"(导出|生成|创建|制作|输出|转换|转成|转为|整理成|另存为|保存为|下载|make|generate|create|export|convert|save|download|render|write)",
+            flags=re.IGNORECASE,
+        )
+        if not action_pattern.search(latest_user_text):
+            return set()
+
+        inferred_skill_ids: set[str] = set()
+        intent_rules = {
+            "minimax-pdf": re.compile(r"(\bpdf\b|pdf格式|pdf文件)", flags=re.IGNORECASE),
+            "minimax-docx": re.compile(
+                r"(\bdocx\b|\bword\b|word文档|word 文档|word格式|docx格式)",
+                flags=re.IGNORECASE,
+            ),
+            "minimax-xlsx": re.compile(
+                r"(\bxlsx\b|\bexcel\b|excel表|excel 文件|工作簿|电子表格|xlsx格式)",
+                flags=re.IGNORECASE,
+            ),
+            "pptx-generator": re.compile(
+                r"(\bpptx\b|\bppt\b|\bpowerpoint\b|演示文稿|幻灯片|ppt格式|pptx格式)",
+                flags=re.IGNORECASE,
+            ),
+        }
+
+        for skill_id, format_pattern in intent_rules.items():
+            if skill_id not in available_skill_ids:
+                continue
+            if format_pattern.search(latest_user_text):
+                inferred_skill_ids.add(skill_id)
+
+        return inferred_skill_ids
+
+    def _build_inferred_document_skill_prompt(skill_ids: set[str]) -> str:
+        if not skill_ids:
+            return ""
+
+        notes: list[str] = []
+        for skill_id in sorted(skill_ids):
+            note = str(DOCUMENT_SKILL_PHASE_NOTES.get(skill_id) or "").strip()
+            if note:
+                notes.append(f"- {note}")
+
+        if not notes:
+            return ""
+
+        return (
+            "【文档路由提示】用户本轮明确要求生成或导出可下载文档。"
+            "优先调用下面对应的文档工具；如果本轮没有返回标准文件引用，"
+            "不要声称文件已经生成成功或已经可下载。\n"
+            + "\n".join(notes)
+        )
+
     tool_ids = form_data.pop("tool_ids", None)
     terminal_id = form_data.pop("terminal_id", None)
     files = form_data.pop("files", None)
@@ -5054,8 +5769,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     installed_tool_ids = list(
         ResourceInstallations.get_installed_resource_ids(user.id, "tool")
     )
-    tool_ids = list(
-        dict.fromkeys([*(tool_ids or []), *session_tool_ids, *installed_tool_ids])
+    tool_ids = filter_hidden_tool_ids(
+        list(dict.fromkeys([*(tool_ids or []), *session_tool_ids, *installed_tool_ids]))
     )
 
     # Caller-provided OpenAI-style tools take precedence over server-side
@@ -5063,14 +5778,23 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     payload_tools = form_data.get("tools", None)
 
     # Skills
-    user_skill_ids = set(form_data.pop("skill_ids", None) or [])
-    user_skill_ids |= session_skill_ids
-    user_skill_ids |= ResourceInstallations.get_installed_resource_ids(user.id, "skill")
-    model_skill_ids = set(model.get("info", {}).get("meta", {}).get("skillIds", []))
+    user_skill_ids = set(
+        filter_hidden_skill_ids(
+            [
+                *(form_data.pop("skill_ids", None) or []),
+                *session_skill_ids,
+                *ResourceInstallations.get_installed_resource_ids(user.id, "skill"),
+            ]
+        )
+    )
+    model_skill_ids = set(
+        filter_hidden_skill_ids(model.get("info", {}).get("meta", {}).get("skillIds", []))
+    )
 
-    all_skill_ids = user_skill_ids | model_skill_ids
-    available_skills = []
-    if all_skill_ids:
+    indexed_skills = {}
+    inferred_skill_ids: set[str] = set()
+    latest_user_text = _extract_latest_user_message_text(form_data.get("messages"))
+    if user_skill_ids or model_skill_ids or latest_user_text:
         from open_webui.models.skills import Skills as SkillsModel
 
         indexed_skills = {
@@ -5078,7 +5802,19 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             for skill in filter_visible_skills(
                 SkillsModel.get_skills(), user, require_active=True
             )
+            if is_catalog_runtime_activatable(
+                getattr(skill, "meta", None), getattr(skill, "access_grants", [])
+            )
         }
+        if latest_user_text:
+            inferred_skill_ids = _infer_document_skill_ids(
+                form_data.get("messages"), set(indexed_skills.keys())
+            )
+            model_skill_ids |= inferred_skill_ids
+
+    all_skill_ids = set(filter_hidden_skill_ids(user_skill_ids | model_skill_ids))
+    available_skills = []
+    if all_skill_ids and indexed_skills:
         available_skills = [
             indexed_skills[skill_id]
             for skill_id in all_skill_ids
@@ -5105,29 +5841,68 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 append=True,
             )
 
+        inferred_skill_prompt = _build_inferred_document_skill_prompt(inferred_skill_ids)
+        if inferred_skill_prompt:
+            form_data["messages"] = add_or_update_system_message(
+                inferred_skill_prompt,
+                form_data["messages"],
+                append=True,
+            )
+
     prompt = get_last_user_message(form_data["messages"])
     # TODO: re-enable URL extraction from prompt
     # urls = []
     # if prompt and len(prompt or "") < 500 and (not files or len(files) == 0):
     #     urls = extract_urls(prompt)
 
-    if files:
-        if not files:
-            files = []
+    if isinstance(files, list):
+        expanded_files: list[dict] = []
 
         for file_item in files:
+            if not isinstance(file_item, dict):
+                continue
+
             if file_item.get("type", "file") == "folder":
-                # Get folder files
                 folder_id = file_item.get("id", None)
                 if folder_id:
                     folder = Folders.get_folder_by_id_and_user_id(folder_id, user.id)
                     if folder and folder.data and "files" in folder.data:
-                        files = [f for f in files if f.get("id", None) != folder_id]
-                        files = [*files, *folder.data["files"]]
+                        expanded_files.extend(
+                            _apply_adaptive_focus_metadata_to_items(
+                                folder.data["files"],
+                                origin=(
+                                    str(file_item.get("focus_origin") or "").strip()
+                                    or _ADAPTIVE_FOCUS_DERIVED
+                                ),
+                                tier=(
+                                    _normalize_adaptive_focus_tier(
+                                        file_item.get("focus_tier")
+                                    )
+                                    or _ADAPTIVE_FOCUS_REFERENCE
+                                ),
+                            )
+                        )
+                        continue
 
-        # files = [*files, *[{"type": "url", "url": url, "name": url} for url in urls]]
-        # Remove duplicate files based on their content
-        files = list({json.dumps(f, sort_keys=True): f for f in files}.values())
+            expanded_files.append(file_item)
+
+        files = _dedupe_file_context_items(
+            [
+                _apply_adaptive_focus_metadata(
+                    file_item,
+                    origin=(
+                        str(file_item.get("focus_origin") or "").strip()
+                        or _ADAPTIVE_FOCUS_DERIVED
+                    ),
+                    tier=(
+                        _normalize_adaptive_focus_tier(file_item.get("focus_tier"))
+                        or _ADAPTIVE_FOCUS_REFERENCE
+                    ),
+                )
+                for file_item in expanded_files
+                if isinstance(file_item, dict)
+            ]
+        )
 
         # Drop invalid/incomplete file entries (e.g. null id/url from in-flight uploads).
         sanitized_files = []
@@ -5719,10 +6494,6 @@ async def background_tasks_handler(ctx):
                 "local:"
             ):  # Only update titles and tags for non-temp chats
                 if TASKS.TITLE_GENERATION in tasks:
-                    user_message = get_last_user_message(messages)
-                    if user_message and len(user_message) > 100:
-                        user_message = user_message[:100] + "..."
-
                     title = None
                     if tasks[TASKS.TITLE_GENERATION]:
                         res = await generate_title(
@@ -5735,36 +6506,21 @@ async def background_tasks_handler(ctx):
                             user,
                         )
 
-                        if res and isinstance(res, dict):
-                            if len(res.get("choices", [])) == 1:
-                                response_message = res.get("choices", [])[0].get(
-                                    "message", {}
+                        if isinstance(res, dict):
+                            title = resolve_generated_chat_title(res, messages)
+                            if title:
+                                Chats.update_chat_title_by_id(metadata["chat_id"], title)
+
+                                await event_emitter(
+                                    {
+                                        "type": "chat:title",
+                                        "data": title,
+                                    }
                                 )
 
-                                title_string = (
-                                    response_message.get("content")
-                                    or response_message.get(
-                                        "reasoning_content",
-                                    )
-                                    or message.get("content", user_message)
-                                )
-                            else:
-                                title_string = ""
-
-                            title_string = title_string[
-                                title_string.find("{") : title_string.rfind("}") + 1
-                            ]
-
-                            try:
-                                title = json.loads(title_string).get(
-                                    "title", user_message
-                                )
-                            except Exception as e:
-                                title = ""
-
-                            if not title:
-                                title = messages[0].get("content", user_message)
-
+                    if title is None and len(messages) == 2:
+                        title = build_fallback_chat_title(messages)
+                        if title:
                             Chats.update_chat_title_by_id(metadata["chat_id"], title)
 
                             await event_emitter(
@@ -5773,18 +6529,6 @@ async def background_tasks_handler(ctx):
                                     "data": title,
                                 }
                             )
-
-                    if title == None and len(messages) == 2:
-                        title = messages[0].get("content", user_message)
-
-                        Chats.update_chat_title_by_id(metadata["chat_id"], title)
-
-                        await event_emitter(
-                            {
-                                "type": "chat:title",
-                                "data": message.get("content", user_message),
-                            }
-                        )
 
                 if TASKS.TAGS_GENERATION in tasks and tasks[TASKS.TAGS_GENERATION]:
                     res = await generate_chat_tags(
@@ -5973,6 +6717,35 @@ async def non_streaming_chat_response_handler(response, ctx):
                 if response_output is None:
                     response_output = []
 
+                response_output, response_payload, output_generated_files = (
+                    _stabilize_output_generated_files(
+                        request,
+                        response_output or [],
+                        metadata,
+                        user,
+                    )
+                )
+                combined_generated_files = _merge_generated_file_entries(
+                    bridge_generated_files,
+                    output_generated_files,
+                )
+                if combined_generated_files:
+                    message_metadata = message.get("metadata")
+                    if not isinstance(message_metadata, dict):
+                        message_metadata = {}
+                        message["metadata"] = message_metadata
+                    message_metadata["generated_files"] = combined_generated_files
+
+                    message_files = Chats.add_message_files_by_id_and_message_id(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        combined_generated_files,
+                    )
+                    if not isinstance(message_files, list) or not message_files:
+                        message_files = combined_generated_files
+
+                content = response_payload.get("content", content or "") or ""
+
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
 
                 await event_emitter(
@@ -5984,12 +6757,12 @@ async def non_streaming_chat_response_handler(response, ctx):
                             "output": response_output or [],
                             **(
                                 {"files": message_files}
-                                if bridge_generated_files and isinstance(message_files, list)
+                                if isinstance(message_files, list) and message_files
                                 else {}
                             ),
                             **(
-                                {"metadata": {"generated_files": bridge_generated_files}}
-                                if bridge_generated_files
+                                {"metadata": {"generated_files": combined_generated_files}}
+                                if combined_generated_files
                                 else {}
                             ),
                             "title": title,
@@ -6009,7 +6782,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                         "output": response_output or [],
                         **(
                             {"files": message_files}
-                            if bridge_generated_files and isinstance(message_files, list)
+                            if isinstance(message_files, list) and message_files
                             else {}
                         ),
                         **({"usage": usage} if usage else {}),
@@ -7836,16 +8609,39 @@ async def streaming_chat_response_handler(response, ctx):
 
                 output = strip_leading_message_output_before_tool_call(output)
 
-                title = Chats.get_chat_title_by_id(metadata["chat_id"])
-                output, final_payload = _build_chat_completion_payload(
+                message_files = None
+                output, final_payload, stabilized_generated_files = _stabilize_output_generated_files(
+                    request,
                     output,
-                    fallback_content=content,
+                    metadata,
+                    user,
                 )
+                if stabilized_generated_files:
+                    message_files = Chats.add_message_files_by_id_and_message_id(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        stabilized_generated_files,
+                    )
+                    if not isinstance(message_files, list) or not message_files:
+                        message_files = stabilized_generated_files
+
+                title = Chats.get_chat_title_by_id(metadata["chat_id"])
+                output, final_payload = _build_chat_completion_payload(output, fallback_content=content)
 
                 data = {
                     "done": True,
                     "content": final_payload["content"],
                     "output": output,
+                    **(
+                        {"files": message_files}
+                        if isinstance(message_files, list) and message_files
+                        else {}
+                    ),
+                    **(
+                        {"metadata": {"generated_files": message_files}}
+                        if isinstance(message_files, list) and message_files
+                        else {}
+                    ),
                     "title": title,
                 }
 
@@ -7858,6 +8654,11 @@ async def streaming_chat_response_handler(response, ctx):
                             "role": "assistant",
                             "content": final_payload["content"],
                             "output": output,
+                            **(
+                                {"files": message_files}
+                                if isinstance(message_files, list) and message_files
+                                else {}
+                            ),
                             **({"usage": usage} if usage else {}),
                         },
                     )
@@ -7891,7 +8692,7 @@ async def streaming_chat_response_handler(response, ctx):
                     }
                 )
 
-                if output:
+                if output and _output_contains_proxy_generated_files(output):
                     asyncio.create_task(
                         _finalize_bridge_generated_files_from_output(
                             request,

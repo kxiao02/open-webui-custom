@@ -27,7 +27,6 @@
 	import { goto, replaceState } from '$app/navigation';
 	import { get } from 'svelte/store';
 
-	import ShareChatModal from '../chat/ShareChatModal.svelte';
 	import ModelSelector from '../chat/ModelSelector.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
 	import Menu from '$lib/components/layout/Navbar/Menu.svelte';
@@ -66,7 +65,6 @@
 
 	let closedBannerIds = [];
 
-	let showShareChatModal = false;
 	let showDownloadChatModal = false;
 	let previewAvailable = false;
 
@@ -180,8 +178,6 @@
 		themeObserver = null;
 	});
 </script>
-
-<ShareChatModal bind:show={showShareChatModal} chatId={$chatId} />
 
 <button
 	id="new-chat-button"
@@ -309,13 +305,9 @@
 						</Tooltip>
 					{/if}
 
-					{#if shareEnabled && chat && (chat.id || $temporaryChatEnabled)}
+					{#if chat && (chat.id || $temporaryChatEnabled)}
 						<Menu
 							{chat}
-							{shareEnabled}
-							shareHandler={() => {
-								showShareChatModal = !showShareChatModal;
-							}}
 							archiveChatHandler={() => {
 								archiveChatHandler(chat.id);
 							}}

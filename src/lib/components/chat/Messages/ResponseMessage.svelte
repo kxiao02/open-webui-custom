@@ -58,6 +58,7 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 		inferFileName,
 		isFileGeneratingToolId,
 		isDownloadRef,
+		parseToolCallPayload,
 		isPrimaryDocumentArtifact,
 		triggerGeneratedFileDownload,
 		resolveToolCallStatus,
@@ -867,6 +868,7 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 
 	const getProcessToolLabel = (attrs: Record<string, string>): string => {
 		const rawArgs = attrs.arguments || '';
+		const rawResult = attrs.result || '';
 		let parsedArgs: Record<string, unknown> | null = null;
 		if (rawArgs) {
 			try {
@@ -878,12 +880,14 @@ import { WEBUI_API_BASE_URL, WEBUI_VERSION } from '$lib/constants';
 				parsedArgs = null;
 			}
 		}
+		const parsedResult = rawResult ? parseToolCallPayload(rawResult) : null;
 
 		return resolveToolDisplay({
 			toolId: attrs.tool_id,
 			toolName: attrs.tool_name,
 			legacyName: attrs.name,
-			parsedArgs
+			parsedArgs,
+			parsedResult
 		}).toolName;
 	};
 

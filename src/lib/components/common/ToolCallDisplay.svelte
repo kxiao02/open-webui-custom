@@ -58,6 +58,7 @@
 	export let open = false;
 	export let className = '';
 	export let embedded = false;
+	export let disableVisualStatusDelay = false;
 
 	const RESULT_PREVIEW_LIMIT = 10000;
 	let expandedResult = false;
@@ -271,7 +272,8 @@
 		toolId: attributes?.tool_id,
 		toolName: attributes?.tool_name,
 		legacyName: attributes?.name,
-		parsedArgs
+		parsedArgs,
+		parsedResult
 	});
 	$: displayName = toolDisplay.toolName;
 	$: normalizedToolId = toolDisplay.toolId || normalizeToolId(attributes?.name);
@@ -284,7 +286,11 @@
 	$: hasResultArtifacts = supportsArtifactInference && getToolCallArtifactEvidence(normalizedAttrs);
 	$: hasArtifactEvidence = hasFiles || Boolean(terminalResultFile) || hasResultArtifacts;
 	$: statusCandidate = resolveToolCallStatus(normalizedAttrs);
-	$: status = getEffectiveStatus(statusCandidate, toolVisualKey, !hasArtifactEvidence);
+	$: status = getEffectiveStatus(
+		statusCandidate,
+		toolVisualKey,
+		!disableVisualStatusDelay && !hasArtifactEvidence
+	);
 	$: isTerminal = status !== 'running';
 	$: isExecuting = status === 'running';
 	$: statusMessage = getStatusMessage(status);
