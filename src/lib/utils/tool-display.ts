@@ -11,7 +11,7 @@ export const TOOL_DISPLAY_DEFINITIONS: ToolDisplayDefinition[] = [
 	{
 		toolId: 'internet_search',
 		toolName: '网络搜索',
-		aliases: ['联网搜索', 'web_search', 'search', '搜索'],
+		aliases: ['联网搜索', 'web_search', 'search_web', 'search', '搜索'],
 		category: 'web'
 	},
 	{

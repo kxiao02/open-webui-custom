@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1
+# Use the bundled Dockerfile frontend so builds do not depend on fetching
+# docker/dockerfile:1 from Docker Hub at build time.
 # Initialize device type args
 # use build args in the docker build command with --build-arg="BUILDARG=true"
 ARG USE_CUDA=false
@@ -40,7 +41,7 @@ ARG APT_SECURITY_MIRROR
 ARG SKIP_NLTK_PRELOAD
 
 ######## WebUI frontend ########
-FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS build
+FROM ${NODE_IMAGE} AS build
 ARG BUILD_HASH
 ARG NPM_CONFIG_REGISTRY
 ARG GITHUB_MIRROR_PREFIX
@@ -231,6 +232,10 @@ RUN set -e; \
     pip3 install --no-cache-dir psycopg2-binary==2.9.11 pgvector==0.4.2 && \
     mkdir -p /app/backend/data && chown -R $UID:$GID /app/backend/data/ && \
     rm -rf /var/lib/apt/lists/*;
+
+# S3-backed deployments require boto3 at runtime even when the slim/min install
+# path skips the full backend requirements layer.
+RUN pip3 install --no-cache-dir boto3==1.42.62
 
 # Fail the build if the runtime image still lacks core backend packages.
 RUN python3 - <<'PY'

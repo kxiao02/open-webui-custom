@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import Optional
 import logging
+import json
 import re
 
 from open_webui.utils.chat import generate_chat_completion
@@ -39,6 +40,85 @@ from open_webui.config import (
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _message_text(content) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+
+    return ""
+
+
+def _sanitize_title(value: str) -> Optional[str]:
+    text = re.sub(r"\s+", " ", (value or "").strip())
+    text = text.strip("`#*_-:;,\"' ")
+    if not text:
+        return None
+
+    if len(text) <= 60:
+        return text
+
+    clipped = text[:60].rstrip()
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return f"{clipped}..."
+
+
+def build_fallback_chat_title(messages: list[dict]) -> Optional[str]:
+    for message in messages or []:
+        if message.get("role") != "user":
+            continue
+
+        title = _sanitize_title(_message_text(message.get("content")))
+        if title:
+            return title
+
+    return None
+
+
+def resolve_generated_chat_title(response: dict, messages: list[dict]) -> Optional[str]:
+    choices = response.get("choices", []) if isinstance(response, dict) else []
+    if not choices:
+        return None
+
+    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    raw_content = message.get("content") or message.get("reasoning_content") or ""
+    if not isinstance(raw_content, str):
+        return None
+
+    content = raw_content.strip()
+    if not content:
+        return None
+
+    content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.DOTALL).strip()
+
+    for candidate in (content, *re.findall(r"\{[\s\S]*?\}", content)):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+
+        if isinstance(parsed, dict):
+            title = _sanitize_title(str(parsed.get("title", "")))
+            if title:
+                return title
+
+    match = re.search(r'"title"\s*:\s*"([^"]+)"', content)
+    if match:
+        title = _sanitize_title(match.group(1))
+        if title:
+            return title
+
+    return _sanitize_title(content)
 
 
 ##################################

@@ -1,7 +1,7 @@
 import { decode } from 'html-entities';
 
 import { WEBUI_API_BASE_URL } from '$lib/constants';
-import { resolveToolDisplay } from '$lib/utils/tool-display';
+import { normalizeToolId, resolveToolDisplay } from '$lib/utils/tool-display';
 
 export type GeneratedFileItem = {
 	id: string;
@@ -476,6 +476,130 @@ export const parseNestedJSON = (value: unknown): unknown => {
 		const pythonLikeLiteral = parsePythonLikeLiteral(value);
 		return pythonLikeLiteral === value ? value : pythonLikeLiteral;
 	}
+};
+
+const asToolOutputRecord = (value: unknown): Record<string, unknown> | null => {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		return null;
+	}
+	return value as Record<string, unknown>;
+};
+
+const extractToolOutputPayload = (value: unknown): unknown => {
+	if (Array.isArray(value)) {
+		const text = value
+			.map((entry) => {
+				if (typeof entry === 'string') return entry;
+				const record = asToolOutputRecord(entry);
+				if (!record) return '';
+				const textValue = record.text ?? record.output ?? record.content;
+				return typeof textValue === 'string' ? textValue : '';
+			})
+			.filter(Boolean)
+			.join('\n')
+			.trim();
+		return text ? parseNestedJSON(text) : value;
+	}
+
+	return parseNestedJSON(value);
+};
+
+const isSearchToolOutputPayload = (value: unknown): value is Record<string, unknown> => {
+	const record = asToolOutputRecord(value);
+	if (!record) return false;
+
+	const query = record.query;
+	if (typeof query !== 'string' || !query.trim()) {
+		return false;
+	}
+
+	return (
+		Array.isArray(record.results) ||
+		Array.isArray(record.data) ||
+		Array.isArray(record.images) ||
+		Object.prototype.hasOwnProperty.call(record, 'raw')
+	);
+};
+
+const stringifyToolOutputPayload = (value: unknown): string => {
+	if (typeof value === 'string') return value;
+	try {
+		return JSON.stringify(value, null, 2);
+	} catch {
+		return String(value ?? '');
+	}
+};
+
+export const normalizeToolResponseOutput = (value: unknown): unknown => {
+	if (!Array.isArray(value)) return value;
+
+	const output = value.map((entry) =>
+		entry && typeof entry === 'object' && !Array.isArray(entry)
+			? { ...(entry as Record<string, unknown>) }
+			: entry
+	);
+	let changed = false;
+	const functionCallByKey = new Map<string, Record<string, unknown>>();
+
+	for (const entry of output) {
+		const record = asToolOutputRecord(entry);
+		if (!record || record.type !== 'function_call') continue;
+		const key = String(record.call_id ?? record.id ?? '').trim();
+		if (!key) continue;
+		functionCallByKey.set(key, record);
+	}
+
+	for (const entry of output) {
+		const record = asToolOutputRecord(entry);
+		if (!record || record.type !== 'function_call_output') continue;
+
+		const key = String(record.call_id ?? record.id ?? '').trim();
+		if (!key) continue;
+
+		const functionCall = functionCallByKey.get(key);
+		const toolName = String(functionCall?.name ?? record.name ?? '').trim();
+		if (normalizeToolId(toolName) !== 'internet_search') {
+			continue;
+		}
+
+		const parsedPayload = extractToolOutputPayload(record.output ?? record.result ?? record.content);
+		if (!isSearchToolOutputPayload(parsedPayload)) {
+			continue;
+		}
+
+		const query = String(parsedPayload.query ?? '').trim();
+		if (!query) continue;
+
+		if (functionCall) {
+			const rawArguments = asToolOutputRecord(functionCall.arguments) ?? {};
+			if (!String(rawArguments.query ?? '').trim()) {
+				functionCall.arguments = { ...rawArguments, query };
+				changed = true;
+			}
+		}
+
+		const currentQuery = functionCall
+			? String(asToolOutputRecord(functionCall.arguments)?.query ?? '').trim()
+			: '';
+		if (currentQuery !== query) {
+			continue;
+		}
+
+		const visiblePayload = { ...parsedPayload };
+		delete visiblePayload.query;
+		if (Object.keys(visiblePayload).length === 0) {
+			continue;
+		}
+
+		const serializedPayload = stringifyToolOutputPayload(visiblePayload);
+		const replacementOutput = [{ type: 'input_text', text: serializedPayload }];
+		if (JSON.stringify(record.output ?? null) !== JSON.stringify(replacementOutput)) {
+			record.output = replacementOutput;
+			changed = true;
+		}
+	}
+
+	return changed ? output : value;
 };
 
 const PYTHON_COLLECTION_LITERAL_REGEX = /^(?:\{[\s\S]*\}|\[[\s\S]*\])$/;

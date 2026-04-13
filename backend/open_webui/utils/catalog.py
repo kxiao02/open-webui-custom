@@ -43,6 +43,38 @@ def get_user_group_ids(user_id: str, db=None) -> set[str]:
     return {group.id for group in Groups.get_groups_by_member_id(user_id, db=db)}
 
 
+def _normalize_resource_ids(resource_ids: Iterable[Any] | None) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for resource_id in resource_ids or []:
+        if not isinstance(resource_id, str):
+            continue
+
+        value = resource_id.strip()
+        if not value or value in seen:
+            continue
+
+        seen.add(value)
+        normalized.append(value)
+
+    return normalized
+
+
+def is_catalog_runtime_activatable(meta: Any, access_grants: list | None = None) -> bool:
+    # Runtime availability is decided by the caller's visibility/access checks.
+    # Hidden or unpublished personal drafts still need to remain selectable.
+    return True
+
+
+def filter_hidden_tool_ids(tool_ids: Iterable[Any] | None, db=None) -> list[str]:
+    return _normalize_resource_ids(tool_ids)
+
+
+def filter_hidden_skill_ids(skill_ids: Iterable[Any] | None, db=None) -> list[str]:
+    return _normalize_resource_ids(skill_ids)
+
+
 def is_tool_catalog_visible(tool: Any, user: Any, user_group_ids: set[str], db=None) -> bool:
     if getattr(user, "role", None) == "admin":
         return True

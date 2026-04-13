@@ -6,7 +6,7 @@ import uuid
 import logging
 from datetime import timedelta
 from pathlib import Path
-from typing import Callable, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Sequence, Union
 import json
 import aiohttp
 import mimeparse
@@ -136,6 +136,201 @@ def get_content_from_message(message: dict) -> Optional[str]:
     return None
 
 
+_TOOL_HISTORY_TERMINAL_STATUSES = {"success", "error", "timeout"}
+_TOOL_HISTORY_REPLAY_BLOCKED_TOOL_IDS = {"visit_webpage", "fetch_url"}
+
+
+def _normalize_replay_tool_status(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+
+    normalized = value.strip().lower()
+    if not normalized:
+        return ""
+    if normalized == "completed":
+        return "success"
+    if normalized == "failed":
+        return "error"
+    if normalized in {"in_progress", "running"}:
+        return "running"
+    return normalized
+
+
+def _parse_replay_tool_arguments(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+
+    candidate = value.strip()
+    if not candidate:
+        return {}
+
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_replay_tool_output_text(item: dict) -> str:
+    output_parts = item.get("output", [])
+    content = ""
+    if isinstance(output_parts, list):
+        for part in output_parts:
+            if "text" not in part:
+                continue
+            output_text = part.get("text", "")
+            content += (
+                str(output_text) if not isinstance(output_text, str) else output_text
+            )
+    elif isinstance(output_parts, str):
+        content = output_parts
+
+    if content:
+        return content
+
+    for key in ("result", "content", "text"):
+        value = item.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    return ""
+
+
+def _normalize_replay_tool_name(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _tool_call_has_replayable_arguments(tool_name: str, arguments: dict[str, Any]) -> bool:
+    normalized_tool_name = _normalize_replay_tool_name(tool_name)
+    if normalized_tool_name not in _TOOL_HISTORY_REPLAY_BLOCKED_TOOL_IDS:
+        return True
+    return bool(str(arguments.get("url") or "").strip())
+
+
+def _prepare_output_for_replay_messages(output: list) -> list[dict]:
+    if not output or not isinstance(output, list):
+        return []
+
+    groups: dict[str, dict[str, Any]] = {}
+
+    for index, item in enumerate(output):
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type", "")
+        if item_type not in {"function_call", "function_call_output"}:
+            continue
+
+        call_key = str(item.get("call_id") or item.get("id") or f"output:{index}").strip()
+        group = groups.setdefault(
+            call_key,
+            {
+                "call_item": None,
+                "selected_output_index": None,
+                "selected_output_item": None,
+                "replay_as_tool_call": False,
+                "tool_name": "",
+            },
+        )
+
+        if item_type == "function_call":
+            if group["call_item"] is None:
+                group["call_item"] = item
+            if not group["tool_name"]:
+                group["tool_name"] = str(item.get("name") or "")
+        else:
+            output_text = _extract_replay_tool_output_text(item)
+            status = _normalize_replay_tool_status(item.get("status"))
+            if (
+                group["selected_output_item"] is None
+                or output_text
+                or status in _TOOL_HISTORY_TERMINAL_STATUSES
+            ):
+                group["selected_output_item"] = item
+                group["selected_output_index"] = index
+            if not group["tool_name"]:
+                group["tool_name"] = str(
+                    item.get("name") or item.get("tool_name") or item.get("tool") or ""
+                )
+
+    for group in groups.values():
+        call_item = group["call_item"]
+        selected_output_item = group["selected_output_item"]
+        tool_name = group["tool_name"] or str(
+            (call_item or {}).get("name")
+            or (selected_output_item or {}).get("name")
+            or (selected_output_item or {}).get("tool_name")
+            or ""
+        )
+        group["tool_name"] = tool_name
+
+        call_arguments = _parse_replay_tool_arguments(
+            (call_item or {}).get("arguments", "{}")
+        )
+        call_status = _normalize_replay_tool_status((call_item or {}).get("status"))
+        output_status = _normalize_replay_tool_status(
+            (selected_output_item or {}).get("status")
+        )
+
+        terminal_status = output_status or call_status
+        if (
+            not terminal_status
+            and selected_output_item is not None
+            and _extract_replay_tool_output_text(selected_output_item).strip()
+        ):
+            terminal_status = "success"
+
+        missing_required_arguments = not _tool_call_has_replayable_arguments(
+            tool_name, call_arguments
+        )
+        group["replay_as_tool_call"] = bool(
+            call_item
+            and terminal_status == "success"
+            and not missing_required_arguments
+        )
+
+    # Historical tool attempts that cannot be reconstructed as valid tool calls
+    # are omitted from replay instead of being translated into assistant text.
+    # Otherwise internal validation/error notes can leak into later user-facing
+    # answers when the reconstructed messages are sent back to the model.
+    prepared_output: list[dict] = []
+
+    for index, item in enumerate(output):
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type", "")
+        if item_type not in {"function_call", "function_call_output"}:
+            prepared_output.append(item)
+            continue
+
+        call_key = str(item.get("call_id") or item.get("id") or f"output:{index}").strip()
+        group = groups.get(call_key)
+        if not group or not group["replay_as_tool_call"]:
+            continue
+
+        if item_type == "function_call":
+            if group["call_item"] is item:
+                prepared_output.append(item)
+            continue
+
+        selected_output_index = group["selected_output_index"]
+        if selected_output_index is not None and selected_output_index != index:
+            continue
+
+        prepared_output.append(group["selected_output_item"] or item)
+
+    return prepared_output
+
+
 def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
     """
     Convert OR-aligned output items to OpenAI Chat Completion-format messages.
@@ -152,6 +347,7 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
     if not output or not isinstance(output, list):
         return []
 
+    output = _prepare_output_for_replay_messages(output)
     messages = []
     pending_tool_calls = []
     pending_content = []
@@ -208,27 +404,18 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
         elif item_type == "function_call_output":
             # Flush any pending content/tool_calls before adding tool result
             flush_pending()
-
-            # Extract text from output content parts
-            output_parts = item.get("output", [])
-            content = ""
-            for part in output_parts:
-                if part.get("type") == "input_text":
-                    output_text = part.get("text", "")
-                    content += (
-                        str(output_text)
-                        if not isinstance(output_text, str)
-                        else output_text
-                    )
+            content = _extract_replay_tool_output_text(item)
+            call_id = item.get("call_id", "")
+            tool_name = tool_name_by_call_id.get(call_id, "")
 
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": item.get("call_id", ""),
+                    "tool_call_id": call_id,
                     "content": content,
                     **(
-                        {"name": tool_name_by_call_id.get(item.get("call_id", ""), "")}
-                        if tool_name_by_call_id.get(item.get("call_id", ""), "")
+                        {"name": tool_name}
+                        if tool_name
                         else {}
                     ),
                 }

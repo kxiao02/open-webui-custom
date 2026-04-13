@@ -71,6 +71,7 @@
 	import { AudioQueue } from '$lib/utils/audio';
 	import {
 		collectGeneratedFilesFromResponseOutput,
+		normalizeToolResponseOutput,
 		normalizeToolCallContent
 	} from '$lib/utils/generated-files';
 
@@ -515,6 +516,93 @@
 		}
 
 		return dedupedFiles;
+	};
+
+	const extractFileIdFromUrl = (value: string | null): string | null => {
+		if (!value) {
+			return null;
+		}
+		const match = value.match(/\/api\/v1\/files\/([^/?#]+)/);
+		return match?.[1] ?? null;
+	};
+
+	const resolveImageFileUrl = (file: any): string | null => {
+		const candidates = [
+			normalizeFileRef(file?.download_url),
+			normalizeFileRef(file?.downloadUrl),
+			normalizeFileRef(file?.generated_file_url),
+			normalizeFileRef(file?.bridge_url),
+			normalizeFileRef(file?.url)
+		].filter((value): value is string => Boolean(value));
+
+		const fallbackId =
+			normalizeFileRef(file?.id) ??
+			normalizeFileRef(file?.file_id) ??
+			normalizeFileRef(file?.fileId) ??
+			normalizeFileRef(file?.bridge_file_id);
+
+		if (candidates.length === 0) {
+			return fallbackId;
+		}
+
+		const apiCandidate =
+			candidates.find((value) => value.includes('/api/v1/files/') && value.includes('/content')) ??
+			candidates.find((value) => value.includes('/api/v1/files/'));
+
+		return apiCandidate ?? candidates[0] ?? fallbackId;
+	};
+
+	const resolveImageFileId = (file: any, url: string | null): string | null =>
+		normalizeFileRef(file?.id) ??
+		normalizeFileRef(file?.file_id) ??
+		normalizeFileRef(file?.fileId) ??
+		normalizeFileRef(file?.bridge_file_id) ??
+		extractFileIdFromUrl(url);
+
+	const scoreImageUrl = (value: string | null): number => {
+		if (!value) {
+			return 0;
+		}
+		if (value.includes('/api/v1/files/') && value.includes('/content')) {
+			return 4;
+		}
+		if (value.includes('/api/v1/files/')) {
+			return 3;
+		}
+		if (value.startsWith('http')) {
+			return 2;
+		}
+		return 1;
+	};
+
+	const dedupeImageFiles = (files: any[] = []): any[] => {
+		if (!Array.isArray(files)) {
+			return [];
+		}
+
+		const deduped: any[] = [];
+		const indexByKey = new Map<string, number>();
+
+		for (const file of files) {
+			const resolvedUrl = resolveImageFileUrl(file);
+			if (!resolvedUrl) {
+				continue;
+			}
+			const dedupeKey = resolveImageFileId(file, resolvedUrl) ?? resolvedUrl;
+			const existingIndex = indexByKey.get(dedupeKey);
+			if (existingIndex === undefined) {
+				indexByKey.set(dedupeKey, deduped.length);
+				deduped.push({ ...file, url: resolvedUrl });
+				continue;
+			}
+			const existing = deduped[existingIndex];
+			if (scoreImageUrl(normalizeFileRef(existing?.url)) >= scoreImageUrl(resolvedUrl)) {
+				continue;
+			}
+			deduped[existingIndex] = { ...existing, ...file, url: resolvedUrl };
+		}
+
+		return deduped;
 	};
 
 	const mergeFilesLists = (...fileGroups: any[]) =>
@@ -1271,13 +1359,24 @@
 			return message;
 		}
 
-		if (message.role !== 'assistant' || typeof message.content !== 'string') {
+		if (message.role !== 'assistant') {
+			return message;
+		}
+
+		const normalizedContent =
+			typeof message.content === 'string'
+				? normalizeAssistantResponseContent(message.content)
+				: message.content;
+		const normalizedOutput = normalizeToolResponseOutput(message.output);
+
+		if (normalizedContent === message.content && normalizedOutput === message.output) {
 			return message;
 		}
 
 		return {
 			...message,
-			content: normalizeAssistantResponseContent(message.content)
+			content: normalizedContent,
+			output: normalizedOutput
 		};
 	};
 
@@ -2847,6 +2946,15 @@
 		/(^|\n)\s*(?:type="tool_calls"|name="[^"\n]*"|tool_id="[^"\n]*"|tool_name="[^"\n]*"|arguments="[^"\n]*"|result="[^"\n]*"|done="(?:true|false)"\s+status="[^"\n]*")[^\n]*(?=\n|$)/gi;
 	const SOURCE_SECTION_LINE_REGEX = /(^|\n)\s*(参考来源|Sources)\s*:?\s*(?:\n|$)/i;
 	const SOURCE_SECTION_INLINE_REGEX = /(参考来源|Sources)\s*:?\s*(?:\[[^\]]+\][^\n\r]*)$/i;
+	const HISTORICAL_REPLAY_NOTE_START = 'Historical tool attempt retained as plain context only.';
+	const HISTORICAL_REPLAY_NOTE_SECOND_SENTENCE = 'Do not replay it as a new tool call.';
+	const HISTORICAL_REPLAY_NOTE_LINE_PREFIXES = [
+		'Tool:',
+		'Status:',
+		'Arguments:',
+		'Replay was skipped because',
+		'Reported output:'
+	];
 
 	const getToolCallAttrs = (block: string): Record<string, string> => {
 		const openTag = block.match(TOOL_CALL_OPEN_TAG_REGEX)?.[1] ?? '';
@@ -2961,24 +3069,116 @@
 		return normalized.replace(/\n{3,}/g, '\n\n').trim();
 	};
 
+	const isHistoricalReplayNoteLine = (line: string) => {
+		const trimmed = line.trim();
+		return HISTORICAL_REPLAY_NOTE_LINE_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+	};
+
+	const extractHistoricalReplayNoteRemainder = (line: string): string | null => {
+		const trimmed = line.trim();
+		if (!trimmed) {
+			return null;
+		}
+
+		if (trimmed.startsWith(HISTORICAL_REPLAY_NOTE_START)) {
+			let remainder = trimmed.slice(HISTORICAL_REPLAY_NOTE_START.length).trimStart();
+			if (remainder.startsWith(HISTORICAL_REPLAY_NOTE_SECOND_SENTENCE)) {
+				remainder = remainder
+					.slice(HISTORICAL_REPLAY_NOTE_SECOND_SENTENCE.length)
+					.trimStart();
+			}
+			return remainder && !isHistoricalReplayNoteLine(remainder) ? remainder : null;
+		}
+
+		if (!trimmed.startsWith('Reported output:')) {
+			return null;
+		}
+
+		const remainder = trimmed.slice('Reported output:'.length).trim();
+		if (!remainder) {
+			return null;
+		}
+
+		const parts = remainder.split(/(?:\s{2,}|\t+)/, 2);
+		if (parts.length < 2) {
+			return null;
+		}
+
+		const candidate = parts[1]?.trim() ?? '';
+		return candidate && !isHistoricalReplayNoteLine(candidate) ? candidate : null;
+	};
+
+	const stripHistoricalReplayNote = (content: string) => {
+		if (!content || !content.includes(HISTORICAL_REPLAY_NOTE_START)) return content;
+
+		const lines = content.split('\n');
+		const kept: string[] = [];
+		let inBlock = false;
+
+		for (const line of lines) {
+			const trimmed = line.trim();
+
+			if (!inBlock) {
+				if (trimmed.startsWith(HISTORICAL_REPLAY_NOTE_START)) {
+					inBlock = true;
+
+					const remainder = extractHistoricalReplayNoteRemainder(line);
+					if (remainder) {
+						kept.push(remainder);
+						inBlock = false;
+					}
+					continue;
+				}
+
+				kept.push(line);
+				continue;
+			}
+
+			if (!trimmed) {
+				continue;
+			}
+
+			const remainder = extractHistoricalReplayNoteRemainder(line);
+			if (remainder) {
+				kept.push(remainder);
+				inBlock = false;
+				continue;
+			}
+
+			if (isHistoricalReplayNoteLine(trimmed)) {
+				if (trimmed.startsWith('Reported output:')) {
+					inBlock = false;
+				}
+				continue;
+			}
+
+			inBlock = false;
+			kept.push(line);
+		}
+
+		return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+	};
+
 	const normalizeAssistantResponseContent = (content: string) => {
 		if (!content) return content;
 
+		let normalized = stripHistoricalReplayNote(content);
+		if (!normalized) return normalized;
+
 		const needsStructuralNormalization =
-			content.includes('<details') ||
-			content.includes('type="tool_calls"') ||
-			content.includes('tool_id="') ||
-			content.includes('tool_name="') ||
-			content.includes('arguments="') ||
-			content.includes('result="') ||
-			content.includes('参考来源') ||
-			content.includes('Sources');
+			normalized.includes('<details') ||
+			normalized.includes('type="tool_calls"') ||
+			normalized.includes('tool_id="') ||
+			normalized.includes('tool_name="') ||
+			normalized.includes('arguments="') ||
+			normalized.includes('result="') ||
+			normalized.includes('参考来源') ||
+			normalized.includes('Sources');
 
 		if (!needsStructuralNormalization) {
-			return content;
+			return normalized;
 		}
 
-		let normalized = content;
 		const toolCallStartIndex = normalized.search(TOOL_CALL_BLOCK_START_REGEX);
 		if (toolCallStartIndex > 0) {
 			const leading = normalized.slice(0, toolCallStartIndex);
@@ -3060,7 +3260,6 @@
 		}
 
 		await tick();
-
 		if ($chatId == _chatId) {
 			if (!$temporaryChatEnabled) {
 				const historyToPersist = sanitizeHistoryForPersistence(structuredClone(history));
@@ -3283,7 +3482,7 @@
 
 		// Store raw OR-aligned output items from backend
 		if (output) {
-			message.output = output;
+			message.output = normalizeToolResponseOutput(output);
 			hasVisibleResponseUpdate = true;
 		}
 
@@ -3912,12 +4111,19 @@
 
 		messages = messages
 			.map((message, idx, arr) => {
-				const imageFiles = (message?.files ?? []).filter(
-					(file) => file.type === 'image' || (file?.content_type ?? '').startsWith('image/')
+				const imageFiles = dedupeImageFiles(
+					(message?.files ?? []).filter(
+						(file) => file.type === 'image' || (file?.content_type ?? '').startsWith('image/')
+					)
 				);
 
 				return {
 					role: message.role,
+					...(message.role === 'assistant' && message.output
+						? { output: message.output }
+						: {}),
+					...(message.statusHistory ? { statusHistory: message.statusHistory } : {}),
+					...(message.status ? { status: message.status } : {}),
 					...(message.role === 'user' && imageFiles.length > 0
 						? {
 								content: [
@@ -3938,7 +4144,17 @@
 							})
 				};
 			})
-			.filter((message) => message?.role === 'user' || message?.content?.trim());
+			.filter((message) => {
+				if (message?.role === 'user') {
+					return true;
+				}
+
+				if (typeof message?.content === 'string' && message.content.trim()) {
+					return true;
+				}
+
+				return Array.isArray(message?.output) && message.output.length > 0;
+			});
 
 		const toolIds = [];
 		const toolServerIds = [];

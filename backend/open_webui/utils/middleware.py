@@ -951,6 +951,135 @@ def _strip_leaked_vision_specialist_prefix(text: Any) -> Any:
     return remainder
 
 
+_HISTORICAL_TOOL_REPLAY_NOTE_START = (
+    "Historical tool attempt retained as plain context only."
+)
+_HISTORICAL_TOOL_REPLAY_NOTE_SECOND_SENTENCE = (
+    "Do not replay it as a new tool call."
+)
+_HISTORICAL_TOOL_REPLAY_NOTE_LINE_PREFIXES = (
+    "Tool:",
+    "Status:",
+    "Arguments:",
+    "Replay was skipped because",
+    "Reported output:",
+)
+
+
+def _is_historical_tool_replay_note_line(line: str) -> bool:
+    trimmed = line.strip()
+    return any(
+        trimmed.startswith(prefix) for prefix in _HISTORICAL_TOOL_REPLAY_NOTE_LINE_PREFIXES
+    )
+
+
+def _extract_historical_tool_replay_note_remainder(line: str) -> Optional[str]:
+    trimmed = line.strip()
+    if not trimmed:
+        return None
+
+    if trimmed.startswith(_HISTORICAL_TOOL_REPLAY_NOTE_START):
+        remainder = trimmed[len(_HISTORICAL_TOOL_REPLAY_NOTE_START) :].lstrip()
+        if remainder.startswith(_HISTORICAL_TOOL_REPLAY_NOTE_SECOND_SENTENCE):
+            remainder = remainder[
+                len(_HISTORICAL_TOOL_REPLAY_NOTE_SECOND_SENTENCE) :
+            ].lstrip()
+        if remainder and not _is_historical_tool_replay_note_line(remainder):
+            return remainder
+        return None
+
+    if not trimmed.startswith("Reported output:"):
+        return None
+
+    remainder = trimmed[len("Reported output:") :].strip()
+    if not remainder:
+        return None
+
+    parts = re.split(r"(?:\s{2,}|\t+)", remainder, maxsplit=1)
+    if len(parts) < 2:
+        return None
+
+    candidate = parts[1].strip()
+    if not candidate or _is_historical_tool_replay_note_line(candidate):
+        return None
+
+    return candidate
+
+
+def _strip_historical_tool_replay_note_text(text: Any) -> Any:
+    if not isinstance(text, str):
+        return text
+    if _HISTORICAL_TOOL_REPLAY_NOTE_START not in text:
+        return text
+
+    kept: list[str] = []
+    in_block = False
+
+    for line in text.splitlines():
+        trimmed = line.strip()
+
+        if not in_block:
+            if trimmed.startswith(_HISTORICAL_TOOL_REPLAY_NOTE_START):
+                in_block = True
+                remainder = _extract_historical_tool_replay_note_remainder(line)
+                if remainder:
+                    kept.append(remainder)
+                    in_block = False
+                continue
+            kept.append(line)
+            continue
+
+        if not trimmed:
+            continue
+
+        remainder = _extract_historical_tool_replay_note_remainder(line)
+        if remainder:
+            kept.append(remainder)
+            in_block = False
+            continue
+
+        if _is_historical_tool_replay_note_line(trimmed):
+            if trimmed.startswith("Reported output:"):
+                in_block = False
+            continue
+
+        in_block = False
+        kept.append(line)
+
+    sanitized = "\n".join(kept)
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+    return sanitized.strip()
+
+
+def _sanitize_assistant_text_content(text: Any) -> Any:
+    sanitized = _strip_leaked_vision_specialist_prefix(text)
+    return _strip_historical_tool_replay_note_text(sanitized)
+
+
+def _sanitize_assistant_message_content(content: Any) -> Any:
+    if isinstance(content, list):
+        updated_content = []
+        changed = False
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") in {"text", "input_text", "output_text"}
+            ):
+                original_text = part.get("text")
+                sanitized_text = _sanitize_assistant_text_content(original_text)
+                if sanitized_text != original_text:
+                    updated_content.append({**part, "text": sanitized_text})
+                    changed = True
+                    continue
+            updated_content.append(part)
+        return updated_content if changed else content
+
+    if isinstance(content, str):
+        return _sanitize_assistant_text_content(content)
+
+    return content
+
+
 def _normalize_output_for_chat(output: list) -> list:
     if not isinstance(output, list):
         return []
@@ -1010,27 +1139,9 @@ def _normalize_output_for_chat(output: list) -> list:
             continue
 
         content = item.get("content")
-        if isinstance(content, list):
-            updated_content = []
-            changed = False
-            for part in content:
-                if (
-                    isinstance(part, dict)
-                    and part.get("type") in {"text", "input_text", "output_text"}
-                ):
-                    original_text = part.get("text")
-                    sanitized_text = _strip_leaked_vision_specialist_prefix(
-                        original_text
-                    )
-                    if sanitized_text != original_text:
-                        updated_content.append({**part, "text": sanitized_text})
-                        changed = True
-                        continue
-                updated_content.append(part)
-            if changed:
-                item["content"] = updated_content
-        elif isinstance(content, str):
-            item["content"] = _strip_leaked_vision_specialist_prefix(content)
+        sanitized_content = _sanitize_assistant_message_content(content)
+        if sanitized_content != content:
+            item["content"] = sanitized_content
 
     return normalized_output
 
@@ -1051,7 +1162,7 @@ def _serialize_output_for_chat_content(
 
         message_text = _extract_text_from_output_parts(item.get("content"))
         message_text = _strip_bridge_details_blocks(message_text).strip()
-        message_text = _strip_leaked_vision_specialist_prefix(message_text).strip()
+        message_text = _sanitize_assistant_text_content(message_text).strip()
         if message_text:
             message_blocks.append(message_text)
 
@@ -5028,6 +5139,22 @@ async def chat_completion_files_handler(
     return body, {"sources": sources}
 
 
+def _is_media_file_item(file_item: Any) -> bool:
+    if not isinstance(file_item, dict):
+        return False
+
+    file_type = str(file_item.get("type") or "").strip().lower()
+    if file_type in {"image", "audio", "video"}:
+        return True
+
+    content_type = str(
+        file_item.get("content_type")
+        or file_item.get("meta", {}).get("content_type")
+        or ""
+    ).strip().lower()
+    return content_type.startswith(("image/", "audio/", "video/"))
+
+
 def _should_prepare_chat_file(file_item: Any) -> bool:
     if not isinstance(file_item, dict):
         return False
@@ -5040,12 +5167,7 @@ def _should_prepare_chat_file(file_item: Any) -> bool:
     if not isinstance(file_id, str) or not file_id.strip():
         return False
 
-    content_type = str(
-        file_item.get("content_type")
-        or file_item.get("meta", {}).get("content_type")
-        or ""
-    ).strip().lower()
-    if content_type.startswith(("image/", "audio/", "video/")):
+    if _is_media_file_item(file_item):
         return False
 
     return True
@@ -5194,6 +5316,8 @@ async def _prepare_chat_files_for_retrieval(
                 ),
             )
             prepared_files.append(prepared_file)
+            if _is_media_file_item(prepared_file):
+                continue
             if _is_active_focus_file(prepared_file):
                 active_retrieval_files.append(prepared_file)
             else:
@@ -5204,6 +5328,8 @@ async def _prepare_chat_files_for_retrieval(
             _prepare_chat_file_sync, request, file_item, user
         )
         prepared_files.append(prepared_file)
+        if _is_media_file_item(prepared_file):
+            continue
         if inline_source:
             if _is_active_focus_file(prepared_file):
                 active_inline_sources.append(inline_source)
@@ -5290,7 +5416,12 @@ async def convert_url_images_to_base64(form_data):
                 new_content.append(item)
                 continue
 
-            image_url = item.get("image_url", {}).get("url", "")
+            image_url = item.get("image_url", {}).get("url")
+            if not isinstance(image_url, str) or not image_url.strip():
+                log.debug("Skipping image_url item without a valid URL.")
+                continue
+
+            image_url = image_url.strip()
             if image_url.startswith("data:image/"):
                 new_content.append(item)
                 continue
@@ -5299,12 +5430,19 @@ async def convert_url_images_to_base64(form_data):
                 base64_data = await asyncio.to_thread(
                     get_image_base64_from_url, image_url
                 )
-                new_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": base64_data},
-                    }
-                )
+                if base64_data:
+                    new_content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": base64_data},
+                        }
+                    )
+                else:
+                    log.debug(
+                        "Skipping base64 image_url conversion for %s: empty result.",
+                        image_url,
+                    )
+                    new_content.append(item)
             except Exception as e:
                 log.debug(f"Error converting image URL to base64: {e}")
                 new_content.append(item)
@@ -5317,7 +5455,7 @@ async def convert_url_images_to_base64(form_data):
 def load_messages_from_db(chat_id: str, message_id: str) -> Optional[list[dict]]:
     """
     Load the message chain from DB up to message_id,
-    keeping only LLM-relevant fields (role, content, output).
+    keeping the fields needed for prompt reconstruction.
     """
     messages_map = Chats.get_messages_map_by_chat_id(chat_id)
     if not messages_map:
@@ -5328,7 +5466,20 @@ def load_messages_from_db(chat_id: str, message_id: str) -> Optional[list[dict]]
         return None
 
     messages = [
-        {k: v for k, v in msg.items() if k in ("role", "content", "output", "files")}
+        {
+            k: v
+            for k, v in msg.items()
+            if k
+            in (
+                "role",
+                "content",
+                "output",
+                "files",
+                "status",
+                "status_history",
+                "statusHistory",
+            )
+        }
         for msg in db_messages
     ]
     for message in messages:
@@ -5356,20 +5507,30 @@ def process_messages_with_output(messages: list[dict]) -> list[dict]:
     Process messages with OR-aligned output items for LLM consumption.
 
     For assistant messages with 'output' field, produces properly formatted
-    OpenAI-style messages (tool_calls + tool results). Strips 'output' before LLM.
+    OpenAI-style messages (tool_calls + tool results). Internal chat metadata is
+    stripped before the provider-facing payload is sent.
     """
     processed = []
 
     for message in messages:
         if message.get("role") == "assistant" and message.get("output"):
             # Use output items for clean OpenAI-format messages
-            output_messages = convert_output_to_messages(message["output"], raw=True)
+            normalized_output = _normalize_output_for_chat(message["output"])
+            output_messages = convert_output_to_messages(normalized_output, raw=True)
             if output_messages:
                 processed.extend(output_messages)
                 continue
 
-        # Strip 'output' field before adding (LLM shouldn't see it)
-        clean_message = {k: v for k, v in message.items() if k != "output"}
+        # Strip internal metadata before adding (LLM shouldn't see it)
+        clean_message = {
+            k: v
+            for k, v in message.items()
+            if k not in {"output", "status", "statusHistory", "status_history"}
+        }
+        if clean_message.get("role") == "assistant":
+            clean_message["content"] = _sanitize_assistant_message_content(
+                clean_message.get("content")
+            )
         processed.append(clean_message)
 
     return processed

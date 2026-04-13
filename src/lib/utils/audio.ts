@@ -12,6 +12,17 @@ export class AudioQueue {
 		this.onStopped = null; // optional callback
 	}
 
+	revokeUrl(url) {
+		if (typeof url === 'string' && url.startsWith('blob:')) {
+			URL.revokeObjectURL(url);
+		}
+	}
+
+	clearQueuedUrls() {
+		this.queue.forEach((url) => this.revokeUrl(url));
+		this.queue = [];
+	}
+
 	setId(newId) {
 		console.log('Setting audio queue ID to:', newId);
 		if (this.id !== newId) {
@@ -45,13 +56,19 @@ export class AudioQueue {
 	}
 
 	next() {
+		const previous = this.current;
 		this.current = this.queue.shift();
 		if (this.current) {
 			this.audio.src = this.current;
 			this.audio.play();
 			console.log('Playing audio URL:', this.current);
+			if (previous && previous !== this.current) {
+				this.revokeUrl(previous);
+			}
 		} else {
-			this.stop();
+			this.audio.src = '';
+			this.revokeUrl(previous);
+			this.current = null;
 			if (this.onStopped) this.onStopped({ event: 'empty-queue', id: this.id });
 		}
 	}
@@ -60,7 +77,8 @@ export class AudioQueue {
 		this.audio.pause();
 		this.audio.currentTime = 0;
 		this.audio.src = '';
-		this.queue = [];
+		this.revokeUrl(this.current);
+		this.clearQueuedUrls();
 		this.current = null;
 		if (this.onStopped) this.onStopped({ event: 'stop', id: this.id });
 	}

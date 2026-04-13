@@ -1,3 +1,4 @@
+import ast
 import logging
 import json
 import re
@@ -221,11 +222,162 @@ def _extract_text_from_output_parts(parts: object) -> str:
     return "".join(chunks)
 
 
+def _parse_tool_output_payload(value: object) -> object:
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return value
+
+    candidate = value.strip()
+    if not candidate:
+        return value
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        try:
+            parsed = ast.literal_eval(candidate)
+        except (SyntaxError, ValueError):
+            return value
+        return parsed if isinstance(parsed, (dict, list)) else value
+
+
+def _extract_function_call_output_payload(item: dict) -> object:
+    for key in ("output", "result", "content", "text"):
+        value = item.get(key)
+        if value in (None, "", []):
+            continue
+        if key == "output" and isinstance(value, list):
+            text_value = _extract_text_from_output_parts(value)
+            return _parse_tool_output_payload(text_value) if text_value else value
+        return _parse_tool_output_payload(value)
+    return ""
+
+
+def _serialize_tool_output_payload(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except TypeError:
+        return str(value)
+
+
+def _is_search_tool_output_payload(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+
+    query = value.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return False
+
+    return any(key in value for key in ("results", "data", "images", "raw"))
+
+
+_SEARCH_TOOL_NAMES = {
+    "internet_search",
+    "web_search",
+    "search_web",
+    "search",
+    "联网搜索",
+    "搜索",
+}
+_SEARCH_TOOL_NAME_LOOKUP = {candidate.lower() for candidate in _SEARCH_TOOL_NAMES}
+
+
+def _is_search_tool_name(tool_name: str) -> bool:
+    return str(tool_name or "").strip().lower() in _SEARCH_TOOL_NAME_LOOKUP
+
+
+def _normalize_search_tool_io_pair(
+    function_call_item: dict, function_output_item: dict
+) -> bool:
+    tool_name = str(
+        function_call_item.get("name") or function_output_item.get("name") or ""
+    ).strip()
+    if not _is_search_tool_name(tool_name):
+        return False
+
+    parsed_payload = _extract_function_call_output_payload(function_output_item)
+    if not _is_search_tool_output_payload(parsed_payload):
+        return False
+
+    query = str(parsed_payload.get("query") or "").strip()
+    if not query:
+        return False
+
+    raw_arguments = function_call_item.get("arguments")
+    arguments = raw_arguments if isinstance(raw_arguments, dict) else {}
+    changed = False
+
+    if not str(arguments.get("query") or "").strip():
+        arguments = {**arguments, "query": query}
+        function_call_item["arguments"] = arguments
+        changed = True
+
+    if str(arguments.get("query") or "").strip() != query:
+        return changed
+
+    visible_payload = dict(parsed_payload)
+    visible_payload.pop("query", None)
+    if not visible_payload:
+        return changed
+
+    serialized_payload = _serialize_tool_output_payload(visible_payload)
+    replacement_output = [{"type": "input_text", "text": serialized_payload}]
+
+    if function_output_item.get("output") != replacement_output:
+        function_output_item["output"] = replacement_output
+        changed = True
+
+    if "result" in function_output_item and function_output_item.get("result") != serialized_payload:
+        function_output_item["result"] = serialized_payload
+        changed = True
+
+    return changed
+
+
+def _normalize_message_tool_output_contract(output: object) -> tuple[object, bool]:
+    if not isinstance(output, list):
+        return output, False
+
+    changed = False
+    function_call_by_key: dict[str, dict] = {}
+
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "function_call":
+            continue
+        item_key = str(item.get("call_id") or item.get("id") or "").strip()
+        if item_key:
+            function_call_by_key[item_key] = item
+
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "function_call_output":
+            continue
+        item_key = str(item.get("call_id") or item.get("id") or "").strip()
+        if not item_key:
+            continue
+        function_call_item = function_call_by_key.get(item_key)
+        if function_call_item and _normalize_search_tool_io_pair(
+            function_call_item, item
+        ):
+            changed = True
+
+    return output, changed
+
+
 def _sanitize_message_output(output: object) -> tuple[object, bool]:
     if not isinstance(output, list):
         return output, False
 
     changed = False
+    output, contract_changed = _normalize_message_tool_output_contract(output)
+    if contract_changed:
+        changed = True
     for item in output:
         if not isinstance(item, dict):
             continue
@@ -296,6 +448,48 @@ def _sanitize_assistant_message(message: object) -> tuple[object, bool]:
             changed = True
 
     return message, changed
+
+
+def _sanitize_chat_message_collection(messages: object) -> tuple[object, bool]:
+    changed = False
+
+    if isinstance(messages, dict):
+        for message_id, message in messages.items():
+            sanitized_message, message_changed = _sanitize_assistant_message(message)
+            if message_changed:
+                messages[message_id] = sanitized_message
+                changed = True
+        return messages, changed
+
+    if isinstance(messages, list):
+        for index, message in enumerate(messages):
+            sanitized_message, message_changed = _sanitize_assistant_message(message)
+            if message_changed:
+                messages[index] = sanitized_message
+                changed = True
+        return messages, changed
+
+    return messages, False
+
+
+def _normalize_chat_history_tool_outputs(chat_payload: object) -> tuple[object, bool]:
+    if not isinstance(chat_payload, dict):
+        return chat_payload, False
+
+    changed = False
+    history = chat_payload.get("history")
+    if isinstance(history, dict):
+        messages = history.get("messages")
+        _, message_collection_changed = _sanitize_chat_message_collection(messages)
+        if message_collection_changed:
+            changed = True
+
+    top_level_messages = chat_payload.get("messages")
+    _, top_level_changed = _sanitize_chat_message_collection(top_level_messages)
+    if top_level_changed:
+        changed = True
+
+    return chat_payload, changed
 
 
 def _sanitize_chat_history_specialist_leaks(chat_payload: object) -> tuple[object, bool]:
@@ -554,6 +748,27 @@ class ChatTable:
         """Recursively remove null bytes from strings in dict/list structures."""
         return sanitize_data_for_db(obj)
 
+    def _ensure_chat_payload_identity(self, chat_payload: object, chat_id: str) -> object:
+        if not isinstance(chat_payload, dict):
+            return chat_payload
+
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return chat_payload
+
+        if chat_payload.get("id") == normalized_chat_id:
+            return chat_payload
+
+        return {**chat_payload, "id": normalized_chat_id}
+
+    def _normalize_chat_payload_for_storage(
+        self, chat_payload: object, chat_id: str
+    ) -> object:
+        normalized = self._ensure_chat_payload_identity(chat_payload, chat_id)
+        normalized, _ = _normalize_chat_history_tool_outputs(normalized)
+        normalized, _ = _sanitize_chat_history_specialist_leaks(normalized)
+        return normalized
+
     def _normalize_file_ref(self, value) -> Optional[str]:
         if not isinstance(value, str):
             return None
@@ -684,11 +899,9 @@ class ChatTable:
         # Clean JSON
         if chat_item.chat:
             cleaned = self._clean_null_bytes(chat_item.chat)
+            cleaned = self._normalize_chat_payload_for_storage(cleaned, chat_item.id)
             cleaned, file_refs_changed = self._sanitize_chat_file_refs(cleaned)
-            cleaned, specialist_leak_changed = _sanitize_chat_history_specialist_leaks(
-                cleaned
-            )
-            if file_refs_changed or specialist_leak_changed or cleaned != chat_item.chat:
+            if file_refs_changed or cleaned != chat_item.chat:
                 chat_item.chat = cleaned
                 changed = True
 
@@ -1289,6 +1502,7 @@ class ChatTable:
     ) -> Optional[ChatModel]:
         with get_db_context(db) as db:
             id = str(uuid.uuid4())
+            chat_payload = self._normalize_chat_payload_for_storage(form_data.chat, id)
             chat = ChatModel(
                 **{
                     "id": id,
@@ -1298,7 +1512,7 @@ class ChatTable:
                         if "title" in form_data.chat
                         else "New Chat"
                     ),
-                    "chat": self._clean_null_bytes(form_data.chat),
+                    "chat": self._clean_null_bytes(chat_payload),
                     "meta": self._clean_null_bytes(form_data.meta or {}),
                     "folder_id": form_data.folder_id,
                     "created_at": int(time.time()),
@@ -1334,6 +1548,7 @@ class ChatTable:
         self, user_id: str, form_data: ChatImportForm
     ) -> ChatModel:
         id = str(uuid.uuid4())
+        chat_payload = self._normalize_chat_payload_for_storage(form_data.chat, id)
         chat = ChatModel(
             **{
                 "id": id,
@@ -1341,7 +1556,7 @@ class ChatTable:
                 "title": self._clean_null_bytes(
                     form_data.chat["title"] if "title" in form_data.chat else "New Chat"
                 ),
-                "chat": self._clean_null_bytes(form_data.chat),
+                "chat": self._clean_null_bytes(chat_payload),
                 "meta": form_data.meta,
                 "pinned": form_data.pinned,
                 "folder_id": form_data.folder_id,
@@ -1397,7 +1612,9 @@ class ChatTable:
         try:
             with get_db_context(db) as db:
                 chat_item = db.get(Chat, id)
-                chat_item.chat = self._clean_null_bytes(chat)
+                chat_item.chat = self._clean_null_bytes(
+                    self._normalize_chat_payload_for_storage(chat, id)
+                )
                 chat_item.title = (
                     self._clean_null_bytes(chat["title"])
                     if "title" in chat

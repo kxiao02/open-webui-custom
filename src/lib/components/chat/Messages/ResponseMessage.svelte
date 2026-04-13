@@ -58,6 +58,7 @@
 		inferFileName,
 		isFileGeneratingToolId,
 		isDownloadRef,
+		parseNestedJSON,
 		isPrimaryDocumentArtifact,
 		triggerGeneratedFileDownload,
 		resolveToolCallStatus,
@@ -104,6 +105,7 @@
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import AccessControl from '$lib/components/workspace/common/AccessControl.svelte';
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
+	import { normalizeToolId } from '$lib/utils/tool-display';
 
 	interface MessageType {
 		id: string;
@@ -715,6 +717,66 @@
 		return String(value ?? '');
 	};
 
+	const parseStructuredToolPayload = (value: unknown): unknown => {
+		if (Array.isArray(value)) {
+			return parseNestedJSON(extractToolCallOutputText(value));
+		}
+		return parseNestedJSON(value);
+	};
+
+	const getToolPayloadRecord = (value: unknown): Record<string, unknown> | null => {
+		const parsed = parseStructuredToolPayload(value);
+		return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+			? (parsed as Record<string, unknown>)
+			: null;
+	};
+
+	const getSearchQueryFromToolPayload = (value: unknown): string => {
+		const record = getToolPayloadRecord(value);
+		if (!record) return '';
+
+		for (const key of ['query', 'q', 'keyword', 'keywords', 'search_query']) {
+			const candidate = record[key];
+			if (typeof candidate === 'string' && candidate.trim()) {
+				return candidate.trim();
+			}
+		}
+
+		return '';
+	};
+
+	const normalizeToolCallDisplayPayload = (
+		toolName: string,
+		rawArguments: unknown,
+		rawResult: unknown
+	): { argumentsValue: unknown; resultValue: unknown } => {
+		if (normalizeToolId(toolName) !== 'internet_search') {
+			return {
+				argumentsValue: rawArguments,
+				resultValue: rawResult
+			};
+		}
+
+		const query =
+			getSearchQueryFromToolPayload(rawArguments) || getSearchQueryFromToolPayload(rawResult);
+		const parsedArguments = getToolPayloadRecord(rawArguments);
+		const parsedResult = getToolPayloadRecord(rawResult);
+
+		let argumentsValue: unknown = rawArguments;
+		if (query && !getSearchQueryFromToolPayload(rawArguments)) {
+			argumentsValue = { ...(parsedArguments ?? {}), query };
+		}
+
+		let resultValue: unknown = rawResult;
+		if (parsedResult && Object.keys(parsedResult).some((key) => key !== 'query')) {
+			const nextResult = { ...parsedResult };
+			delete nextResult.query;
+			resultValue = nextResult;
+		}
+
+		return { argumentsValue, resultValue };
+	};
+
 	const collectToolCallsFromOutput = (value: unknown): ProcessToolCallItem[] => {
 		if (!Array.isArray(value)) return [];
 		const grouped = new Map<
@@ -766,6 +828,11 @@
 						: hasTerminalOutput
 							? 'true'
 							: 'false';
+			const normalizedPayload = normalizeToolCallDisplayPayload(
+				toolName,
+				callItem.arguments,
+				outputItem.output ?? outputItem.result ?? ''
+			);
 			const attrs: Record<string, string> = {
 				type: 'tool_calls',
 				id: String(callItem.id ?? outputItem.id ?? ''),
@@ -773,8 +840,8 @@
 				name: toolName,
 				tool_id: toolName,
 				tool_name: toolName,
-				arguments: normalizeToolCallPayloadValue(callItem.arguments),
-				result: extractToolCallOutputText(outputItem.output ?? outputItem.result ?? ''),
+				arguments: normalizeToolCallPayloadValue(normalizedPayload.argumentsValue),
+				result: extractToolCallOutputText(normalizedPayload.resultValue),
 				files: normalizeToolCallPayloadValue(outputItem.files),
 				embeds: normalizeToolCallPayloadValue(outputItem.embeds),
 				status: statusValue,
