@@ -206,6 +206,112 @@ def _strip_leaked_vision_specialist_prefix(text: object) -> object:
     return remainder
 
 
+_HISTORICAL_TOOL_REPLAY_NOTE_START = (
+    "Historical tool attempt retained as plain context only."
+)
+_HISTORICAL_TOOL_REPLAY_NOTE_SECOND_SENTENCE = (
+    "Do not replay it as a new tool call."
+)
+_HISTORICAL_TOOL_REPLAY_NOTE_LINE_PREFIXES = (
+    "Tool:",
+    "Status:",
+    "Arguments:",
+    "Replay was skipped because",
+    "Reported output:",
+)
+
+
+def _is_historical_tool_replay_note_line(line: str) -> bool:
+    trimmed = line.strip()
+    return any(
+        trimmed.startswith(prefix)
+        for prefix in _HISTORICAL_TOOL_REPLAY_NOTE_LINE_PREFIXES
+    )
+
+
+def _extract_historical_tool_replay_note_remainder(line: str) -> Optional[str]:
+    trimmed = line.strip()
+    if not trimmed:
+        return None
+
+    if trimmed.startswith(_HISTORICAL_TOOL_REPLAY_NOTE_START):
+        remainder = trimmed[len(_HISTORICAL_TOOL_REPLAY_NOTE_START) :].lstrip()
+        if remainder.startswith(_HISTORICAL_TOOL_REPLAY_NOTE_SECOND_SENTENCE):
+            remainder = remainder[
+                len(_HISTORICAL_TOOL_REPLAY_NOTE_SECOND_SENTENCE) :
+            ].lstrip()
+        if remainder and not _is_historical_tool_replay_note_line(remainder):
+            return remainder
+        return None
+
+    if not trimmed.startswith("Reported output:"):
+        return None
+
+    remainder = trimmed[len("Reported output:") :].strip()
+    if not remainder:
+        return None
+
+    parts = re.split(r"(?:\s{2,}|\t+)", remainder, maxsplit=1)
+    if len(parts) < 2:
+        return None
+
+    candidate = parts[1].strip()
+    if not candidate or _is_historical_tool_replay_note_line(candidate):
+        return None
+
+    return candidate
+
+
+def _strip_historical_tool_replay_note_text(text: object) -> object:
+    if not isinstance(text, str):
+        return text
+    if _HISTORICAL_TOOL_REPLAY_NOTE_START not in text:
+        return text
+
+    kept: list[str] = []
+    in_block = False
+
+    for line in text.splitlines():
+        trimmed = line.strip()
+
+        if not in_block:
+            if trimmed.startswith(_HISTORICAL_TOOL_REPLAY_NOTE_START):
+                in_block = True
+                remainder = _extract_historical_tool_replay_note_remainder(line)
+                if remainder:
+                    kept.append(remainder)
+                    in_block = False
+                continue
+            kept.append(line)
+            continue
+
+        if not trimmed:
+            continue
+
+        remainder = _extract_historical_tool_replay_note_remainder(line)
+        if remainder:
+            kept.append(remainder)
+            in_block = False
+            continue
+
+        if _is_historical_tool_replay_note_line(trimmed):
+            if trimmed.startswith("Reported output:"):
+                in_block = False
+            continue
+
+        in_block = False
+        kept.append(line)
+
+    sanitized = "\n".join(kept)
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+    return sanitized.strip()
+
+
+def _sanitize_assistant_text_content(text: object) -> object:
+    sanitized = _strip_leaked_vision_specialist_prefix(text)
+    return _strip_historical_tool_replay_note_text(sanitized)
+
+
 def _extract_text_from_output_parts(parts: object) -> str:
     if not isinstance(parts, list):
         return ""
@@ -396,12 +502,19 @@ def _sanitize_message_output(output: object) -> tuple[object, bool]:
                 and part.get("type") in {"text", "input_text", "output_text"}
             ):
                 original_text = part.get("text")
-                sanitized_text = _strip_leaked_vision_specialist_prefix(original_text)
+                sanitized_text = _sanitize_assistant_text_content(original_text)
                 if sanitized_text != original_text:
                     updated_content.append({**part, "text": sanitized_text})
                     item_changed = True
                     continue
             updated_content.append(part)
+
+        summary = item.get("summary")
+        if isinstance(summary, str):
+            sanitized_summary = _sanitize_assistant_text_content(summary)
+            if sanitized_summary != summary:
+                item["summary"] = sanitized_summary
+                item_changed = True
 
         if item_changed:
             item["content"] = updated_content
@@ -418,10 +531,12 @@ def _serialize_message_output_content(output: object, fallback_content: object) 
                 continue
             blocks.append(_extract_text_from_output_parts(item.get("content")))
         content = "\n".join(block for block in blocks if block).strip()
+        content = _sanitize_assistant_text_content(content)
         if content:
             return content
     if isinstance(fallback_content, str):
-        return _strip_leaked_vision_specialist_prefix(fallback_content).strip()
+        sanitized = _sanitize_assistant_text_content(fallback_content)
+        return sanitized.strip() if isinstance(sanitized, str) else ""
     return ""
 
 
@@ -442,7 +557,7 @@ def _sanitize_assistant_message(message: object) -> tuple[object, bool]:
 
     content = message.get("content")
     if isinstance(content, str):
-        sanitized_content = _strip_leaked_vision_specialist_prefix(content)
+        sanitized_content = _sanitize_assistant_text_content(content)
         if sanitized_content != content:
             message["content"] = sanitized_content
             changed = True
@@ -3065,6 +3180,65 @@ class ChatTable:
             return [
                 ChatFileModel.model_validate(chat_file) for chat_file in all_chat_files
             ]
+
+    def get_orphan_message_files_by_chat_id(
+        self,
+        chat_id: str,
+        before_timestamp: Optional[int] = None,
+        db: Optional[Session] = None,
+    ) -> list[dict]:
+        with get_db_context(db) as db:
+            chat_item = db.get(Chat, chat_id)
+            if chat_item is None or not isinstance(chat_item.chat, dict):
+                return []
+
+            known_message_ids = set(
+                (
+                    chat_item.chat.get("history", {}) or {}
+                ).get("messages", {}).keys()
+            )
+
+            query = (
+                db.query(ChatFile)
+                .filter_by(chat_id=chat_id)
+                .filter(ChatFile.message_id.isnot(None))
+                .order_by(ChatFile.created_at.asc())
+            )
+            if before_timestamp is not None:
+                query = query.filter(ChatFile.created_at <= before_timestamp)
+
+            orphan_rows = [
+                row
+                for row in query.all()
+                if str(row.message_id or "").strip()
+                and str(row.message_id or "").strip() not in known_message_ids
+            ]
+            if not orphan_rows:
+                return []
+
+            file_ids = list(
+                {
+                    str(row.file_id or "").strip()
+                    for row in orphan_rows
+                    if str(row.file_id or "").strip()
+                }
+            )
+            if not file_ids:
+                return []
+
+            file_models_by_id = {
+                file_model.id: file_model
+                for file_model in Files.get_files_by_ids(file_ids, db=db)
+            }
+
+            orphan_files: list[dict] = []
+            for row in orphan_rows:
+                file_model = file_models_by_id.get(str(row.file_id or "").strip())
+                if file_model is None:
+                    continue
+                orphan_files.append(self._message_file_from_file_model(file_model))
+
+            return self._merge_message_files([], orphan_files, "user")
 
     def delete_chat_file(
         self, chat_id: str, file_id: str, db: Optional[Session] = None

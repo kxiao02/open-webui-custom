@@ -5155,6 +5155,59 @@ def _is_media_file_item(file_item: Any) -> bool:
     return content_type.startswith(("image/", "audio/", "video/"))
 
 
+def _is_image_file_item(file_item: Any) -> bool:
+    if not isinstance(file_item, dict):
+        return False
+
+    file_type = str(file_item.get("type") or "").strip().lower()
+    if file_type == "image":
+        return True
+
+    content_type = str(
+        file_item.get("content_type")
+        or file_item.get("meta", {}).get("content_type")
+        or ""
+    ).strip().lower()
+    return content_type.startswith("image/")
+
+
+def _resolve_chat_file_url(file_item: Any) -> str:
+    if not isinstance(file_item, dict):
+        return ""
+
+    for key in (
+        "url",
+        "bridge_url",
+        "generated_file_url",
+        "download_url",
+        "downloadUrl",
+    ):
+        value = file_item.get(key)
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip()
+        if not normalized or normalized.lower() in {"null", "undefined"}:
+            continue
+        if normalized.startswith(("http://", "https://", "/", "data:")):
+            return normalized
+        return f"/api/v1/files/{normalized}/content"
+
+    file_info = file_item.get("file")
+    nested_file_id = file_info.get("id") if isinstance(file_info, dict) else None
+    for key in ("id", "file_id", "fileId", "bridge_file_id"):
+        value = file_item.get(key)
+        normalized = value.strip() if isinstance(value, str) else ""
+        if normalized and normalized.lower() not in {"null", "undefined"}:
+            return f"/api/v1/files/{normalized}/content"
+
+    if isinstance(nested_file_id, str):
+        normalized = nested_file_id.strip()
+        if normalized and normalized.lower() not in {"null", "undefined"}:
+            return f"/api/v1/files/{normalized}/content"
+
+    return ""
+
+
 def _should_prepare_chat_file(file_item: Any) -> bool:
     if not isinstance(file_item, dict):
         return False
@@ -5499,6 +5552,66 @@ def load_messages_from_db(chat_id: str, message_id: str) -> Optional[list[dict]]
             )
             continue
 
+    if not any(
+        message.get("role") == "user"
+        and any(_is_image_file_item(file_item) for file_item in message.get("files", []))
+        for message in messages
+    ):
+        target_message = messages_map.get(message_id, {})
+        target_timestamp = (
+            int(target_message.get("timestamp"))
+            if isinstance(target_message.get("timestamp"), (int, float))
+            else None
+        )
+        orphan_image_files = [
+            {**file_item, "url": _resolve_chat_file_url(file_item)}
+            for file_item in Chats.get_orphan_message_files_by_chat_id(
+                chat_id, before_timestamp=target_timestamp
+            )
+            if _is_image_file_item(file_item) and _resolve_chat_file_url(file_item)
+        ]
+        if orphan_image_files:
+            target_user_index = next(
+                (
+                    index
+                    for index in range(len(messages) - 1, -1, -1)
+                    if messages[index].get("role") == "user"
+                ),
+                None,
+            )
+            if target_user_index is None:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "",
+                        "files": orphan_image_files,
+                    }
+                )
+            else:
+                existing_files = messages[target_user_index].get("files", [])
+                merged_files = []
+                seen_refs: set[str] = set()
+                for file_item in [
+                    *(existing_files if isinstance(existing_files, list) else []),
+                    *orphan_image_files,
+                ]:
+                    if not isinstance(file_item, dict):
+                        continue
+                    file_ref = (
+                        _resolve_chat_file_url(file_item)
+                        or str(file_item.get("id") or "").strip()
+                    )
+                    if file_ref and file_ref in seen_refs:
+                        continue
+                    if file_ref:
+                        seen_refs.add(file_ref)
+                    merged_files.append(file_item)
+
+                messages[target_user_index] = {
+                    **messages[target_user_index],
+                    "files": merged_files,
+                }
+
     return messages
 
 
@@ -5562,22 +5675,29 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 image_files = [
                     f
                     for f in message.get("files", [])
-                    if f.get("type") == "image"
-                    or (f.get("content_type") or "").startswith("image/")
+                    if _is_image_file_item(f)
                 ]
                 if message.get("role") == "user" and image_files:
                     text_content = message.get("content", "")
                     if isinstance(text_content, str):
+                        image_parts = [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": file_url},
+                            }
+                            for f in image_files
+                            if (file_url := _resolve_chat_file_url(f))
+                        ]
+                        if not image_parts:
+                            message.pop("files", None)
+                            continue
                         message["content"] = [
-                            {"type": "text", "text": text_content},
-                            *[
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f["url"]},
-                                }
-                                for f in image_files
-                                if f.get("url")
-                            ],
+                            *(
+                                [{"type": "text", "text": text_content}]
+                                if text_content
+                                else []
+                            ),
+                            *image_parts,
                         ]
                 # Strip files field — it's been incorporated into content
                 message.pop("files", None)
