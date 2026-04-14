@@ -1,4 +1,5 @@
 import json
+import math
 import time
 import uuid
 from typing import Any, Optional
@@ -39,6 +40,37 @@ def _normalize_timestamp(timestamp: int) -> float:
         return now
 
     return timestamp
+
+
+def _sanitize_non_finite_values(payload: Any) -> Any:
+    if isinstance(payload, float):
+        return payload if math.isfinite(payload) else None
+    if isinstance(payload, dict):
+        return {key: _sanitize_non_finite_values(value) for key, value in payload.items()}
+    if isinstance(payload, list):
+        return [_sanitize_non_finite_values(value) for value in payload]
+    return payload
+
+
+def _sanitize_message_payload(data: Any) -> Any:
+    if not isinstance(data, dict):
+        return data
+    sanitized = dict(data)
+    for key in (
+        "content",
+        "output",
+        "files",
+        "sources",
+        "embeds",
+        "status_history",
+        "statusHistory",
+        "error",
+        "usage",
+        "info",
+    ):
+        if key in sanitized:
+            sanitized[key] = _sanitize_non_finite_values(sanitized[key])
+    return sanitized
 
 
 ####################
@@ -134,6 +166,7 @@ class ChatMessageTable:
     ) -> Optional[ChatMessageModel]:
         """Insert or update a chat message."""
         with get_db_context(db) as db:
+            sanitized_data = _sanitize_message_payload(data)
             now = int(time.time())
             timestamp = data.get("timestamp", now)
 
@@ -144,33 +177,37 @@ class ChatMessageTable:
             if existing:
                 # Update existing
                 if "role" in data:
-                    existing.role = data["role"]
+                    existing.role = sanitized_data["role"]
                 if "parent_id" in data:
-                    existing.parent_id = data.get("parent_id") or data.get("parentId")
+                    existing.parent_id = sanitized_data.get("parent_id") or sanitized_data.get(
+                        "parentId"
+                    )
                 if "content" in data:
-                    existing.content = data.get("content")
+                    existing.content = sanitized_data.get("content")
                 if "output" in data:
-                    existing.output = data.get("output")
+                    existing.output = sanitized_data.get("output")
                 if "model_id" in data or "model" in data:
-                    existing.model_id = data.get("model_id") or data.get("model")
+                    existing.model_id = sanitized_data.get("model_id") or sanitized_data.get(
+                        "model"
+                    )
                 if "files" in data:
-                    existing.files = data.get("files")
+                    existing.files = sanitized_data.get("files")
                 if "sources" in data:
-                    existing.sources = data.get("sources")
+                    existing.sources = sanitized_data.get("sources")
                 if "embeds" in data:
-                    existing.embeds = data.get("embeds")
+                    existing.embeds = sanitized_data.get("embeds")
                 if "done" in data:
-                    existing.done = data.get("done", True)
+                    existing.done = sanitized_data.get("done", True)
                 if "status_history" in data or "statusHistory" in data:
-                    existing.status_history = data.get("status_history") or data.get(
+                    existing.status_history = sanitized_data.get("status_history") or sanitized_data.get(
                         "statusHistory"
                     )
                 if "error" in data:
-                    existing.error = data.get("error")
+                    existing.error = sanitized_data.get("error")
                 # Extract usage - check direct field first, then info.usage
-                usage = data.get("usage")
+                usage = sanitized_data.get("usage")
                 if not usage:
-                    info = data.get("info", {})
+                    info = sanitized_data.get("info", {})
                     usage = info.get("usage") if info else None
                 if usage:
                     existing.usage = usage
@@ -181,26 +218,26 @@ class ChatMessageTable:
             else:
                 # Insert new
                 # Extract usage - check direct field first, then info.usage
-                usage = data.get("usage")
+                usage = sanitized_data.get("usage")
                 if not usage:
-                    info = data.get("info", {})
+                    info = sanitized_data.get("info", {})
                     usage = info.get("usage") if info else None
                 message = ChatMessage(
                     id=composite_id,
                     chat_id=chat_id,
                     user_id=user_id,
-                    role=data.get("role", "user"),
-                    parent_id=data.get("parent_id") or data.get("parentId"),
-                    content=data.get("content"),
-                    output=data.get("output"),
-                    model_id=data.get("model_id") or data.get("model"),
-                    files=data.get("files"),
-                    sources=data.get("sources"),
-                    embeds=data.get("embeds"),
-                    done=data.get("done", True),
-                    status_history=data.get("status_history")
-                    or data.get("statusHistory"),
-                    error=data.get("error"),
+                    role=sanitized_data.get("role", "user"),
+                    parent_id=sanitized_data.get("parent_id") or sanitized_data.get("parentId"),
+                    content=sanitized_data.get("content"),
+                    output=sanitized_data.get("output"),
+                    model_id=sanitized_data.get("model_id") or sanitized_data.get("model"),
+                    files=sanitized_data.get("files"),
+                    sources=sanitized_data.get("sources"),
+                    embeds=sanitized_data.get("embeds"),
+                    done=sanitized_data.get("done", True),
+                    status_history=sanitized_data.get("status_history")
+                    or sanitized_data.get("statusHistory"),
+                    error=sanitized_data.get("error"),
                     usage=usage,
                     created_at=timestamp,
                     updated_at=now,

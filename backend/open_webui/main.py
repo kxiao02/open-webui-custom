@@ -2074,10 +2074,27 @@ async def chat_completion(
             if metadata.get("chat_id") and metadata.get("message_id"):
                 try:
                     if not metadata["chat_id"].startswith("local:"):
+                        parent_message_id = str(
+                            metadata.get("parent_message_id") or ""
+                        ).strip()
+                        parent_message = metadata.get("parent_message")
+                        if parent_message_id and isinstance(parent_message, dict):
+                            Chats.upsert_message_to_chat_by_id_and_message_id(
+                                metadata["chat_id"],
+                                parent_message_id,
+                                {
+                                    **parent_message,
+                                    "id": parent_message_id,
+                                    "role": parent_message.get("role") or "user",
+                                },
+                            )
+
                         Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata["chat_id"],
                             metadata["message_id"],
                             {
+                                "id": metadata["message_id"],
+                                "role": "assistant",
                                 "parentId": metadata.get("parent_message_id", None),
                                 "model": model_id,
                             },

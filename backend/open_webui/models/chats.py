@@ -876,12 +876,86 @@ class ChatTable:
 
         return {**chat_payload, "id": normalized_chat_id}
 
+    def _build_history_branch_messages(self, history: object) -> Optional[list[dict]]:
+        if not isinstance(history, dict):
+            return None
+
+        branch_ids, current_id, messages = self._get_history_branch_ids(history)
+        if current_id is None:
+            return []
+
+        branch_messages: list[dict] = []
+        for message_id in branch_ids:
+            message = messages.get(message_id)
+            if isinstance(message, dict):
+                branch_messages.append(message)
+
+        return branch_messages
+
+    def _normalize_chat_history_for_storage(
+        self, chat_payload: object
+    ) -> tuple[object, bool]:
+        if not isinstance(chat_payload, dict):
+            return chat_payload, False
+
+        history = chat_payload.get("history")
+        if not isinstance(history, dict):
+            return chat_payload, False
+
+        messages = history.get("messages")
+        if not isinstance(messages, dict):
+            return chat_payload, False
+
+        normalized_messages = messages
+        changed = False
+
+        for message_id, message in messages.items():
+            if not isinstance(message_id, str) or not isinstance(message, dict):
+                continue
+            if message.get("id") == message_id:
+                continue
+            if normalized_messages is messages:
+                normalized_messages = dict(messages)
+            normalized_messages[message_id] = {**message, "id": message_id}
+            changed = True
+
+        normalized_history = history
+        if normalized_messages is not messages:
+            normalized_history = {**normalized_history, "messages": normalized_messages}
+
+        resolved_current_id = self._resolve_history_current_id(normalized_history)
+        if normalized_history.get("currentId") != resolved_current_id:
+            normalized_history = {
+                **normalized_history,
+                "currentId": resolved_current_id,
+            }
+            changed = True
+
+        branch_messages = self._build_history_branch_messages(normalized_history)
+        normalized_chat_payload = chat_payload
+
+        if normalized_history is not history:
+            normalized_chat_payload = {
+                **normalized_chat_payload,
+                "history": normalized_history,
+            }
+
+        if branch_messages is not None and normalized_chat_payload.get("messages") != branch_messages:
+            normalized_chat_payload = {
+                **normalized_chat_payload,
+                "messages": branch_messages,
+            }
+            changed = True
+
+        return normalized_chat_payload, changed
+
     def _normalize_chat_payload_for_storage(
         self, chat_payload: object, chat_id: str
     ) -> object:
         normalized = self._ensure_chat_payload_identity(chat_payload, chat_id)
         normalized, _ = _normalize_chat_history_tool_outputs(normalized)
         normalized, _ = _sanitize_chat_history_specialist_leaks(normalized)
+        normalized, _ = self._normalize_chat_history_for_storage(normalized)
         return normalized
 
     def _normalize_file_ref(self, value) -> Optional[str]:
@@ -1835,6 +1909,8 @@ class ChatTable:
         if isinstance(message.get("content"), str):
             message["content"] = sanitize_text_for_db(message["content"])
 
+        message = {**message, "id": message_id}
+
         user_id = chat.user_id
         chat = chat.chat
         history = chat.get("history", {})
@@ -1984,7 +2060,12 @@ class ChatTable:
                         message_files
                     )
 
-                history["messages"][message_id]["files"] = message_files
+                history["messages"][message_id] = {
+                    **history["messages"][message_id],
+                    "id": message_id,
+                    "role": "assistant",
+                    "files": message_files,
+                }
             elif sanitized_files:
                 message_files = []
                 seen_file_keys: set[str] = set()
@@ -2002,14 +2083,15 @@ class ChatTable:
                 message_files = _collapse_assistant_generated_file_variants(message_files)
 
                 history.setdefault("messages", {})[message_id] = {
+                    "id": message_id,
                     "role": "assistant",
                     "content": "",
                     "files": message_files,
                     "done": False,
                     "timestamp": int(time.time()),
                 }
-                if not history.get("currentId"):
-                    history["currentId"] = message_id
+
+            history["currentId"] = message_id
 
             chat["history"] = history
             self.update_chat_by_id(id, chat, db=db)
