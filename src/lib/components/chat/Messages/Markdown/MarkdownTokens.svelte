@@ -19,6 +19,7 @@
 	import Collapsible from '$lib/components/common/Collapsible.svelte';
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
+	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 
@@ -342,8 +343,12 @@
 				className="w-full space-y-1"
 			/>
 		{:else if token?.attributes?.type === 'reasoning'}
-			<div class="my-2 w-full overflow-hidden rounded-2xl border border-amber-200/80 bg-gradient-to-br from-amber-50/95 via-white to-orange-50/90 shadow-xs dark:border-amber-900/70 dark:from-gray-900 dark:via-gray-900 dark:to-amber-950/40">
-				<div class="flex items-center gap-2 px-3 py-2 text-sm font-medium text-amber-900 dark:text-amber-100">
+			<div
+				class="my-2 w-full overflow-hidden rounded-2xl border border-amber-200/80 bg-gradient-to-br from-amber-50/95 via-white to-orange-50/90 shadow-xs dark:border-amber-900/70 dark:from-gray-900 dark:via-gray-900 dark:to-amber-950/40"
+			>
+				<div
+					class="flex items-center gap-2 px-3 py-2 text-sm font-medium text-amber-900 dark:text-amber-100"
+				>
 					{#if !done}
 						<Spinner className="size-4" />
 					{/if}
@@ -398,18 +403,13 @@
 	{:else if token.type === 'iframe'}
 		{@const iframeFileRef = normalizeFileRef(token?.fileId)}
 		{#if iframeFileRef}
-			<iframe
+			<FullHeightIframe
 				src={`${WEBUI_BASE_URL}/api/v1/files/${iframeFileRef}/content`}
 				title={iframeFileRef}
-				width="100%"
-				frameborder="0"
-				on:load={(e) => {
-					try {
-						e.currentTarget.style.height =
-							e.currentTarget.contentWindow.document.body.scrollHeight + 20 + 'px';
-					} catch {}
-				}}
-			></iframe>
+				iframeClassName="w-full"
+				allowSameOrigin={true}
+				useSandbox={false}
+			/>
 		{/if}
 	{:else if token.type === 'paragraph'}
 		{#if paragraphTag == 'span'}

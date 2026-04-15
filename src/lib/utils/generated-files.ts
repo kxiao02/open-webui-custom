@@ -1581,7 +1581,9 @@ export const collectGeneratedFilesFromHistory = (history: any): GeneratedFileIte
 		result.push(...collectGeneratedFilesFromMessage(message));
 	}
 
-	const deduped = filterGeneratedFilesForDisplay(dedupeGeneratedFiles(result)).sort(
+	// Messages are already filtered individually; re-filtering the merged history would hide
+	// valid text artifacts from one turn just because another turn produced a PDF/XLSX.
+	const deduped = dedupeGeneratedFiles(result).sort(
 		(a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0)
 	);
 	setGeneratedFilesCache(historyGeneratedFilesCache, historyCacheKey, deduped);

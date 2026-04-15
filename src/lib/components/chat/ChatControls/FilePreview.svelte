@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { WorkBook } from 'xlsx';
-	import { getContext, onDestroy } from 'svelte';
+	import { getContext, onDestroy, tick } from 'svelte';
 	import DOMPurify from 'dompurify';
 	import { downloadFileBlob, readFile } from '$lib/apis/terminal';
 	import {
@@ -16,10 +16,17 @@
 		collectGeneratedFilesFromHistory,
 		triggerGeneratedFileDownload
 	} from '$lib/utils/generated-files';
+	import { initMermaid, renderMermaidDiagram } from '$lib/utils';
+	import {
+		isMarkdownPreviewContentType,
+		isMarkdownPreviewPath,
+		renderMarkdownPreviewHtml
+	} from '$lib/utils/markdownPreview';
 
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
+	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import CodeBlock from '$lib/components/chat/Messages/CodeBlock.svelte';
 
 	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
@@ -58,10 +65,17 @@
 	let excelSheetNames: string[] = [];
 	let selectedExcelSheet = '';
 	let currentSlide = 0;
+	let markdownEl: HTMLDivElement;
+	let mermaidInstance: Awaited<ReturnType<typeof initMermaid>> | null = null;
+
+	const getFileExt = (file: PreviewFile | null): string => {
+		const candidate = (file?.name || file?.path || file?.url || '').split(/[?#]/, 1)[0];
+		return candidate.split('.').pop()?.toLowerCase() ?? '';
+	};
 
 	const isImageFile = (file: PreviewFile | null): boolean => {
 		if (!file) return false;
-		const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+		const ext = getFileExt(file);
 		return (
 			(file.url ?? '').startsWith('data:image/') ||
 			file.isImage === true ||
@@ -72,25 +86,31 @@
 
 	const isPdfFile = (file: PreviewFile | null): boolean => {
 		if (!file) return false;
-		const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+		const ext = getFileExt(file);
 		return (file.contentType ?? '') === 'application/pdf' || ext === 'pdf';
 	};
 
 	const isHtmlFile = (file: PreviewFile | null): boolean => {
 		if (!file) return false;
-		const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+		const ext = getFileExt(file);
+		return (file.contentType ?? '').includes('text/html') || ext === 'html' || ext === 'htm';
+	};
+
+	const isMarkdownFile = (file: PreviewFile | null): boolean => {
+		if (!file) return false;
 		return (
-			(file.contentType ?? '').includes('text/html') || ext === 'html' || ext === 'htm'
+			isMarkdownPreviewPath(file.name || file.path || file.url || null) ||
+			isMarkdownPreviewContentType(file.contentType)
 		);
 	};
 
 	const isTextLikeFile = (file: PreviewFile | null): boolean => {
 		if (!file) return false;
-		const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+		const ext = getFileExt(file);
 		if ((file.contentType ?? '').startsWith('text/')) return true;
+		if (isMarkdownFile(file)) return true;
 		return [
 			'txt',
-			'md',
 			'csv',
 			'json',
 			'xml',
@@ -106,8 +126,10 @@
 
 	const isPythonFile = (file: PreviewFile | null): boolean => {
 		if (!file) return false;
-		const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
-		return ext === 'py' || ext === 'pyw' || (file.contentType ?? '').toLowerCase().includes('python');
+		const ext = getFileExt(file);
+		return (
+			ext === 'py' || ext === 'pyw' || (file.contentType ?? '').toLowerCase().includes('python')
+		);
 	};
 
 	const getFileSourceLabel = (file: PreviewFile): string => {
@@ -119,7 +141,7 @@
 
 	const isDocxFile = (file: PreviewFile | null): boolean => {
 		if (!file) return false;
-		const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+		const ext = getFileExt(file);
 		return (
 			(file.contentType ?? '') ===
 				'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || ext === 'docx'
@@ -128,7 +150,7 @@
 
 	const isXlsxFile = (file: PreviewFile | null): boolean => {
 		if (!file) return false;
-		const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+		const ext = getFileExt(file);
 		return (
 			(file.contentType ?? '') ===
 				'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || ext === 'xlsx'
@@ -137,10 +159,11 @@
 
 	const isPptxFile = (file: PreviewFile | null): boolean => {
 		if (!file) return false;
-		const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+		const ext = getFileExt(file);
 		return (
 			(file.contentType ?? '') ===
-				'application/vnd.openxmlformats-officedocument.presentationml.presentation' || ext === 'pptx'
+				'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
+			ext === 'pptx'
 		);
 	};
 
@@ -154,6 +177,34 @@
 			return decodeURIComponent(body);
 		} catch {
 			return '';
+		}
+	};
+
+	const renderMermaidBlocks = async (el: HTMLDivElement) => {
+		if (!el) return;
+		const codeEls = el.querySelectorAll('code.language-mermaid');
+		if (codeEls.length === 0) return;
+
+		if (!mermaidInstance) {
+			mermaidInstance = await initMermaid();
+		}
+
+		for (const codeEl of codeEls) {
+			const pre = codeEl.parentElement;
+			if (!pre || pre.tagName !== 'PRE' || pre.dataset.mermaidRendered) continue;
+			pre.dataset.mermaidRendered = 'true';
+
+			try {
+				const svg = await renderMermaidDiagram(mermaidInstance, codeEl.textContent ?? '');
+				if (svg) {
+					const wrapper = document.createElement('div');
+					wrapper.className = 'mermaid-diagram flex justify-center py-2';
+					wrapper.innerHTML = svg;
+					pre.replaceWith(wrapper);
+				}
+			} catch (error) {
+				console.error('Mermaid render error:', error);
+			}
 		}
 	};
 
@@ -211,7 +262,11 @@
 		previewOfficeHtml = result.html;
 	};
 
-	const loadOfficePreview = async (file: PreviewFile, arrayBuffer: ArrayBuffer, requestId: number) => {
+	const loadOfficePreview = async (
+		file: PreviewFile,
+		arrayBuffer: ArrayBuffer,
+		requestId: number
+	) => {
 		clearOfficePreview();
 		revokePreviewObjectUrl();
 		previewText = '';
@@ -319,7 +374,11 @@
 		if (!selectedFile) return;
 
 		if (selectedFile.downloadMode === 'terminal' && selectedFile.path && activeTerminal) {
-			const result = await downloadFileBlob(activeTerminal.url, activeTerminal.key, selectedFile.path);
+			const result = await downloadFileBlob(
+				activeTerminal.url,
+				activeTerminal.key,
+				selectedFile.path
+			);
 			if (!result) {
 				previewError = 'Failed to download file.';
 				return;
@@ -359,46 +418,46 @@
 			previewLoading = true;
 			previewError = '';
 
-				try {
-					if (isTextLikeFile(file)) {
-						const text = await readFile(terminal.url, terminal.key, file.path);
-						if (text === null) {
-							throw new Error('Failed to read terminal file');
-						}
+			try {
+				if (isTextLikeFile(file)) {
+					const text = await readFile(terminal.url, terminal.key, file.path);
+					if (text === null) {
+						throw new Error('Failed to read terminal file');
+					}
+					if (requestId !== previewRequestId) return;
+					revokePreviewObjectUrl();
+					previewText = text;
+					clearOfficePreview();
+					previewError = '';
+				} else {
+					const result = await downloadFileBlob(terminal.url, terminal.key, file.path);
+					if (!result) {
+						throw new Error('Failed to download terminal file');
+					}
+					if (requestId !== previewRequestId) return;
+
+					if (isDocxFile(file) || isXlsxFile(file) || isPptxFile(file)) {
+						const arrayBuffer = await result.blob.arrayBuffer();
 						if (requestId !== previewRequestId) return;
-						revokePreviewObjectUrl();
-						previewText = text;
-						clearOfficePreview();
+						await loadOfficePreview(file, arrayBuffer, requestId);
+						if (requestId !== previewRequestId) return;
 						previewError = '';
 					} else {
-						const result = await downloadFileBlob(terminal.url, terminal.key, file.path);
-						if (!result) {
-							throw new Error('Failed to download terminal file');
-						}
-						if (requestId !== previewRequestId) return;
-
-						if (isDocxFile(file) || isXlsxFile(file) || isPptxFile(file)) {
-							const arrayBuffer = await result.blob.arrayBuffer();
-							if (requestId !== previewRequestId) return;
-							await loadOfficePreview(file, arrayBuffer, requestId);
-							if (requestId !== previewRequestId) return;
-							previewError = '';
-						} else {
-							previewText = '';
-							clearOfficePreview();
-							previewError = '';
-							setPreviewObjectUrl(result.blob, targetLoadKey);
-						}
-					}
-				} catch (error) {
-					console.error(error);
-					clearPreviewContent();
-					previewError = getPreviewErrorMessage(file);
-				} finally {
-					if (requestId === previewRequestId) {
-						previewLoading = false;
+						previewText = '';
+						clearOfficePreview();
+						previewError = '';
+						setPreviewObjectUrl(result.blob, targetLoadKey);
 					}
 				}
+			} catch (error) {
+				console.error(error);
+				clearPreviewContent();
+				previewError = getPreviewErrorMessage(file);
+			} finally {
+				if (requestId === previewRequestId) {
+					previewLoading = false;
+				}
+			}
 
 			return;
 		}
@@ -515,6 +574,11 @@
 			files[0].id;
 	}
 	$: selectedFile = files.find((file) => file.id === selectedFileId) ?? null;
+	$: renderedMarkdownHtml =
+		isMarkdownFile(selectedFile) && previewText ? renderMarkdownPreviewHtml(previewText) : '';
+	$: if (renderedMarkdownHtml && markdownEl) {
+		tick().then(() => renderMermaidBlocks(markdownEl));
+	}
 	$: {
 		const nextPreviewLoadKey = buildPreviewLoadKey(selectedFile, activeTerminal);
 		if (selectedFile && nextPreviewLoadKey !== previewLoadKey) {
@@ -591,7 +655,9 @@
 					{/each}
 				</div>
 
-				<div class="min-h-0 rounded-xl border border-gray-100 bg-white dark:border-gray-800 dark:bg-gray-900">
+				<div
+					class="min-h-0 rounded-xl border border-gray-100 bg-white dark:border-gray-800 dark:bg-gray-900"
+				>
 					{#if selectedFile}
 						<div class="flex h-full min-h-0 flex-col">
 							<div
@@ -616,7 +682,9 @@
 
 							<div class="min-h-0 flex-1 overflow-auto p-2">
 								{#if (isImageFile(selectedFile) || isPdfFile(selectedFile) || isHtmlFile(selectedFile)) && previewLoading}
-									<div class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400">
+									<div
+										class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400"
+									>
 										<Spinner className="size-4 mr-2" />
 										<span class="text-xs">{$i18n.t('Loading...')}</span>
 									</div>
@@ -626,20 +694,40 @@
 										alt={selectedFile.name}
 										class="h-full max-h-full w-full object-contain rounded-lg"
 									/>
-									{:else if isPdfFile(selectedFile) || isHtmlFile(selectedFile)}
-										<iframe
-											title={selectedFile.name}
-											src={getSelectedFileUrl()}
-											class="h-full min-h-[320px] w-full rounded-lg border-0"
-										></iframe>
-									{:else if isTextLikeFile(selectedFile)}
-										{#if previewLoading}
-											<div class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400">
-												<Spinner className="size-4 mr-2" />
-												<span class="text-xs">{$i18n.t('Loading...')}</span>
-											</div>
+								{:else if isPdfFile(selectedFile)}
+									<iframe
+										title={selectedFile.name}
+										src={getSelectedFileUrl()}
+										class="h-full min-h-[320px] w-full rounded-lg border-0"
+									></iframe>
+								{:else if isHtmlFile(selectedFile)}
+									<FullHeightIframe
+										title={selectedFile.name}
+										src={getSelectedFileUrl()}
+										iframeClassName="h-full min-h-[320px] w-full rounded-lg border-0"
+										allowForms={$settings?.iframeSandboxAllowForms ?? false}
+										allowSameOrigin={true}
+										allowPopups={true}
+										useSandbox={false}
+									/>
+								{:else if isTextLikeFile(selectedFile)}
+									{#if previewLoading}
+										<div
+											class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400"
+										>
+											<Spinner className="size-4 mr-2" />
+											<span class="text-xs">{$i18n.t('Loading...')}</span>
+										</div>
 									{:else if previewError}
 										<div class="text-xs text-rose-600 dark:text-rose-400">{previewError}</div>
+									{:else if isMarkdownFile(selectedFile)}
+										<div
+											bind:this={markdownEl}
+											class="prose max-w-full rounded-lg bg-gray-50 p-3 text-sm text-gray-700 dark:bg-gray-850 dark:text-gray-200 dark:prose-invert"
+										>
+											<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+											{@html renderedMarkdownHtml}
+										</div>
 									{:else if isPythonFile(selectedFile)}
 										<CodeBlock
 											id="generated-file-preview-{selectedFile.id}"
@@ -653,137 +741,165 @@
 											editorClassName="rounded-b-2xl"
 										/>
 									{:else}
-										<pre class="m-0 whitespace-pre-wrap break-all rounded-lg bg-gray-50 p-3 text-xs text-gray-700 dark:bg-gray-850 dark:text-gray-200">{previewText}</pre>
+										<pre
+											class="m-0 whitespace-pre-wrap break-all rounded-lg bg-gray-50 p-3 text-xs text-gray-700 dark:bg-gray-850 dark:text-gray-200">{previewText}</pre>
 									{/if}
-									{:else if isDocxFile(selectedFile)}
-										{#if previewLoading}
-											<div class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400">
-												<Spinner className="size-4 mr-2" />
-												<span class="text-xs">{$i18n.t('Loading...')}</span>
-											</div>
+								{:else if isDocxFile(selectedFile)}
+									{#if previewLoading}
+										<div
+											class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400"
+										>
+											<Spinner className="size-4 mr-2" />
+											<span class="text-xs">{$i18n.t('Loading...')}</span>
+										</div>
 									{:else if previewError}
 										<div class="text-xs text-rose-600 dark:text-rose-400">{previewError}</div>
-										{:else if previewDocxHtml}
-											<div
-												class="office-preview max-h-full overflow-auto rounded-lg bg-gray-50 p-3 prose text-sm text-gray-700 dark:bg-gray-850 dark:text-gray-200 dark:prose-invert max-w-full"
-											>
-												<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-												{@html previewDocxHtml}
-											</div>
-										{:else}
-											<div class="h-full flex items-center justify-center text-xs text-gray-500 dark:text-gray-400">
-												{$i18n.t('Preview is not available for this file type.')}
-											</div>
-										{/if}
-									{:else if isXlsxFile(selectedFile)}
-										{#if previewLoading}
-											<div class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400">
-												<Spinner className="size-4 mr-2" />
-												<span class="text-xs">{$i18n.t('Loading...')}</span>
-											</div>
-										{:else if previewError}
-											<div class="text-xs text-rose-600 dark:text-rose-400">{previewError}</div>
-										{:else if previewOfficeHtml}
-											<div class="flex h-full min-h-0 flex-col">
-												<div class="office-preview max-h-full flex-1 overflow-auto rounded-lg bg-gray-50 p-3 text-sm text-gray-700 dark:bg-gray-850 dark:text-gray-200">
-													{@html previewOfficeHtml}
-												</div>
-												{#if excelSheetNames.length > 1}
-													<div class="mt-2 flex items-center gap-1 overflow-x-auto border-t border-gray-100 px-1 pt-2 dark:border-gray-800">
-														{#each excelSheetNames as sheet}
-															<button
-																type="button"
-																class="shrink-0 rounded-md px-3 py-1 text-xs transition-colors {selectedExcelSheet === sheet
-																	? 'bg-gray-200 text-gray-800 dark:bg-gray-700 dark:text-gray-200 font-medium'
-																	: 'text-gray-500 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800'}"
-																on:click={() => renderExcelSheet(sheet)}
-															>
-																{sheet}
-															</button>
-														{/each}
-													</div>
-												{/if}
-											</div>
-										{:else}
-											<div class="h-full flex items-center justify-center text-xs text-gray-500 dark:text-gray-400">
-												{$i18n.t('Preview is not available for this file type.')}
-											</div>
-										{/if}
-									{:else if isPptxFile(selectedFile)}
-										{#if previewLoading}
-											<div class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400">
-												<Spinner className="size-4 mr-2" />
-												<span class="text-xs">{$i18n.t('Loading...')}</span>
-											</div>
-										{:else if previewError}
-											<div class="text-xs text-rose-600 dark:text-rose-400">{previewError}</div>
-										{:else if previewOfficeSlides.length > 0}
-											<div class="flex h-full min-h-0 flex-col">
-												<div class="flex min-h-0 flex-1 items-center justify-center overflow-auto rounded-lg bg-gray-50 p-3 dark:bg-gray-850">
-													<img
-														src={previewOfficeSlides[currentSlide]}
-														alt="Slide {currentSlide + 1}"
-														class="max-h-full max-w-full rounded-md object-contain shadow-lg"
-														draggable="false"
-													/>
-												</div>
-												{#if previewOfficeSlides.length > 1}
-													<div class="mt-2 flex items-center justify-center gap-3 text-xs text-gray-500 dark:text-gray-400">
-														<button
-															type="button"
-															class="rounded-md p-1 hover:bg-gray-100 disabled:opacity-30 dark:hover:bg-gray-800"
-															disabled={currentSlide === 0}
-															aria-label={$i18n.t('Previous slide')}
-															on:click={() => (currentSlide = Math.max(0, currentSlide - 1))}
-														>
-															<svg
-																xmlns="http://www.w3.org/2000/svg"
-																viewBox="0 0 20 20"
-																fill="currentColor"
-																class="size-4"
-															>
-																<path
-																	fill-rule="evenodd"
-																	d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z"
-																	clip-rule="evenodd"
-																/>
-															</svg>
-														</button>
-														<span>{currentSlide + 1} / {previewOfficeSlides.length}</span>
-														<button
-															type="button"
-															class="rounded-md p-1 hover:bg-gray-100 disabled:opacity-30 dark:hover:bg-gray-800"
-															disabled={currentSlide === previewOfficeSlides.length - 1}
-															aria-label={$i18n.t('Next slide')}
-															on:click={() =>
-																(currentSlide = Math.min(previewOfficeSlides.length - 1, currentSlide + 1))}
-														>
-															<svg
-																xmlns="http://www.w3.org/2000/svg"
-																viewBox="0 0 20 20"
-																fill="currentColor"
-																class="size-4"
-															>
-																<path
-																	fill-rule="evenodd"
-																	d="M8.22 5.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 0 1 0-1.06Z"
-																	clip-rule="evenodd"
-																/>
-															</svg>
-														</button>
-													</div>
-												{/if}
-											</div>
-										{:else}
-											<div class="h-full flex items-center justify-center text-xs text-gray-500 dark:text-gray-400">
-												{$i18n.t('Preview is not available for this file type.')}
-											</div>
-										{/if}
+									{:else if previewDocxHtml}
+										<div
+											class="office-preview max-h-full overflow-auto rounded-lg bg-gray-50 p-3 prose text-sm text-gray-700 dark:bg-gray-850 dark:text-gray-200 dark:prose-invert max-w-full"
+										>
+											<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+											{@html previewDocxHtml}
+										</div>
 									{:else}
-										<div class="h-full flex items-center justify-center text-xs text-gray-500 dark:text-gray-400">
+										<div
+											class="h-full flex items-center justify-center text-xs text-gray-500 dark:text-gray-400"
+										>
 											{$i18n.t('Preview is not available for this file type.')}
 										</div>
 									{/if}
+								{:else if isXlsxFile(selectedFile)}
+									{#if previewLoading}
+										<div
+											class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400"
+										>
+											<Spinner className="size-4 mr-2" />
+											<span class="text-xs">{$i18n.t('Loading...')}</span>
+										</div>
+									{:else if previewError}
+										<div class="text-xs text-rose-600 dark:text-rose-400">{previewError}</div>
+									{:else if previewOfficeHtml}
+										<div class="flex h-full min-h-0 flex-col">
+											<div
+												class="office-preview max-h-full flex-1 overflow-auto rounded-lg bg-gray-50 p-3 text-sm text-gray-700 dark:bg-gray-850 dark:text-gray-200"
+											>
+												<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+												{@html previewOfficeHtml}
+											</div>
+											{#if excelSheetNames.length > 1}
+												<div
+													class="mt-2 flex items-center gap-1 overflow-x-auto border-t border-gray-100 px-1 pt-2 dark:border-gray-800"
+												>
+													{#each excelSheetNames as sheet}
+														<button
+															type="button"
+															class="shrink-0 rounded-md px-3 py-1 text-xs transition-colors {selectedExcelSheet ===
+															sheet
+																? 'bg-gray-200 text-gray-800 dark:bg-gray-700 dark:text-gray-200 font-medium'
+																: 'text-gray-500 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800'}"
+															on:click={() => renderExcelSheet(sheet)}
+														>
+															{sheet}
+														</button>
+													{/each}
+												</div>
+											{/if}
+										</div>
+									{:else}
+										<div
+											class="h-full flex items-center justify-center text-xs text-gray-500 dark:text-gray-400"
+										>
+											{$i18n.t('Preview is not available for this file type.')}
+										</div>
+									{/if}
+								{:else if isPptxFile(selectedFile)}
+									{#if previewLoading}
+										<div
+											class="h-full flex items-center justify-center text-gray-500 dark:text-gray-400"
+										>
+											<Spinner className="size-4 mr-2" />
+											<span class="text-xs">{$i18n.t('Loading...')}</span>
+										</div>
+									{:else if previewError}
+										<div class="text-xs text-rose-600 dark:text-rose-400">{previewError}</div>
+									{:else if previewOfficeSlides.length > 0}
+										<div class="flex h-full min-h-0 flex-col">
+											<div
+												class="flex min-h-0 flex-1 items-center justify-center overflow-auto rounded-lg bg-gray-50 p-3 dark:bg-gray-850"
+											>
+												<img
+													src={previewOfficeSlides[currentSlide]}
+													alt="Slide {currentSlide + 1}"
+													class="max-h-full max-w-full rounded-md object-contain shadow-lg"
+													draggable="false"
+												/>
+											</div>
+											{#if previewOfficeSlides.length > 1}
+												<div
+													class="mt-2 flex items-center justify-center gap-3 text-xs text-gray-500 dark:text-gray-400"
+												>
+													<button
+														type="button"
+														class="rounded-md p-1 hover:bg-gray-100 disabled:opacity-30 dark:hover:bg-gray-800"
+														disabled={currentSlide === 0}
+														aria-label={$i18n.t('Previous slide')}
+														on:click={() => (currentSlide = Math.max(0, currentSlide - 1))}
+													>
+														<svg
+															xmlns="http://www.w3.org/2000/svg"
+															viewBox="0 0 20 20"
+															fill="currentColor"
+															class="size-4"
+														>
+															<path
+																fill-rule="evenodd"
+																d="M11.78 5.22a.75.75 0 0 1 0 1.06L8.06 10l3.72 3.72a.75.75 0 1 1-1.06 1.06l-4.25-4.25a.75.75 0 0 1 0-1.06l4.25-4.25a.75.75 0 0 1 1.06 0Z"
+																clip-rule="evenodd"
+															/>
+														</svg>
+													</button>
+													<span>{currentSlide + 1} / {previewOfficeSlides.length}</span>
+													<button
+														type="button"
+														class="rounded-md p-1 hover:bg-gray-100 disabled:opacity-30 dark:hover:bg-gray-800"
+														disabled={currentSlide === previewOfficeSlides.length - 1}
+														aria-label={$i18n.t('Next slide')}
+														on:click={() =>
+															(currentSlide = Math.min(
+																previewOfficeSlides.length - 1,
+																currentSlide + 1
+															))}
+													>
+														<svg
+															xmlns="http://www.w3.org/2000/svg"
+															viewBox="0 0 20 20"
+															fill="currentColor"
+															class="size-4"
+														>
+															<path
+																fill-rule="evenodd"
+																d="M8.22 5.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 0 1 0-1.06Z"
+																clip-rule="evenodd"
+															/>
+														</svg>
+													</button>
+												</div>
+											{/if}
+										</div>
+									{:else}
+										<div
+											class="h-full flex items-center justify-center text-xs text-gray-500 dark:text-gray-400"
+										>
+											{$i18n.t('Preview is not available for this file type.')}
+										</div>
+									{/if}
+								{:else}
+									<div
+										class="h-full flex items-center justify-center text-xs text-gray-500 dark:text-gray-400"
+									>
+										{$i18n.t('Preview is not available for this file type.')}
+									</div>
+								{/if}
 							</div>
 						</div>
 					{/if}

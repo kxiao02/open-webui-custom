@@ -115,6 +115,12 @@ export const TOOL_DISPLAY_DEFINITIONS: ToolDisplayDefinition[] = [
 		toolName: '委派任务',
 		aliases: ['delegate_task', 'subagent_task'],
 		category: 'utility'
+	},
+	{
+		toolId: 'write_todos',
+		toolName: '任务清单',
+		aliases: ['todo_list', 'task_list'],
+		category: 'utility'
 	}
 ];
 
@@ -253,6 +259,10 @@ const getDynamicToolName = (
 	}
 	if (toolId === 'visit_webpage') {
 		return getVisitWebsiteLabel(parsedArgs);
+	}
+	if (toolId === 'write_todos') {
+		const title = truncateDisplayText(getStringField(parsedArgs, ['title', 'name']), 36);
+		return title ? `任务清单：${title}` : '任务清单';
 	}
 	return '';
 };

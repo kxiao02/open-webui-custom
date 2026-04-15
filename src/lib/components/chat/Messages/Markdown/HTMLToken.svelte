@@ -4,6 +4,7 @@
 
 	import { WEBUI_BASE_URL } from '$lib/constants';
 	import { settings } from '$lib/stores';
+	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 
 	export let id: string;
 	export let token: Token;
@@ -103,28 +104,18 @@
 		{:else}
 			{token.text}
 		{/if}
-		{:else if token.text.includes(`<file type="html"`)}
-			{@const match = token.text.match(/<file type="html" id="([^"]+)"/)}
-			{@const fileId = match && match[1]}
-			{#if fileId && fileId !== 'null' && fileId !== 'undefined'}
-				<iframe
-					class="w-full my-2"
-					src={`${WEBUI_BASE_URL}/api/v1/files/${fileId}/content/html`}
+	{:else if token.text.includes(`<file type="html"`)}
+		{@const match = token.text.match(/<file type="html" id="([^"]+)"/)}
+		{@const fileId = match && match[1]}
+		{#if fileId && fileId !== 'null' && fileId !== 'undefined'}
+			<FullHeightIframe
+				src={`${WEBUI_BASE_URL}/api/v1/files/${fileId}/content/html`}
 				title="Content"
-				frameborder="0"
-				sandbox="allow-scripts allow-downloads{($settings?.iframeSandboxAllowForms ?? false)
-					? ' allow-forms'
-					: ''}{($settings?.iframeSandboxAllowSameOrigin ?? false) ? ' allow-same-origin' : ''}"
-				referrerpolicy="strict-origin-when-cross-origin"
-				allowfullscreen
-				width="100%"
-				on:load={(e) => {
-					try {
-						e.currentTarget.style.height =
-							e.currentTarget.contentWindow.document.body.scrollHeight + 20 + 'px';
-					} catch {}
-				}}
-			></iframe>
+				iframeClassName="w-full my-2"
+				allowForms={$settings?.iframeSandboxAllowForms ?? false}
+				allowSameOrigin={$settings?.iframeSandboxAllowSameOrigin ?? false}
+				allowPopups={true}
+			/>
 		{/if}
 	{:else if token.text.trim().match(/^<br\s*\/?>$/i)}
 		<br />

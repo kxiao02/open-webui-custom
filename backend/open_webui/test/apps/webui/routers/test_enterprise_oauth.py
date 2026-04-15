@@ -593,3 +593,56 @@ class TestEnterpriseOAuth(AbstractPostgresTest):
             assert linked_user.oauth["portal"]["account_no"] == "sysmintest"
         finally:
             self._restore_portal_sso_config(snapshot)
+
+    def test_portal_sso_callback_links_existing_user_by_email_when_merge_enabled(
+        self, monkeypatch
+    ):
+        snapshot = self._snapshot_portal_sso_config()
+        prev_merge = config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value
+        try:
+            config.PORTAL_SSO_ENABLED.value = True
+            config.PORTAL_SSO_VALIDATE_URL.value = "https://portal.example.com/casValidate"
+            config.PORTAL_SSO_AUTO_SIGNUP.value = True
+            config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value = True
+
+            existing_user = Users.insert_new_user(
+                id="email-merge-user",
+                name="Existing User",
+                email="merge@example.com",
+                role="user",
+                db=self.db,
+            )
+            assert existing_user is not None
+
+            request = self.make_request(
+                "/sso/portal/callback",
+                query_string=b"ticket=t3",
+            )
+            manager = PortalSSOManager(request.app)
+
+            async def _fake_validate(_ticket):
+                return {
+                    "portal_sub": "GLOBAL-USER-3",
+                    "account_no": "",
+                    "actual_name": "Merged User",
+                    "display_name": "mergeuser",
+                    "nick_name": "Merged User",
+                    "email": "merge@example.com",
+                    "roles": ["common"],
+                    "tenant_id": "tenant-1",
+                    "company_name": "company-1",
+                    "telephone": "",
+                }
+
+            monkeypatch.setattr(manager, "_validate_ticket", _fake_validate)
+
+            self.run_async(manager.handle_callback(request, db=self.db))
+
+            linked_user = Users.get_user_by_id("email-merge-user", db=self.db)
+            assert linked_user is not None
+            assert linked_user.name == "Merged User"
+            assert linked_user.oauth["portal"]["sub"] == "GLOBAL-USER-3"
+            assert linked_user.email == "merge@example.com"
+        finally:
+            config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value = prev_merge
+            self._restore_portal_sso_config(snapshot)

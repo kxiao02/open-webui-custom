@@ -367,6 +367,7 @@
 					event.preventDefault();
 					document.getElementById('generate-message-pair-button')?.click();
 				} else if (
+					!event.repeat &&
 					isShortcutMatch(event, shortcuts[Shortcut.REGENERATE_RESPONSE]) &&
 					document.activeElement?.id === 'chat-input'
 				) {

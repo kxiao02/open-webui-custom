@@ -12,6 +12,7 @@
 	import { copyToClipboard, unescapeHtml } from '$lib/utils';
 
 	import Image from '$lib/components/common/Image.svelte';
+	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import KatexRenderer from './KatexRenderer.svelte';
 	import Source from './Source.svelte';
 	import HtmlToken from './HTMLToken.svelte';
@@ -122,18 +123,13 @@
 	{:else if token.type === 'iframe'}
 		{@const iframeFileRef = normalizeFileRef(token?.fileId)}
 		{#if iframeFileRef}
-			<iframe
+			<FullHeightIframe
 				src={`${WEBUI_BASE_URL}/api/v1/files/${iframeFileRef}/content`}
 				title={iframeFileRef}
-				width="100%"
-				frameborder="0"
-				on:load={(e) => {
-					try {
-						e.currentTarget.style.height =
-							e.currentTarget.contentWindow.document.body.scrollHeight + 20 + 'px';
-					} catch {}
-				}}
-			></iframe>
+				iframeClassName="w-full"
+				allowSameOrigin={true}
+				useSandbox={false}
+			/>
 		{/if}
 	{:else if token.type === 'mention'}
 		<MentionToken {token} />

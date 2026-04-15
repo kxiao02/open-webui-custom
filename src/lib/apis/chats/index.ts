@@ -670,15 +670,24 @@ export const getChatById = async (
 		? `${WEBUI_API_BASE_URL}/chats/${id}?${query}`
 		: `${WEBUI_API_BASE_URL}/chats/${id}`;
 
-	const res = await fetch(url, {
-		method: 'GET',
-		headers: {
-			Accept: 'application/json',
-			'Content-Type': 'application/json',
-			...(token && { authorization: `Bearer ${token}` })
-		}
-	})
+	const requestChat = async (cache: RequestCache = 'no-store') =>
+		fetch(url, {
+			method: 'GET',
+			cache,
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				...(token && { authorization: `Bearer ${token}` })
+			}
+		});
+
+	const res = await requestChat()
 		.then(async (res) => {
+			// Some browsers can surface a 304 for cached API responses during chat reloads.
+			// Retry uncached so the chat page never rehydrates from stale conversation state.
+			if (res.status === 304) {
+				res = await requestChat('reload');
+			}
 			if (!res.ok) throw await res.json();
 			return res.json();
 		})

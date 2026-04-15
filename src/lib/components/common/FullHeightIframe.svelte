@@ -1,62 +1,64 @@
 <script lang="ts">
+	import { browser } from '$app/environment';
 	import { onDestroy, onMount, tick } from 'svelte';
 
-	// Props
-	export let src: string | null = null; // URL or raw HTML (auto-detected)
+	import {
+		IFRAME_THEME_MESSAGE_TYPE,
+		buildIframeRequestHeaders,
+		buildThemedIframeDocument,
+		captureIframeThemeSnapshot,
+		isHtmlLikeResponse,
+		isIframeMarkup,
+		resolveIframeUrl,
+		shouldFetchIframeUrl
+	} from '$lib/utils/iframe';
+
+	export let src: string | null = null;
 	export let title = 'Embedded Content';
-	export let initialHeight: number | null = null; // initial height in px, null = auto
-
+	export let initialHeight: number | null = null;
 	export let iframeClassName = 'w-full rounded-2xl';
-
-	export let args = null;
+	export let args: unknown = null;
 
 	export let allowScripts = true;
 	export let allowForms = false;
-
-	export let allowSameOrigin = false; // set to true only when you trust the content
+	export let allowSameOrigin = false;
 	export let allowPopups = false;
 	export let allowDownloads = true;
+	export let useSandbox = true;
 
 	export let referrerPolicy: HTMLIFrameElement['referrerPolicy'] =
 		'strict-origin-when-cross-origin';
 	export let allowFullscreen = true;
-
-	export let payload = null; // payload to send into the iframe on request
+	export let payload: unknown = null;
 
 	let iframe: HTMLIFrameElement | null = null;
 	let iframeSrc: string | null = null;
 	let iframeDoc: string | null = null;
+	let loadRequestId = 0;
+	let injectedBlobUrls: string[] = [];
+	let themeObserver: MutationObserver | null = null;
 
-	// Derived: build sandbox attribute from flags
-	$: sandbox =
-		[
-			allowScripts && 'allow-scripts',
-			allowForms && 'allow-forms',
-			allowSameOrigin && 'allow-same-origin',
-			allowPopups && 'allow-popups',
-			allowDownloads && 'allow-downloads'
-		]
-			.filter(Boolean)
-			.join(' ') || undefined;
+	$: sandbox = useSandbox
+		? [
+				allowScripts && 'allow-scripts',
+				allowForms && 'allow-forms',
+				allowSameOrigin && 'allow-same-origin',
+				allowPopups && 'allow-popups',
+				allowDownloads && 'allow-downloads'
+			]
+				.filter(Boolean)
+				.join(' ') || undefined
+		: undefined;
 
-	// Detect URL vs raw HTML and prep src/srcdoc
-	$: isUrl = typeof src === 'string' && /^(https?:)?\/\//i.test(src);
-	$: if (src) {
-		setIframeSrc();
+	$: if (browser && src) {
+		void refreshIframeSource();
+	} else {
+		loadRequestId += 1;
+		iframeSrc = null;
+		iframeDoc = null;
+		releaseInjectedBlobUrls();
 	}
 
-	const setIframeSrc = async () => {
-		await tick();
-		if (isUrl) {
-			iframeSrc = src as string;
-			iframeDoc = null;
-		} else {
-			iframeDoc = await processHtmlForDeps(src as string);
-			iframeSrc = null;
-		}
-	};
-
-	// Alpine directives detection
 	const alpineDirectives = [
 		'x-data',
 		'x-init',
@@ -78,114 +80,214 @@
 		'x-id'
 	];
 
-	async function processHtmlForDeps(html: string): Promise<string> {
-		if (!allowSameOrigin) return html;
+	const releaseInjectedBlobUrls = () => {
+		injectedBlobUrls.forEach((blobUrl) => URL.revokeObjectURL(blobUrl));
+		injectedBlobUrls = [];
+	};
+
+	const buildDependencyMarkup = async (html: string) => {
+		if (!allowSameOrigin) {
+			return '';
+		}
 
 		const scriptTags: string[] = [];
-
-		// --- Alpine.js detection & injection ---
-		const hasAlpineDirectives = alpineDirectives.some((dir) => html.includes(dir));
+		const hasAlpineDirectives = alpineDirectives.some((directive) => html.includes(directive));
 		if (hasAlpineDirectives) {
 			try {
 				const { default: alpineCode } = await import('alpinejs/dist/cdn.min.js?raw');
 				const alpineBlob = new Blob([alpineCode], { type: 'text/javascript' });
 				const alpineUrl = URL.createObjectURL(alpineBlob);
-				const alpineTag = `<script src="${alpineUrl}" defer><\/script>`;
-				scriptTags.push(alpineTag);
+				injectedBlobUrls = [...injectedBlobUrls, alpineUrl];
+				scriptTags.push(`<script src="${alpineUrl}" defer><\/script>`);
 			} catch (error) {
 				console.error('Error processing Alpine for iframe:', error);
 			}
 		}
 
-		// --- Chart.js detection & injection ---
 		const chartJsDirectives = ['new Chart(', 'Chart.'];
-		const hasChartJsDirectives = chartJsDirectives.some((dir) => html.includes(dir));
+		const hasChartJsDirectives = chartJsDirectives.some((directive) => html.includes(directive));
 		if (hasChartJsDirectives) {
 			try {
-				// import chartUrl from 'chart.js/auto?url';
 				const { default: Chart } = await import('chart.js/auto');
-				(window as any).Chart = Chart;
-
-				const chartTag = `<script>
-window.Chart = parent.Chart; // Chart previously assigned on parent
-<\/script>`;
-				scriptTags.push(chartTag);
+				(window as Window & { Chart?: unknown }).Chart = Chart;
+				scriptTags.push(`<script>
+window.Chart = parent.Chart
+<\/script>`);
 			} catch (error) {
 				console.error('Error processing Chart.js for iframe:', error);
 			}
 		}
 
-		// If nothing to inject, return original HTML
-		if (scriptTags.length === 0) return html;
+		return scriptTags.join('\n');
+	};
 
-		const tags = scriptTags.join('\n');
-
-		// Prefer injecting into <head>, then before </body>, otherwise prepend
-		if (html.includes('</head>')) {
-			return html.replace('</head>', `${tags}\n</head>`);
+	const loadUrlAsHtml = async (resolvedUrl: string) => {
+		if (!shouldFetchIframeUrl(resolvedUrl)) {
+			return null;
 		}
-		if (html.includes('</body>')) {
-			return html.replace('</body>', `${tags}\n</body>`);
-		}
-		return `${tags}\n${html}`;
-	}
 
-	// Try to measure same-origin content safely
+		try {
+			const requestHeaders = buildIframeRequestHeaders();
+			const response = await fetch(resolvedUrl, {
+				credentials: 'include',
+				headers: Object.keys(requestHeaders).length > 0 ? requestHeaders : undefined
+			});
+			if (!response.ok) {
+				return null;
+			}
+
+			const contentType = response.headers.get('content-type') ?? '';
+			if (!isHtmlLikeResponse(resolvedUrl, contentType)) {
+				return null;
+			}
+
+			return await response.text();
+		} catch (error) {
+			console.error('Error loading iframe HTML source:', error);
+			return null;
+		}
+	};
+
+	const buildIframeDocument = async (html: string, baseHref: string | null = null) => {
+		const headMarkup = await buildDependencyMarkup(html);
+		return buildThemedIframeDocument({
+			html,
+			baseHref,
+			theme: captureIframeThemeSnapshot(),
+			headMarkup
+		});
+	};
+
+	const refreshIframeSource = async () => {
+		const requestId = ++loadRequestId;
+		releaseInjectedBlobUrls();
+		await tick();
+
+		const nextSrc = src?.trim() ?? '';
+		if (!nextSrc) {
+			if (requestId === loadRequestId) {
+				iframeSrc = null;
+				iframeDoc = null;
+			}
+			return;
+		}
+
+		if (isIframeMarkup(nextSrc)) {
+			const nextDoc = await buildIframeDocument(nextSrc);
+			if (requestId !== loadRequestId) {
+				return;
+			}
+			iframeDoc = nextDoc;
+			iframeSrc = null;
+			return;
+		}
+
+		const resolvedUrl = resolveIframeUrl(nextSrc);
+		if (!resolvedUrl) {
+			const nextDoc = await buildIframeDocument(nextSrc);
+			if (requestId !== loadRequestId) {
+				return;
+			}
+			iframeDoc = nextDoc;
+			iframeSrc = null;
+			return;
+		}
+
+		const urlHtml = await loadUrlAsHtml(resolvedUrl);
+		if (requestId !== loadRequestId) {
+			return;
+		}
+
+		if (urlHtml !== null) {
+			const nextDoc = await buildIframeDocument(urlHtml, resolvedUrl);
+			if (requestId !== loadRequestId) {
+				releaseInjectedBlobUrls();
+				return;
+			}
+			iframeDoc = nextDoc;
+			iframeSrc = null;
+			return;
+		}
+
+		iframeSrc = resolvedUrl;
+		iframeDoc = null;
+	};
+
+	const postThemeToIframe = () => {
+		if (!iframe?.contentWindow) {
+			return;
+		}
+
+		iframe.contentWindow.postMessage(
+			{
+				type: IFRAME_THEME_MESSAGE_TYPE,
+				theme: captureIframeThemeSnapshot()
+			},
+			'*'
+		);
+	};
+
 	function resizeSameOrigin() {
 		if (!iframe) return;
 		try {
 			const doc = iframe.contentDocument || iframe.contentWindow?.document;
-			console.log('iframe doc:', doc);
 			if (!doc) return;
-			const h = Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0);
-			if (h > 0) iframe.style.height = h + 20 + 'px';
+			const height = Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0);
+			if (height > 0) {
+				iframe.style.height = height + 20 + 'px';
+			}
 		} catch {
-			// Cross-origin → rely on postMessage from inside the iframe
+			// Cross-origin documents report their own height via postMessage.
 		}
 	}
 
-	function onMessage(e: MessageEvent) {
-		if (!iframe || e.source !== iframe.contentWindow) return;
+	function onMessage(event: MessageEvent) {
+		if (!iframe || event.source !== iframe.contentWindow) return;
 
-		const data = e.data || {};
+		const data = event.data || {};
 		if (data?.type === 'iframe:height' && typeof data.height === 'number') {
 			iframe.style.height = Math.max(0, data.height) + 'px';
 		}
 
-		// Pong message for testing connectivity
 		if (data?.type === 'pong') {
-			console.log('Received pong from iframe:', data);
-
-			// Optional: reply back
 			iframe.contentWindow?.postMessage({ type: 'pong:ack' }, '*');
 		}
 
-		// Send payload data if requested
 		if (data?.type === 'payload') {
 			iframe.contentWindow?.postMessage(
-				{ type: 'payload', requestId: data?.requestId ?? null, payload: payload },
+				{ type: 'payload', requestId: data?.requestId ?? null, payload },
 				'*'
 			);
 		}
 	}
 
-	// When the iframe loads, try same-origin resize (cross-origin will noop)
-	const onLoad = async () => {
-		requestAnimationFrame(resizeSameOrigin);
+	const onLoad = () => {
+		requestAnimationFrame(() => {
+			resizeSameOrigin();
+			postThemeToIframe();
+		});
 
-		// if arguments are provided, inject them into the iframe window
 		if (args && iframe?.contentWindow) {
-			(iframe.contentWindow as any).args = args;
+			(iframe.contentWindow as Window & { args?: unknown }).args = args;
 		}
 	};
 
-	// Ensure event listener bound only while component lives
 	onMount(() => {
 		window.addEventListener('message', onMessage);
+		themeObserver = new MutationObserver(() => {
+			postThemeToIframe();
+			requestAnimationFrame(resizeSameOrigin);
+		});
+		themeObserver.observe(document.documentElement, {
+			attributes: true,
+			attributeFilter: ['class', 'style']
+		});
 	});
 
 	onDestroy(() => {
+		themeObserver?.disconnect();
 		window.removeEventListener('message', onMessage);
+		releaseInjectedBlobUrls();
 	});
 </script>
 
@@ -195,25 +297,25 @@ window.Chart = parent.Chart; // Chart previously assigned on parent
 		srcdoc={iframeDoc}
 		{title}
 		class={iframeClassName}
-		style={`${initialHeight ? `height:${initialHeight}px;` : ''}`}
+		style={initialHeight ? `height:${initialHeight}px;` : undefined}
 		width="100%"
 		frameborder="0"
 		{sandbox}
-		{allowFullscreen}
+		allowfullscreen={allowFullscreen}
 		on:load={onLoad}
-	/>
+	></iframe>
 {:else if iframeSrc}
 	<iframe
 		bind:this={iframe}
 		src={iframeSrc}
 		{title}
 		class={iframeClassName}
-		style={`${initialHeight ? `height:${initialHeight}px;` : ''}`}
+		style={initialHeight ? `height:${initialHeight}px;` : undefined}
 		width="100%"
 		frameborder="0"
 		{sandbox}
 		referrerpolicy={referrerPolicy}
-		{allowFullscreen}
+		allowfullscreen={allowFullscreen}
 		on:load={onLoad}
-	/>
+	></iframe>
 {/if}

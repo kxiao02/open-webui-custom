@@ -1,17 +1,18 @@
 <script lang="ts">
 	import { getContext, onDestroy, tick } from 'svelte';
 	import panzoom, { type PanZoom } from 'panzoom';
-	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 	import { settings } from '$lib/stores';
 	import { isCodeFile } from '$lib/utils/codeHighlight';
 	import { initMermaid, renderMermaidDiagram } from '$lib/utils';
+	import { isMarkdownPreviewPath, renderMarkdownPreviewHtml } from '$lib/utils/markdownPreview';
 	import Spinner from '../../common/Spinner.svelte';
 	import PDFViewer from '../../common/PDFViewer.svelte';
 	import JsonTreeView from './JsonTreeView.svelte';
 	import NotebookView from './NotebookView.svelte';
 	import SqliteView from './SqliteView.svelte';
 	import FileCodeEditor from './FileCodeEditor.svelte';
+	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 
 	let pdfViewerRef: PDFViewer;
 	let fileCodeEditorRef: FileCodeEditor;
@@ -89,13 +90,12 @@
 
 	$: isTextFile = fileContent !== null && fileImageUrl === null && filePdfData === null;
 
-	const MD_EXTS = new Set(['md', 'markdown', 'mdx']);
 	const CSV_EXTS = new Set(['csv', 'tsv']);
 	const HTML_EXTS = new Set(['html', 'htm']);
 	const JSON_EXTS = new Set(['json', 'jsonc', 'jsonl', 'json5']);
 	const getExt = (path: string | null) => path?.split('.').pop()?.toLowerCase() ?? '';
 
-	$: isMarkdown = MD_EXTS.has(getExt(selectedFile));
+	$: isMarkdown = isMarkdownPreviewPath(selectedFile);
 	$: isCsv = CSV_EXTS.has(getExt(selectedFile));
 	$: isHtml = HTML_EXTS.has(getExt(selectedFile));
 	$: isJson = JSON_EXTS.has(getExt(selectedFile));
@@ -103,10 +103,7 @@
 	$: isNotebook = getExt(selectedFile) === 'ipynb';
 	$: isCode = isCodeFile(selectedFile);
 	$: csvDelimiter = getExt(selectedFile) === 'tsv' ? '\t' : ',';
-	$: renderedHtml =
-		isMarkdown && fileContent
-			? DOMPurify.sanitize(marked.parse(fileContent, { async: false }) as string)
-			: '';
+	$: renderedHtml = isMarkdown && fileContent ? renderMarkdownPreviewHtml(fileContent) : '';
 
 	let markdownEl: HTMLDivElement;
 	let mermaidInstance: any = null;
@@ -403,13 +400,12 @@
 			{#if overlay}
 				<div class="absolute top-0 left-0 right-0 bottom-0 z-10"></div>
 			{/if}
-			<iframe
-				srcdoc={fileContent}
-				sandbox="allow-scripts allow-downloads{($settings?.iframeSandboxAllowForms ?? false)
-					? ' allow-forms'
-					: ''}{($settings?.iframeSandboxAllowSameOrigin ?? false) ? ' allow-same-origin' : ''}"
-				class="w-full h-full border-none bg-white"
+			<FullHeightIframe
+				src={fileContent}
 				title="HTML Preview"
+				iframeClassName="w-full h-full border-none bg-white"
+				allowForms={$settings?.iframeSandboxAllowForms ?? false}
+				allowSameOrigin={$settings?.iframeSandboxAllowSameOrigin ?? false}
 			/>
 		{:else if isHtml && showRaw}
 			<div class="h-full">

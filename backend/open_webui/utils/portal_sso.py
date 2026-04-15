@@ -13,6 +13,7 @@ from starlette.responses import RedirectResponse
 
 from open_webui.config import (
     JWT_EXPIRES_IN,
+    OAUTH_MERGE_ACCOUNTS_BY_EMAIL,
     PORTAL_SSO_AUTO_SIGNUP,
     PORTAL_SSO_APP_INITIATED_ENABLED,
     PORTAL_SSO_ENTRY_URL_TEMPLATE,
@@ -299,6 +300,31 @@ class PortalSSOManager:
                             )
                             user.email = real_email
                 else:
+                    if real_email and OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value:
+                        user = Users.get_user_by_email(real_email, db=db_session)
+                        if user:
+                            Users.update_user_oauth_by_id(
+                                user.id,
+                                "portal",
+                                profile["portal_sub"],
+                                payload=payload,
+                                db=db_session,
+                                commit=False,
+                            )
+
+                            if actual_name and actual_name != user.name:
+                                Users.update_user_by_id(
+                                    user.id,
+                                    {"name": actual_name},
+                                    db=db_session,
+                                    commit=False,
+                                )
+                                user.name = actual_name
+
+                    if user:
+                        db_session.commit()
+                        return user
+
                     if not PORTAL_SSO_AUTO_SIGNUP.value:
                         raise HTTPException(
                             status_code=status.HTTP_403_FORBIDDEN,

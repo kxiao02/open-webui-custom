@@ -88,7 +88,9 @@
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
+	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
 	import ChevronUp from '$lib/components/icons/ChevronUp.svelte';
+	import Document from '$lib/components/icons/Document.svelte';
 	import WrenchSolid from '$lib/components/icons/WrenchSolid.svelte';
 
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
@@ -194,10 +196,56 @@
 		return (hash >>> 0).toString(36);
 	};
 
-	const buildStructuredSignature = (value: unknown): string => {
-		const serialized = safeStringify(value);
-		if (!serialized) return '';
-		return `${serialized.length}:${hashString(serialized)}`;
+	const OUTPUT_SIGNATURE_MAX_DEPTH = 2;
+	const OUTPUT_SIGNATURE_MAX_ARRAY_ITEMS = 4;
+	const OUTPUT_SIGNATURE_MAX_OBJECT_KEYS = 8;
+	const OUTPUT_SIGNATURE_HEAD_CHARS = 160;
+	const OUTPUT_SIGNATURE_TAIL_CHARS = 96;
+
+	const buildStringSignature = (value: string): string => {
+		if (!value) return '0:0';
+		if (value.length <= OUTPUT_SIGNATURE_HEAD_CHARS + OUTPUT_SIGNATURE_TAIL_CHARS) {
+			return `${value.length}:${hashString(value)}`;
+		}
+
+		const sample = `${value.slice(0, OUTPUT_SIGNATURE_HEAD_CHARS)}::${value.slice(
+			-OUTPUT_SIGNATURE_TAIL_CHARS
+		)}`;
+		return `${value.length}:${hashString(sample)}`;
+	};
+
+	const buildStructuredSignature = (value: unknown, depth = 0): string => {
+		if (value === null || value === undefined) return '';
+		if (typeof value === 'string') return `s:${buildStringSignature(value)}`;
+		if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+			return `${typeof value}:${String(value)}`;
+		}
+
+		if (Array.isArray(value)) {
+			if (depth >= OUTPUT_SIGNATURE_MAX_DEPTH) {
+				return `a:${value.length}`;
+			}
+			return `a:${value.length}[${value
+				.slice(0, OUTPUT_SIGNATURE_MAX_ARRAY_ITEMS)
+				.map((item) => buildStructuredSignature(item, depth + 1))
+				.join('|')}]`;
+		}
+
+		if (typeof value === 'object') {
+			const record = value as Record<string, unknown>;
+			const keys = Object.keys(record).sort();
+			if (depth >= OUTPUT_SIGNATURE_MAX_DEPTH) {
+				return `o:${keys.length}:${keys
+					.slice(0, OUTPUT_SIGNATURE_MAX_OBJECT_KEYS)
+					.join(',')}`;
+			}
+			return `o:${keys.length}{${keys
+				.slice(0, OUTPUT_SIGNATURE_MAX_OBJECT_KEYS)
+				.map((key) => `${key}=${buildStructuredSignature(record[key], depth + 1)}`)
+				.join('|')}}`;
+		}
+
+		return `${typeof value}:${String(value)}`;
 	};
 
 	const buildOutputSignature = (value: unknown): string => {
@@ -576,6 +624,25 @@
 		await triggerGeneratedFileDownload(file.url, file.name);
 	};
 
+	const getGeneratedFileBadgeLabel = (file: GeneratedFileItem): string => {
+		const extensionMatch = file.name.match(/\.([A-Za-z0-9]{1,16})$/);
+		if (extensionMatch?.[1]) {
+			return extensionMatch[1].toUpperCase();
+		}
+		return file.isImage ? 'IMAGE' : 'FILE';
+	};
+
+	const getGeneratedFileSummary = (file: GeneratedFileItem, active: boolean): string => {
+		const badgeLabel = getGeneratedFileBadgeLabel(file);
+		const actionLabel = active ? '预览已打开' : '点击查看预览';
+		return badgeLabel ? `${badgeLabel} · ${actionLabel}` : actionLabel;
+	};
+
+	const getGeneratedFileContainerClass = (active: boolean): string =>
+		active
+			? 'border-blue-200 bg-blue-50/90 shadow-xs dark:border-blue-900 dark:bg-blue-950/40'
+			: 'border-gray-200/90 bg-gray-50/85 hover:border-gray-300 hover:bg-gray-100/85 dark:border-gray-800 dark:bg-gray-900/80 dark:hover:border-gray-700 dark:hover:bg-gray-900';
+
 	const INLINE_GENERATED_FILES_MARKER = '<!--__GENERATED_FILES__-->';
 
 	const GENERATED_FILE_LINK_REGEX =
@@ -616,7 +683,7 @@
 	type ProcessToolCallItem = { key: string; attrs: Record<string, string> };
 	type ProcessToolVisualTiming = { firstSeenAt: number };
 
-	const MIN_PROCESS_RUNNING_MS = 900;
+	const MIN_PROCESS_RUNNING_MS = 450;
 	const processToolVisualTimingByKeyByMessageId = new Map<
 		string,
 		Map<string, ProcessToolVisualTiming>
@@ -2817,52 +2884,92 @@
 							{/if}
 
 							{#if displayGeneratedFiles.length > 0 && placeInlineGeneratedFiles}
-								<div
-									class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900/70"
-								>
-									<div
-										class="border-b border-gray-200 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:border-gray-800 dark:text-gray-300"
-									>
-										生成文件
-									</div>
-									<div class="space-y-1.5 p-2">
-										{#each displayGeneratedFiles as file}
-											<div
-												class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850"
-											>
-												<div class="min-w-0 flex items-center gap-2">
-													{#if file.isImage && file.url}
-														<img
-															src={file.url}
-															alt={file.name}
-															class="size-8 rounded-md border border-gray-200 object-cover dark:border-gray-700"
-														/>
-													{/if}
-													<div class="min-w-0">
-														<button
-															type="button"
-															class="line-clamp-1 text-left text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
-															on:click={() => {
-																openGeneratedFile(file);
-															}}
-														>
-															{file.name}
-														</button>
+								<div class="mt-3 space-y-2">
+									{#each displayGeneratedFiles as file}
+										{@const generatedFilePreviewOpen =
+											$showFilePreview && $selectedGeneratedFilePreviewId === file.id}
+										<div
+											class={`group relative overflow-hidden rounded-2xl border transition-all duration-150 focus-within:ring-2 focus-within:ring-blue-500/20 ${getGeneratedFileContainerClass(
+												generatedFilePreviewOpen
+											)}`}
+										>
+											<button
+												type="button"
+												class="absolute inset-0 z-0 rounded-2xl focus-visible:outline-none"
+												aria-label={`打开 ${file.name} 预览`}
+												on:click={() => {
+													openGeneratedFile(file);
+												}}
+											></button>
+
+											<div class="pointer-events-none relative z-10 flex min-w-0 items-center gap-3 px-3 py-2.5 pr-14">
+												{#if file.isImage && file.url}
+													<img
+														src={file.url}
+														alt={file.name}
+														class={`size-10 shrink-0 rounded-xl border object-cover shadow-sm ${
+															generatedFilePreviewOpen
+																? 'border-blue-200 dark:border-blue-800'
+																: 'border-gray-200 dark:border-gray-700'
+														}`}
+													/>
+												{:else}
+													<div
+														class={`flex size-10 shrink-0 items-center justify-center rounded-xl ${
+															generatedFilePreviewOpen
+																? 'bg-blue-100 text-blue-600 dark:bg-blue-950/70 dark:text-blue-300'
+																: 'bg-gray-200/70 text-gray-600 dark:bg-gray-800 dark:text-gray-200'
+														}`}
+													>
+														<Document className="size-4.5" />
+													</div>
+												{/if}
+
+												<div class="min-w-0 flex-1">
+													<div
+														class={`line-clamp-1 text-sm font-medium ${
+															generatedFilePreviewOpen
+																? 'text-blue-900 dark:text-blue-100'
+																: 'text-gray-800 dark:text-gray-100'
+														}`}
+													>
+														{file.name}
+													</div>
+													<div
+														class={`line-clamp-1 text-xs ${
+															generatedFilePreviewOpen
+																? 'text-blue-600 dark:text-blue-300'
+																: 'text-gray-500 dark:text-gray-400'
+														}`}
+													>
+														{getGeneratedFileSummary(file, generatedFilePreviewOpen)}
 													</div>
 												</div>
-												<button
-													type="button"
-													class="shrink-0 inline-flex size-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
-													title={$i18n.t('Download')}
-													on:click={async () => {
-														await downloadGeneratedFile(file);
-													}}
-												>
-													<Download className="size-3.5" />
-												</button>
+
+												<div class="shrink-0 text-gray-400 dark:text-gray-500">
+													<ChevronRight
+														className={`size-4 transition-transform duration-150 group-hover:translate-x-0.5 ${
+															generatedFilePreviewOpen
+																? 'text-blue-500 dark:text-blue-300'
+																: ''
+														}`}
+														strokeWidth="3"
+													/>
+												</div>
 											</div>
-										{/each}
-									</div>
+
+											<button
+												type="button"
+												class="absolute right-2 top-1/2 z-20 inline-flex size-8 -translate-y-1/2 items-center justify-center rounded-lg border border-transparent bg-white/80 text-gray-600 transition hover:border-gray-200 hover:bg-white hover:text-blue-600 dark:bg-gray-950/70 dark:text-gray-200 dark:hover:border-gray-700 dark:hover:bg-gray-900 dark:hover:text-blue-400"
+												title={$i18n.t('Download')}
+												on:click|stopPropagation={async () => {
+													await downloadGeneratedFile(file);
+												}}
+											>
+												<Download className="size-3.5" />
+											</button>
+										</div>
+									{/each}
 								</div>
 
 								{#if finalContentAfterGeneratedFiles}
@@ -2909,52 +3016,92 @@
 							{/if}
 
 							{#if displayGeneratedFiles.length > 0 && !placeInlineGeneratedFiles}
-								<div
-									class="mt-3 rounded-xl border border-gray-200/90 bg-gray-50/70 dark:border-gray-800 dark:bg-gray-900/70"
-								>
-									<div
-										class="border-b border-gray-200 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-gray-600 dark:border-gray-800 dark:text-gray-300"
-									>
-										生成文件
-									</div>
-									<div class="space-y-1.5 p-2">
-										{#each displayGeneratedFiles as file}
-											<div
-												class="flex items-center justify-between gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1.5 dark:border-gray-700 dark:bg-gray-850"
-											>
-												<div class="min-w-0 flex items-center gap-2">
-													{#if file.isImage && file.url}
-														<img
-															src={file.url}
-															alt={file.name}
-															class="size-8 rounded-md border border-gray-200 object-cover dark:border-gray-700"
-														/>
-													{/if}
-													<div class="min-w-0">
-														<button
-															type="button"
-															class="line-clamp-1 text-left text-[13px] font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-400"
-															on:click={() => {
-																openGeneratedFile(file);
-															}}
-														>
-															{file.name}
-														</button>
+								<div class="mt-3 space-y-2">
+									{#each displayGeneratedFiles as file}
+										{@const generatedFilePreviewOpen =
+											$showFilePreview && $selectedGeneratedFilePreviewId === file.id}
+										<div
+											class={`group relative overflow-hidden rounded-2xl border transition-all duration-150 focus-within:ring-2 focus-within:ring-blue-500/20 ${getGeneratedFileContainerClass(
+												generatedFilePreviewOpen
+											)}`}
+										>
+											<button
+												type="button"
+												class="absolute inset-0 z-0 rounded-2xl focus-visible:outline-none"
+												aria-label={`打开 ${file.name} 预览`}
+												on:click={() => {
+													openGeneratedFile(file);
+												}}
+											></button>
+
+											<div class="pointer-events-none relative z-10 flex min-w-0 items-center gap-3 px-3 py-2.5 pr-14">
+												{#if file.isImage && file.url}
+													<img
+														src={file.url}
+														alt={file.name}
+														class={`size-10 shrink-0 rounded-xl border object-cover shadow-sm ${
+															generatedFilePreviewOpen
+																? 'border-blue-200 dark:border-blue-800'
+																: 'border-gray-200 dark:border-gray-700'
+														}`}
+													/>
+												{:else}
+													<div
+														class={`flex size-10 shrink-0 items-center justify-center rounded-xl ${
+															generatedFilePreviewOpen
+																? 'bg-blue-100 text-blue-600 dark:bg-blue-950/70 dark:text-blue-300'
+																: 'bg-gray-200/70 text-gray-600 dark:bg-gray-800 dark:text-gray-200'
+														}`}
+													>
+														<Document className="size-4.5" />
+													</div>
+												{/if}
+
+												<div class="min-w-0 flex-1">
+													<div
+														class={`line-clamp-1 text-sm font-medium ${
+															generatedFilePreviewOpen
+																? 'text-blue-900 dark:text-blue-100'
+																: 'text-gray-800 dark:text-gray-100'
+														}`}
+													>
+														{file.name}
+													</div>
+													<div
+														class={`line-clamp-1 text-xs ${
+															generatedFilePreviewOpen
+																? 'text-blue-600 dark:text-blue-300'
+																: 'text-gray-500 dark:text-gray-400'
+														}`}
+													>
+														{getGeneratedFileSummary(file, generatedFilePreviewOpen)}
 													</div>
 												</div>
-												<button
-													type="button"
-													class="shrink-0 inline-flex size-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-100 hover:text-blue-600 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-blue-400"
-													title={$i18n.t('Download')}
-													on:click={async () => {
-														await downloadGeneratedFile(file);
-													}}
-												>
-													<Download className="size-3.5" />
-												</button>
+
+												<div class="shrink-0 text-gray-400 dark:text-gray-500">
+													<ChevronRight
+														className={`size-4 transition-transform duration-150 group-hover:translate-x-0.5 ${
+															generatedFilePreviewOpen
+																? 'text-blue-500 dark:text-blue-300'
+																: ''
+														}`}
+														strokeWidth="3"
+													/>
+												</div>
 											</div>
-										{/each}
-									</div>
+
+											<button
+												type="button"
+												class="absolute right-2 top-1/2 z-20 inline-flex size-8 -translate-y-1/2 items-center justify-center rounded-lg border border-transparent bg-white/80 text-gray-600 transition hover:border-gray-200 hover:bg-white hover:text-blue-600 dark:bg-gray-950/70 dark:text-gray-200 dark:hover:border-gray-700 dark:hover:bg-gray-900 dark:hover:text-blue-400"
+												title={$i18n.t('Download')}
+												on:click|stopPropagation={async () => {
+													await downloadGeneratedFile(file);
+												}}
+											>
+												<Download className="size-3.5" />
+											</button>
+										</div>
+									{/each}
 								</div>
 							{/if}
 
