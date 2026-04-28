@@ -3295,6 +3295,28 @@ def _collect_generated_files_from_output_items(output: Any) -> list[dict]:
     return _merge_generated_file_entries(collected_files)
 
 
+def _collect_embeds_from_output_items(output: Any) -> list[str]:
+    if not isinstance(output, list):
+        return []
+
+    collected_embeds: list[Any] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+
+        embeds = item.get("embeds")
+        if isinstance(embeds, (list, tuple, str)):
+            collected_embeds.append(embeds)
+
+        item_metadata = item.get("metadata")
+        if isinstance(item_metadata, dict):
+            metadata_embeds = item_metadata.get("embeds")
+            if isinstance(metadata_embeds, (list, tuple, str)):
+                collected_embeds.append(metadata_embeds)
+
+    return _merge_embed_entries(*collected_embeds)
+
+
 def _output_contains_proxy_generated_files(output: Any) -> bool:
     return any(
         _is_proxy_generated_file_entry(item)
@@ -3505,15 +3527,27 @@ def _extract_generated_files_from_choices(choices: Any) -> list[dict]:
     return generated_files
 
 
+def _normalize_embed_entry(value: Any) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    return normalized
+
+
 def _merge_embed_entries(*groups: Any) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
 
     for group in groups:
-        if not isinstance(group, list):
+        if isinstance(group, str):
+            items = [group]
+        elif isinstance(group, (list, tuple)):
+            items = group
+        else:
             continue
-        for item in group:
-            normalized = str(item or "").strip()
+
+        for item in items:
+            normalized = _normalize_embed_entry(item)
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
@@ -4077,7 +4111,7 @@ def _extract_embeds_from_choices(choices: Any) -> list[str]:
             if not isinstance(items, list):
                 continue
             for item in items:
-                normalized = str(item or "").strip()
+                normalized = _normalize_embed_entry(item)
                 if not normalized or normalized in seen:
                     continue
                 seen.add(normalized)
@@ -8083,8 +8117,10 @@ async def non_streaming_chat_response_handler(response, ctx):
                     bridge_generated_files,
                     output_generated_files,
                 )
+                output_embeds = _collect_embeds_from_output_items(response_output)
                 combined_embeds = _merge_embed_entries(
                     bridge_embeds,
+                    output_embeds,
                     _extract_embeds_from_choices([{"message": message}]),
                 )
                 if combined_generated_files:
@@ -8146,6 +8182,11 @@ async def non_streaming_chat_response_handler(response, ctx):
                     message_metadata["embeds"] = combined_embeds
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
+                completion_metadata = {}
+                if combined_generated_files:
+                    completion_metadata["generated_files"] = combined_generated_files
+                if combined_embeds:
+                    completion_metadata["embeds"] = combined_embeds
 
                 await event_emitter(
                     {
@@ -8160,8 +8201,8 @@ async def non_streaming_chat_response_handler(response, ctx):
                                 else {}
                             ),
                             **(
-                                {"metadata": {"generated_files": combined_generated_files}}
-                                if combined_generated_files
+                                {"metadata": completion_metadata}
+                                if completion_metadata
                                 else {}
                             ),
                             **(
@@ -8561,6 +8602,9 @@ async def streaming_chat_response_handler(response, ctx):
                 else:
                     output = []
 
+            accumulated_embeds = _merge_embed_entries(
+                message.get("embeds", []) if isinstance(message, dict) else []
+            )
             usage = None
             stream_done = False
             has_visible_status_event = any(
@@ -8649,6 +8693,7 @@ async def streaming_chat_response_handler(response, ctx):
                     nonlocal usage
                     nonlocal output
                     nonlocal stream_done
+                    nonlocal accumulated_embeds
 
                     response_tool_calls = []
 
@@ -8945,6 +8990,11 @@ async def streaming_chat_response_handler(response, ctx):
                                             normalized_embeds.append(embed)
                                         if not normalized_embeds:
                                             normalized_embeds = []
+                                        if normalized_embeds:
+                                            accumulated_embeds = _merge_embed_entries(
+                                                accumulated_embeds,
+                                                normalized_embeds,
+                                            )
                                         delta_metadata = delta.get("metadata")
                                         if isinstance(delta_metadata, dict):
                                             delta_metadata["embeds"] = normalized_embeds
@@ -10051,7 +10101,11 @@ async def streaming_chat_response_handler(response, ctx):
                 combined_generated_files = _merge_generated_file_entries(
                     stabilized_generated_files
                 )
-                combined_embeds = _merge_embed_entries()
+                output_embeds = _collect_embeds_from_output_items(output)
+                combined_embeds = _merge_embed_entries(
+                    accumulated_embeds,
+                    output_embeds,
+                )
                 retrieval_generated_files, retrieval_embeds = (
                     _select_retrieval_source_visual_payloads(
                         metadata,
@@ -10080,6 +10134,11 @@ async def streaming_chat_response_handler(response, ctx):
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
                 output, final_payload = _build_chat_completion_payload(output, fallback_content=content)
+                completion_metadata = {}
+                if isinstance(message_files, list) and message_files:
+                    completion_metadata["generated_files"] = message_files
+                if combined_embeds:
+                    completion_metadata["embeds"] = combined_embeds
 
                 data = {
                     "done": True,
@@ -10091,8 +10150,8 @@ async def streaming_chat_response_handler(response, ctx):
                         else {}
                     ),
                     **(
-                        {"metadata": {"generated_files": message_files}}
-                        if isinstance(message_files, list) and message_files
+                        {"metadata": completion_metadata}
+                        if completion_metadata
                         else {}
                     ),
                     **({"embeds": combined_embeds} if combined_embeds else {}),

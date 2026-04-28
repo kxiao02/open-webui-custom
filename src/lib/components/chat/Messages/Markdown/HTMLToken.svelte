@@ -139,22 +139,12 @@
 		{@const match = tokenText.match(/<iframe\s+[^>]*src="([^"]+)"[^>]*><\/iframe>/)}
 		{@const iframeSrc = match && match[1]}
 		{#if iframeSrc}
-				<iframe
-					class="w-full my-2"
-					src={normalizeMediaUrl(iframeSrc)}
-					title="Embedded content"
-					frameborder="0"
-					sandbox=""
-					on:load={(e) => {
-						try {
-							const frame = e.currentTarget as HTMLIFrameElement;
-							const body = frame.contentWindow?.document.body;
-							if (body) {
-								frame.style.height = body.scrollHeight + 20 + 'px';
-							}
-						} catch {}
-					}}
-				></iframe>
+			<FullHeightIframe
+				src={normalizeMediaUrl(iframeSrc)}
+				title="Embedded content"
+				iframeClassName="w-full my-2"
+				sandboxPreset="strict"
+			/>
 		{:else}
 			{tokenText}
 		{/if}

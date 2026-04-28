@@ -787,6 +787,28 @@ async def disconnect(sid):
         # print(f"Unknown session ID {sid} disconnected")
 
 
+def _merge_embed_entries(*groups):
+    merged = []
+    seen = set()
+
+    for group in groups:
+        if isinstance(group, str):
+            items = [group]
+        elif isinstance(group, (list, tuple)):
+            items = group
+        else:
+            continue
+
+        for item in items:
+            normalized = str(item or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
+
+    return merged
+
+
 def get_event_emitter(request_info, update_db=True):
     async def __event_emitter__(event_data):
         user_id = request_info["user_id"]
@@ -858,8 +880,10 @@ def get_event_emitter(request_info, update_db=True):
                     request_info["message_id"],
                 )
 
-                embeds = event_data.get("data", {}).get("embeds", [])
-                embeds.extend(message.get("embeds", []))
+                embeds = _merge_embed_entries(
+                    message.get("embeds", []) if isinstance(message, dict) else [],
+                    event_data.get("data", {}).get("embeds", []),
+                )
 
                 await asyncio.to_thread(
                     Chats.upsert_message_to_chat_by_id_and_message_id,

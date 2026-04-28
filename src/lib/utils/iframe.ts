@@ -22,6 +22,92 @@ const SYNCED_ROOT_CSS_VARIABLES = [
 export const IFRAME_THEME_MESSAGE_TYPE = 'open-webui:theme';
 const IFRAME_HEIGHT_PADDING_PX = 20;
 
+export type IframeSandboxPreset = 'default' | 'strict' | 'trusted';
+
+export type IframeSandboxPolicy = {
+	useSandbox: boolean;
+	allowScripts: boolean;
+	allowForms: boolean;
+	allowSameOrigin: boolean;
+	allowPopups: boolean;
+	allowDownloads: boolean;
+};
+
+type ResolveIframeSandboxPolicyOptions = {
+	preset?: IframeSandboxPreset;
+	useSandbox?: boolean | null;
+	allowScripts?: boolean | null;
+	allowForms?: boolean | null;
+	allowSameOrigin?: boolean | null;
+	allowPopups?: boolean | null;
+	allowDownloads?: boolean | null;
+};
+
+const IFRAME_SANDBOX_PRESETS: Record<IframeSandboxPreset, IframeSandboxPolicy> = {
+	default: {
+		useSandbox: true,
+		allowScripts: true,
+		allowForms: false,
+		allowSameOrigin: false,
+		allowPopups: false,
+		allowDownloads: true
+	},
+	strict: {
+		useSandbox: true,
+		allowScripts: false,
+		allowForms: false,
+		allowSameOrigin: false,
+		allowPopups: false,
+		allowDownloads: false
+	},
+	trusted: {
+		useSandbox: false,
+		allowScripts: true,
+		allowForms: true,
+		allowSameOrigin: true,
+		allowPopups: true,
+		allowDownloads: true
+	}
+};
+
+const applyPolicyOverride = (
+	baseValue: boolean,
+	overrideValue: boolean | null | undefined
+): boolean => {
+	return overrideValue ?? baseValue;
+};
+
+export const resolveIframeSandboxPolicy = (
+	options: ResolveIframeSandboxPolicyOptions = {}
+): IframeSandboxPolicy => {
+	const basePolicy = IFRAME_SANDBOX_PRESETS[options.preset ?? 'default'];
+
+	return {
+		useSandbox: applyPolicyOverride(basePolicy.useSandbox, options.useSandbox),
+		allowScripts: applyPolicyOverride(basePolicy.allowScripts, options.allowScripts),
+		allowForms: applyPolicyOverride(basePolicy.allowForms, options.allowForms),
+		allowSameOrigin: applyPolicyOverride(basePolicy.allowSameOrigin, options.allowSameOrigin),
+		allowPopups: applyPolicyOverride(basePolicy.allowPopups, options.allowPopups),
+		allowDownloads: applyPolicyOverride(basePolicy.allowDownloads, options.allowDownloads)
+	};
+};
+
+export const buildIframeSandboxAttribute = (policy: IframeSandboxPolicy): string | undefined => {
+	if (!policy.useSandbox) {
+		return undefined;
+	}
+
+	return [
+		policy.allowScripts && 'allow-scripts',
+		policy.allowForms && 'allow-forms',
+		policy.allowSameOrigin && 'allow-same-origin',
+		policy.allowPopups && 'allow-popups',
+		policy.allowDownloads && 'allow-downloads'
+	]
+		.filter(Boolean)
+		.join(' ');
+};
+
 export type IframeThemeSnapshot = {
 	theme: string;
 	classes: string[];

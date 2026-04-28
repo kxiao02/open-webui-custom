@@ -4,13 +4,16 @@
 
 	import {
 		IFRAME_THEME_MESSAGE_TYPE,
+		buildIframeSandboxAttribute,
 		buildIframeRequestHeaders,
 		buildThemedIframeDocument,
 		captureIframeThemeSnapshot,
 		getIframeHeightWithPadding,
+		type IframeSandboxPreset,
 		isHtmlLikeResponse,
 		isIframeMarkup,
 		measureIframeDocumentHeight,
+		resolveIframeSandboxPolicy,
 		resolveIframeUrl,
 		shouldFetchIframeUrl
 	} from '$lib/utils/iframe';
@@ -21,12 +24,13 @@
 	export let iframeClassName = 'w-full rounded-2xl';
 	export let args: unknown = null;
 
-	export let allowScripts = true;
-	export let allowForms = false;
-	export let allowSameOrigin = false;
-	export let allowPopups = false;
-	export let allowDownloads = true;
-	export let useSandbox = true;
+	export let sandboxPreset: IframeSandboxPreset = 'default';
+	export let allowScripts: boolean | null = null;
+	export let allowForms: boolean | null = null;
+	export let allowSameOrigin: boolean | null = null;
+	export let allowPopups: boolean | null = null;
+	export let allowDownloads: boolean | null = null;
+	export let useSandbox: boolean | null = null;
 
 	export let referrerPolicy: HTMLIFrameElement['referrerPolicy'] =
 		'strict-origin-when-cross-origin';
@@ -39,18 +43,19 @@
 	let loadRequestId = 0;
 	let injectedBlobUrls: string[] = [];
 	let themeObserver: MutationObserver | null = null;
+	let sandboxPolicy = resolveIframeSandboxPolicy();
+	let sandbox: string | undefined = undefined;
 
-	$: sandbox = useSandbox
-		? [
-				allowScripts && 'allow-scripts',
-				allowForms && 'allow-forms',
-				allowSameOrigin && 'allow-same-origin',
-				allowPopups && 'allow-popups',
-				allowDownloads && 'allow-downloads'
-			]
-				.filter(Boolean)
-				.join(' ') || undefined
-		: undefined;
+	$: sandboxPolicy = resolveIframeSandboxPolicy({
+		preset: sandboxPreset,
+		useSandbox,
+		allowScripts,
+		allowForms,
+		allowSameOrigin,
+		allowPopups,
+		allowDownloads
+	});
+	$: sandbox = buildIframeSandboxAttribute(sandboxPolicy);
 
 	$: if (browser && src) {
 		void refreshIframeSource();
@@ -88,7 +93,7 @@
 	};
 
 	const buildDependencyMarkup = async (html: string) => {
-		if (!allowSameOrigin) {
+		if (!sandboxPolicy.allowSameOrigin) {
 			return '';
 		}
 
