@@ -55,6 +55,135 @@ const processOutsideCodeBlocks = (content: string, replacer: (str: string) => st
 	return replaceOutsideCode(content, replacer);
 };
 
+const PIPE_TABLE_SEPARATOR_CELL_RE = /^:?-{3,}:?$/;
+
+function looksLikePipeTableLine(line: string): boolean {
+	const trimmed = line.trim();
+	return trimmed.startsWith('|') && trimmed.lastIndexOf('|') > 0;
+}
+
+function getPipeTableIndent(line: string): string {
+	return line.match(/^(\s*)\|/)?.[1] ?? '';
+}
+
+function splitPipeTableCells(line: string): string[] {
+	let trimmed = line.trim();
+	if (trimmed.startsWith('|')) {
+		trimmed = trimmed.slice(1);
+	}
+	if (trimmed.endsWith('|')) {
+		trimmed = trimmed.slice(0, -1);
+	}
+
+	const cells: string[] = [];
+	let current = '';
+	let escaped = false;
+
+	for (const char of trimmed) {
+		if (char === '|' && !escaped) {
+			cells.push(current.trim());
+			current = '';
+			continue;
+		}
+
+		current += char;
+		escaped = char === '\\' && !escaped;
+	}
+
+	cells.push(current.trim());
+	return cells;
+}
+
+function isPipeTableSeparatorLine(line: string): boolean {
+	if (!looksLikePipeTableLine(line)) {
+		return false;
+	}
+
+	const cells = splitPipeTableCells(line);
+	return cells.length > 0 && cells.every((cell) => PIPE_TABLE_SEPARATOR_CELL_RE.test(cell));
+}
+
+function formatPipeTableRow(line: string, targetColumnCount: number): string {
+	const cells = splitPipeTableCells(line);
+	while (cells.length < targetColumnCount) {
+		cells.push('');
+	}
+
+	return `${getPipeTableIndent(line)}| ${cells.join(' | ')} |`;
+}
+
+function formatPipeTableSeparator(line: string, targetColumnCount: number): string {
+	const cells = splitPipeTableCells(line).map((cell) => cell.replace(/\s+/g, '') || '---');
+	while (cells.length < targetColumnCount) {
+		cells.push('---');
+	}
+
+	return `${getPipeTableIndent(line)}|${cells.join('|')}|`;
+}
+
+function normalizePipeTableBlocks(content: string): string {
+	return processOutsideCodeBlocks(content, (segment) => {
+		const lines = segment.split('\n');
+		const normalizedLines: string[] = [];
+
+		for (let index = 0; index < lines.length; ) {
+			const headerLine = lines[index];
+			const separatorLine = lines[index + 1];
+
+			if (
+				!headerLine ||
+				!separatorLine ||
+				!looksLikePipeTableLine(headerLine) ||
+				!isPipeTableSeparatorLine(separatorLine)
+			) {
+				normalizedLines.push(headerLine);
+				index += 1;
+				continue;
+			}
+
+			const headerCells = splitPipeTableCells(headerLine);
+			if (headerCells.length < 2) {
+				normalizedLines.push(headerLine);
+				index += 1;
+				continue;
+			}
+
+			normalizedLines.push(formatPipeTableRow(headerLine, headerCells.length));
+			normalizedLines.push(formatPipeTableSeparator(separatorLine, headerCells.length));
+			index += 2;
+
+			while (index < lines.length && looksLikePipeTableLine(lines[index])) {
+				normalizedLines.push(formatPipeTableRow(lines[index], headerCells.length));
+				index += 1;
+			}
+		}
+
+		return normalizedLines.join('\n');
+	});
+}
+
+function normalizeMermaidCodeBlocks(content: string): string {
+	return content
+		.split(/(```[\s\S]*?```|`[\s\S]*?`)/)
+		.map((segment) => {
+			if (!segment.startsWith('```')) {
+				return segment;
+			}
+
+			const match = segment.match(/^```(\s*mermaid[^\n]*)\n([\s\S]*?)```$/i);
+			if (!match) {
+				return segment;
+			}
+
+			const [, fence, body] = match;
+			const hasTrailingNewline = body.endsWith('\n');
+			const diagramBody = hasTrailingNewline ? body.slice(0, -1) : body;
+			const normalizedBody = normalizeMermaidDiagramSource(diagramBody);
+			return `\`\`\`${fence}\n${normalizedBody}${hasTrailingNewline ? '\n' : ''}\`\`\``;
+		})
+		.join('');
+}
+
 export const replaceTokens = (content, char, user) => {
 	const tokens = [
 		{ regex: /{{char}}/gi, replacement: char },
@@ -99,6 +228,8 @@ export const processResponseContent = (content: string) => {
 	content = processChineseContent(content);
 	content = processBareMathContent(content);
 	content = normalizeDetailsTags(content);
+	content = normalizePipeTableBlocks(content);
+	content = normalizeMermaidCodeBlocks(content);
 	content = linkifyRelativeFileDownloadPaths(content);
 	return content.trim();
 };
@@ -1874,23 +2005,181 @@ export const decodeString = (str: string) => {
 	}
 };
 
+const MERMAID_XYCHART_UNQUOTED_LABEL_RE = /^[A-Za-z0-9&+=*._-]+$/;
+
+function isMermaidXYChartDiagram(source: string): boolean {
+	for (const line of source.split('\n')) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith('%%')) {
+			continue;
+		}
+		return /^xychart(?:-beta)?\b/i.test(trimmed);
+	}
+
+	return false;
+}
+
+function splitMermaidXYChartAxisLabels(labels: string): string[] {
+	const parts: string[] = [];
+	let current = '';
+	let quoteChar = '';
+	let escaped = false;
+
+	for (const char of labels) {
+		if (escaped) {
+			current += char;
+			escaped = false;
+			continue;
+		}
+
+		if (quoteChar) {
+			current += char;
+			if (char === '\\') {
+				escaped = true;
+				continue;
+			}
+			if (char === quoteChar) {
+				quoteChar = '';
+			}
+			continue;
+		}
+
+		if (char === '"' || char === "'") {
+			quoteChar = char;
+			current += char;
+			continue;
+		}
+
+		if (char === ',') {
+			parts.push(current);
+			current = '';
+			continue;
+		}
+
+		current += char;
+	}
+
+	parts.push(current);
+	return parts;
+}
+
+function normalizeMermaidXYChartLabel(label: string): string {
+	const trimmed = label.trim();
+	if (!trimmed) {
+		return trimmed;
+	}
+
+	if (
+		(trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+		(trimmed.startsWith("'") && trimmed.endsWith("'"))
+	) {
+		return trimmed;
+	}
+
+	if (MERMAID_XYCHART_UNQUOTED_LABEL_RE.test(trimmed)) {
+		return trimmed;
+	}
+
+	return JSON.stringify(trimmed);
+}
+
+function normalizeMermaidXYChartAxisLine(line: string): string {
+	const match = line.match(/^(\s*x-axis\b[^[]*\[)(.*)(\]\s*(?:%%.*)?)$/i);
+	if (!match) {
+		return line;
+	}
+
+	const [, prefix, rawLabels, suffix] = match;
+	const labels = splitMermaidXYChartAxisLabels(rawLabels);
+	if (!labels.length) {
+		return line;
+	}
+
+	const normalizedLabels = labels.map((label) => normalizeMermaidXYChartLabel(label));
+	const needsNormalization = normalizedLabels.some((label, index) => label !== labels[index].trim());
+
+	return needsNormalization ? `${prefix}${normalizedLabels.join(', ')}${suffix}` : line;
+}
+
+function normalizeMermaidDiagramSource(source: string): string {
+	if (!source.includes('x-axis') || !isMermaidXYChartDiagram(source)) {
+		return source;
+	}
+
+	let changed = false;
+	const normalized = source
+		.split('\n')
+		.map((line) => {
+			const nextLine = normalizeMermaidXYChartAxisLine(line);
+			if (nextLine !== line) {
+				changed = true;
+			}
+			return nextLine;
+		})
+		.join('\n');
+
+	return changed ? normalized : source;
+}
+
+let mermaidInitPromise = null;
+let mermaidInitTheme = null;
+let mermaidRenderQueue = Promise.resolve();
+
 export const initMermaid = async () => {
-	const { default: mermaid } = await import('mermaid');
-	mermaid.initialize({
-		startOnLoad: false, // Should be false when using render API
-		theme: document.documentElement.classList.contains('dark') ? 'dark' : 'default',
-		securityLevel: 'loose'
-	});
-	return mermaid;
+	const theme =
+		typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
+			? 'dark'
+			: 'default';
+
+	if (!mermaidInitPromise || mermaidInitTheme !== theme) {
+		mermaidInitTheme = theme;
+		mermaidInitPromise = import('mermaid').then(({ default: mermaid }) => {
+			mermaid.initialize({
+				startOnLoad: false, // Should be false when using render API
+				theme,
+				securityLevel: 'loose'
+			});
+			return mermaid;
+		});
+	}
+
+	return mermaidInitPromise;
 };
 
 export const renderMermaidDiagram = async (mermaid, code: string) => {
-	const parseResult = await mermaid.parse(code, { suppressErrors: false });
-	if (parseResult) {
-		const { svg } = await mermaid.render(`mermaid-${uuidv4()}`, code);
-		return svg;
+	const source = code?.trim?.() ?? '';
+	if (!source) {
+		return '';
 	}
-	return '';
+
+	const normalizedSource = normalizeMermaidDiagramSource(source);
+
+	const renderSource = async (diagramSource: string) => {
+		const parseResult = await mermaid.parse(diagramSource, { suppressErrors: false });
+		if (parseResult) {
+			const { svg } = await mermaid.render(`mermaid-${uuidv4()}`, diagramSource);
+			return svg;
+		}
+		return '';
+	};
+
+	const renderTask = async () => {
+		try {
+			return await renderSource(source);
+		} catch (error) {
+			if (normalizedSource !== source) {
+				return await renderSource(normalizedSource);
+			}
+			throw error;
+		}
+	};
+
+	const queuedTask = mermaidRenderQueue.then(renderTask, renderTask);
+	mermaidRenderQueue = queuedTask.then(
+		() => undefined,
+		() => undefined
+	);
+	return queuedTask;
 };
 
 export const renderVegaVisualization = async (spec: string, i18n?: any) => {

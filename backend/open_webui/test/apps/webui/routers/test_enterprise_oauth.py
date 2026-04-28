@@ -492,7 +492,8 @@ class TestEnterpriseOAuth(AbstractPostgresTest):
             assert user.name == "张三"
             assert user.oauth["portal"]["account_no"] == "sysmintest"
             assert user.oauth["portal"]["nick_name"] == "张三"
-            assert redirect.headers["location"].endswith("/auth")
+            assert redirect.headers["location"].endswith("/")
+            assert "token=" in redirect.headers.get("set-cookie", "")
         finally:
             self._restore_portal_sso_config(snapshot)
 
@@ -594,7 +595,7 @@ class TestEnterpriseOAuth(AbstractPostgresTest):
         finally:
             self._restore_portal_sso_config(snapshot)
 
-    def test_portal_sso_callback_links_existing_user_by_email_when_merge_enabled(
+    def test_portal_sso_callback_links_existing_user_by_email_even_when_oauth_merge_is_disabled(
         self, monkeypatch
     ):
         snapshot = self._snapshot_portal_sso_config()
@@ -603,7 +604,7 @@ class TestEnterpriseOAuth(AbstractPostgresTest):
             config.PORTAL_SSO_ENABLED.value = True
             config.PORTAL_SSO_VALIDATE_URL.value = "https://portal.example.com/casValidate"
             config.PORTAL_SSO_AUTO_SIGNUP.value = True
-            config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value = True
+            config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value = False
 
             existing_user = Users.insert_new_user(
                 id="email-merge-user",

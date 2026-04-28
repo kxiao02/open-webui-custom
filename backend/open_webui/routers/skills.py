@@ -28,7 +28,7 @@ from open_webui.utils.catalog import (
     is_catalog_runtime_activatable,
     is_skill_catalog_visible,
 )
-from open_webui.utils.skill_import import sync_minimax_document_skills
+from open_webui.utils.skill_import import sync_minimax_skills as sync_minimax_skill_catalog
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
 from open_webui.constants import ERROR_MESSAGES
@@ -39,9 +39,29 @@ PAGE_ITEM_COUNT = 30
 
 router = APIRouter()
 
+
 class SkillSyncForm(BaseModel):
     root_path: Optional[str] = None
     dry_run: bool = False
+
+
+def _format_minimax_sync_missing_root_detail(
+    root_path: Optional[str], exc: FileNotFoundError
+) -> str:
+    detail = str(exc)
+    if root_path:
+        return (
+            f"{detail}. The provided `root_path` is not available inside the running "
+            "application container. Mount that directory into the container or correct "
+            "the path before retrying `/sync/minimax`."
+        )
+
+    return (
+        f"{detail}. Bundled MiniMax seed skills are no longer mounted into the running "
+        "application container by default. Use the one-shot `open-webui-skill-seed` "
+        "service to import them into the DB, or call `/sync/minimax` with an explicit "
+        "`root_path` that is mounted into the container."
+    )
 
 
 def _skill_write_access(
@@ -181,7 +201,7 @@ async def export_skills(
     return Skills.get_skills(db=db)
 
 ############################
-# Sync MiniMax Document Skills
+# Sync MiniMax Skills
 ############################
 
 
@@ -198,7 +218,7 @@ async def sync_minimax_skills(
         )
 
     try:
-        return sync_minimax_document_skills(
+        return sync_minimax_skill_catalog(
             user_id=user.id,
             root_path=form_data.root_path,
             db=db,
@@ -207,10 +227,12 @@ async def sync_minimax_skills(
     except FileNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ERROR_MESSAGES.DEFAULT(str(exc)),
+            detail=ERROR_MESSAGES.DEFAULT(
+                _format_minimax_sync_missing_root_detail(form_data.root_path, exc)
+            ),
         ) from exc
     except Exception as exc:
-        log.exception("Failed to sync MiniMax document skills: %s", exc)
+        log.exception("Failed to sync MiniMax skills: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.DEFAULT(str(exc)),

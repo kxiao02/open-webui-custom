@@ -16,10 +16,14 @@
 		collectGeneratedFilesFromHistory,
 		triggerGeneratedFileDownload
 	} from '$lib/utils/generated-files';
+	import { normalizeMediaUrl } from '$lib/utils/knowflowAssets';
 	import { initMermaid, renderMermaidDiagram } from '$lib/utils';
 	import {
 		isMarkdownPreviewContentType,
+		isMermaidPreviewContentType,
+		isMermaidPreviewPath,
 		isMarkdownPreviewPath,
+		prepareMarkdownPreviewSource,
 		renderMarkdownPreviewHtml
 	} from '$lib/utils/markdownPreview';
 
@@ -104,10 +108,19 @@
 		);
 	};
 
+	const isMermaidFile = (file: PreviewFile | null): boolean => {
+		if (!file) return false;
+		return (
+			isMermaidPreviewPath(file.name || file.path || file.url || null) ||
+			isMermaidPreviewContentType(file.contentType)
+		);
+	};
+
 	const isTextLikeFile = (file: PreviewFile | null): boolean => {
 		if (!file) return false;
 		const ext = getFileExt(file);
 		if ((file.contentType ?? '').startsWith('text/')) return true;
+		if (isMermaidFile(file)) return true;
 		if (isMarkdownFile(file)) return true;
 		return [
 			'txt',
@@ -192,17 +205,18 @@
 		for (const codeEl of codeEls) {
 			const pre = codeEl.parentElement;
 			if (!pre || pre.tagName !== 'PRE' || pre.dataset.mermaidRendered) continue;
-			pre.dataset.mermaidRendered = 'true';
 
 			try {
 				const svg = await renderMermaidDiagram(mermaidInstance, codeEl.textContent ?? '');
 				if (svg) {
+					pre.dataset.mermaidRendered = 'true';
 					const wrapper = document.createElement('div');
 					wrapper.className = 'mermaid-diagram flex justify-center py-2';
 					wrapper.innerHTML = svg;
 					pre.replaceWith(wrapper);
 				}
 			} catch (error) {
+				delete pre.dataset.mermaidRendered;
 				console.error('Mermaid render error:', error);
 			}
 		}
@@ -225,7 +239,7 @@
 	const getSelectedFileUrl = () =>
 		previewObjectUrl && previewObjectUrlKey === previewLoadKey
 			? previewObjectUrl
-			: (selectedFile?.url ?? '');
+			: normalizeMediaUrl(selectedFile?.url ?? '');
 
 	const clearOfficePreview = () => {
 		previewDocxHtml = '';
@@ -575,7 +589,13 @@
 	}
 	$: selectedFile = files.find((file) => file.id === selectedFileId) ?? null;
 	$: renderedMarkdownHtml =
-		isMarkdownFile(selectedFile) && previewText ? renderMarkdownPreviewHtml(previewText) : '';
+		(isMarkdownFile(selectedFile) || isMermaidFile(selectedFile)) && previewText
+			? renderMarkdownPreviewHtml(
+					prepareMarkdownPreviewSource(previewText, {
+						mermaid: isMermaidFile(selectedFile)
+					})
+				)
+			: '';
 	$: if (renderedMarkdownHtml && markdownEl) {
 		tick().then(() => renderMermaidBlocks(markdownEl));
 	}
@@ -720,7 +740,7 @@
 										</div>
 									{:else if previewError}
 										<div class="text-xs text-rose-600 dark:text-rose-400">{previewError}</div>
-									{:else if isMarkdownFile(selectedFile)}
+									{:else if isMarkdownFile(selectedFile) || isMermaidFile(selectedFile)}
 										<div
 											bind:this={markdownEl}
 											class="prose max-w-full rounded-lg bg-gray-50 p-3 text-sm text-gray-700 dark:bg-gray-850 dark:text-gray-200 dark:prose-invert"

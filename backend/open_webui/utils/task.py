@@ -13,6 +13,438 @@ from open_webui.config import DEFAULT_RAG_TEMPLATE
 log = logging.getLogger(__name__)
 
 
+_FOLLOW_UP_USER_MARKERS = (
+    "这",
+    "那",
+    "还",
+    "再",
+    "刚才",
+    "前面",
+    "上面",
+    "这种情况",
+    "这样的话",
+    "那我",
+    "那如果",
+    "是否",
+    "会不会",
+    "would this",
+    "does that",
+    "what about",
+    "how about",
+    "in that case",
+    "then ",
+)
+_COMMON_CJK_FACT_TOKENS = {
+    "我的",
+    "我们",
+    "你们",
+    "请问",
+    "一下",
+    "这个",
+    "那个",
+    "如果",
+    "还有",
+    "是不是",
+    "是否",
+    "一个",
+    "个月",
+    "今天",
+    "今年",
+}
+_SESSION_USER_FACTS_LIMIT = 12
+_SESSION_USER_FACTS_PROMPT_LIMIT = 5
+_GENERIC_DETAIL_PATTERNS = (
+    re.compile(r"\d"),
+    re.compile(
+        r"(\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b|\b\d{1,2}:\d{2}(?::\d{2})?\b|"
+        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|"
+        r"(年|月|日|周|天|小时|分鐘|分钟|秒))",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"(%|[$¥€£]|usd|eur|cny|rmb|人民币|元|块|公里|km|kg|mb|gb|tb|hz|°c|°f)",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"([a-z0-9]+(?:[-_/.:#][a-z0-9]+)+|\bv?\d+\.\d+(?:\.\d+)*\b)",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(r"([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|https?://\S+|www\.\S+)", flags=re.IGNORECASE),
+    re.compile(r"(`[^`]+`|\"[^\"]{3,}\"|'[^']{3,}'|“[^”]{2,}”|‘[^’]{2,}’)"),
+)
+
+
+def _extract_text_from_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return re.sub(r"\s+", " ", content).strip()
+
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in {"text", "input_text", "output_text"}:
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(re.sub(r"\s+", " ", text).strip())
+
+    return "\n".join(parts).strip()
+
+
+def _tokenize_relevant_fact_text(text: str) -> set[str]:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return set()
+
+    tokens: set[str] = set()
+    lowered = normalized.lower()
+
+    for match in re.finditer(r"[a-z0-9_]{2,}", lowered):
+        tokens.add(match.group(0))
+
+    for match in re.finditer(r"\d+(?:\.\d+)?%?", lowered):
+        tokens.add(match.group(0))
+
+    for segment in re.findall(r"[\u4e00-\u9fff]{2,}", normalized):
+        if len(segment) <= 4 and segment not in _COMMON_CJK_FACT_TOKENS:
+            tokens.add(segment)
+
+        for size in (2, 3):
+            if len(segment) < size:
+                continue
+            for index in range(len(segment) - size + 1):
+                token = segment[index : index + size]
+                if token in _COMMON_CJK_FACT_TOKENS:
+                    continue
+                tokens.add(token)
+
+    return tokens
+
+
+def _looks_like_follow_up_user_turn(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not normalized:
+        return False
+
+    if any(marker in normalized for marker in _FOLLOW_UP_USER_MARKERS):
+        return True
+
+    if len(normalized) <= 32 and normalized.endswith(("吗", "么", "呢", "?")):
+        return True
+
+    return False
+
+
+def _score_salient_detail_markers(text: str) -> int:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return 0
+
+    score = sum(1 for pattern in _GENERIC_DETAIL_PATTERNS if pattern.search(normalized))
+
+    # Long, information-dense turns often carry concrete state even when they
+    # lack an obvious numeric or identifier pattern.
+    if len(normalized) >= 48:
+        score += 1
+
+    return score
+
+
+def _normalize_session_fact_text(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def normalize_session_user_facts(facts: Any) -> list[dict[str, str]]:
+    if not isinstance(facts, list):
+        return []
+
+    normalized_facts: list[dict[str, str]] = []
+    seen_texts: set[str] = set()
+    for fact in facts:
+        if not isinstance(fact, dict):
+            continue
+
+        text = _normalize_session_fact_text(fact.get("text"))
+        if not text or text in seen_texts:
+            continue
+
+        confidence = str(fact.get("confidence") or "medium").strip().lower()
+        if confidence not in {"low", "medium", "high"}:
+            confidence = "medium"
+
+        normalized_facts.append({"text": text, "confidence": confidence})
+        seen_texts.add(text)
+
+    return normalized_facts
+
+
+def extract_session_user_facts(
+    messages: Optional[list[dict]], limit: int = _SESSION_USER_FACTS_LIMIT
+) -> list[dict[str, str]]:
+    if not isinstance(messages, list):
+        return []
+
+    scored_facts: list[tuple[int, int, dict[str, str]]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+
+        text = _extract_text_from_message_content(message.get("content"))
+        if not text:
+            continue
+
+        detail_score = _score_salient_detail_markers(text)
+        token_count = len(_tokenize_relevant_fact_text(text))
+        if detail_score < 2 and not (detail_score >= 1 and token_count >= 6):
+            if len(text) < 80 or token_count < 8:
+                continue
+
+        score = min(detail_score, 4) + min(token_count, 4)
+        confidence = "high" if score >= 6 else "medium"
+        scored_facts.append((index, score, {"text": text, "confidence": confidence}))
+
+    seen_texts: set[str] = set()
+    ordered_facts: list[dict[str, str]] = []
+    for _, _, fact in sorted(scored_facts, key=lambda item: (-item[0], -item[1])):
+        text = fact["text"]
+        if text in seen_texts:
+            continue
+        seen_texts.add(text)
+        ordered_facts.append(fact)
+        if len(ordered_facts) >= limit:
+            break
+
+    return ordered_facts
+
+
+def _score_session_fact_relevance(
+    candidate_text: str,
+    latest_user_turn: str,
+    latest_tokens: set[str],
+    latest_is_follow_up: bool,
+    immediate_previous_text: str = "",
+) -> int:
+    candidate_tokens = _tokenize_relevant_fact_text(candidate_text)
+    shared_tokens = latest_tokens & candidate_tokens
+    score = len(shared_tokens) * 3
+    salient_detail_score = _score_salient_detail_markers(candidate_text)
+
+    if candidate_text == immediate_previous_text:
+        score += 2
+        if latest_is_follow_up:
+            score += 3
+
+    score += min(salient_detail_score, 3)
+    if shared_tokens and salient_detail_score > 0:
+        score += 1
+
+    return score
+
+
+def get_relevant_prior_user_facts(
+    messages: Optional[list[dict]], limit: int = 3
+) -> list[dict[str, str]]:
+    if not isinstance(messages, list):
+        return []
+
+    user_turns: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = _extract_text_from_message_content(message.get("content"))
+        if text:
+            user_turns.append(text)
+
+    if len(user_turns) < 2:
+        return []
+
+    latest_user_turn = user_turns[-1]
+    latest_tokens = _tokenize_relevant_fact_text(latest_user_turn)
+    latest_is_follow_up = _looks_like_follow_up_user_turn(latest_user_turn)
+
+    scored_facts: list[tuple[int, int, dict[str, str]]] = []
+    immediate_previous_text = user_turns[-2] if len(user_turns) >= 2 else ""
+
+    for index, candidate_text in enumerate(user_turns[:-1]):
+        if candidate_text == latest_user_turn:
+            continue
+
+        score = _score_session_fact_relevance(
+            candidate_text,
+            latest_user_turn,
+            latest_tokens,
+            latest_is_follow_up,
+            immediate_previous_text=immediate_previous_text,
+        )
+
+        if score < 3:
+            continue
+
+        confidence = "high" if score >= 8 else "medium"
+        scored_facts.append(
+            (
+                score,
+                index,
+                {
+                    "confidence": confidence,
+                    "text": candidate_text,
+                },
+            )
+        )
+
+    if not scored_facts and latest_is_follow_up:
+        fallback_text = immediate_previous_text
+        if fallback_text:
+            return [{"confidence": "medium", "text": fallback_text}]
+
+    seen_texts: set[str] = set()
+    ordered_facts: list[dict[str, str]] = []
+    for _, _, fact in sorted(scored_facts, key=lambda item: (-item[0], -item[1])):
+        text = fact["text"]
+        if text in seen_texts:
+            continue
+        seen_texts.add(text)
+        ordered_facts.append(fact)
+        if len(ordered_facts) >= limit:
+            break
+
+    return ordered_facts
+
+
+def get_relevant_session_user_facts(
+    messages: Optional[list[dict]],
+    stored_facts: Optional[list[dict[str, str]]] = None,
+    limit: int = _SESSION_USER_FACTS_PROMPT_LIMIT,
+) -> list[dict[str, str]]:
+    if not isinstance(messages, list):
+        return []
+
+    latest_user_turn = get_last_user_message(messages)
+    if not latest_user_turn:
+        return []
+
+    latest_user_turn = _normalize_session_fact_text(latest_user_turn)
+    latest_tokens = _tokenize_relevant_fact_text(latest_user_turn)
+    latest_is_follow_up = _looks_like_follow_up_user_turn(latest_user_turn)
+
+    user_turns = [
+        _extract_text_from_message_content(message.get("content"))
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    user_turns = [turn for turn in user_turns if turn]
+    immediate_previous_text = user_turns[-2] if len(user_turns) >= 2 else ""
+
+    candidate_facts = normalize_session_user_facts(
+        stored_facts if stored_facts is not None else extract_session_user_facts(messages)
+    )
+    if not candidate_facts:
+        return []
+
+    scored_facts: list[tuple[int, int, dict[str, str]]] = []
+    for index, fact in enumerate(candidate_facts):
+        candidate_text = fact["text"]
+        if candidate_text == latest_user_turn:
+            continue
+
+        score = _score_session_fact_relevance(
+            candidate_text,
+            latest_user_turn,
+            latest_tokens,
+            latest_is_follow_up,
+            immediate_previous_text=immediate_previous_text,
+        )
+        if score < 3:
+            continue
+
+        scored_facts.append((score, index, fact))
+
+    relevant_facts: list[dict[str, str]] = []
+    seen_texts: set[str] = set()
+    for _, _, fact in sorted(scored_facts, key=lambda item: (-item[0], item[1])):
+        text = fact["text"]
+        if text in seen_texts:
+            continue
+        seen_texts.add(text)
+        relevant_facts.append(fact)
+        if len(relevant_facts) >= limit:
+            break
+
+    if relevant_facts:
+        return relevant_facts
+
+    if latest_is_follow_up:
+        fallback_facts = []
+        for fact in candidate_facts:
+            text = fact["text"]
+            if text == latest_user_turn or text in seen_texts:
+                continue
+            fallback_facts.append(fact)
+            if len(fallback_facts) >= min(limit, 2):
+                break
+        return fallback_facts
+
+    return []
+
+
+def build_relevant_prior_user_facts_block(
+    messages: Optional[list[dict]], limit: int = 3
+) -> str:
+    facts = get_relevant_prior_user_facts(messages, limit=limit)
+    if not facts:
+        return ""
+
+    fact_lines = [
+        f'- {fact["confidence"]} confidence | earlier user turn: "{fact["text"]}"'
+        for fact in facts
+    ]
+    return "<prior_user_facts>\n" + "\n".join(fact_lines) + "\n</prior_user_facts>"
+
+
+def build_follow_up_context_guidance(
+    messages: Optional[list[dict]], limit: int = 3
+) -> str:
+    facts_block = build_relevant_prior_user_facts_block(messages, limit=limit)
+    if not facts_block:
+        return ""
+
+    return (
+        "### Follow-Up Context Guidance:\n"
+        "- Reuse relevant user-provided facts from earlier turns before falling back to a generic answer.\n"
+        "- If a retrieved policy, rule, or source uses a narrower term than the user's earlier wording, explicitly mention the mismatch and ask one short clarification instead of assuming they are identical.\n"
+        "- Ignore these facts when they are not relevant to the latest user request.\n"
+        f"{facts_block}"
+    )
+
+
+def build_session_user_memory_prompt(
+    messages: Optional[list[dict]],
+    stored_facts: Optional[list[dict[str, str]]] = None,
+    limit: int = _SESSION_USER_FACTS_PROMPT_LIMIT,
+) -> str:
+    facts = get_relevant_session_user_facts(messages, stored_facts=stored_facts, limit=limit)
+    if not facts:
+        return ""
+
+    fact_lines = [
+        f'- {fact["confidence"]} confidence | prior user context: "{fact["text"]}"'
+        for fact in facts
+    ]
+
+    return (
+        "### Session User Memory:\n"
+        "- Treat the items below as user-provided context established earlier in this chat.\n"
+        "- Reuse them when they materially help answer the current turn.\n"
+        "- If sources or policies use narrower or slightly different terminology, reconcile the difference explicitly or ask one short clarification.\n"
+        "<session_user_memory>\n"
+        + "\n".join(fact_lines)
+        + "\n</session_user_memory>"
+    )
+
+
 def get_task_model_id(
     default_model_id: str, task_model: str, task_model_external: str, models
 ) -> str:
@@ -384,6 +816,16 @@ def query_generation_template(
     prompt = get_last_user_message(messages)
     template = replace_prompt_variable(template, prompt)
     template = replace_messages_variable(template, messages)
+    prior_facts_block = build_relevant_prior_user_facts_block(messages)
+    if prior_facts_block:
+        template = (
+            f"{template}\n\n### Relevant Prior User Facts:\n"
+            "Use these earlier user facts when they materially narrow the latest search request. "
+            "If the authoritative source may use narrower terminology than the user's wording, "
+            "preserve the user's facts in the search queries and add the narrower term only when "
+            "it helps verify the mapping.\n"
+            f"{prior_facts_block}\n"
+        )
 
     template = prompt_template(template, user)
     return template

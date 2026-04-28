@@ -363,7 +363,7 @@ $: isAdmin = role === 'admin' || $user?.role === 'admin';
 					localStorage.removeItem('settings');
 					settings.set({});
 
-					location.href = res?.redirect_url ?? '/auth';
+					location.href = res?.redirect_url ?? '/auth?manual=1';
 					show = false;
 				}}
 			>

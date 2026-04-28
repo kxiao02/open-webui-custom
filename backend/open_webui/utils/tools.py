@@ -6,6 +6,7 @@ import aiohttp
 import asyncio
 import yaml
 import json
+import hashlib
 
 from pydantic import BaseModel
 from pydantic.fields import FieldInfo
@@ -40,7 +41,7 @@ from open_webui.models.users import UserModel
 from open_webui.models.groups import Groups
 from open_webui.models.access_grants import AccessGrants
 from open_webui.utils.catalog import get_user_group_ids, is_tool_catalog_visible
-from open_webui.utils.plugin import load_tool_module_by_id
+from open_webui.utils.plugin import load_tool_module_by_id, replace_imports
 from open_webui.utils.access_control import has_access, has_connection_access
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, ENABLE_KNOWLEDGE
 from open_webui.env import (
@@ -75,6 +76,7 @@ from open_webui.tools.builtin import (
     view_channel_thread,
     replace_note_content,
     write_note,
+    list_skills,
     list_knowledge_bases,
     search_knowledge_bases,
     query_knowledge_bases,
@@ -88,6 +90,12 @@ from open_webui.tools.builtin import (
 import copy
 
 log = logging.getLogger(__name__)
+
+
+DEEPAGENT_RUNTIME_TOOL_SCHEMA_VERSION = 1
+DEEPAGENT_RUNTIME_TOOL_PREFIX = "owu__"
+DEEPAGENT_BUILTIN_SKILLS_TOOL_ID = "builtin:skills"
+DEEPAGENT_RUNTIME_SKILL_IDS_METADATA_KEY = "deepagent_runtime_skill_ids"
 
 
 BUILTIN_TOOL_CATALOG: tuple[dict[str, Any], ...] = (
@@ -706,9 +714,9 @@ def get_builtin_tools(
             ]
         )
 
-    # Skills tools - view_skill allows model to load full skill instructions on demand
+    # Skills tools - allow the model to discover and load full skill instructions on demand
     if extra_params.get("__skill_ids__"):
-        builtin_functions.append(view_skill)
+        builtin_functions.extend([list_skills, view_skill])
 
     for func in builtin_functions:
         callable = get_async_tool_function_and_apply_extra_params(
@@ -722,6 +730,7 @@ def get_builtin_tools(
                 "__chat_id__": extra_params.get("__chat_id__"),
                 "__message_id__": extra_params.get("__message_id__"),
                 "__model_knowledge__": model_knowledge,
+                "__skill_ids__": extra_params.get("__skill_ids__"),
             },
         )
 
@@ -904,6 +913,223 @@ def get_tool_specs(tool_module: object) -> list[dict]:
     ]
 
     return specs
+
+
+def _compute_deepagent_tool_revision(tool: Any) -> str:
+    payload = {
+        "id": getattr(tool, "id", ""),
+        "content": replace_imports(str(getattr(tool, "content", "") or "")),
+        "specs": getattr(tool, "specs", []),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def get_deepagent_runtime_skill_ids(metadata: dict | None) -> list[str]:
+    if not isinstance(metadata, dict):
+        return []
+
+    normalized: list[str] = []
+    for skill_id in metadata.get(DEEPAGENT_RUNTIME_SKILL_IDS_METADATA_KEY, []) or []:
+        if not isinstance(skill_id, str):
+            continue
+        candidate = skill_id.strip()
+        if candidate:
+            normalized.append(candidate)
+
+    return sorted(dict.fromkeys(normalized))
+
+
+def compute_deepagent_builtin_skills_revision(skill_ids: list[str] | None) -> str:
+    payload = {
+        "tool_id": DEEPAGENT_BUILTIN_SKILLS_TOOL_ID,
+        "functions": [list_skills.__name__, view_skill.__name__],
+        "skill_ids": sorted(dict.fromkeys(skill_ids or [])),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sanitize_deepagent_runtime_parameters(parameters: dict | None) -> dict:
+    if not isinstance(parameters, dict):
+        return {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        }
+
+    sanitized = copy.deepcopy(parameters)
+    properties = sanitized.get("properties", {})
+    if isinstance(properties, dict):
+        sanitized["properties"] = {
+            key: value
+            for key, value in properties.items()
+            if not str(key).startswith("__")
+        }
+
+    required = sanitized.get("required", [])
+    if isinstance(required, list):
+        sanitized["required"] = [
+            key for key in required if not str(key).startswith("__")
+        ]
+
+    sanitized.setdefault("type", "object")
+    sanitized.setdefault("properties", {})
+    sanitized.setdefault("required", [])
+    return sanitized
+
+
+def _build_deepagent_registered_tool_name(
+    tool_id: str, function_name: str, revision: str
+) -> str:
+    safe_tool_id = re.sub(r"[^A-Za-z0-9_]", "_", str(tool_id or "").strip()) or "tool"
+    digest = hashlib.sha256(
+        f"{tool_id}:{function_name}:{revision}".encode("utf-8")
+    ).hexdigest()[:10]
+    prefix = f"{DEEPAGENT_RUNTIME_TOOL_PREFIX}{safe_tool_id}__"
+    max_tool_id_len = max(8, 64 - len(DEEPAGENT_RUNTIME_TOOL_PREFIX) - len(digest) - 2)
+    if len(safe_tool_id) > max_tool_id_len:
+        safe_tool_id = safe_tool_id[:max_tool_id_len]
+        prefix = f"{DEEPAGENT_RUNTIME_TOOL_PREFIX}{safe_tool_id}__"
+    return f"{prefix}{digest}"
+
+
+def build_deepagent_runtime_tool_snapshot(
+    tool_ids: list[str] | None,
+    user: UserModel,
+    *,
+    files: list[dict] | None = None,
+    metadata: dict | None = None,
+    db=None,
+) -> dict[str, Any]:
+    requested_tool_ids = [
+        str(tool_id).strip()
+        for tool_id in (tool_ids or [])
+        if isinstance(tool_id, str) and str(tool_id).strip()
+    ]
+    if user.role == "admin":
+        user_group_ids: set[str] = set()
+    else:
+        user_group_ids = get_user_group_ids(user.id, db=db)
+
+    runtime_tools: list[dict[str, Any]] = []
+
+    for tool_id in requested_tool_ids:
+        if tool_id.startswith("server:"):
+            continue
+
+        tool = Tools.get_tool_by_id(tool_id, db=db)
+        if tool is None:
+            continue
+        if not is_tool_catalog_visible(tool, user, user_group_ids, db=db):
+            continue
+
+        revision = _compute_deepagent_tool_revision(tool)
+        functions: list[dict[str, Any]] = []
+
+        for spec in list(getattr(tool, "specs", []) or []):
+            if not isinstance(spec, dict):
+                continue
+
+            function_name = str(spec.get("name") or "").strip()
+            if not function_name:
+                continue
+
+            registered_name = _build_deepagent_registered_tool_name(
+                tool.id,
+                function_name,
+                revision,
+            )
+            parameters = _sanitize_deepagent_runtime_parameters(
+                spec.get("parameters") if isinstance(spec.get("parameters"), dict) else None
+            )
+
+            functions.append(
+                {
+                    "registered_name": registered_name,
+                    "function_name": function_name,
+                    "description": str(spec.get("description") or function_name),
+                    "openai_tool": {
+                        "type": "function",
+                        "function": {
+                            "name": registered_name,
+                            "description": str(spec.get("description") or function_name),
+                            "parameters": parameters,
+                        },
+                    },
+                }
+            )
+
+        if not functions:
+            continue
+
+        runtime_tools.append(
+            {
+                "tool_id": tool.id,
+                "tool_name": tool.name,
+                "revision": revision,
+                "updated_at": int(getattr(tool, "updated_at", 0) or 0),
+                "functions": functions,
+            }
+        )
+
+    runtime_skill_ids = get_deepagent_runtime_skill_ids(metadata)
+    if runtime_skill_ids:
+        revision = compute_deepagent_builtin_skills_revision(runtime_skill_ids)
+        functions: list[dict[str, Any]] = []
+
+        for func in (list_skills, view_skill):
+            spec = clean_openai_tool_schema(
+                convert_pydantic_model_to_openai_function_spec(
+                    convert_function_to_pydantic_model(func)
+                )
+            )
+            function_name = str(spec.get("name") or func.__name__).strip() or func.__name__
+            functions.append(
+                {
+                    "registered_name": function_name,
+                    "function_name": function_name,
+                    "description": str(spec.get("description") or function_name),
+                    "openai_tool": {
+                        "type": "function",
+                        "function": {
+                            "name": function_name,
+                            "description": str(spec.get("description") or function_name),
+                            "parameters": _sanitize_deepagent_runtime_parameters(
+                                spec.get("parameters")
+                                if isinstance(spec.get("parameters"), dict)
+                                else None
+                            ),
+                        },
+                    },
+                }
+            )
+
+        runtime_tools.append(
+            {
+                "tool_id": DEEPAGENT_BUILTIN_SKILLS_TOOL_ID,
+                "tool_name": "Workspace Skills",
+                "revision": revision,
+                "updated_at": 0,
+                "functions": functions,
+            }
+        )
+
+    sanitized_metadata = copy.deepcopy(metadata or {})
+    sanitized_metadata.pop("deepagent_runtime_tools", None)
+
+    return {
+        "version": DEEPAGENT_RUNTIME_TOOL_SCHEMA_VERSION,
+        "tools": runtime_tools,
+        "context": {
+            "user_id": user.id,
+            "chat_id": sanitized_metadata.get("chat_id"),
+            "session_id": sanitized_metadata.get("session_id"),
+            "message_id": sanitized_metadata.get("message_id"),
+            "files": copy.deepcopy(files or []),
+            "metadata": sanitized_metadata,
+        },
+    }
 
 
 def resolve_schema(schema, components):

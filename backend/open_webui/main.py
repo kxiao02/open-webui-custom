@@ -59,6 +59,7 @@ from starsessions.stores.redis import RedisStore
 
 from open_webui.utils import logger
 from open_webui.utils.audit import AuditLevel, AuditLoggingMiddleware
+from open_webui.utils.knowflow import get_knowflow_public_config
 from open_webui.utils.logger import start_logger
 from open_webui.socket.main import (
     MODELS,
@@ -98,6 +99,7 @@ from open_webui.routers import (
     memories,
     models,
     knowledge,
+    knowflow,
     prompts,
     evaluations,
     skills,
@@ -190,6 +192,7 @@ from open_webui.config import (
     # Audio
     AUDIO_STT_ENGINE,
     AUDIO_STT_MODEL,
+    AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL,
     AUDIO_STT_SUPPORTED_CONTENT_TYPES,
     AUDIO_STT_OPENAI_API_BASE_URL,
     AUDIO_STT_OPENAI_API_KEY,
@@ -232,6 +235,7 @@ from open_webui.config import (
     RAG_FULL_CONTEXT,
     BYPASS_EMBEDDING_AND_RETRIEVAL,
     RAG_EMBEDDING_MODEL,
+    RAG_EMBEDDING_FALLBACK_MODEL,
     RAG_EMBEDDING_MODEL_AUTO_UPDATE,
     RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
     RAG_RERANKING_ENGINE,
@@ -245,6 +249,7 @@ from open_webui.config import (
     RAG_EMBEDDING_BATCH_SIZE,
     ENABLE_ASYNC_EMBEDDING,
     RAG_EMBEDDING_CONCURRENT_REQUESTS,
+    RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL,
     RAG_TOP_K,
     RAG_TOP_K_RERANKER,
     RAG_RELEVANCE_THRESHOLD,
@@ -383,8 +388,16 @@ from open_webui.config import (
     ENABLE_CHANNELS,
     ENABLE_NOTES,
     ENABLE_KNOWLEDGE,
+    KNOWFLOW_SITE_URL,
+    KNOWFLOW_SERVER_BASE_URL,
+    KNOWFLOW_RAGFLOW_BASE_URL,
+    KNOWFLOW_SERVICE_API_KEY,
+    KNOWFLOW_PUBLIC_READ_ONLY_API_KEY,
+    KNOWFLOW_TIMEOUT_SECONDS,
+    KNOWFLOW_MANAGED_LOOKUP_ENABLED,
+    KNOWFLOW_MANUAL_BINDING_ENABLED,
+    KNOWFLOW_READ_ONLY,
     ENABLE_USER_STATUS,
-    ENABLE_COMMUNITY_SHARING,
     ENABLE_MESSAGE_RATING,
     ENABLE_USER_WEBHOOKS,
     ENABLE_EVALUATION_ARENA_MODELS,
@@ -982,7 +995,15 @@ app.state.config.FOLDER_MAX_FILE_COUNT = FOLDER_MAX_FILE_COUNT
 app.state.config.ENABLE_CHANNELS = ENABLE_CHANNELS
 app.state.config.ENABLE_NOTES = ENABLE_NOTES
 app.state.config.ENABLE_KNOWLEDGE = ENABLE_KNOWLEDGE
-app.state.config.ENABLE_COMMUNITY_SHARING = ENABLE_COMMUNITY_SHARING
+app.state.config.KNOWFLOW_SITE_URL = KNOWFLOW_SITE_URL
+app.state.config.KNOWFLOW_SERVER_BASE_URL = KNOWFLOW_SERVER_BASE_URL
+app.state.config.KNOWFLOW_RAGFLOW_BASE_URL = KNOWFLOW_RAGFLOW_BASE_URL
+app.state.config.KNOWFLOW_SERVICE_API_KEY = KNOWFLOW_SERVICE_API_KEY
+app.state.config.KNOWFLOW_PUBLIC_READ_ONLY_API_KEY = KNOWFLOW_PUBLIC_READ_ONLY_API_KEY
+app.state.config.KNOWFLOW_TIMEOUT_SECONDS = KNOWFLOW_TIMEOUT_SECONDS
+app.state.config.KNOWFLOW_MANAGED_LOOKUP_ENABLED = KNOWFLOW_MANAGED_LOOKUP_ENABLED
+app.state.config.KNOWFLOW_MANUAL_BINDING_ENABLED = KNOWFLOW_MANUAL_BINDING_ENABLED
+app.state.config.KNOWFLOW_READ_ONLY = KNOWFLOW_READ_ONLY
 app.state.config.ENABLE_MESSAGE_RATING = ENABLE_MESSAGE_RATING
 app.state.config.ENABLE_USER_WEBHOOKS = ENABLE_USER_WEBHOOKS
 app.state.config.ENABLE_USER_STATUS = ENABLE_USER_STATUS
@@ -1143,9 +1164,13 @@ app.state.config.CHUNK_OVERLAP = CHUNK_OVERLAP
 
 app.state.config.RAG_EMBEDDING_ENGINE = RAG_EMBEDDING_ENGINE
 app.state.config.RAG_EMBEDDING_MODEL = RAG_EMBEDDING_MODEL
+app.state.config.RAG_EMBEDDING_FALLBACK_MODEL = RAG_EMBEDDING_FALLBACK_MODEL
 app.state.config.RAG_EMBEDDING_BATCH_SIZE = RAG_EMBEDDING_BATCH_SIZE
 app.state.config.ENABLE_ASYNC_EMBEDDING = ENABLE_ASYNC_EMBEDDING
 app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS = RAG_EMBEDDING_CONCURRENT_REQUESTS
+app.state.config.RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL = (
+    RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL
+)
 
 app.state.config.RAG_RERANKING_ENGINE = RAG_RERANKING_ENGINE
 app.state.config.RAG_RERANKING_MODEL = RAG_RERANKING_MODEL
@@ -1304,6 +1329,8 @@ if retrieval_bootstrap_enabled:
         ),
         enable_async=app.state.config.ENABLE_ASYNC_EMBEDDING,
         concurrent_requests=app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
+        fallback_to_local=app.state.config.RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL,
+        fallback_embedding_model=app.state.config.RAG_EMBEDDING_FALLBACK_MODEL,
     )
 
     app.state.RERANKING_FUNCTION = get_reranking_function(
@@ -1402,6 +1429,9 @@ app.state.config.IMAGES_EDIT_COMFYUI_WORKFLOW_NODES = IMAGES_EDIT_COMFYUI_WORKFL
 
 app.state.config.STT_ENGINE = AUDIO_STT_ENGINE
 app.state.config.STT_MODEL = AUDIO_STT_MODEL
+app.state.config.AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL = (
+    AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL
+)
 app.state.config.STT_SUPPORTED_CONTENT_TYPES = AUDIO_STT_SUPPORTED_CONTENT_TYPES
 
 app.state.config.STT_OPENAI_API_BASE_URL = AUDIO_STT_OPENAI_API_BASE_URL
@@ -1669,8 +1699,11 @@ app.add_middleware(
 app.mount("/ws", socket_app)
 
 
+app.include_router(knowflow.asset_router, prefix="/openai", tags=["knowflow-assets"])
 app.include_router(ollama.router, prefix="/ollama", tags=["ollama"])
 app.include_router(openai.router, prefix="/openai", tags=["openai"])
+app.include_router(knowflow.asset_router, tags=["knowflow-assets"])
+app.include_router(knowflow.api_asset_router, tags=["knowflow-assets"])
 
 
 app.include_router(pipelines.router, prefix="/api/v1/pipelines", tags=["pipelines"])
@@ -1694,6 +1727,7 @@ app.include_router(notes.router, prefix="/api/v1/notes", tags=["notes"])
 app.include_router(models.router, prefix="/api/v1/models", tags=["models"])
 if ENABLE_KNOWLEDGE.value:
     app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["knowledge"])
+    app.include_router(knowflow.router, prefix="/api/v1/knowflow", tags=["knowflow"])
 app.include_router(prompts.router, prefix="/api/v1/prompts", tags=["prompts"])
 app.include_router(tools.router, prefix="/api/v1/tools", tags=["tools"])
 app.include_router(skills.router, prefix="/api/v1/skills", tags=["skills"])
@@ -2391,6 +2425,7 @@ async def get_app_config(request: Request):
             "app_initiated_enabled": PORTAL_SSO_APP_INITIATED_ENABLED.value,
             "provider_name": PORTAL_SSO_PROVIDER_NAME.value,
         },
+        "knowflow": get_knowflow_public_config(app.state.config),
         "features": {
             "auth": WEBUI_AUTH,
             "auth_trusted_header": bool(app.state.AUTH_TRUSTED_EMAIL_HEADER),
@@ -2411,6 +2446,9 @@ async def get_app_config(request: Request):
                     "enable_channels": app.state.config.ENABLE_CHANNELS,
                     "enable_notes": app.state.config.ENABLE_NOTES,
                     "enable_knowledge": app.state.config.ENABLE_KNOWLEDGE,
+                    "enable_knowflow": get_knowflow_public_config(app.state.config)[
+                        "enabled"
+                    ],
                     "enable_web_search": app.state.config.ENABLE_WEB_SEARCH,
                     "enable_code_execution": app.state.config.ENABLE_CODE_EXECUTION,
                     "enable_code_interpreter": app.state.config.ENABLE_CODE_INTERPRETER,
@@ -2418,7 +2456,6 @@ async def get_app_config(request: Request):
                         app.state.config
                     ),
                     "enable_autocomplete_generation": app.state.config.ENABLE_AUTOCOMPLETE_GENERATION,
-                    "enable_community_sharing": app.state.config.ENABLE_COMMUNITY_SHARING,
                     "enable_message_rating": app.state.config.ENABLE_MESSAGE_RATING,
                     "enable_user_webhooks": app.state.config.ENABLE_USER_WEBHOOKS,
                     "enable_user_status": app.state.config.ENABLE_USER_STATUS,

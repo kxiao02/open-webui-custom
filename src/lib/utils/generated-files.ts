@@ -1,6 +1,7 @@
 import { decode } from 'html-entities';
 
 import { WEBUI_API_BASE_URL } from '$lib/constants';
+import { normalizeMediaUrl } from '$lib/utils/knowflowAssets';
 import { normalizeToolId, resolveToolDisplay } from '$lib/utils/tool-display';
 
 export type GeneratedFileItem = {
@@ -103,6 +104,7 @@ const OPEN_WEBUI_FILE_URL_REGEX =
 	/^(?:https?:\/\/[^/]+)?\/?(?:api\/v1|openai\/v1|v1)\/files\/([^/?#]+)(?:\/content)?(?:[?#].*)?$/i;
 const OPEN_WEBUI_GENERATED_FILE_URL_REGEX =
 	/^(?:https?:\/\/[^/]+)?\/?(?:api\/v1|openai\/v1|v1)\/generated-files\/([^?#]+)(?:[?#].*)?$/i;
+const KNOWFLOW_MINIO_REF_REGEX = /\/(?:openai\/)?minio\/[^?#]+/i;
 
 const normalizeTokenForMatching = (value: string): string => {
 	return value.trim().replace(QUOTED_WRAPPER_REGEX, '').replace(TRAILING_PUNCTUATION_REGEX, '');
@@ -126,6 +128,70 @@ export const normalizeFileRef = (value: unknown): string | null => {
 	const lowered = normalized.toLowerCase();
 	if (lowered === 'null' || lowered === 'undefined') return null;
 	return normalized;
+};
+
+export const normalizeVisualUrlForMatching = (value: unknown): string => {
+	const normalized = normalizeFileRef(value);
+	if (!normalized) return '';
+	if (normalized.startsWith('data:') || normalized.startsWith('blob:')) return normalized;
+
+	const openWebUiFileUrlMatch = normalized.match(OPEN_WEBUI_FILE_URL_REGEX);
+	if (openWebUiFileUrlMatch?.[1]) {
+		return `/api/v1/files/${openWebUiFileUrlMatch[1]}`;
+	}
+
+	const openWebUiGeneratedFileUrlMatch = normalized.match(OPEN_WEBUI_GENERATED_FILE_URL_REGEX);
+	if (openWebUiGeneratedFileUrlMatch?.[1]) {
+		return `/api/v1/generated-files/${openWebUiGeneratedFileUrlMatch[1]}`;
+	}
+
+	try {
+		const parsed = new URL(normalized, WEBUI_API_BASE_URL);
+		const knowflowRef = parsed.pathname.match(KNOWFLOW_MINIO_REF_REGEX)?.[0];
+		if (knowflowRef) {
+			return knowflowRef.replace(/^\/openai(?=\/minio\/)/i, '');
+		}
+
+		return `${parsed.pathname}${parsed.search}`;
+	} catch {
+		const knowflowRef = normalized.match(KNOWFLOW_MINIO_REF_REGEX)?.[0];
+		if (knowflowRef) {
+			return knowflowRef.replace(/^\/openai(?=\/minio\/)/i, '');
+		}
+
+		return normalized;
+	}
+};
+
+const extractKnowflowAssetRef = (value: string | undefined): string => {
+	const normalized = normalizeFileRef(value ?? '');
+	if (!normalized) return '';
+	if (normalized.startsWith('data:') || normalized.startsWith('blob:')) return '';
+
+	let path = normalized;
+	try {
+		path = new URL(normalized, WEBUI_API_BASE_URL).pathname || normalized;
+	} catch {
+		path = normalized;
+	}
+
+	if (!path.startsWith('/')) {
+		path = `/${path.replace(/^\/+/, '')}`;
+	}
+
+	const match = path.match(KNOWFLOW_MINIO_REF_REGEX);
+	if (!match) return '';
+
+	return match[0].replace(/^\/openai(?=\/minio\/)/i, '');
+};
+
+export const normalizeKnowflowAssetUrl = (value: unknown): string | null => {
+	const normalized = normalizeFileRef(value);
+	if (!normalized) return null;
+	if (normalized.startsWith('data:') || normalized.startsWith('blob:')) return normalized;
+
+	const knowflowAssetRef = extractKnowflowAssetRef(normalized);
+	return knowflowAssetRef || normalized;
 };
 
 export const inferFileName = (value: string, fallback = 'generated-file') => {
@@ -401,6 +467,11 @@ export const normalizeOpenWebUiFileUrl = (value: string): string => {
 		return `/openai/v1/generated-files/${openWebUiGeneratedFileMatch[1]}`;
 	}
 
+	const knowflowAssetRef = extractKnowflowAssetRef(output);
+	if (knowflowAssetRef) {
+		return normalizeMediaUrl(knowflowAssetRef);
+	}
+
 	if (/^(?:api\/v1|openai\/v1|v1)\//i.test(output)) {
 		return `/${output}`;
 	}
@@ -424,10 +495,14 @@ export const isDownloadRef = (value: string): boolean => {
 	return (
 		normalized.startsWith('http') ||
 		normalized.startsWith('data:') ||
+		normalized.startsWith('/minio/') ||
+		normalized.startsWith('/openai/minio/') ||
 		normalized.startsWith('/api/v1/files/') ||
 		normalized.startsWith('/api/v1/generated-files/') ||
 		normalized.startsWith('/openai/v1/files/') ||
 		normalized.startsWith('/openai/v1/generated-files/') ||
+		normalized.startsWith('minio/') ||
+		normalized.startsWith('openai/minio/') ||
 		normalized.startsWith('/v1/files/') ||
 		normalized.startsWith('/v1/generated-files/') ||
 		normalized.startsWith('api/v1/files/') ||
@@ -442,6 +517,11 @@ export const isDownloadRef = (value: string): boolean => {
 const getCanonicalGeneratedFileRef = (value: string | undefined): string => {
 	const normalized = normalizeFileRef(value ?? '');
 	if (!normalized) return '';
+
+	const knowflowAssetRef = extractKnowflowAssetRef(normalized);
+	if (knowflowAssetRef) {
+		return `knowflow:${knowflowAssetRef}`;
+	}
 
 	const openWebUiFileUrlMatch = normalized.match(OPEN_WEBUI_FILE_URL_REGEX);
 	if (openWebUiFileUrlMatch?.[1]) {
@@ -1090,10 +1170,9 @@ const isSameGeneratedFile = (
 	}
 
 	return (
-		existing.downloadMode !== incoming.downloadMode ||
-		existing.source !== incoming.source ||
-		!existingRef ||
-		!incomingRef
+		existing.downloadMode === incoming.downloadMode &&
+		existing.source === incoming.source &&
+		(!existingRef || !incomingRef)
 	);
 };
 
@@ -1105,6 +1184,26 @@ const scoreGeneratedFileName = (name: string | undefined): number => {
 	return normalized.length;
 };
 
+const scoreGeneratedFileUrl = (value: string | undefined): number => {
+	const normalized = normalizeKnowflowAssetUrl(value ?? '');
+	if (!normalized) return 0;
+
+	const lowered = normalized.toLowerCase();
+	if (lowered.includes('/api/v1/files/') && lowered.includes('/content')) {
+		return 5;
+	}
+	if (lowered.includes('/api/v1/files/')) {
+		return 4;
+	}
+	if (extractKnowflowAssetRef(normalized)) {
+		return 3;
+	}
+	if (lowered.startsWith('https://') || lowered.startsWith('http://')) {
+		return 2;
+	}
+	return 0;
+};
+
 const mergeGeneratedFile = (
 	existing: GeneratedFileItem | undefined,
 	incoming: GeneratedFileItem
@@ -1114,21 +1213,28 @@ const mergeGeneratedFile = (
 	const existingNameScore = scoreGeneratedFileName(existing.name);
 	const incomingNameScore = scoreGeneratedFileName(incoming.name);
 	const preferredName = incomingNameScore >= existingNameScore ? incoming.name : existing.name;
-	const preferredUrl = incoming.url ?? existing.url;
+	const existingUrl = normalizeKnowflowAssetUrl(existing.url) ?? existing.url;
+	const incomingUrl = normalizeKnowflowAssetUrl(incoming.url) ?? incoming.url;
+	const preferredUrl =
+		scoreGeneratedFileUrl(existingUrl) >= scoreGeneratedFileUrl(incomingUrl)
+			? (existingUrl ?? incomingUrl)
+			: (incomingUrl ?? existingUrl);
 	const preferredPath = incoming.path ?? existing.path;
 	const preferredDownloadMode =
 		preferredUrl && (!preferredPath || incoming.downloadMode === 'link' || existing.downloadMode === 'link')
 			? 'link'
 			: incoming.downloadMode ?? existing.downloadMode;
+	const preferredId =
+		incomingNameScore >= existingNameScore ? incoming.id ?? existing.id : existing.id ?? incoming.id;
 
 	return {
 		...existing,
 		...incoming,
 		name: preferredName,
-		url: preferredUrl,
+		url: preferredUrl ? normalizeOpenWebUiFileUrl(preferredUrl) : preferredUrl,
 		path: preferredPath,
 		downloadMode: preferredDownloadMode,
-		id: incoming.id,
+		id: preferredId,
 		timestamp: Math.max(existing.timestamp ?? 0, incoming.timestamp ?? 0) || undefined
 	};
 };

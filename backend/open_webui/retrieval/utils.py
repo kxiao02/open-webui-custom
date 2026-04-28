@@ -44,11 +44,29 @@ from open_webui.env import (
     OFFLINE_MODE,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     AIOHTTP_CLIENT_SESSION_SSL,
+    DEVICE_TYPE,
+    SENTENCE_TRANSFORMERS_BACKEND,
+    SENTENCE_TRANSFORMERS_MODEL_KWARGS,
 )
 from open_webui.config import (
+    RAG_EMBEDDING_MODEL_AUTO_UPDATE,
+    RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
     RAG_EMBEDDING_QUERY_PREFIX,
     RAG_EMBEDDING_CONTENT_PREFIX,
     RAG_EMBEDDING_PREFIX_FIELD_NAME,
+)
+from open_webui.utils.knowflow import (
+    KnowflowError,
+    build_knowflow_markdown_image,
+    get_knowflow_chunk_content,
+    get_knowflow_chunk_file_id,
+    get_knowflow_chunk_render_metadata,
+    get_knowflow_chunk_similarity,
+    get_knowflow_chunk_source_name,
+    is_knowflow_enabled,
+    is_knowflow_image_ref,
+    knowflow_content_has_inline_visuals,
+    retrieve_from_knowledge,
 )
 
 log = logging.getLogger(__name__)
@@ -90,6 +108,43 @@ def get_content_from_url(request, url: str) -> str:
     docs = loader.load()
     content = " ".join([doc.page_content for doc in docs])
     return content, docs
+
+
+def load_sentence_transformer_embedding_model(
+    embedding_model: str,
+    auto_update: bool = RAG_EMBEDDING_MODEL_AUTO_UPDATE,
+):
+    if not embedding_model:
+        raise ValueError("Embedding model is required for local fallback.")
+
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(
+        get_model_path(embedding_model, auto_update),
+        device=DEVICE_TYPE,
+        trust_remote_code=RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
+        backend=SENTENCE_TRANSFORMERS_BACKEND,
+        model_kwargs=SENTENCE_TRANSFORMERS_MODEL_KWARGS,
+    )
+
+
+async def _encode_with_sentence_transformer(
+    embedding_function,
+    query,
+    prefix=None,
+    embedding_batch_size=1,
+):
+    return await asyncio.to_thread(
+        (
+            lambda query, prefix=None: embedding_function.encode(
+                query,
+                batch_size=int(embedding_batch_size),
+                **({"prompt": prefix} if prefix else {}),
+            ).tolist()
+        ),
+        query,
+        prefix,
+    )
 
 
 CHUNK_HASH_KEY = "_chunk_hash"
@@ -842,6 +897,8 @@ def get_embedding_function(
     azure_api_version=None,
     enable_async=True,
     concurrent_requests=0,
+    fallback_to_local=False,
+    fallback_embedding_model=None,
 ) -> Awaitable:
     if embedding_engine == "":
         if embedding_function is None:
@@ -855,21 +912,16 @@ def get_embedding_function(
 
         # Sentence transformers: CPU-bound sync operation
         async def async_embedding_function(query, prefix=None, user=None):
-            return await asyncio.to_thread(
-                (
-                    lambda query, prefix=None: embedding_function.encode(
-                        query,
-                        batch_size=int(embedding_batch_size),
-                        **({"prompt": prefix} if prefix else {}),
-                    ).tolist()
-                ),
+            return await _encode_with_sentence_transformer(
+                embedding_function,
                 query,
                 prefix,
+                embedding_batch_size,
             )
 
         return async_embedding_function
     elif embedding_engine in ["ollama", "openai", "azure_openai"]:
-        embedding_function = lambda query, prefix=None, user=None: generate_embeddings(
+        external_embedding_function = lambda query, prefix=None, user=None: generate_embeddings(
             engine=embedding_engine,
             model=embedding_model,
             text=query,
@@ -879,61 +931,116 @@ def get_embedding_function(
             user=user,
             azure_api_version=azure_api_version,
         )
+        local_embedding_function = embedding_function
+        fallback_model_name = str(fallback_embedding_model or "").strip()
+        fallback_lock = asyncio.Lock()
 
-        async def async_embedding_function(query, prefix=None, user=None):
-            if isinstance(query, list):
-                # Create batches
-                batches = [
-                    query[i : i + embedding_batch_size]
-                    for i in range(0, len(query), embedding_batch_size)
-                ]
+        async def encode_with_local_fallback(query, prefix=None):
+            nonlocal local_embedding_function
 
-                if enable_async:
-                    log.debug(
-                        f"generate_multiple_async: Processing {len(batches)} batches in parallel"
-                    )
-                    # Use semaphore to limit concurrent embedding API requests
-                    # 0 = unlimited (no semaphore)
-                    if concurrent_requests:
-                        semaphore = asyncio.Semaphore(concurrent_requests)
-
-                        async def generate_batch_with_semaphore(batch):
-                            async with semaphore:
-                                return await embedding_function(
-                                    batch, prefix=prefix, user=user
-                                )
-
-                        tasks = [
-                            generate_batch_with_semaphore(batch) for batch in batches
-                        ]
-                    else:
-                        tasks = [
-                            embedding_function(batch, prefix=prefix, user=user)
-                            for batch in batches
-                        ]
-                    batch_results = await asyncio.gather(*tasks)
-                else:
-                    log.debug(
-                        f"generate_multiple_async: Processing {len(batches)} batches sequentially"
-                    )
-                    batch_results = []
-                    for batch in batches:
-                        batch_results.append(
-                            await embedding_function(batch, prefix=prefix, user=user)
+            if local_embedding_function is None:
+                async with fallback_lock:
+                    if local_embedding_function is None:
+                        log.warning(
+                            "Loading local fallback embedding model %s after %s embedding failure.",
+                            fallback_model_name,
+                            embedding_engine,
+                        )
+                        local_embedding_function = await asyncio.to_thread(
+                            load_sentence_transformer_embedding_model,
+                            fallback_model_name,
                         )
 
-                # Flatten results
-                embeddings = []
-                for batch_embeddings in batch_results:
-                    if isinstance(batch_embeddings, list):
-                        embeddings.extend(batch_embeddings)
+            return await _encode_with_sentence_transformer(
+                local_embedding_function,
+                query,
+                prefix,
+                embedding_batch_size,
+            )
 
-                log.debug(
-                    f"generate_multiple_async: Generated {len(embeddings)} embeddings from {len(batches)} parallel batches"
+        async def async_embedding_function(query, prefix=None, user=None):
+            try:
+                if isinstance(query, list):
+                    # Create batches
+                    batches = [
+                        query[i : i + embedding_batch_size]
+                        for i in range(0, len(query), embedding_batch_size)
+                    ]
+
+                    if enable_async:
+                        log.debug(
+                            f"generate_multiple_async: Processing {len(batches)} batches in parallel"
+                        )
+                        # Use semaphore to limit concurrent embedding API requests
+                        # 0 = unlimited (no semaphore)
+                        if concurrent_requests:
+                            semaphore = asyncio.Semaphore(concurrent_requests)
+
+                            async def generate_batch_with_semaphore(batch):
+                                async with semaphore:
+                                    return await external_embedding_function(
+                                        batch, prefix=prefix, user=user
+                                    )
+
+                            tasks = [
+                                generate_batch_with_semaphore(batch) for batch in batches
+                            ]
+                        else:
+                            tasks = [
+                                external_embedding_function(
+                                    batch, prefix=prefix, user=user
+                                )
+                                for batch in batches
+                            ]
+                        batch_results = await asyncio.gather(*tasks)
+                    else:
+                        log.debug(
+                            f"generate_multiple_async: Processing {len(batches)} batches sequentially"
+                        )
+                        batch_results = []
+                        for batch in batches:
+                            batch_results.append(
+                                await external_embedding_function(
+                                    batch, prefix=prefix, user=user
+                                )
+                            )
+
+                    if fallback_to_local and any(
+                        batch_embeddings is None for batch_embeddings in batch_results
+                    ):
+                        raise RuntimeError(
+                            f"{embedding_engine} embeddings request returned no data."
+                        )
+
+                    # Flatten results
+                    embeddings = []
+                    for batch_embeddings in batch_results:
+                        if isinstance(batch_embeddings, list):
+                            embeddings.extend(batch_embeddings)
+
+                    log.debug(
+                        f"generate_multiple_async: Generated {len(embeddings)} embeddings from {len(batches)} parallel batches"
+                    )
+                    return embeddings
+
+                result = await external_embedding_function(query, prefix, user)
+                if result is None and fallback_to_local:
+                    raise RuntimeError(
+                        f"{embedding_engine} embeddings request returned no data."
+                    )
+                return result
+            except Exception as exc:
+                if not fallback_to_local or not fallback_model_name:
+                    raise
+
+                log.warning(
+                    "External embeddings via %s model %s failed; falling back to local model %s: %s",
+                    embedding_engine,
+                    embedding_model,
+                    fallback_model_name,
+                    exc,
                 )
-                return embeddings
-            else:
-                return await embedding_function(query, prefix, user)
+                return await encode_with_local_fallback(query, prefix)
 
         return async_embedding_function
     else:
@@ -1001,6 +1108,86 @@ def get_reranking_function(reranking_engine, reranking_model, reranking_function
         )
 
 
+def _first_non_empty_query(queries: list[str]) -> str:
+    for query in queries or []:
+        normalized_query = str(query or "").strip()
+        if normalized_query:
+            return normalized_query
+    return ""
+
+
+def _format_knowflow_document_content(content: str, metadata: dict[str, Any]) -> str:
+    normalized_content = str(content or "").strip()
+    has_inline_visuals = knowflow_content_has_inline_visuals(normalized_content)
+
+    render_markdown = str(metadata.get("render_markdown") or "").strip()
+    render_url = str(metadata.get("url") or "").strip()
+    if (
+        not render_markdown
+        and render_url
+        and is_knowflow_image_ref(render_url)
+        and not has_inline_visuals
+    ):
+        render_markdown = build_knowflow_markdown_image(
+            render_url,
+            str(metadata.get("name") or "Knowledge image"),
+        )
+
+    if render_markdown:
+        if not normalized_content:
+            return render_markdown
+        if render_markdown not in normalized_content:
+            return f"{normalized_content}\n\n{render_markdown}"
+
+    if not normalized_content:
+        return str(metadata.get("html_content") or "").strip()
+
+    return normalized_content
+
+
+def _to_knowflow_query_result(
+    chunks: list[dict],
+    *,
+    config=None,
+    fallback_file_id: str = "",
+    fallback_name: str = "",
+) -> Optional[dict]:
+    documents: list[str] = []
+    metadatas: list[dict] = []
+    distances: list[float] = []
+
+    for chunk in chunks or []:
+        content = get_knowflow_chunk_content(chunk)
+        file_id = get_knowflow_chunk_file_id(chunk, fallback_file_id=fallback_file_id)
+        source_name = get_knowflow_chunk_source_name(chunk, fallback_name=fallback_name)
+        metadata = {
+            "file_id": file_id,
+            "name": source_name,
+            "source": source_name,
+            **get_knowflow_chunk_render_metadata(chunk, config),
+        }
+        content = _format_knowflow_document_content(content, metadata)
+        if not content:
+            continue
+
+        similarity = get_knowflow_chunk_similarity(chunk)
+        if similarity is not None:
+            metadata["similarity"] = similarity
+
+        documents.append(content)
+        metadatas.append(metadata)
+        distances.append(float(similarity) if similarity is not None else 0.0)
+
+    if not documents:
+        return None
+
+    return {
+        "documents": [documents],
+        "metadatas": [metadatas],
+        "distances": [distances],
+    }
+
+
 async def get_sources_from_items(
     request,
     items,
@@ -1021,6 +1208,8 @@ async def get_sources_from_items(
 
     extracted_collections = []
     query_results = []
+    knowflow_enabled = is_knowflow_enabled(request.app.state.config)
+    primary_query = _first_non_empty_query(queries)
 
     for item in items:
         query_result = None
@@ -1153,15 +1342,68 @@ async def get_sources_from_items(
                             ],
                         }
             else:
-                # Fallback to collection names
-                if item.get("legacy"):
-                    collection_names.append(f"{item['id']}")
-                else:
-                    collection_names.append(f"file-{item['id']}")
+                if knowflow_enabled and not full_context and primary_query and item.get("id"):
+                    try:
+                        chunks = await retrieve_from_knowledge(
+                            request.app.state.config,
+                            user,
+                            primary_query,
+                            document_ids=[item["id"]],
+                            page_size=max(1, int(k)),
+                        )
+                        query_result = _to_knowflow_query_result(
+                            chunks,
+                            config=request.app.state.config,
+                            fallback_file_id=str(item.get("id") or ""),
+                            fallback_name=str(item.get("name") or ""),
+                        )
+                    except KnowflowError as exc:
+                        log.warning(f"Knowflow file retrieval failed: {exc}")
+                    except Exception as exc:
+                        log.warning(f"Knowflow file retrieval failed unexpectedly: {exc}")
+
+                if query_result is None:
+                    # Fallback to local collection names
+                    if item.get("legacy"):
+                        collection_names.append(f"{item['id']}")
+                    else:
+                        collection_names.append(f"file-{item['id']}")
 
         elif item.get("type") == "collection":
+            if (
+                knowflow_enabled
+                and not full_context
+                and item.get("context") != "full"
+                and not request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
+                and primary_query
+                and item.get("id")
+            ):
+                try:
+                    chunks = await retrieve_from_knowledge(
+                        request.app.state.config,
+                        user,
+                        primary_query,
+                        dataset_ids=[item["id"]],
+                        page_size=max(1, int(k)),
+                    )
+                    query_result = _to_knowflow_query_result(
+                        chunks,
+                        config=request.app.state.config,
+                        fallback_name=str(item.get("name") or ""),
+                    )
+                except KnowflowError as exc:
+                    log.warning(f"Knowflow collection retrieval failed: {exc}")
+                except Exception as exc:
+                    log.warning(
+                        f"Knowflow collection retrieval failed unexpectedly: {exc}"
+                    )
+
             # Manual Full Mode Toggle for Collection
-            knowledge_base = Knowledges.get_knowledge_by_id(item.get("id"))
+            knowledge_base = (
+                Knowledges.get_knowledge_by_id(item.get("id"))
+                if query_result is None
+                else None
+            )
 
             if knowledge_base and (
                 user.role == "admin"

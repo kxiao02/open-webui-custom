@@ -14,6 +14,14 @@ export type ClientCapabilities = {
 		mode: 'inline_or_modal';
 		types: string[];
 	};
+	diagram_render: {
+		enabled: boolean;
+		engines: string[];
+		surfaces: string[];
+		assistant_message_engines: string[];
+		file_preview_engines: string[];
+		file_extensions: string[];
+	};
 	workspace_tool_draft: {
 		enabled: boolean;
 		mode: 'confirm_then_edit';
@@ -30,14 +38,35 @@ type BuildClientCapabilitiesArgs = {
 	chatId?: string | null;
 	temporaryChatEnabled?: boolean | null;
 	canShareChat?: boolean;
+	canDraftTool?: boolean;
+	canDraftSkill?: boolean;
 };
 
-const PREVIEWABLE_FILE_TYPES = ['image', 'pdf', 'docx', 'text', 'markdown', 'code'];
+const PREVIEWABLE_FILE_TYPES = [
+	'image',
+	'pdf',
+	'docx',
+	'xlsx',
+	'pptx',
+	'html',
+	'markdown',
+	'mermaid',
+	'text',
+	'code',
+	'json',
+	'csv',
+	'notebook',
+	'sqlite',
+	'audio',
+	'video'
+];
 
 export const getClientCapabilities = ({
 	chatId,
 	temporaryChatEnabled,
-	canShareChat = true
+	canShareChat = true,
+	canDraftTool = true,
+	canDraftSkill = true
 }: BuildClientCapabilitiesArgs): ClientCapabilities => {
 	const hasPersistentChat = typeof chatId === 'string' && !!chatId && !chatId.startsWith('local:');
 	const shareEnabled = Boolean(hasPersistentChat && !temporaryChatEnabled && canShareChat);
@@ -58,13 +87,21 @@ export const getClientCapabilities = ({
 			mode: 'inline_or_modal',
 			types: PREVIEWABLE_FILE_TYPES
 		},
-		workspace_tool_draft: {
+		diagram_render: {
 			enabled: true,
+			engines: ['mermaid', 'vega', 'vega-lite'],
+			surfaces: ['assistant_message'],
+			assistant_message_engines: ['mermaid', 'vega', 'vega-lite'],
+			file_preview_engines: ['mermaid'],
+			file_extensions: ['.md', '.markdown', '.mdx', '.mermaid', '.mmd']
+		},
+		workspace_tool_draft: {
+			enabled: canDraftTool,
 			mode: 'confirm_then_edit',
 			format: 'python_tool_class'
 		},
 		workspace_skill_draft: {
-			enabled: true,
+			enabled: canDraftSkill,
 			mode: 'confirm_then_edit',
 			format: 'markdown_skill'
 		}

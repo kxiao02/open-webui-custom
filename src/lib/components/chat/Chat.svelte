@@ -71,6 +71,8 @@
 	import { AudioQueue } from '$lib/utils/audio';
 	import {
 		collectGeneratedFilesFromResponseOutput,
+		normalizeKnowflowAssetUrl,
+		normalizeVisualUrlForMatching,
 		normalizeToolResponseOutput,
 		normalizeToolCallContent
 	} from '$lib/utils/generated-files';
@@ -365,23 +367,56 @@
 		return `${baseConversationId}::branch::${responseMessageId}`;
 	};
 
+	const extractKnowflowAssetRef = (value: unknown): string | null => {
+		if (typeof value !== 'string') {
+			return null;
+		}
+
+		const normalized = value.trim();
+		if (!normalized || normalized.startsWith('data:') || normalized.startsWith('blob:')) {
+			return null;
+		}
+
+		let path = normalized;
+		try {
+			const parsed = new URL(
+				normalized,
+				typeof window !== 'undefined' ? window.location.origin : WEBUI_BASE_URL
+			);
+			path = parsed.pathname || normalized;
+		} catch {
+			path = normalized;
+		}
+
+		if (!path.startsWith('/')) {
+			path = `/${path.replace(/^\/+/, '')}`;
+		}
+
+		const match = path.match(/\/(?:openai\/)?minio\/[^?#]+/i);
+		if (!match) {
+			return null;
+		}
+
+		return match[0].replace(/^\/openai(?=\/minio\/)/i, '');
+	};
+
 	const sanitizeFilesList = (fileList: any[] = []) => {
 		if (!Array.isArray(fileList)) {
 			return [];
 		}
 
 		const extractFileDownloadRef = (file: any): string | null =>
-			normalizeFileRef(file?.url) ??
-			normalizeFileRef(file?.bridge_url) ??
-			normalizeFileRef(file?.generated_file_url) ??
-			normalizeFileRef(file?.download_url) ??
-			normalizeFileRef(file?.downloadUrl);
+			normalizeKnowflowAssetUrl(file?.bridge_url) ??
+			normalizeKnowflowAssetUrl(file?.generated_file_url) ??
+			normalizeKnowflowAssetUrl(file?.download_url) ??
+			normalizeKnowflowAssetUrl(file?.downloadUrl) ??
+			normalizeKnowflowAssetUrl(file?.url);
 
 		const extractFileIdRef = (file: any): string | null =>
-			normalizeFileRef(file?.id) ??
-			normalizeFileRef(file?.bridge_file_id) ??
-			normalizeFileRef(file?.file_id) ??
-			normalizeFileRef(file?.fileId);
+			normalizeKnowflowAssetUrl(file?.id) ??
+			normalizeKnowflowAssetUrl(file?.bridge_file_id) ??
+			normalizeKnowflowAssetUrl(file?.file_id) ??
+			normalizeKnowflowAssetUrl(file?.fileId);
 
 		const extractFilePathRef = (file: any): string | null =>
 			normalizeFileRef(file?.path) ??
@@ -393,14 +428,33 @@
 			if (typeof value !== 'string') return 0;
 			const normalized = value.trim();
 			if (!normalized) return 0;
-			if (normalized === 'generated-file') return 1;
+			if (['generated-file', 'knowledge visual', 'knowflow', 'image', 'file'].includes(normalized.toLowerCase())) {
+				return 1;
+			}
 			return normalized.length;
+		};
+
+		const scoreFileRef = (value: unknown): number => {
+			const normalized = normalizeKnowflowAssetUrl(value)?.toLowerCase() ?? '';
+			if (!normalized) return 0;
+			if (normalized.includes('/api/v1/files/') && normalized.includes('/content')) return 5;
+			if (normalized.includes('/api/v1/files/')) return 4;
+			if (extractKnowflowAssetRef(normalized)) return 3;
+			if (normalized.startsWith('https://') || normalized.startsWith('http://')) return 2;
+			return 0;
 		};
 
 		const buildFileDedupeKey = (file: any): string => {
 			const pathRef = extractFilePathRef(file);
 			if (pathRef) {
 				return `path::${pathRef}`;
+			}
+
+			const assetRef = extractKnowflowAssetRef(
+				extractFileDownloadRef(file) ?? extractFileIdRef(file)
+			);
+			if (assetRef) {
+				return `asset::${assetRef}`;
 			}
 
 			return [
@@ -425,8 +479,12 @@
 				scoreFileLabel(incoming?.filename),
 				scoreFileLabel(incoming?.fileName)
 			);
+			const existingDownloadRef = extractFileDownloadRef(existing);
+			const incomingDownloadRef = extractFileDownloadRef(incoming);
 			const preferredDownloadRef =
-				extractFileDownloadRef(incoming) ?? extractFileDownloadRef(existing);
+				scoreFileRef(existingDownloadRef) >= scoreFileRef(incomingDownloadRef)
+					? (existingDownloadRef ?? incomingDownloadRef)
+					: (incomingDownloadRef ?? existingDownloadRef);
 			const preferredId = extractFileIdRef(incoming) ?? extractFileIdRef(existing);
 			const preferredPath = extractFilePathRef(incoming) ?? extractFilePathRef(existing);
 
@@ -528,18 +586,18 @@
 
 	const resolveImageFileUrl = (file: any): string | null => {
 		const candidates = [
-			normalizeFileRef(file?.download_url),
-			normalizeFileRef(file?.downloadUrl),
-			normalizeFileRef(file?.generated_file_url),
-			normalizeFileRef(file?.bridge_url),
-			normalizeFileRef(file?.url)
+			normalizeKnowflowAssetUrl(file?.bridge_url),
+			normalizeKnowflowAssetUrl(file?.generated_file_url),
+			normalizeKnowflowAssetUrl(file?.download_url),
+			normalizeKnowflowAssetUrl(file?.downloadUrl),
+			normalizeKnowflowAssetUrl(file?.url)
 		].filter((value): value is string => Boolean(value));
 
 		const fallbackId =
-			normalizeFileRef(file?.id) ??
-			normalizeFileRef(file?.file_id) ??
-			normalizeFileRef(file?.fileId) ??
-			normalizeFileRef(file?.bridge_file_id);
+			normalizeKnowflowAssetUrl(file?.id) ??
+			normalizeKnowflowAssetUrl(file?.file_id) ??
+			normalizeKnowflowAssetUrl(file?.fileId) ??
+			normalizeKnowflowAssetUrl(file?.bridge_file_id);
 
 		if (candidates.length === 0) {
 			return fallbackId;
@@ -553,10 +611,11 @@
 	};
 
 	const resolveImageFileId = (file: any, url: string | null): string | null =>
-		normalizeFileRef(file?.id) ??
-		normalizeFileRef(file?.file_id) ??
-		normalizeFileRef(file?.fileId) ??
-		normalizeFileRef(file?.bridge_file_id) ??
+		normalizeKnowflowAssetUrl(file?.id) ??
+		normalizeKnowflowAssetUrl(file?.file_id) ??
+		normalizeKnowflowAssetUrl(file?.fileId) ??
+		normalizeKnowflowAssetUrl(file?.bridge_file_id) ??
+		extractKnowflowAssetRef(url) ??
 		extractFileIdFromUrl(url);
 
 	const scoreImageUrl = (value: string | null): number => {
@@ -611,6 +670,170 @@
 				Array.isArray(group) ? group : group && typeof group === 'object' ? [group] : []
 			)
 		);
+
+	const EMBED_IMAGE_TAG_REGEX = /<img\b[^>]*\bsrc=["']([^"'<>]+)["'][^>]*>/gi;
+	const EMBED_TABLE_ROW_REGEX = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+	const EMBED_TABLE_CELL_REGEX = /<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi;
+	const EMBED_BREAK_TAG_REGEX = /<br\s*\/?>/gi;
+	const EMBED_HTML_TAG_REGEX = /<[^>]+>/g;
+	const EMBED_HTML_ENTITY_REGEX = /&nbsp;/gi;
+
+	const normalizeEmbedText = (value: string): string =>
+		value
+			.replace(EMBED_BREAK_TAG_REGEX, ' ')
+			.replace(EMBED_HTML_ENTITY_REGEX, ' ')
+			.replace(EMBED_HTML_TAG_REGEX, ' ')
+			.replace(/\s+/g, ' ')
+			.trim();
+
+	const extractEmbedImageUrls = (html: string): string[] =>
+		Array.from(html.matchAll(EMBED_IMAGE_TAG_REGEX), (match) =>
+			normalizeVisualUrlForMatching(match[1] ?? '')
+		).filter(Boolean);
+
+	const EMBED_IFRAME_TAG_REGEX = /<iframe\b[^>]*\bsrc=(['"])(.*?)\1/gi;
+	const STANDALONE_EMBED_URL_REGEX =
+		/^(?:https?:\/\/|\/|data:|blob:|(?:api|openai)\/v1\/|v1\/)/i;
+
+	const extractEmbedIframeUrls = (html: string): string[] =>
+		Array.from(html.matchAll(EMBED_IFRAME_TAG_REGEX), (match) =>
+			normalizeVisualUrlForMatching(match[2] ?? '')
+		).filter(Boolean);
+
+	const buildNormalizedEmbedUrlSetKey = (urls: string[]): string =>
+		Array.from(new Set(urls.filter(Boolean))).sort().join('|');
+
+	const extractStandaloneEmbedUrl = (value: string): string => {
+		const normalized = value.trim();
+		if (!normalized || normalized.includes('<') || !STANDALONE_EMBED_URL_REGEX.test(normalized)) {
+			return '';
+		}
+
+		return normalizeVisualUrlForMatching(normalized);
+	};
+
+	const extractEmbedTableSignature = (html: string): string => {
+		const rows = Array.from(html.matchAll(EMBED_TABLE_ROW_REGEX), (rowMatch) => {
+			const cells = Array.from(rowMatch[1].matchAll(EMBED_TABLE_CELL_REGEX), (cellMatch) =>
+				normalizeEmbedText(cellMatch[1] ?? '')
+			).filter((cell) => cell.length > 0);
+			return cells.join('|');
+		}).filter((row) => row.length > 0);
+
+		return rows.join('||');
+	};
+
+	const buildEmbedMergeKey = (value: unknown): string => {
+		if (typeof value !== 'string') {
+			return '';
+		}
+
+		const normalized = value.trim();
+		if (!normalized) {
+			return '';
+		}
+
+		const tableSignature = extractEmbedTableSignature(normalized);
+		if (tableSignature) {
+			return `table:${tableSignature}`;
+		}
+
+		const imageUrls = extractEmbedImageUrls(normalized);
+		if (imageUrls.length > 0) {
+			return `image:${buildNormalizedEmbedUrlSetKey(imageUrls)}`;
+		}
+
+		const iframeUrls = extractEmbedIframeUrls(normalized);
+		if (iframeUrls.length > 0) {
+			return `iframe:${buildNormalizedEmbedUrlSetKey(iframeUrls)}`;
+		}
+
+		const standaloneUrl = extractStandaloneEmbedUrl(normalized);
+		if (standaloneUrl) {
+			return `url:${standaloneUrl}`;
+		}
+
+		return `html:${normalized}`;
+	};
+
+	const scoreEmbedContent = (value: string): number => {
+		const normalized = value.trim();
+		if (!normalized) {
+			return 0;
+		}
+
+		let score = normalized.length;
+		if (/<table\b/i.test(normalized)) {
+			score += 1000;
+		}
+		if (/<img\b/i.test(normalized)) {
+			score += 500;
+		}
+		if (/<iframe\b/i.test(normalized)) {
+			score += 250;
+		}
+
+		return score;
+	};
+
+	const mergeEmbedsLists = (...embedGroups: any[]) => {
+		const merged: string[] = [];
+		const indexByKey = new Map<string, number>();
+
+		for (const group of embedGroups) {
+			const items = Array.isArray(group)
+				? group
+				: typeof group === 'string'
+					? [group]
+					: [];
+			for (const item of items) {
+				if (typeof item !== 'string') {
+					continue;
+				}
+
+				const normalized = item.trim();
+				if (!normalized) {
+					continue;
+				}
+
+				const mergeKey = buildEmbedMergeKey(normalized);
+				const existingIndex = indexByKey.get(mergeKey);
+				if (existingIndex === undefined) {
+					indexByKey.set(mergeKey, merged.length);
+					merged.push(normalized);
+					continue;
+				}
+
+				if (scoreEmbedContent(normalized) >= scoreEmbedContent(merged[existingIndex] ?? '')) {
+					merged[existingIndex] = normalized;
+				}
+			}
+		}
+
+		return merged;
+	};
+
+	const hasSameEmbedList = (existing: unknown, next: string[]): boolean => {
+		if (!Array.isArray(existing) || existing.length !== next.length) {
+			return false;
+		}
+
+		return existing.every((item, index) => typeof item === 'string' && item.trim() === next[index]);
+	};
+
+	const mergeEmbedsIntoMessage = (message: Record<string, unknown>, ...embedGroups: any[]): boolean => {
+		const nextEmbeds = mergeEmbedsLists(message?.embeds ?? [], ...embedGroups);
+		if (nextEmbeds.length === 0) {
+			return false;
+		}
+
+		if (hasSameEmbedList(message?.embeds, nextEmbeds)) {
+			return false;
+		}
+
+		message.embeds = nextEmbeds;
+		return true;
+	};
 
 	const collectGeneratedFilesFromCompletionData = (payload: any) =>
 		mergeFilesLists(
@@ -1160,6 +1383,14 @@
 		}
 
 		if (Array.isArray(message.output) && message.output.length > 0) {
+			return true;
+		}
+
+		if (Array.isArray(message.files) && message.files.length > 0) {
+			return true;
+		}
+
+		if (Array.isArray(message.embeds) && message.embeds.length > 0) {
 			return true;
 		}
 
@@ -1989,16 +2220,18 @@
 				} else if (type === 'chat:message:files' || type === 'files') {
 					message.files = mergeFilesLists(message?.files ?? [], data?.files ?? []);
 				} else if (type === 'chat:message:embeds' || type === 'embeds') {
-					message.embeds = data.embeds;
+					const didUpdateEmbeds = mergeEmbedsIntoMessage(message, data?.embeds);
 
-					// Auto-scroll to the embed once it's rendered in the DOM
-					await tick();
-					setTimeout(() => {
-						const embedEl = document.getElementById(`${event.message_id}-embeds-container`);
-						if (embedEl) {
-							embedEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-						}
-					}, 100);
+					if (didUpdateEmbeds) {
+						// Auto-scroll only when the visible embed set actually changes.
+						await tick();
+						setTimeout(() => {
+							const embedEl = document.getElementById(`${event.message_id}-embeds-container`);
+							if (embedEl) {
+								embedEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+							}
+						}, 100);
+					}
 				} else if (type === 'chat:message:error') {
 					message.error = data.error;
 				} else if (type === 'chat:message:follow_ups') {
@@ -3475,10 +3708,18 @@
 		const hasContent = Object.prototype.hasOwnProperty.call(data ?? {}, 'content');
 		let hasVisibleResponseUpdate = false;
 		const completionFiles = collectGeneratedFilesFromCompletionData(data);
+		const completionEmbeds = mergeEmbedsLists(
+			data?.embeds,
+			data?.metadata?.embeds,
+			data?.choices?.[0]?.message?.metadata?.embeds
+		);
 
 		if (completionFiles.length > 0) {
 			message.files = mergeFilesLists(message?.files ?? [], completionFiles);
 		}
+
+		const didUpdateEmbeds =
+			completionEmbeds.length > 0 && mergeEmbedsIntoMessage(message, completionEmbeds);
 
 		// Store raw OR-aligned output items from backend
 		if (output) {
@@ -3588,6 +3829,16 @@
 		}
 
 		history.messages[message.id] = message;
+
+		if (didUpdateEmbeds) {
+			await tick();
+			setTimeout(() => {
+				const embedEl = document.getElementById(`${message.id}-embeds-container`);
+				if (embedEl) {
+					embedEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+				}
+			}, 100);
+		}
 
 		if (done) {
 			const activeTaskIds = await resolveActiveTaskIds(chatId);

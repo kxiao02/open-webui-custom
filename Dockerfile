@@ -42,7 +42,6 @@ ARG SKIP_NLTK_PRELOAD
 
 ######## WebUI frontend ########
 FROM ${NODE_IMAGE} AS build
-ARG BUILD_HASH
 ARG NPM_CONFIG_REGISTRY
 ARG GITHUB_MIRROR_PREFIX
 ARG NODE_MAX_OLD_SPACE_SIZE
@@ -52,9 +51,6 @@ ARG ONNXRUNTIME_NODE_INSTALL_CUDA=skip
 ENV NODE_MAX_OLD_SPACE_SIZE=${NODE_MAX_OLD_SPACE_SIZE}
 
 WORKDIR /app
-
-# to store git revision in build
-RUN apk add --no-cache git
 
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 ENV GITHUB_MIRROR_PREFIX=${GITHUB_MIRROR_PREFIX}
@@ -66,7 +62,16 @@ RUN if [ -n "$NPM_CONFIG_REGISTRY" ]; then npm config set registry "$NPM_CONFIG_
 ENV NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE} --require /app/scripts/github-mirror.js"
 RUN npm ci --force
 
-COPY . .
+# Copy only the frontend inputs so backend-only changes keep the prebaked
+# node_modules layer and frontend build cache intact.
+COPY CHANGELOG.md ./CHANGELOG.md
+COPY postcss.config.js svelte.config.js tailwind.config.js tsconfig.json vite.config.ts ./
+COPY src ./src
+COPY static ./static
+COPY scripts ./scripts
+# Keep the deploy/version hash late so changing it does not invalidate the
+# cached frontend dependency install.
+ARG BUILD_HASH
 ENV APP_BUILD_HASH=${BUILD_HASH}
 RUN if [ "$SKIP_PYODIDE_FETCH" = "true" ]; then \
     echo "Skipping pyodide fetch for faster build"; \
@@ -237,7 +242,43 @@ RUN set -e; \
 # path skips the full backend requirements layer.
 RUN pip3 install --no-cache-dir boto3==1.42.62
 
-# Fail the build if the runtime image still lacks core backend packages.
+# Ensure the local STT stack is always present in the runtime image.
+# Slim/cached builds have intermittently booted without faster-whisper even
+# though local audio transcription is enabled by default.
+RUN pip3 install --no-cache-dir faster-whisper==1.2.1 modelscope==1.36.0
+
+# Ensure the local embedding stack is always present in the runtime image.
+# Slim/cached builds can otherwise boot without the packages needed to index
+# file content for retrieval, even when the embedding model cache already exists.
+RUN set -e; \
+    PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL_CPU:-https://download.pytorch.org/whl/cpu}" && \
+    pip3 install --no-cache-dir \
+        'torch<=2.9.1' \
+        --index-url "$PYTORCH_INDEX_URL" \
+        --trusted-host "$(echo "$PYTORCH_INDEX_URL" | sed -E 's#^https?://([^/]+)/?.*#\1#')" && \
+    pip3 install --no-cache-dir \
+        transformers==5.3.0 \
+        sentence-transformers==5.2.3 \
+        accelerate
+
+# Ensure the document extraction stack is always present in the runtime image.
+# This guards against slim/cached builds shipping without the packages needed
+# to read uploaded office documents during chat.
+RUN pip3 install --no-cache-dir \
+    unstructured==0.18.31 \
+    pandas==3.0.1 \
+    msoffcrypto-tool==6.0.0 \
+    networkx==3.4.2 \
+    openpyxl==3.1.5 \
+    pyxlsb==1.0.10 \
+    xlrd==2.0.2 \
+    docx2txt==0.9 \
+    python-pptx==1.0.2 \
+    pypandoc==1.16.2 \
+    nltk==3.9.3
+
+# Fail the build if the runtime image still lacks core backend or file
+# extraction packages.
 RUN python3 - <<'PY'
 import importlib.util
 
@@ -247,6 +288,24 @@ required_modules = {
     "psycopg2": "psycopg2-binary",
     "uvicorn": "uvicorn",
     "typer": "typer",
+    "docx2txt": "docx2txt",
+    "msoffcrypto": "msoffcrypto-tool",
+    "networkx": "networkx",
+    "nltk": "nltk",
+    "openpyxl": "openpyxl",
+    "pandas": "pandas",
+    "pptx": "python-pptx",
+    "pypandoc": "pypandoc",
+    "pyxlsb": "pyxlsb",
+    "sentence_transformers": "sentence-transformers",
+    "torch": "torch",
+    "transformers": "transformers",
+    "accelerate": "accelerate",
+    "ctranslate2": "ctranslate2",
+    "faster_whisper": "faster-whisper",
+    "modelscope": "modelscope",
+    "unstructured": "unstructured",
+    "xlrd": "xlrd",
 }
 missing = sorted(
     package_name
@@ -264,105 +323,12 @@ print("Dependency check OK: core runtime packages present.")
 PY
 
 # Preload NLTK resources required by unstructured Excel/document loaders.
-# We use mirror-first direct package URLs (if provided), then fall back to upstream.
-RUN python3 - <<'PY'
-import io
-import os
-import urllib.request
-import zipfile
-import sys
-
-download_dir = os.environ.get("NLTK_DATA", "/usr/local/share/nltk_data")
-mirror_prefix = (os.environ.get("GITHUB_MIRROR_PREFIX") or "").strip().rstrip("/")
-skip_nltk_preload = (os.environ.get("SKIP_NLTK_PRELOAD") or "").lower() == "true"
-
-if skip_nltk_preload:
-    print("Skipping NLTK preload during image build")
-    sys.exit(0)
-
-resources = [
-    ("taggers", "averaged_perceptron_tagger_eng"),
-    ("tokenizers", "punkt_tab"),
-]
-
-os.makedirs(download_dir, exist_ok=True)
-
-def candidates(category: str, package: str):
-    paths = []
-    if mirror_prefix:
-        paths.append(
-            f"{mirror_prefix}/nltk/nltk_data/raw/gh-pages/packages/{category}/{package}.zip"
-        )
-    paths.append(
-        f"https://raw.githubusercontent.com/nltk/nltk_data/gh-pages/packages/{category}/{package}.zip"
-    )
-    return paths
-
-def present(category: str, package: str) -> bool:
-    return os.path.isdir(os.path.join(download_dir, category, package))
-
-def normalize(category: str, package: str):
-    # Handle previously flattened layout: /nltk_data/<package> -> /nltk_data/<category>/<package>
-    flat = os.path.join(download_dir, package)
-    nested = os.path.join(download_dir, category, package)
-    if os.path.isdir(flat) and not os.path.isdir(nested):
-        os.makedirs(os.path.join(download_dir, category), exist_ok=True)
-        os.replace(flat, nested)
-
-def extract_archive(zf: zipfile.ZipFile, category: str, package: str):
-    names = [n for n in zf.namelist() if n and not n.startswith("__MACOSX/")]
-    category_prefix = f"{category}/"
-    package_prefix = f"{package}/"
-
-    if any(n.startswith(category_prefix) for n in names):
-        zf.extractall(download_dir)
-    elif any(n.startswith(package_prefix) for n in names):
-        zf.extractall(os.path.join(download_dir, category))
-    else:
-        target_root = os.path.join(download_dir, category, package)
-        os.makedirs(target_root, exist_ok=True)
-        for name in names:
-            if name.endswith("/"):
-                os.makedirs(os.path.join(target_root, name), exist_ok=True)
-                continue
-            dest = os.path.join(target_root, name)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with zf.open(name) as src, open(dest, "wb") as out:
-                out.write(src.read())
-
-for category, package in resources:
-    normalize(category, package)
-    if present(category, package):
-        print(f"NLTK resource already present: {category}/{package}")
-        continue
-
-    last_error = None
-    for url in candidates(category, package):
-        try:
-            print(f"Downloading {category}/{package} from {url}")
-            with urllib.request.urlopen(url, timeout=120) as response:
-                archive = response.read()
-            with zipfile.ZipFile(io.BytesIO(archive)) as zf:
-                extract_archive(zf, category, package)
-            normalize(category, package)
-            if present(category, package):
-                print(f"Installed {category}/{package} via {url}")
-                last_error = None
-                break
-            last_error = RuntimeError(
-                f"Package extracted but not discoverable: {category}/{package}"
-            )
-        except Exception as exc:  # pragma: no cover - build-time path
-            print(f"Download failed from {url}: {exc}")
-            last_error = exc
-
-    if last_error is not None:
-        raise RuntimeError(
-            f"Failed to preload NLTK resource {category}/{package}: {last_error}"
-        )
-
-print("NLTK preload complete.")
-PY
+# Keep the preload logic in a real Python module so classic Docker builds do
+# not silently keep a stale heredoc script when only the logic changes.
+COPY --chown=$UID:$GID ./backend/open_webui/utils/nltk_preload.py /tmp/nltk_preload.py
+RUN mkdir -p "$NLTK_DATA" && \
+    printf 'nltk-preload-v7\n' > "$NLTK_DATA/.image-marker" && \
+    python3 /tmp/nltk_preload.py --build-preload
 
 # Install Ollama if requested
 RUN if [ "$USE_OLLAMA" = "true" ]; then \
@@ -383,6 +349,15 @@ COPY --chown=$UID:$GID --from=build /app/package.json /app/package.json
 
 # copy backend files
 COPY --chown=$UID:$GID ./backend .
+
+# Keep the runtime API's build hash aligned with the frontend assets without
+# invalidating the heavy dependency layers when the deploy tag changes.
+ARG BUILD_HASH
+ENV WEBUI_BUILD_HASH=${BUILD_HASH}
+
+# Runtime-only mirror configuration is kept late so changing the mirror does not
+# invalidate the prebaked apt/pip dependency layers above.
+ENV GITHUB_MIRROR_PREFIX=${GITHUB_MIRROR_PREFIX}
 
 EXPOSE 8080
 

@@ -60,6 +60,7 @@
 		isDownloadRef,
 		parseNestedJSON,
 		isPrimaryDocumentArtifact,
+		normalizeVisualUrlForMatching,
 		triggerGeneratedFileDownload,
 		resolveToolCallStatus,
 		shouldHideHelperArtifact
@@ -102,12 +103,25 @@
 	import ContentRenderer from './ContentRenderer.svelte';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
 	import FollowUps from './ResponseMessage/FollowUps.svelte';
+	import StatusHistory from './ResponseMessage/StatusHistory.svelte';
 	import { fade } from 'svelte/transition';
 	import RegenerateMenu from './ResponseMessage/RegenerateMenu.svelte';
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import AccessControl from '$lib/components/workspace/common/AccessControl.svelte';
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
-	import { normalizeToolId } from '$lib/utils/tool-display';
+	import { isHiddenHelperToolCall, normalizeToolId } from '$lib/utils/tool-display';
+
+	type MessageStatus = {
+		done?: boolean;
+		action?: string;
+		description?: string;
+		hidden?: boolean;
+		urls?: string[];
+		items?: unknown[];
+		query?: string;
+		queries?: string[];
+		count?: number;
+	};
 
 	interface MessageType {
 		id: string;
@@ -116,20 +130,8 @@
 		files?: { type: string; url: string }[];
 		timestamp: number;
 		role: string;
-		statusHistory?: {
-			done: boolean;
-			action: string;
-			description: string;
-			urls?: string[];
-			query?: string;
-		}[];
-		status?: {
-			done: boolean;
-			action: string;
-			description: string;
-			urls?: string[];
-			query?: string;
-		};
+		statusHistory?: MessageStatus[];
+		status?: MessageStatus;
 		done: boolean;
 		error?: boolean | { content: string };
 		sources?: string[];
@@ -263,10 +265,44 @@
 					record.tool_name ?? '',
 					buildStructuredSignature(record.arguments),
 					buildStructuredSignature(record.output),
+					buildStructuredSignature(record.result),
+					buildStructuredSignature(record.files),
+					buildStructuredSignature(record.embeds),
 					buildStructuredSignature(record.content),
-					buildStructuredSignature(record.summary)
+					buildStructuredSignature(record.summary),
+					buildStructuredSignature(record.error),
+					buildStructuredSignature(record.metadata)
 				].join(':');
 			})
+			.join('|');
+	};
+
+	const buildMessageFileSignature = (value: unknown): string => {
+		if (!Array.isArray(value)) return '';
+		return value
+			.map((item) => {
+				if (!item || typeof item !== 'object') return String(item ?? '');
+				const record = item as Record<string, unknown>;
+				return buildStructuredSignature({
+					id: record.id ?? '',
+					type: record.type ?? '',
+					name: record.name ?? record.filename ?? record.fileName ?? '',
+					url: record.url ?? '',
+					download_url: record.download_url ?? '',
+					bridge_url: record.bridge_url ?? '',
+					generated_file_url: record.generated_file_url ?? '',
+					path: record.path ?? ''
+				});
+			})
+			.join('|');
+	};
+
+	const buildMessageEmbedSignature = (value: unknown): string => {
+		if (!Array.isArray(value)) return '';
+		return value
+			.map((item) =>
+				typeof item === 'string' ? buildStringSignature(item.trim()) : buildStructuredSignature(item)
+			)
 			.join('|');
 	};
 
@@ -276,32 +312,30 @@
 		const status = source.status ?? {};
 		const annotation = source.annotation ?? {};
 		const outputSignature = buildOutputSignature((source as any).output);
-		const filesLength = Array.isArray((source as any).files) ? (source as any).files.length : 0;
+		const filesSignature = buildMessageFileSignature((source as any).files);
 		const followUpsLength = Array.isArray((source as any).followUps)
 			? (source as any).followUps.length
 			: 0;
 		const sourcesLength = Array.isArray((source as any).sources)
 			? (source as any).sources.length
 			: 0;
-		const statusHistoryLength = Array.isArray((source as any).statusHistory)
-			? (source as any).statusHistory.length
-			: 0;
+		const statusHistorySignature = buildStructuredSignature((source as any).statusHistory);
 		const codeExecutionsLength = Array.isArray((source as any).code_executions)
 			? (source as any).code_executions.length
 			: 0;
-		const embedsLength = Array.isArray((source as any).embeds) ? (source as any).embeds.length : 0;
+		const embedsSignature = buildMessageEmbedSignature((source as any).embeds);
 
 		return [
 			source.done ? '1' : '0',
 			getErrorKey(source.error),
-			`${status?.action ?? ''}:${status?.done ?? ''}`,
-			statusHistoryLength,
+			buildStructuredSignature(status),
+			statusHistorySignature,
 			outputSignature,
-			filesLength,
+			filesSignature,
 			followUpsLength,
 			sourcesLength,
 			codeExecutionsLength,
-			embedsLength,
+			embedsSignature,
 			`${annotation?.type ?? ''}:${annotation?.rating ?? ''}`,
 			`${info?.prompt_tokens ?? ''}:${info?.completion_tokens ?? ''}:${info?.total_tokens ?? ''}`,
 			`${info?.eval_count ?? ''}:${info?.eval_duration ?? ''}:${info?.total_duration ?? ''}:${info?.load_duration ?? ''}`
@@ -325,6 +359,38 @@
 			}
 		}
 	}
+
+	const isVisibleMessageStatus = (
+		status: MessageStatus | null | undefined
+	): status is MessageStatus => Boolean(status) && status?.hidden !== true;
+
+	const getNormalizedStatusHistory = (
+		source: MessageType | null | undefined
+	): MessageStatus[] => {
+		const historyItems = Array.isArray(source?.statusHistory)
+			? source.statusHistory.filter(Boolean)
+			: [];
+		if (historyItems.length > 0) {
+			if (!historyItems.some(isVisibleMessageStatus) && isVisibleMessageStatus(source?.status)) {
+				return [source.status];
+			}
+			return historyItems;
+		}
+
+		return source?.status ? [source.status] : [];
+	};
+
+	const shouldRenderStatusHistory = (history: MessageStatus[]): boolean => {
+		const visibleStatuses = history.filter(isVisibleMessageStatus);
+		if (visibleStatuses.length === 0) return false;
+
+		const latestStatus = history.at(-1);
+		if (latestStatus?.hidden === true && visibleStatuses.every((status) => status.action === 'chat')) {
+			return false;
+		}
+
+		return true;
+	};
 
 	export let siblings;
 
@@ -382,11 +448,17 @@
 	let generatedFiles: GeneratedFileItem[] = [];
 	let displayGeneratedFiles: GeneratedFileItem[] = [];
 	let visibleMessageFiles: any[] = [];
+	let visibleMessageEmbeds: string[] = [];
+	let statusUpdatesEnabled = true;
+	let normalizedStatusHistory: MessageStatus[] = [];
+	let hasVisibleStatusHistory = false;
 	let generatedFilesKey = '';
 	let generatedFilesListKey = '';
 	let parsedContentKey = '';
 	let parsedGeneratedFilesKey = '';
 	let parsedOutputKey = '';
+	let parsedFilesKey = '';
+	let parsedEmbedsKey = '';
 	let parsedProcessStatusTick = -1;
 	let parsedSkillDraftKey = '';
 	let parsedSkillDraft: ParsedSkillDraft | null = null;
@@ -415,6 +487,10 @@
 	let creatingToolDraft = false;
 	let canSharePublicSkill = false;
 	let canSharePublicTool = false;
+
+	$: statusUpdatesEnabled = model?.info?.meta?.capabilities?.status_updates ?? true;
+	$: normalizedStatusHistory = statusUpdatesEnabled ? getNormalizedStatusHistory(message) : [];
+	$: hasVisibleStatusHistory = shouldRenderStatusHistory(normalizedStatusHistory);
 
 	const cloneSkillDraftForEditing = (draft: ParsedSkillDraft) => ({
 		id: draft.id,
@@ -476,7 +552,320 @@
 		}
 	}
 
-	$: displayGeneratedFiles = generatedFiles;
+	const shouldInlineAssistantImageArtifact = (file: GeneratedFileItem): boolean => {
+		return file.source === 'assistant' && file.isImage === true && !!file.url;
+	};
+
+	$: displayGeneratedFiles = generatedFiles.filter(
+		(file) => !shouldInlineAssistantImageArtifact(file)
+	);
+
+	type ContentVisualSignatures = {
+		imageUrls: Set<string>;
+		tableSignatures: Set<string>;
+		embedUrls: Set<string>;
+	};
+
+	const HTML_IMAGE_TAG_REGEX = /<img\b[^>]*\bsrc=(['"])(.*?)\1[^>]*>/gi;
+	const HTML_IFRAME_TAG_REGEX = /<iframe\b[^>]*\bsrc=(['"])(.*?)\1[^>]*>/gi;
+	const HTML_TABLE_TAG_REGEX = /<table\b[\s\S]*?<\/table>/gi;
+	const MARKDOWN_IMAGE_REGEX = /!\[[^\]]*]\((\S+?)(?:\s+["'][^"']*["'])?\)/g;
+	const MARKDOWN_TABLE_ALIGNMENT_REGEX =
+		/^\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
+	const STANDALONE_EMBED_URL_REGEX =
+		/^(?:https?:\/\/|\/|data:|blob:|(?:api|openai)\/v1\/|v1\/)/i;
+
+	const normalizeVisualTextForMatching = (value: string): string =>
+		value
+			.replace(/\s+/g, ' ')
+			.trim()
+			.toLowerCase();
+
+	const buildNormalizedVisualUrlSetKey = (urls: string[]): string =>
+		Array.from(new Set(urls.filter(Boolean))).sort().join('|');
+
+	const buildTableSignature = (rows: string[][]): string => {
+		const normalizedRows = rows
+			.map((row) =>
+				row
+					.map((cell) => normalizeVisualTextForMatching(cell))
+					.filter(Boolean)
+					.join('|')
+			)
+			.filter(Boolean);
+
+		return normalizedRows.join('||');
+	};
+
+	const extractTableSignatureFromHtml = (html: string): string => {
+		const normalizedHtml = (html ?? '').trim();
+		if (!normalizedHtml || !normalizedHtml.includes('<table')) return '';
+
+		if (typeof DOMParser !== 'undefined') {
+			try {
+				const doc = new DOMParser().parseFromString(normalizedHtml, 'text/html');
+				const table = doc.querySelector('table');
+				if (!table) return '';
+
+				const rows = Array.from(table.querySelectorAll('tr'))
+					.map((row) =>
+						Array.from(row.querySelectorAll('th,td')).map((cell) => cell.textContent ?? '')
+					)
+					.filter((row) => row.some((cell) => normalizeVisualTextForMatching(cell)));
+
+				return buildTableSignature(rows);
+			} catch {
+				// Fall through to regex-based extraction.
+			}
+		}
+
+		const rows = Array.from(normalizedHtml.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi), (rowMatch) =>
+			Array.from(rowMatch[1].matchAll(/<t[hd]\b[^>]*>([\s\S]*?)<\/t[hd]>/gi), (cellMatch) =>
+				cellMatch[1].replace(/<[^>]+>/g, ' ')
+			)
+		).filter((row) => row.some((cell) => normalizeVisualTextForMatching(cell)));
+
+		return buildTableSignature(rows);
+	};
+
+	const extractImageUrlsFromHtml = (html: string): string[] =>
+		Array.from(html.matchAll(HTML_IMAGE_TAG_REGEX), (match) =>
+			normalizeVisualUrlForMatching(match[2])
+		).filter(Boolean);
+
+	const extractIframeUrlsFromHtml = (html: string): string[] =>
+		Array.from(html.matchAll(HTML_IFRAME_TAG_REGEX), (match) =>
+			normalizeVisualUrlForMatching(match[2])
+		).filter(Boolean);
+
+	const extractStandaloneEmbedUrl = (value: string): string => {
+		const normalized = value.trim();
+		if (!normalized || normalized.includes('<') || !STANDALONE_EMBED_URL_REGEX.test(normalized)) {
+			return '';
+		}
+
+		return normalizeVisualUrlForMatching(normalized);
+	};
+
+	const extractTableRowCells = (line: string): string[] => {
+		const trimmed = line.trim();
+		if (!trimmed.includes('|')) return [];
+
+		const segments = trimmed
+			.split('|')
+			.map((segment) => segment.trim())
+			.filter((segment, index, array) => {
+				if (segment) return true;
+				return index !== 0 && index !== array.length - 1;
+			});
+
+		return segments;
+	};
+
+	const extractTableSignaturesFromMarkdown = (content: string): string[] => {
+		const lines = content.split(/\r?\n/);
+		const signatures: string[] = [];
+
+		for (let index = 0; index < lines.length - 1; index += 1) {
+			const headerLine = lines[index]?.trim() ?? '';
+			const alignmentLine = lines[index + 1]?.trim() ?? '';
+			if (!headerLine.startsWith('|') || !MARKDOWN_TABLE_ALIGNMENT_REGEX.test(alignmentLine)) {
+				continue;
+			}
+
+			const rows = [extractTableRowCells(headerLine)];
+			let nextIndex = index + 2;
+			while (nextIndex < lines.length) {
+				const rowLine = lines[nextIndex]?.trim() ?? '';
+				if (!rowLine.startsWith('|') || !rowLine.includes('|')) {
+					break;
+				}
+				rows.push(extractTableRowCells(rowLine));
+				nextIndex += 1;
+			}
+
+			const signature = buildTableSignature(rows);
+			if (signature) {
+				signatures.push(signature);
+			}
+
+			index = nextIndex - 1;
+		}
+
+		return signatures;
+	};
+
+	const collectContentVisualSignatures = (content: string): ContentVisualSignatures => {
+		const imageUrls = new Set<string>();
+		const tableSignatures = new Set<string>();
+		const embedUrls = new Set<string>();
+		const normalizedContent = content.trim();
+
+		if (!normalizedContent) {
+			return { imageUrls, tableSignatures, embedUrls };
+		}
+
+		Array.from(normalizedContent.matchAll(MARKDOWN_IMAGE_REGEX), (match) =>
+			normalizeVisualUrlForMatching(match[1])
+		)
+			.filter(Boolean)
+			.forEach((url) => imageUrls.add(url));
+
+		extractTableSignaturesFromMarkdown(normalizedContent).forEach((signature) =>
+			tableSignatures.add(signature)
+		);
+
+		extractImageUrlsFromHtml(normalizedContent).forEach((url) => imageUrls.add(url));
+		extractIframeUrlsFromHtml(normalizedContent).forEach((url) => embedUrls.add(url));
+		Array.from(normalizedContent.matchAll(HTML_TABLE_TAG_REGEX), (match) => match[0]).forEach(
+			(tableHtml) => {
+				const signature = extractTableSignatureFromHtml(tableHtml);
+				if (signature) tableSignatures.add(signature);
+			}
+		);
+
+		return { imageUrls, tableSignatures, embedUrls };
+	};
+
+	const renderedAssistantContentForVisualMatching = (state: {
+		placeInlineGeneratedFiles: boolean;
+		finalMessageContent: string;
+		finalContentBeforeGeneratedFiles: string;
+		finalContentAfterGeneratedFiles: string;
+	}): string =>
+		(
+			state.placeInlineGeneratedFiles
+				? [state.finalContentBeforeGeneratedFiles, state.finalContentAfterGeneratedFiles]
+				: [state.finalMessageContent]
+		)
+			.filter((value) => typeof value === 'string' && value.trim().length > 0)
+			.join('\n\n')
+			.trim();
+
+	let renderedContentVisualSignatures: ContentVisualSignatures = {
+		imageUrls: new Set<string>(),
+		tableSignatures: new Set<string>(),
+		embedUrls: new Set<string>()
+	};
+
+	const scoreEmbedContent = (value: string): number => {
+		const normalized = value.trim();
+		if (!normalized) {
+			return 0;
+		}
+
+		let score = normalized.length;
+		if (/<table\b/i.test(normalized)) {
+			score += 1000;
+		}
+		if (/<img\b/i.test(normalized)) {
+			score += 500;
+		}
+		if (/<iframe\b/i.test(normalized)) {
+			score += 250;
+		}
+
+		return score;
+	};
+
+	const getEmbedCanonicalKey = (embed: string): string => {
+		const normalizedEmbed = embed.trim();
+		if (!normalizedEmbed) return '';
+
+		const tableSignature = extractTableSignatureFromHtml(normalizedEmbed);
+		if (tableSignature) {
+			return `table:${tableSignature}`;
+		}
+
+		const imageKey = buildNormalizedVisualUrlSetKey(extractImageUrlsFromHtml(normalizedEmbed));
+		if (imageKey) {
+			return `image:${imageKey}`;
+		}
+
+		const iframeKey = buildNormalizedVisualUrlSetKey(extractIframeUrlsFromHtml(normalizedEmbed));
+		if (iframeKey) {
+			return `iframe:${iframeKey}`;
+		}
+
+		const standaloneUrl = extractStandaloneEmbedUrl(normalizedEmbed);
+		if (standaloneUrl) {
+			return `url:${standaloneUrl}`;
+		}
+
+		return `html:${normalizedEmbed}`;
+	};
+
+	const dedupeEmbedsForDisplay = (embeds: unknown[]): string[] => {
+		const deduped: string[] = [];
+		const indexByKey = new Map<string, number>();
+
+		for (const embed of embeds) {
+			if (typeof embed !== 'string') continue;
+			const normalized = embed.trim();
+			if (!normalized) continue;
+
+			const key = getEmbedCanonicalKey(normalized);
+			const existingIndex = indexByKey.get(key);
+			if (existingIndex === undefined) {
+				indexByKey.set(key, deduped.length);
+				deduped.push(normalized);
+				continue;
+			}
+
+			if (scoreEmbedContent(normalized) >= scoreEmbedContent(deduped[existingIndex] ?? '')) {
+				deduped[existingIndex] = normalized;
+			}
+		}
+
+		return deduped;
+	};
+
+	const isEmbedDuplicatedByContent = (
+		embed: string,
+		contentVisualSignatures: ContentVisualSignatures
+	): boolean => {
+		const normalizedEmbed = embed.trim();
+		if (!normalizedEmbed) return true;
+
+		const tableSignature = extractTableSignatureFromHtml(normalizedEmbed);
+		if (tableSignature && contentVisualSignatures.tableSignatures.has(tableSignature)) {
+			return true;
+		}
+
+		const imageUrls = extractImageUrlsFromHtml(normalizedEmbed);
+		if (imageUrls.length > 0) {
+			return imageUrls.every((url) => contentVisualSignatures.imageUrls.has(url));
+		}
+
+		const iframeUrls = extractIframeUrlsFromHtml(normalizedEmbed);
+		if (iframeUrls.length > 0) {
+			return iframeUrls.every((url) => contentVisualSignatures.embedUrls.has(url));
+		}
+
+		const standaloneUrl = extractStandaloneEmbedUrl(normalizedEmbed);
+		if (standaloneUrl) {
+			return contentVisualSignatures.embedUrls.has(standaloneUrl);
+		}
+
+		return false;
+	};
+
+	const isMessageFileDuplicatedByContent = (
+		file: Record<string, unknown>,
+		contentVisualSignatures: ContentVisualSignatures
+	): boolean => {
+		const candidateUrls = [
+			file?.url,
+			file?.download_url,
+			file?.bridge_url,
+			file?.generated_file_url,
+			file?.path
+		]
+			.map((candidate) => normalizeVisualUrlForMatching(candidate))
+			.filter(Boolean);
+
+		return candidateUrls.some((url) => contentVisualSignatures.imageUrls.has(url));
+	};
 
 	const normalizeGeneratedFileMatchToken = (value: unknown): string => {
 		if (typeof value !== 'string') return '';
@@ -543,22 +932,33 @@
 		return false;
 	};
 
-	$: {
+	const updateVisibleMessageAttachments = (renderState: {
+		finalMessageContent: string;
+		finalContentBeforeGeneratedFiles: string;
+		finalContentAfterGeneratedFiles: string;
+		placeInlineGeneratedFiles: boolean;
+	}) => {
+		renderedContentVisualSignatures = collectContentVisualSignatures(
+			renderedAssistantContentForVisualMatching({
+				placeInlineGeneratedFiles: renderState.placeInlineGeneratedFiles,
+				finalMessageContent: renderState.finalMessageContent,
+				finalContentBeforeGeneratedFiles: renderState.finalContentBeforeGeneratedFiles,
+				finalContentAfterGeneratedFiles: renderState.finalContentAfterGeneratedFiles
+			})
+		);
+
 		const messageFiles = Array.isArray(message?.files) ? message.files : [];
 		const hasPrimaryDocumentArtifact = displayGeneratedFiles.some((file) =>
 			isPrimaryDocumentArtifact(file)
 		);
-		if (
-			message?.role !== 'assistant' ||
-			messageFiles.length === 0 ||
-			displayGeneratedFiles.length === 0
-		) {
+		if (message?.role !== 'assistant' || messageFiles.length === 0) {
 			visibleMessageFiles = messageFiles;
 		} else {
 			const matchKeys = buildGeneratedFileMatchKeys(displayGeneratedFiles);
 			visibleMessageFiles = messageFiles.filter(
 				(file: Record<string, unknown>) =>
 					!isMessageFileDuplicatedByGeneratedFiles(file, matchKeys) &&
+					!isMessageFileDuplicatedByContent(file, renderedContentVisualSignatures) &&
 					!shouldHideHelperArtifact(
 						{
 							name:
@@ -574,7 +974,19 @@
 					)
 			);
 		}
-	}
+
+		const messageEmbeds = Array.isArray(message?.embeds) ? dedupeEmbedsForDisplay(message.embeds) : [];
+		if (message?.role !== 'assistant' || messageEmbeds.length === 0) {
+			visibleMessageEmbeds = messageEmbeds;
+		} else {
+			visibleMessageEmbeds = messageEmbeds.filter(
+				(embed: unknown) =>
+					typeof embed === 'string' &&
+					embed.trim().length > 0 &&
+					!isEmbedDuplicatedByContent(embed, renderedContentVisualSignatures)
+			);
+		}
+	};
 
 	type ActiveTerminal = { url: string; key: string } | null;
 
@@ -844,6 +1256,25 @@
 		return { argumentsValue, resultValue };
 	};
 
+	const isHiddenProcessToolCall = (
+		toolName: string,
+		rawArguments: unknown
+	): boolean => {
+		const parsedArgs = getToolPayloadRecord(rawArguments);
+		return isHiddenHelperToolCall({
+			toolId: toolName,
+			toolName,
+			legacyName: toolName,
+			parsedArgs
+		});
+	};
+
+	const isHiddenProcessToolCallAttrs = (attrs: Record<string, string>): boolean => {
+		const toolName = String(attrs.tool_id || attrs.tool_name || attrs.name || '').trim();
+		if (!toolName) return false;
+		return isHiddenProcessToolCall(toolName, attrs.arguments);
+	};
+
 	const collectToolCallsFromOutput = (value: unknown): ProcessToolCallItem[] => {
 		if (!Array.isArray(value)) return [];
 		const grouped = new Map<
@@ -921,9 +1352,25 @@
 		return items;
 	};
 
-	const outputHasStructuredAssistantItems = (value: unknown): boolean =>
-		Array.isArray(value) &&
-		value.some((item) => item && typeof item === 'object' && (item as Record<string, unknown>).type !== 'message');
+	const outputHasStructuredAssistantItems = (value: unknown): boolean => {
+		if (!Array.isArray(value)) return false;
+
+		const hasVisibleNonToolStructuredItems = value.some((item) => {
+			if (!item || typeof item !== 'object') return false;
+			const record = item as Record<string, unknown>;
+			return (
+				record.type !== 'message' &&
+				record.type !== 'function_call' &&
+				record.type !== 'function_call_output'
+			);
+		});
+
+		if (hasVisibleNonToolStructuredItems) return true;
+
+		return collectToolCallsFromOutput(value).some(
+			(item) => !isHiddenProcessToolCallAttrs(item.attrs ?? {})
+		);
+	};
 
 	const outputHasAssistantMessageItem = (value: unknown): boolean =>
 		Array.isArray(value) &&
@@ -1022,6 +1469,11 @@
 		return merged;
 	};
 
+	const filterHiddenProcessToolCalls = (
+		items: ProcessToolCallItem[]
+	): ProcessToolCallItem[] =>
+		items.filter((item) => !isHiddenProcessToolCallAttrs(item.attrs ?? {}));
+
 	const mergeProcessToolCalls = (
 		contentItems: ProcessToolCallItem[],
 		outputItems: ProcessToolCallItem[]
@@ -1048,6 +1500,26 @@
 		}
 
 		return merged;
+	};
+
+	const extractProcessToolCallItemsFromMarkup = (markup: string): ProcessToolCallItem[] => {
+		if (!markup) return [];
+
+		return Array.from(markup.matchAll(TOOL_CALL_BLOCK_REGEX))
+			.map((match, index) => {
+				const block = match[0] || '';
+				const attrs = getToolCallAttrs(block);
+				const key =
+					(attrs.call_key || '').trim() ||
+					(attrs.id || '').trim() ||
+					`${(attrs.tool_id || attrs.name || '').trim()}-${index}`;
+
+				return {
+					key,
+					attrs
+				};
+			})
+			.filter((item) => Object.keys(item.attrs).length > 0);
 	};
 
 	const dedupeToolCallBlocks = (content: string): string => {
@@ -1139,9 +1611,11 @@
 
 		for (const line of lines) {
 			const trimmed = line.trim();
+			const isMarkdownImageLine = trimmed.startsWith('![');
 			const linkMatch = trimmed.match(/\[[^\]]+\]\(([^)]+)\)/);
 			const linkTarget = linkMatch?.[1] || '';
-			const hasGeneratedFileLink = isGeneratedFileLinkTarget(linkTarget);
+			const hasGeneratedFileLink =
+				!isMarkdownImageLine && isGeneratedFileLinkTarget(linkTarget);
 
 			const hasDownloadLabel =
 				allowInlineFiles &&
@@ -1171,8 +1645,7 @@
 	const splitToolCallSection = (content: string): { process: string; final: string } => {
 		if (!content) return { process: '', final: '' };
 
-		const toolCallRegex = /<details\b[^>]*\btype="tool_calls"[^>]*>[\s\S]*?<\/details>/gim;
-		const matches = Array.from(content.matchAll(toolCallRegex));
+		const matches = Array.from(content.matchAll(TOOL_CALL_BLOCK_REGEX));
 
 		if (matches.length === 0) {
 			return {
@@ -1351,6 +1824,68 @@
 			: reasoningMarkup;
 	};
 
+	const getCanonicalAssistantContent = (rawContent: string, output: unknown): string =>
+		mergeOutputReasoningIntoContent(getVisibleAssistantContent(rawContent, output), output);
+
+	const normalizeLegacyAssistantContent = (
+		content: string,
+		generatedFiles: GeneratedFileItem[]
+	): string =>
+		promoteFileGeneratingToolCallBlocks(
+			dedupeToolCallBlocks(normalizeSourcesHeading(content)),
+			generatedFiles
+		);
+
+	const resolveAssistantRenderState = (
+		rawContent: string,
+		output: unknown,
+		generatedFiles: GeneratedFileItem[]
+	): {
+		processToolCallItems: ProcessToolCallItem[];
+		finalMessageContent: string;
+		finalContentBeforeGeneratedFiles: string;
+		finalContentAfterGeneratedFiles: string;
+		placeInlineGeneratedFiles: boolean;
+	} => {
+		// `message.output` is the canonical structured source of tool/process state.
+		// Legacy tool-call markup in `content` is preserved only as a compatibility
+		// fallback for historical chats and mixed records.
+		const canonicalContent = getCanonicalAssistantContent(rawContent, output);
+		const legacyCompatibleContent = normalizeLegacyAssistantContent(
+			canonicalContent,
+			generatedFiles
+		);
+		const { process, final } = splitToolCallSection(legacyCompatibleContent);
+		const legacyProcessToolCallItems = extractProcessToolCallItemsFromMarkup(process);
+		const structuredProcessToolCallItems = collectToolCallsFromOutput(output);
+		const mergedProcessToolCallItems = filterHiddenProcessToolCalls(
+			mergeProcessToolCalls(legacyProcessToolCallItems, structuredProcessToolCallItems)
+		);
+
+		const cleanedFinal = normalizeLeakedFormatting(
+			stripDownloadSection(final, generatedFiles)
+		);
+		const renderState = {
+			processToolCallItems: mergedProcessToolCallItems,
+			finalMessageContent: cleanedFinal,
+			finalContentBeforeGeneratedFiles: '',
+			finalContentAfterGeneratedFiles: '',
+			placeInlineGeneratedFiles: false
+		};
+
+		if (!cleanedFinal.includes(INLINE_GENERATED_FILES_MARKER)) {
+			return renderState;
+		}
+
+		const [before = '', after = ''] = cleanedFinal.split(INLINE_GENERATED_FILES_MARKER, 2);
+		return {
+			...renderState,
+			finalContentBeforeGeneratedFiles: before.trim(),
+			finalContentAfterGeneratedFiles: after.trim(),
+			placeInlineGeneratedFiles: true
+		};
+	};
+
 	let processToolCallItems: ProcessToolCallItem[] = [];
 	let processStatusTick = 0;
 	let processStatusTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1464,35 +1999,8 @@
 	};
 
 	const computeParsedContent = (rawContent: string, output: unknown) => {
-		const effectiveContent = mergeOutputReasoningIntoContent(
-			getVisibleAssistantContent(rawContent, output),
-			output
-		);
-		const normalizedContent = promoteFileGeneratingToolCallBlocks(
-			dedupeToolCallBlocks(normalizeSourcesHeading(effectiveContent)),
-			generatedFiles
-		);
-		const { process, final } = splitToolCallSection(normalizedContent);
-		const contentToolCallItems = Array.from(process.matchAll(TOOL_CALL_BLOCK_REGEX))
-			.map((match, index) => {
-				const block = match[0] || '';
-				const attrs = getToolCallAttrs(block);
-				const key =
-					(attrs.call_key || '').trim() ||
-					(attrs.id || '').trim() ||
-					`${(attrs.tool_id || attrs.name || '').trim()}-${index}`;
-
-				return {
-					key,
-					attrs
-				};
-			})
-			.filter((item) => Object.keys(item.attrs).length > 0);
-		const outputToolCallItems = collectToolCallsFromOutput(output);
-		const mergedProcessToolCallItems = mergeProcessToolCalls(
-			contentToolCallItems,
-			outputToolCallItems
-		);
+		const renderState = resolveAssistantRenderState(rawContent, output, generatedFiles);
+		const mergedProcessToolCallItems = renderState.processToolCallItems;
 
 		const timingMap = getProcessTimingMapForMessage(message?.id);
 		const activeProcessKeys = new Set(mergedProcessToolCallItems.map((item) => item.key));
@@ -1507,35 +2015,32 @@
 			attrs: getEffectiveProcessToolCallAttrs(item) ?? item.attrs
 		}));
 
-		const cleanedFinal = normalizeLeakedFormatting(stripDownloadSection(final, generatedFiles));
-		const renderedFinal = cleanedFinal;
-		finalMessageContent = renderedFinal;
-
-		if (renderedFinal.includes(INLINE_GENERATED_FILES_MARKER)) {
-			const [before = '', after = ''] = renderedFinal.split(INLINE_GENERATED_FILES_MARKER, 2);
-			finalContentBeforeGeneratedFiles = before.trim();
-			finalContentAfterGeneratedFiles = after.trim();
-			placeInlineGeneratedFiles = true;
-		} else {
-			finalContentBeforeGeneratedFiles = '';
-			finalContentAfterGeneratedFiles = '';
-			placeInlineGeneratedFiles = false;
-		}
+		finalMessageContent = renderState.finalMessageContent;
+		finalContentBeforeGeneratedFiles = renderState.finalContentBeforeGeneratedFiles;
+		finalContentAfterGeneratedFiles = renderState.finalContentAfterGeneratedFiles;
+		placeInlineGeneratedFiles = renderState.placeInlineGeneratedFiles;
+		updateVisibleMessageAttachments(renderState);
 	};
 
 	$: {
 		processStatusTick;
 		const rawContent = message?.content ?? '';
 		const outputKey = buildOutputSignature(message?.output);
+		const filesKey = buildMessageFileSignature(message?.files);
+		const embedsKey = buildMessageEmbedSignature(message?.embeds);
 		if (
 			rawContent !== parsedContentKey ||
 			generatedFilesListKey !== parsedGeneratedFilesKey ||
 			outputKey !== parsedOutputKey ||
+			filesKey !== parsedFilesKey ||
+			embedsKey !== parsedEmbedsKey ||
 			processStatusTick !== parsedProcessStatusTick
 		) {
 			parsedContentKey = rawContent;
 			parsedGeneratedFilesKey = generatedFilesListKey;
 			parsedOutputKey = outputKey;
+			parsedFilesKey = filesKey;
+			parsedEmbedsKey = embedsKey;
 			parsedProcessStatusTick = processStatusTick;
 			computeParsedContent(rawContent, message?.output);
 		}
@@ -2395,8 +2900,9 @@
 			class="max-h-[60vh] space-y-4 overflow-y-auto pr-1 text-sm text-gray-600 dark:text-gray-300"
 		>
 			<p>
-				This will create the tool in your workspace. You can keep chatting here and edit it later
-				from Workspace.
+				{$i18n.t(
+					'This will create the tool in your workspace. You can keep chatting here and edit it later from Workspace.'
+				)}
 			</p>
 
 			<div class="grid gap-3 sm:grid-cols-2">
@@ -2592,6 +3098,10 @@
 			<div>
 				<div class="chat-{message.role} w-full min-w-full chat-markdown-prose">
 					<div>
+						{#if hasVisibleStatusHistory}
+							<StatusHistory statusHistory={normalizedStatusHistory} />
+						{/if}
+
 						{#if visibleMessageFiles.length > 0}
 							<div
 								class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap"
@@ -2616,12 +3126,12 @@
 							</div>
 						{/if}
 
-						{#if message?.embeds && message.embeds.length > 0}
+						{#if visibleMessageEmbeds.length > 0}
 							<div
 								class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap"
 								id={`${message.id}-embeds-container`}
 							>
-								{#each message.embeds as embed, idx}
+								{#each visibleMessageEmbeds as embed, idx}
 									<div class="my-2 w-full" id={`${message.id}-embeds-${idx}`}>
 										<FullHeightIframe
 											src={embed}
@@ -2791,7 +3301,7 @@
 								</div>
 							{/if}
 
-							{#if finalMessageContent === '' && processToolCallItems.length === 0 && !message.error && ((model?.info?.meta?.capabilities?.status_updates ?? true) ? (message?.statusHistory ?? [...(message?.status ? [message?.status] : [])]).length === 0 || (message?.statusHistory?.at(-1)?.hidden ?? false) : true)}
+							{#if finalMessageContent === '' && processToolCallItems.length === 0 && visibleMessageFiles.length === 0 && visibleMessageEmbeds.length === 0 && !message.error && !hasVisibleStatusHistory && message.done !== true}
 								<Skeleton />
 							{:else if finalMessageContent && message.error !== true}
 								<!-- always show message contents even if there's an error -->

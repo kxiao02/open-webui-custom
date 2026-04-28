@@ -48,6 +48,7 @@
 	export let stickyButtonsClassName = 'top-0';
 
 	let pyodideWorker = null;
+	$: normalizedLang = `${lang ?? ''}`.trim().toLowerCase();
 
 	let _code = '';
 	$: if (code) {
@@ -339,7 +340,7 @@
 
 	const render = async () => {
 		onUpdate(token);
-		if (lang === 'mermaid' && (token?.raw ?? '').slice(-4).includes('```')) {
+		if (normalizedLang === 'mermaid' && (token?.raw ?? '').slice(-4).includes('```')) {
 			try {
 				renderHTML = await renderMermaid(code);
 			} catch (error) {
@@ -349,7 +350,7 @@
 				renderHTML = null;
 			}
 		} else if (
-			(lang === 'vega' || lang === 'vega-lite') &&
+			(normalizedLang === 'vega' || normalizedLang === 'vega-lite') &&
 			(token?.raw ?? '').slice(-4).includes('```')
 		) {
 			try {
@@ -423,7 +424,7 @@
 		class="relative {className} flex flex-col rounded-2xl border border-gray-100/30 dark:border-gray-850/30 my-0.5"
 		dir="ltr"
 	>
-		{#if ['mermaid', 'vega', 'vega-lite'].includes(lang)}
+		{#if ['mermaid', 'vega', 'vega-lite'].includes(normalizedLang)}
 			{#if renderHTML}
 				<SvgPanZoom
 					className=" rounded-2xl max-h-fit overflow-hidden"
@@ -468,7 +469,7 @@
 						</div>
 					</button>
 
-					{#if ($config?.features?.enable_code_execution ?? true) && (lang.toLowerCase() === 'python' || lang.toLowerCase() === 'py' || (lang === '' && checkPythonCode(code)))}
+					{#if ($config?.features?.enable_code_execution ?? true) && (normalizedLang === 'python' || normalizedLang === 'py' || (normalizedLang === '' && checkPythonCode(code)))}
 						{#if executing}
 							<div
 								class="run-code-button bg-none border-none p-0.5 cursor-not-allowed bg-white dark:bg-black"
@@ -505,7 +506,7 @@
 						on:click={copyCode}>{copied ? $i18n.t('Copied') : $i18n.t('Copy')}</button
 					>
 
-					{#if preview && ['html', 'svg'].includes(lang)}
+					{#if preview && ['html', 'svg'].includes(normalizedLang)}
 						<button
 							class="flex gap-1 items-center run-code-button bg-none border-none transition rounded-md px-1.5 py-0.5 bg-white dark:bg-black"
 							on:click={previewCode}

@@ -13,6 +13,7 @@ from open_webui.models.folders import Folders
 from open_webui.models.chat_messages import ChatMessage, ChatMessages
 from open_webui.models.files import Files
 from open_webui.utils.misc import sanitize_data_for_db, sanitize_text_for_db
+from open_webui.utils.knowflow import get_knowflow_asset_ref_key
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import (
@@ -51,6 +52,9 @@ def _normalize_message_file_ref(value: object) -> str:
     lowered = normalized.lower()
     if lowered in {"null", "undefined"}:
         return ""
+    knowflow_asset_ref = get_knowflow_asset_ref_key(normalized)
+    if knowflow_asset_ref:
+        return knowflow_asset_ref
     return normalized
 
 
@@ -99,12 +103,100 @@ def _message_file_size(file_item: dict) -> Optional[int]:
     return None
 
 
+def _message_file_url_score(file_item: dict) -> int:
+    normalized = _normalize_message_file_ref(
+        file_item.get("download_url")
+        or file_item.get("downloadUrl")
+        or file_item.get("url")
+    )
+    if not normalized:
+        return 0
+
+    lowered = normalized.lower()
+    if "/api/v1/files/" in lowered and "/content" in lowered:
+        return 5
+    if "/api/v1/files/" in lowered:
+        return 4
+    if get_knowflow_asset_ref_key(normalized):
+        return 3
+    if lowered.startswith(("https://", "http://")):
+        return 2
+    return 0
+
+
+def _message_file_label_score(file_item: dict) -> int:
+    label = _infer_message_file_name(file_item)
+    if not label:
+        return 0
+
+    lowered = label.strip().lower()
+    if lowered in {"knowflow", "image", "file", "generated-file"}:
+        return 1
+    return len(label.strip())
+
+
+def _merge_message_file_variants(existing: dict, incoming: dict) -> dict:
+    merged = {
+        **existing,
+        **{
+            key: value
+            for key, value in incoming.items()
+            if value not in (None, "", [], {})
+        },
+    }
+
+    if _message_file_url_score(existing) >= _message_file_url_score(incoming):
+        for key in ("url", "download_url", "downloadUrl"):
+            value = _normalize_message_file_ref(existing.get(key))
+            if value:
+                merged[key] = value
+    else:
+        for key in ("url", "download_url", "downloadUrl"):
+            value = _normalize_message_file_ref(incoming.get(key))
+            if value:
+                merged[key] = value
+
+    if _message_file_label_score(existing) >= _message_file_label_score(incoming):
+        for key in ("name", "filename", "fileName"):
+            value = _normalize_message_file_ref(existing.get(key))
+            if value:
+                merged[key] = value
+    else:
+        for key in ("name", "filename", "fileName"):
+            value = _normalize_message_file_ref(incoming.get(key))
+            if value:
+                merged[key] = value
+
+    existing_id = _normalize_message_file_ref(existing.get("id"))
+    incoming_id = _normalize_message_file_ref(incoming.get("id"))
+    if len(existing_id) >= len(incoming_id):
+        if existing_id:
+            merged["id"] = existing_id
+    elif incoming_id:
+        merged["id"] = incoming_id
+
+    return merged
+
+
 def _collapse_assistant_generated_file_variants(files: list[dict]) -> list[dict]:
     collapsed: list[dict] = []
     index_by_key: dict[str, int] = {}
 
     for file_item in files:
-        key = _collapsible_message_file_key(file_item)
+        key = ""
+        for candidate in (
+            file_item.get("download_url"),
+            file_item.get("downloadUrl"),
+            file_item.get("url"),
+            file_item.get("id"),
+        ):
+            asset_ref = get_knowflow_asset_ref_key(candidate)
+            if asset_ref:
+                key = f"knowflow::{asset_ref}"
+                break
+
+        if not key:
+            key = _collapsible_message_file_key(file_item)
         if not key:
             collapsed.append(file_item)
             continue
@@ -116,6 +208,10 @@ def _collapse_assistant_generated_file_variants(files: list[dict]) -> list[dict]
             continue
 
         existing = collapsed[existing_index]
+        if key.startswith("knowflow::"):
+            collapsed[existing_index] = _merge_message_file_variants(existing, file_item)
+            continue
+
         existing_size = _message_file_size(existing)
         incoming_size = _message_file_size(file_item)
 
@@ -476,6 +572,182 @@ def _normalize_message_tool_output_contract(output: object) -> tuple[object, boo
     return output, changed
 
 
+def _merge_message_file_entries(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    merged = [item for item in existing if isinstance(item, dict)]
+    index_by_key: dict[str, int] = {}
+
+    for index, item in enumerate(merged):
+        key = str(
+            item.get("id")
+            or item.get("url")
+            or item.get("path")
+            or item.get("output_path")
+            or item.get("name")
+            or item.get("filename")
+            or ""
+        ).strip()
+        if key:
+            index_by_key[key] = index
+
+    for item in incoming:
+        if not isinstance(item, dict):
+            continue
+        key = str(
+            item.get("id")
+            or item.get("url")
+            or item.get("path")
+            or item.get("output_path")
+            or item.get("name")
+            or item.get("filename")
+            or ""
+        ).strip()
+        if not key or key not in index_by_key:
+            index_by_key[key] = len(merged)
+            merged.append(dict(item))
+            continue
+
+        existing_item = merged[index_by_key[key]]
+        merged[index_by_key[key]] = {
+            **existing_item,
+            **{k: v for k, v in item.items() if v not in (None, "", [], {})},
+        }
+
+    return merged
+
+
+def _strip_misbinding_tool_output_files(
+    output: list[dict],
+    known_call_ids: set[str],
+) -> bool:
+    changed = False
+
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            continue
+
+        item_call_id = str(item.get("call_id") or item.get("id") or "").strip()
+        existing_files = item.get("files")
+        if not item_call_id or not isinstance(existing_files, list):
+            continue
+
+        cleaned_files = []
+        removed_misbound_files = False
+        for file_item in existing_files:
+            if not isinstance(file_item, dict):
+                cleaned_files.append(file_item)
+                continue
+
+            file_call_id = str(file_item.get("call_id") or "").strip()
+            if (
+                file_call_id
+                and file_call_id != item_call_id
+                and file_call_id in known_call_ids
+            ):
+                removed_misbound_files = True
+                continue
+
+            cleaned_files.append(file_item)
+
+        if removed_misbound_files:
+            item["files"] = cleaned_files
+            changed = True
+
+    return changed
+
+
+def _repair_message_tool_outputs_from_files(
+    output: object,
+    files: object,
+) -> tuple[object, bool]:
+    if not isinstance(output, list) or not isinstance(files, list):
+        return output, False
+
+    changed = False
+    files_by_call_id: dict[str, list[dict]] = {}
+    for file_item in files:
+        if not isinstance(file_item, dict):
+            continue
+        call_id = str(file_item.get("call_id") or "").strip()
+        if not call_id:
+            continue
+        files_by_call_id.setdefault(call_id, []).append(dict(file_item))
+
+    if not files_by_call_id:
+        return output, False
+
+    function_call_by_id: dict[str, dict] = {}
+    function_call_output_by_id: dict[str, dict] = {}
+
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "function_call":
+            call_id = str(item.get("call_id") or item.get("id") or "").strip()
+            if call_id:
+                function_call_by_id[call_id] = item
+        elif item_type == "function_call_output":
+            call_id = str(item.get("call_id") or item.get("id") or "").strip()
+            if call_id:
+                function_call_output_by_id[call_id] = item
+
+    known_call_ids = (
+        set(files_by_call_id.keys())
+        | set(function_call_by_id.keys())
+        | set(function_call_output_by_id.keys())
+    )
+    if _strip_misbinding_tool_output_files(output, known_call_ids):
+        changed = True
+
+    for call_id, call_files in files_by_call_id.items():
+        if call_id in function_call_output_by_id:
+            output_item = function_call_output_by_id[call_id]
+            existing_files = output_item.get("files")
+            merged_files = _merge_message_file_entries(
+                existing_files if isinstance(existing_files, list) else [],
+                call_files,
+            )
+            if merged_files != existing_files:
+                output_item["files"] = merged_files
+                changed = True
+            if str(output_item.get("status") or "").strip().lower() in {"", "running", "in_progress"}:
+                output_item["status"] = "success"
+                changed = True
+            function_call_item = function_call_by_id.get(call_id)
+            if function_call_item is not None and str(
+                function_call_item.get("status") or ""
+            ).strip().lower() in {"", "running", "in_progress"}:
+                function_call_item["status"] = "completed"
+                changed = True
+            continue
+
+        function_call_item = function_call_by_id.get(call_id)
+        if function_call_item is None:
+            continue
+
+        tool_name = str(function_call_item.get("name") or "tool").strip() or "tool"
+        output.append(
+            {
+                "type": "function_call_output",
+                "id": f"fco_{call_id}",
+                "call_id": call_id,
+                "name": tool_name,
+                "status": "success",
+                "files": call_files,
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "工具已完成并生成文件，可在界面中预览或下载。",
+                    }
+                ],
+            }
+        )
+        function_call_item["status"] = "completed"
+        changed = True
+
+    return output, changed
+
+
 def _sanitize_message_output(output: object) -> tuple[object, bool]:
     if not isinstance(output, list):
         return output, False
@@ -547,6 +819,12 @@ def _sanitize_assistant_message(message: object) -> tuple[object, bool]:
     changed = False
     output = message.get("output")
     if isinstance(output, list):
+        _, repaired_output_changed = _repair_message_tool_outputs_from_files(
+            output, message.get("files")
+        )
+        if repaired_output_changed:
+            message["output"] = output
+            changed = True
         _, output_changed = _sanitize_message_output(output)
         if output_changed:
             message["output"] = output
@@ -554,6 +832,10 @@ def _sanitize_assistant_message(message: object) -> tuple[object, bool]:
                 output, message.get("content", "")
             )
             changed = True
+        elif repaired_output_changed:
+            message["content"] = _serialize_message_output_content(
+                output, message.get("content", "")
+            )
 
     content = message.get("content")
     if isinstance(content, str):
@@ -603,28 +885,6 @@ def _normalize_chat_history_tool_outputs(chat_payload: object) -> tuple[object, 
     _, top_level_changed = _sanitize_chat_message_collection(top_level_messages)
     if top_level_changed:
         changed = True
-
-    return chat_payload, changed
-
-
-def _sanitize_chat_history_specialist_leaks(chat_payload: object) -> tuple[object, bool]:
-    if not isinstance(chat_payload, dict):
-        return chat_payload, False
-
-    history = chat_payload.get("history")
-    if not isinstance(history, dict):
-        return chat_payload, False
-
-    messages = history.get("messages")
-    if not isinstance(messages, dict):
-        return chat_payload, False
-
-    changed = False
-    for message_id, message in messages.items():
-        sanitized_message, message_changed = _sanitize_assistant_message(message)
-        if message_changed:
-            messages[message_id] = sanitized_message
-            changed = True
 
     return chat_payload, changed
 
@@ -815,49 +1075,6 @@ class ChatUsageStatsListResponse(BaseModel):
     total: int
     model_config = ConfigDict(extra="allow")
 
-
-class MessageStats(BaseModel):
-    id: str
-    role: str
-    model: Optional[str] = None
-    content_length: int
-    token_count: Optional[int] = None
-    timestamp: Optional[int] = None
-    rating: Optional[int] = None  # Derived from message.annotation.rating
-    tags: Optional[list[str]] = None  # Derived from message.annotation.tags
-
-
-class ChatHistoryStats(BaseModel):
-    messages: dict[str, MessageStats]
-    currentId: Optional[str] = None
-
-
-class ChatBody(BaseModel):
-    history: ChatHistoryStats
-
-
-class AggregateChatStats(BaseModel):
-    average_response_time: float
-    average_user_message_content_length: float
-    average_assistant_message_content_length: float
-    models: dict[str, int]
-    message_count: int
-    history_models: dict[str, int]
-    history_message_count: int
-    history_user_message_count: int
-    history_assistant_message_count: int
-
-
-class ChatStatsExport(BaseModel):
-    id: str
-    user_id: str
-    created_at: int
-    updated_at: int
-    tags: list[str] = []
-    stats: AggregateChatStats
-    chat: ChatBody
-
-
 class ChatTable:
     def _clean_null_bytes(self, obj):
         """Recursively remove null bytes from strings in dict/list structures."""
@@ -954,7 +1171,6 @@ class ChatTable:
     ) -> object:
         normalized = self._ensure_chat_payload_identity(chat_payload, chat_id)
         normalized, _ = _normalize_chat_history_tool_outputs(normalized)
-        normalized, _ = _sanitize_chat_history_specialist_leaks(normalized)
         normalized, _ = self._normalize_chat_history_for_storage(normalized)
         return normalized
 

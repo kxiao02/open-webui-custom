@@ -3,6 +3,15 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 cd "$SCRIPT_DIR" || exit
 
+PYTHON_CMD=$(command -v python3 || command -v python)
+
+ensure_nltk_resources() {
+    echo "Ensuring NLTK resources for document extraction..."
+    "$PYTHON_CMD" -m open_webui.utils.nltk_preload
+}
+
+ensure_nltk_resources
+
 # Add conditional Playwright browser installation
 if [[ "${WEB_LOADER_ENGINE,,}" == "playwright" ]]; then
     if [[ -z "${PLAYWRIGHT_WS_URL}" ]]; then
@@ -10,8 +19,6 @@ if [[ "${WEB_LOADER_ENGINE,,}" == "playwright" ]]; then
         playwright install chromium
         playwright install-deps chromium
     fi
-
-    python -c "import nltk; nltk.download('punkt_tab')"
 fi
 
 if [ -n "${WEBUI_SECRET_KEY_FILE}" ]; then
@@ -22,7 +29,6 @@ fi
 
 PORT="${PORT:-8080}"
 HOST="${HOST:-0.0.0.0}"
-PYTHON_CMD=$(command -v python3 || command -v python)
 if [[ "${STRICT_EXTERNAL_STATE,,}" == "true" ]] && test "$WEBUI_SECRET_KEY $WEBUI_JWT_SECRET_KEY" = " "; then
   echo "STRICT_EXTERNAL_STATE requires WEBUI_SECRET_KEY or WEBUI_JWT_SECRET_KEY to be set via environment."
   exit 1

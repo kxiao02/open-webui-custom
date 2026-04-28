@@ -1,4 +1,5 @@
 import logging
+import inspect
 from pathlib import Path
 from typing import Optional
 import time
@@ -13,6 +14,7 @@ from open_webui.internal.db import get_session
 
 
 from open_webui.models.oauth_sessions import OAuthSessions
+from open_webui.models.users import Users
 from open_webui.models.tools import (
     ToolForm,
     ToolModel,
@@ -29,7 +31,16 @@ from open_webui.utils.plugin import (
     get_tool_module_from_cache,
     resolve_valves_schema_options,
 )
-from open_webui.utils.tools import get_builtin_tool_catalog, get_tool_specs
+from open_webui.utils.tools import (
+    DEEPAGENT_BUILTIN_SKILLS_TOOL_ID,
+    _compute_deepagent_tool_revision,
+    compute_deepagent_builtin_skills_revision,
+    get_deepagent_runtime_skill_ids,
+    get_async_tool_function_and_apply_extra_params,
+    get_builtin_tool_catalog,
+    get_tool_specs,
+)
+from open_webui.tools.builtin import list_skills, view_skill
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import (
     has_permission,
@@ -80,6 +91,30 @@ def get_tool_module(request, tool_id, load_from_db=True):
     Get the tool module by its ID.
     """
     tool_module, _ = get_tool_module_from_cache(request, tool_id, load_from_db)
+    return tool_module
+
+
+def _get_tool_module_from_content_snapshot(request: Request, tool_id: str, content: str):
+    normalized_content = replace_imports(content)
+
+    if (
+        hasattr(request.app.state, "TOOL_CONTENTS")
+        and tool_id in request.app.state.TOOL_CONTENTS
+        and hasattr(request.app.state, "TOOLS")
+        and tool_id in request.app.state.TOOLS
+        and request.app.state.TOOL_CONTENTS[tool_id] == normalized_content
+    ):
+        return request.app.state.TOOLS[tool_id]
+
+    tool_module, _ = load_tool_module_by_id(tool_id, content=normalized_content)
+
+    if not hasattr(request.app.state, "TOOLS"):
+        request.app.state.TOOLS = {}
+    if not hasattr(request.app.state, "TOOL_CONTENTS"):
+        request.app.state.TOOL_CONTENTS = {}
+
+    request.app.state.TOOLS[tool_id] = tool_module
+    request.app.state.TOOL_CONTENTS[tool_id] = normalized_content
     return tool_module
 
 
@@ -172,6 +207,23 @@ def _bridge_catalog_url(openai_base_url: str) -> str:
     if base.endswith("/v1"):
         base = base[:-3]
     return f"{base}/tools/catalog"
+
+
+def _internal_bridge_tokens(request: Request) -> set[str]:
+    raw_keys = list(getattr(request.app.state.config, "OPENAI_API_KEYS", []) or [])
+    return {str(key).strip() for key in raw_keys if str(key).strip()}
+
+
+def _require_internal_bridge_auth(request: Request) -> None:
+    auth = str(request.headers.get("authorization", "") or "").strip()
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if token and token in _internal_bridge_tokens(request):
+            return
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing internal tool runtime token",
+    )
 
 
 async def _get_core_tool_entries(request: Request) -> list[dict]:
@@ -586,6 +638,213 @@ async def get_builtin_tool_list(
 ):
     del user
     return get_builtin_tool_catalog(request)
+
+
+class DeepAgentToolExecuteContext(BaseModel):
+    user_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    session_id: Optional[str] = None
+    message_id: Optional[str] = None
+    files: list[dict] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
+
+
+class DeepAgentToolExecuteForm(BaseModel):
+    tool_id: str
+    function_name: str
+    registered_name: str = ""
+    parameters: dict = Field(default_factory=dict)
+    revision: str
+    context: DeepAgentToolExecuteContext = Field(default_factory=DeepAgentToolExecuteContext)
+
+
+@router.post("/internal/deepagent/execute")
+async def execute_deepagent_tool(
+    request: Request,
+    form_data: DeepAgentToolExecuteForm,
+    db: Session = Depends(get_session),
+):
+    _require_internal_bridge_auth(request)
+    context = form_data.context
+    user = Users.get_user_by_id(context.user_id, db=db) if context.user_id else None
+    metadata = dict(context.metadata or {})
+    metadata.setdefault("deepagent_visual_selection_mode", "langgraph")
+    runtime_skill_ids = get_deepagent_runtime_skill_ids(metadata)
+
+    tool_name = ""
+    tool_user = user.model_dump() if user else {}
+
+    if form_data.tool_id == DEEPAGENT_BUILTIN_SKILLS_TOOL_ID:
+        builtin_functions = {
+            list_skills.__name__: list_skills,
+            view_skill.__name__: view_skill,
+        }
+        current_revision = compute_deepagent_builtin_skills_revision(runtime_skill_ids)
+        if current_revision != form_data.revision:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "tool_revision_mismatch",
+                    "message": "The tool changed after this run started. Retry the request to use the latest version.",
+                    "tool_id": form_data.tool_id,
+                },
+            )
+
+        tool_function = builtin_functions.get(form_data.function_name)
+        if tool_function is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
+
+        tool_name = "Workspace Skills"
+        allowed_params = {
+            name
+            for name in inspect.signature(tool_function).parameters.keys()
+            if not str(name).startswith("__")
+        }
+    else:
+        tool = Tools.get_tool_by_id(form_data.tool_id, db=db)
+        if not tool:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
+
+        current_revision = _compute_deepagent_tool_revision(tool)
+        if current_revision != form_data.revision:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "tool_revision_mismatch",
+                    "message": "The tool changed after this run started. Retry the request to use the latest version.",
+                    "tool_id": form_data.tool_id,
+                },
+            )
+
+        tool_module = _get_tool_module_from_content_snapshot(
+            request,
+            form_data.tool_id,
+            tool.content,
+        )
+        if tool_module is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
+
+        if hasattr(tool_module, "valves") and hasattr(tool_module, "Valves"):
+            valves = Tools.get_tool_valves_by_id(form_data.tool_id, db=db) or {}
+            tool_module.valves = tool_module.Valves(**valves)
+
+        if user and hasattr(tool_module, "UserValves"):
+            tool_user["valves"] = tool_module.UserValves(
+                **(Tools.get_user_valves_by_id_and_user_id(form_data.tool_id, user.id, db=db) or {})
+            )
+
+        tool_function = getattr(tool_module, form_data.function_name, None)
+        if tool_function is None or not callable(tool_function):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
+
+        tool_spec = next(
+            (
+                spec
+                for spec in list(tool.specs or [])
+                if isinstance(spec, dict)
+                and str(spec.get("name") or "").strip() == form_data.function_name
+            ),
+            None,
+        )
+        allowed_params = set()
+        if isinstance(tool_spec, dict):
+            parameters = tool_spec.get("parameters")
+            if isinstance(parameters, dict) and isinstance(parameters.get("properties"), dict):
+                allowed_params = {
+                    key
+                    for key in parameters.get("properties", {}).keys()
+                    if not str(key).startswith("__")
+                }
+        tool_name = tool.name
+
+    tool_params = dict(form_data.parameters or {})
+    if allowed_params:
+        tool_params = {k: v for k, v in tool_params.items() if k in allowed_params}
+
+    request_info = {
+        "user_id": context.user_id,
+        "chat_id": context.chat_id,
+        "session_id": context.session_id,
+        "message_id": context.message_id,
+    }
+
+    from open_webui.socket.main import get_event_call, get_event_emitter
+    from open_webui.utils.middleware import process_tool_result, terminal_event_handler
+
+    event_emitter = get_event_emitter(request_info)
+    event_call = get_event_call(request_info)
+
+    extra_params = {
+        "__event_emitter__": event_emitter,
+        "__event_call__": event_call,
+        "__chat_id__": context.chat_id,
+        "__session_id__": context.session_id,
+        "__message_id__": context.message_id,
+        "__files__": list(context.files or []),
+        "__user__": tool_user,
+        "__metadata__": metadata,
+        "__request__": request,
+    }
+    if form_data.tool_id == DEEPAGENT_BUILTIN_SKILLS_TOOL_ID:
+        extra_params["__skill_ids__"] = runtime_skill_ids
+
+    execution_status = "success"
+    try:
+        tool_callable = get_async_tool_function_and_apply_extra_params(
+            tool_function,
+            extra_params,
+        )
+        raw_result = await tool_callable(**tool_params)
+    except Exception as exc:
+        execution_status = "error"
+        log.exception("DeepAgent tool execution failed for %s/%s", form_data.tool_id, form_data.function_name)
+        raw_result = str(exc)
+
+    tool_result, tool_result_files, tool_result_embeds = process_tool_result(
+        request,
+        form_data.function_name,
+        raw_result,
+        "",
+        False,
+        metadata,
+        user,
+    )
+
+    if event_emitter:
+        await terminal_event_handler(
+            form_data.function_name,
+            tool_params,
+            tool_result,
+            event_emitter,
+        )
+        if tool_result_files:
+            await event_emitter({"type": "files", "data": {"files": tool_result_files}})
+        if tool_result_embeds:
+            await event_emitter({"type": "embeds", "data": {"embeds": tool_result_embeds}})
+
+    return {
+        "status": execution_status,
+        "tool_id": form_data.tool_id,
+        "tool_name": tool_name,
+        "function_name": form_data.function_name,
+        "registered_name": form_data.registered_name,
+        "revision": current_revision,
+        "output_text": tool_result,
+        "files": tool_result_files,
+        "embeds": tool_result_embeds,
+    }
 
 
 ############################

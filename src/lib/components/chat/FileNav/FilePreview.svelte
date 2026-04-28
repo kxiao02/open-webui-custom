@@ -5,7 +5,12 @@
 	import { settings } from '$lib/stores';
 	import { isCodeFile } from '$lib/utils/codeHighlight';
 	import { initMermaid, renderMermaidDiagram } from '$lib/utils';
-	import { isMarkdownPreviewPath, renderMarkdownPreviewHtml } from '$lib/utils/markdownPreview';
+	import {
+		isMarkdownPreviewPath,
+		isMermaidPreviewPath,
+		prepareMarkdownPreviewSource,
+		renderMarkdownPreviewHtml
+	} from '$lib/utils/markdownPreview';
 	import Spinner from '../../common/Spinner.svelte';
 	import PDFViewer from '../../common/PDFViewer.svelte';
 	import JsonTreeView from './JsonTreeView.svelte';
@@ -95,7 +100,8 @@
 	const JSON_EXTS = new Set(['json', 'jsonc', 'jsonl', 'json5']);
 	const getExt = (path: string | null) => path?.split('.').pop()?.toLowerCase() ?? '';
 
-	$: isMarkdown = isMarkdownPreviewPath(selectedFile);
+	$: isMermaid = isMermaidPreviewPath(selectedFile);
+	$: isMarkdown = isMarkdownPreviewPath(selectedFile) || isMermaid;
 	$: isCsv = CSV_EXTS.has(getExt(selectedFile));
 	$: isHtml = HTML_EXTS.has(getExt(selectedFile));
 	$: isJson = JSON_EXTS.has(getExt(selectedFile));
@@ -103,7 +109,12 @@
 	$: isNotebook = getExt(selectedFile) === 'ipynb';
 	$: isCode = isCodeFile(selectedFile);
 	$: csvDelimiter = getExt(selectedFile) === 'tsv' ? '\t' : ',';
-	$: renderedHtml = isMarkdown && fileContent ? renderMarkdownPreviewHtml(fileContent) : '';
+	$: renderedHtml =
+		isMarkdown && fileContent
+			? renderMarkdownPreviewHtml(
+					prepareMarkdownPreviewSource(fileContent, { mermaid: isMermaid })
+				)
+			: '';
 
 	let markdownEl: HTMLDivElement;
 	let mermaidInstance: any = null;
@@ -120,17 +131,18 @@
 		for (const codeEl of codeEls) {
 			const pre = codeEl.parentElement;
 			if (!pre || pre.tagName !== 'PRE' || pre.dataset.mermaidRendered) continue;
-			pre.dataset.mermaidRendered = 'true';
 
 			try {
 				const svg = await renderMermaidDiagram(mermaidInstance, codeEl.textContent ?? '');
 				if (svg) {
+					pre.dataset.mermaidRendered = 'true';
 					const wrapper = document.createElement('div');
 					wrapper.className = 'mermaid-diagram flex justify-center py-2';
 					wrapper.innerHTML = svg;
 					pre.replaceWith(wrapper);
 				}
 			} catch (e) {
+				delete pre.dataset.mermaidRendered;
 				console.error('Mermaid render error:', e);
 			}
 		}

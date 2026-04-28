@@ -34,11 +34,16 @@
 	} from '$lib/stores';
 	import { openGeneratedFilePreview } from '$lib/utils/generated-file-preview';
 	import {
+		collectGeneratedFilesFromValue,
 		getToolCallArtifactEvidence,
 		isFileGeneratingToolId,
 		resolveToolCallStatus
 	} from '$lib/utils/generated-files';
-	import { normalizeToolId, resolveToolDisplay } from '$lib/utils/tool-display';
+	import {
+		isHiddenHelperToolCall,
+		normalizeToolId,
+		resolveToolDisplay
+	} from '$lib/utils/tool-display';
 
 	export let id: string = '';
 	export let attributes: {
@@ -492,11 +497,25 @@
 	$: normalizedAttrs = { ...(attributes ?? {}), tool_id: normalizedToolId || attributes?.tool_id || '' };
 	$: toolVisualKey = getToolVisualKey();
 	$: visualStatusTick;
-	$: hasFiles = Array.isArray(files) && files.length > 0;
+	$: parsedFiles = collectGeneratedFilesFromValue(files, 'tool');
+	$: hasAnyFiles = parsedFiles.length > 0;
+	$: suppressInlineVisuals = isHiddenHelperToolCall({
+		toolId: normalizedToolId,
+		toolName: attributes?.tool_name,
+		legacyName: attributes?.name,
+		parsedArgs
+	});
+	$: visibleFiles = suppressInlineVisuals ? [] : parsedFiles;
+	$: imageFiles = visibleFiles.filter((file) => file.isImage && file.url);
+	$: visibleEmbeds =
+		suppressInlineVisuals || !Array.isArray(embeds)
+			? []
+			: embeds.filter((embed): embed is string => typeof embed === 'string' && embed.trim().length > 0);
+	$: hasFiles = visibleFiles.length > 0;
 	$: terminalResultFile = getGeneratedTerminalFile(normalizedToolId, parsedResult);
 	$: supportsArtifactInference = isFileGeneratingToolId(normalizedToolId);
 	$: hasResultArtifacts = supportsArtifactInference && getToolCallArtifactEvidence(normalizedAttrs);
-	$: hasArtifactEvidence = hasFiles || Boolean(terminalResultFile) || hasResultArtifacts;
+	$: hasArtifactEvidence = hasAnyFiles || Boolean(terminalResultFile) || hasResultArtifacts;
 	$: statusCandidate = resolveToolCallStatus(normalizedAttrs);
 	$: status = getEffectiveStatus(
 		statusCandidate,
@@ -513,7 +532,7 @@
 	$: showTodoResultMessage = shouldShowTodoResultMessage(todoResultMessage, status);
 	$: hasTodoUI = Boolean(todoPayload && todoPayload.todos.length > 0);
 	$: secondaryMessage = hasTodoUI && todoSummary ? todoSummary : statusMessage;
-	$: hasEmbeds = embeds && Array.isArray(embeds) && embeds.length > 0;
+	$: hasEmbeds = visibleEmbeds.length > 0;
 	$: canExpand = !hasEmbeds && (hasTodoUI || Boolean(args) || Boolean(result) || hasFiles);
 	$: if (!canExpand) open = false;
 </script>
@@ -594,7 +613,7 @@
 			<div transition:slide={{ duration: 300, easing: quintOut, axis: 'y' }}>
 				<div class={`space-y-3 ${embedded ? 'px-3 py-2' : 'px-2 py-2'}`}>
 					{#if hasEmbeds}
-						{#each embeds as embed, idx}
+						{#each visibleEmbeds as embed, idx}
 							<div class="my-2" id={`${componentId}-tool-call-embed-${idx}`}>
 								<FullHeightIframe
 									src={embed}
@@ -786,18 +805,12 @@
 
 	<!-- Files display (images etc.) when done -->
 	{#if isTerminal}
-		{#if typeof files === 'object'}
-			{#each files ?? [] as file, idx}
-				{#if typeof file === 'string'}
-					{#if file.startsWith('data:image/')}
-						<Image id={`${componentId}-tool-call-result-${idx}`} src={file} alt="Image" />
-					{/if}
-				{:else if typeof file === 'object'}
-					{#if (file.type === 'image' || (file?.content_type ?? '').startsWith('image/')) && file.url}
-						<Image id={`${componentId}-tool-call-result-${idx}`} src={file.url} alt="Image" />
-					{/if}
+		{#if imageFiles.length > 0}
+			{#each imageFiles as file, idx}
+				{#if file.url}
+					<Image id={`${componentId}-tool-call-result-${idx}`} src={file.url} alt={file.name} />
 				{/if}
-			{/each}
+				{/each}
 		{/if}
 	{/if}
 </div>

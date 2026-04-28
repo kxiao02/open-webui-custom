@@ -69,6 +69,9 @@
 	let renderedMessages: any[] = [];
 	let pendingVisibleReveal: number | null = null;
 	let revealRunId = 0;
+	let messageLogElement: HTMLUListElement | null = null;
+	let messageLogResizeObserver: ResizeObserver | null = null;
+	let pendingBottomAnchor: number | null = null;
 
 	const usesExternalHistoryPagination = () => typeof loadMoreHistory === 'function';
 	const usesLocalWindowing = () => messagesCount !== null && !usesExternalHistoryPagination();
@@ -263,6 +266,45 @@
 		if (!element) return;
 		element.scrollTop = element.scrollHeight;
 	};
+
+	const cancelPendingBottomAnchor = () => {
+		if (pendingBottomAnchor !== null) {
+			cancelAnimationFrame(pendingBottomAnchor);
+			pendingBottomAnchor = null;
+		}
+	};
+
+	const disconnectMessageLogObserver = () => {
+		if (messageLogResizeObserver) {
+			messageLogResizeObserver.disconnect();
+			messageLogResizeObserver = null;
+		}
+		cancelPendingBottomAnchor();
+	};
+
+	const scheduleBottomAnchor = () => {
+		if (!autoScroll || pendingBottomAnchor !== null) {
+			return;
+		}
+
+		pendingBottomAnchor = requestAnimationFrame(async () => {
+			pendingBottomAnchor = null;
+			await tick();
+			if (autoScroll) {
+				scrollToBottom();
+			}
+		});
+	};
+
+	$: {
+		disconnectMessageLogObserver();
+		if (messageLogElement && typeof ResizeObserver !== 'undefined') {
+			messageLogResizeObserver = new ResizeObserver(() => {
+				scheduleBottomAnchor();
+			});
+			messageLogResizeObserver.observe(messageLogElement);
+		}
+	}
 
 	const hasMoreLocalHistory = () => {
 		const first = messages.at(0);
@@ -568,6 +610,7 @@
 			cancelAnimationFrame(pendingRebuild);
 		}
 		cancelVisibleReveal();
+		disconnectMessageLogObserver();
 	});
 
 	const triggerScroll = () => {
@@ -603,7 +646,13 @@
 							</div>
 						</Loader>
 					{/if}
-					<ul role="log" aria-live="polite" aria-relevant="additions" aria-atomic="false">
+					<ul
+						bind:this={messageLogElement}
+						role="log"
+						aria-live="polite"
+						aria-relevant="additions"
+						aria-atomic="false"
+					>
 						{#each renderedMessages as message, messageIdx (message.id)}
 							<Message
 								{chatId}

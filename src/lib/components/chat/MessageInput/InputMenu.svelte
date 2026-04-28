@@ -30,7 +30,7 @@
 
 	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
-	export let files = [];
+	export let files: any[] = [];
 
 	export let selectedModels: string[] = [];
 	export let fileUploadCapableModels: string[] = [];
@@ -60,7 +60,7 @@
 		files = [];
 	}
 
-	const onSelect = (item) => {
+	const onSelect = (item: any) => {
 		if (files.find((f) => f.id === item.id)) {
 			return;
 		}
@@ -124,7 +124,6 @@
 								? 'opacity-50'
 								: ''}"
 							on:click={openUploadFilesPicker}
-							on:select={openUploadFilesPicker}
 						>
 							<Clip />
 

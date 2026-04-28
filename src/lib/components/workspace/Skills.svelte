@@ -24,7 +24,6 @@
 	import Tooltip from '../common/Tooltip.svelte';
 	import ConfirmDialog from '../common/ConfirmDialog.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
-	import EllipsisHorizontal from '../icons/EllipsisHorizontal.svelte';
 	import GarbageBin from '../icons/GarbageBin.svelte';
 	import Search from '../icons/Search.svelte';
 	import Plus from '../icons/Plus.svelte';
@@ -300,7 +299,7 @@
 
 				{#if $user}
 					<a
-						class="px-2 py-1.5 rounded-xl bg-black text-white hover:bg-gray-900 dark:bg-white dark:text-black dark:hover:bg-gray-100 transition font-medium text-sm flex items-center"
+						class="px-2.5 py-1.5 rounded-xl border border-gray-200/80 bg-gray-100/90 text-gray-700 hover:bg-gray-200/80 hover:text-gray-900 dark:border-gray-800 dark:bg-gray-850/90 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-white transition font-medium text-sm flex items-center"
 						href="/workspace/skills/create"
 					>
 						<Plus className="size-3" strokeWidth="2.5" />
@@ -374,10 +373,9 @@
 			<div class=" my-2 gap-2 grid px-3 lg:grid-cols-2">
 				{#each filteredItems as skill}
 					{@const canEdit = skill.write_access}
-					<Tooltip content={skill?.description ?? skill?.id}>
-						<div
-							class="flex space-x-4 text-left w-full px-3 py-2.5 transition rounded-2xl dark:hover:bg-gray-850/50 hover:bg-gray-50"
-						>
+					<div
+						class="flex space-x-4 text-left w-full px-3 py-2.5 transition rounded-2xl dark:hover:bg-gray-850/50 hover:bg-gray-50"
+					>
 							<div
 								class="flex flex-1 space-x-3.5 w-full {canEdit ? 'cursor-pointer' : ''}"
 								role={canEdit ? 'button' : undefined}
@@ -469,15 +467,7 @@
 											showDeleteConfirm = true;
 										}}
 										onClose={() => {}}
-									>
-										<button
-											class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
-											type="button"
-											on:click|stopPropagation
-										>
-											<EllipsisHorizontal className="size-5" />
-										</button>
-									</SkillMenu>
+									/>
 								{/if}
 
 								{#if canEdit}
@@ -493,8 +483,7 @@
 									</button>
 								{/if}
 							</div>
-						</div>
-					</Tooltip>
+					</div>
 				{/each}
 			</div>
 

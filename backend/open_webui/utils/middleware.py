@@ -89,7 +89,11 @@ from open_webui.retrieval.utils import get_sources_from_items
 from open_webui.utils.sanitize import sanitize_code
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.task import (
+    build_follow_up_context_guidance,
+    build_session_user_memory_prompt,
+    extract_session_user_facts,
     get_task_model_id,
+    normalize_session_user_facts,
     rag_template,
     tools_function_calling_generation_template,
 )
@@ -111,11 +115,19 @@ from open_webui.utils.misc import (
     convert_output_to_messages,
 )
 from open_webui.utils.tools import (
+    DEEPAGENT_RUNTIME_SKILL_IDS_METADATA_KEY,
+    build_deepagent_runtime_tool_snapshot,
     get_tools,
     get_updated_tool_function,
     get_terminal_tools,
 )
 from open_webui.utils.access_control import get_permissions, has_connection_access
+from open_webui.utils.knowflow import (
+    get_knowflow_asset_ref_key,
+    is_knowflow_image_ref,
+    resolve_knowflow_asset_url,
+    resolve_knowflow_html_content,
+)
 from open_webui.utils.plugin import load_function_module_by_id
 from open_webui.utils.skill_import import PHASE_NOTES as DOCUMENT_SKILL_PHASE_NOTES
 from open_webui.utils.filter import (
@@ -505,17 +517,33 @@ def get_citation_source_from_tool_result(
                         },
                         "document": [],
                         "metadata": [],
+                        "distances": [],
                     }
 
                 sources_by_file[key]["document"].append(content)
-                sources_by_file[key]["metadata"].append(
-                    {
-                        "file_id": file_id,
-                        "name": source_name,
-                        "source": source_name,
-                        **({"note_id": note_id} if note_id else {}),
-                    }
-                )
+                metadata = {
+                    "file_id": file_id,
+                    "name": source_name,
+                    "source": source_name,
+                    **({"note_id": note_id} if note_id else {}),
+                }
+
+                for field in ("url", "embed_url", "image_id", "chunk_type", "render_markdown", "page"):
+                    value = chunk.get(field)
+                    if value not in (None, "", "null", "undefined"):
+                        metadata[field] = value
+
+                html_content = chunk.get("html_content")
+                if isinstance(html_content, str) and html_content.strip():
+                    metadata["html"] = True
+                    metadata["html_content"] = html_content.strip()
+                elif chunk.get("html") is True:
+                    metadata["html"] = True
+
+                sources_by_file[key]["metadata"].append(metadata)
+
+                distance = chunk.get("distance")
+                sources_by_file[key]["distances"].append(distance)
 
             # Return all grouped sources as a list
             if sources_by_file:
@@ -1651,15 +1679,20 @@ def apply_source_context_to_messages(
     if not context:
         return messages
 
+    rag_prompt = rag_template(request.app.state.config.RAG_TEMPLATE, context, user_message)
+    follow_up_context_guidance = build_follow_up_context_guidance(messages)
+    if follow_up_context_guidance:
+        rag_prompt = f"{rag_prompt}\n\n{follow_up_context_guidance}"
+
     if RAG_SYSTEM_CONTEXT:
         return add_or_update_system_message(
-            rag_template(request.app.state.config.RAG_TEMPLATE, context, user_message),
+            rag_prompt,
             messages,
             append=True,
         )
     else:
         return add_or_update_user_message(
-            rag_template(request.app.state.config.RAG_TEMPLATE, context, user_message),
+            rag_prompt,
             messages,
             append=False,
         )
@@ -1726,9 +1759,19 @@ CLIENT_CAPABILITIES_PREVIEW_TYPES = (
     "image",
     "pdf",
     "docx",
+    "xlsx",
+    "pptx",
+    "html",
+    "mermaid",
     "text",
     "markdown",
     "code",
+    "json",
+    "csv",
+    "notebook",
+    "sqlite",
+    "audio",
+    "video",
 )
 
 
@@ -2855,9 +2898,20 @@ def get_image_urls(delta_images, request, metadata, user) -> list[str]:
 
 
 def _normalize_generated_file_entry(item: Any) -> Optional[dict]:
+    def normalize_generated_file_ref(value: Any) -> str:
+        normalized = str(value or "").strip()
+        if not normalized or normalized.lower() in {"null", "undefined"}:
+            return ""
+
+        knowflow_asset_ref = get_knowflow_asset_ref_key(normalized)
+        if knowflow_asset_ref:
+            return knowflow_asset_ref
+
+        return normalized
+
     if isinstance(item, str):
-        ref = item.strip()
-        if not ref or ref.lower() in {"null", "undefined"}:
+        ref = normalize_generated_file_ref(item)
+        if not ref:
             return None
         return {"url": ref}
 
@@ -2874,11 +2928,10 @@ def _normalize_generated_file_entry(item: Any) -> Optional[dict]:
     ]
     ref = next(
         (
-            value.strip()
+            normalize_generated_file_ref(value)
             for value in candidates
             if isinstance(value, str)
-            and value.strip()
-            and value.strip().lower() not in {"null", "undefined"}
+            and normalize_generated_file_ref(value)
         ),
         "",
     )
@@ -2891,8 +2944,10 @@ def _normalize_generated_file_entry(item: Any) -> Optional[dict]:
     normalized = {"url": ref} if ref else {}
 
     file_id = item.get("id")
-    if isinstance(file_id, str) and file_id.strip():
-        normalized["id"] = file_id.strip()
+    if isinstance(file_id, str):
+        normalized_id = normalize_generated_file_ref(file_id)
+        if normalized_id:
+            normalized["id"] = normalized_id
 
     name = item.get("filename") or item.get("fileName") or item.get("name")
     if isinstance(name, str) and name.strip():
@@ -2959,6 +3014,9 @@ def _generated_file_ref_key(item: dict) -> str:
     if isinstance(ref, str):
         normalized_ref = ref.strip()
         if normalized_ref:
+            knowflow_asset_ref = get_knowflow_asset_ref_key(normalized_ref)
+            if knowflow_asset_ref:
+                return f"knowflow:{knowflow_asset_ref}"
             return normalized_ref
     inline_content = item.get("content_base64")
     if isinstance(inline_content, str) and inline_content.strip():
@@ -2966,6 +3024,78 @@ def _generated_file_ref_key(item: dict) -> str:
         inline_size = item.get("size")
         return f"inline:{inline_name}:{inline_size}:{len(inline_content.strip())}"
     return ""
+
+
+def _score_generated_file_ref(value: Any) -> int:
+    normalized_ref = str(value or "").strip()
+    knowflow_asset_ref = get_knowflow_asset_ref_key(normalized_ref)
+    normalized = knowflow_asset_ref or normalized_ref
+    if not normalized:
+        return 0
+
+    lowered = normalized.lower()
+    if "/api/v1/files/" in lowered and "/content" in lowered:
+        return 5
+    if "/api/v1/files/" in lowered:
+        return 4
+    if knowflow_asset_ref:
+        return 3
+    if lowered.startswith(("https://", "http://")):
+        return 2
+    return 0
+
+
+def _score_generated_file_label(value: Any) -> int:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return 0
+
+    lowered = normalized.lower()
+    if lowered in {"generated-file", "knowledge visual", "knowflow", "image", "file"}:
+        return 1
+    return len(normalized)
+
+
+def _merge_duplicate_generated_file_entries(existing: dict, incoming: dict) -> dict:
+    merged = {
+        **existing,
+        **{
+            key: value
+            for key, value in incoming.items()
+            if value not in (None, "", [], {})
+        },
+    }
+
+    existing_ref = str(existing.get("url") or "").strip()
+    incoming_ref = str(incoming.get("url") or "").strip()
+    if _score_generated_file_ref(existing_ref) >= _score_generated_file_ref(incoming_ref):
+        if existing_ref:
+            merged["url"] = existing_ref
+    elif incoming_ref:
+        merged["url"] = incoming_ref
+
+    existing_id = str(existing.get("id") or "").strip()
+    incoming_id = str(incoming.get("id") or "").strip()
+    if _score_generated_file_label(existing_id) >= _score_generated_file_label(incoming_id):
+        if existing_id:
+            merged["id"] = existing_id
+    elif incoming_id:
+        merged["id"] = incoming_id
+
+    existing_name = str(existing.get("name") or "").strip()
+    incoming_name = str(incoming.get("name") or "").strip()
+    if _score_generated_file_label(existing_name) >= _score_generated_file_label(incoming_name):
+        if existing_name:
+            merged["name"] = existing_name
+    elif incoming_name:
+        merged["name"] = incoming_name
+
+    existing_call_id = str(existing.get("call_id") or "").strip()
+    incoming_call_id = str(incoming.get("call_id") or "").strip()
+    if existing_call_id and not incoming_call_id:
+        merged["call_id"] = existing_call_id
+
+    return merged
 
 
 def _upload_inline_generated_file(
@@ -3139,14 +3269,9 @@ def _merge_generated_file_entries(*groups: Any) -> list[dict]:
             ref_key = _generated_file_ref_key(normalized)
             if ref_key and ref_key in index_by_ref:
                 existing = merged_files[index_by_ref[ref_key]]
-                merged_files[index_by_ref[ref_key]] = {
-                    **existing,
-                    **{
-                        key: value
-                        for key, value in normalized.items()
-                        if value not in (None, "", [], {})
-                    },
-                }
+                merged_files[index_by_ref[ref_key]] = _merge_duplicate_generated_file_entries(
+                    existing, normalized
+                )
                 continue
             if ref_key:
                 index_by_ref[ref_key] = len(merged_files)
@@ -3265,6 +3390,7 @@ def _attach_generated_files_to_output(output: list, files: list[dict]) -> list:
     enriched_output = copy.deepcopy(output)
     scoped_files_by_call_id: dict[str, list[dict]] = {}
     unscoped_files: list[dict] = []
+    function_call_index_by_call_id: dict[str, int] = {}
 
     for file_item in normalized_files:
         call_id = str(file_item.get("call_id") or "").strip()
@@ -3275,8 +3401,17 @@ def _attach_generated_files_to_output(output: list, files: list[dict]) -> list:
 
     target_index = None
     for index, item in enumerate(enriched_output):
-        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+        if not isinstance(item, dict):
             continue
+        item_type = item.get("type")
+        if item_type == "function_call":
+            call_id = str(item.get("call_id") or item.get("id") or "").strip()
+            if call_id:
+                function_call_index_by_call_id[call_id] = index
+            continue
+        if item_type != "function_call_output":
+            continue
+
         target_index = index
         call_id = str(item.get("call_id") or "").strip()
         if not call_id or call_id not in scoped_files_by_call_id:
@@ -3287,11 +3422,40 @@ def _attach_generated_files_to_output(output: list, files: list[dict]) -> list:
             existing_files if isinstance(existing_files, list) else [],
             scoped_files_by_call_id.pop(call_id),
         )
+        if str(item.get("status") or "").strip().lower() in {"", "running", "in_progress"}:
+            item["status"] = "success"
 
-    remaining_files = _merge_generated_file_entries(
-        unscoped_files,
-        *scoped_files_by_call_id.values(),
-    )
+    synthesized_output_items: list[dict] = []
+    for call_id, scoped_files in list(scoped_files_by_call_id.items()):
+        function_call_index = function_call_index_by_call_id.get(call_id)
+        if function_call_index is None:
+            continue
+
+        function_call_item = enriched_output[function_call_index]
+        tool_name = str(function_call_item.get("name") or "tool").strip() or "tool"
+        function_call_item["status"] = "completed"
+        synthesized_output_items.append(
+            {
+                "type": "function_call_output",
+                "id": f"fco_{call_id}",
+                "call_id": call_id,
+                "name": tool_name,
+                "status": "success",
+                "files": scoped_files,
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "工具已完成并生成文件，可在界面中预览或下载。",
+                    }
+                ],
+            }
+        )
+        scoped_files_by_call_id.pop(call_id, None)
+
+    if synthesized_output_items:
+        enriched_output.extend(synthesized_output_items)
+
+    remaining_files = _merge_generated_file_entries(unscoped_files)
     if remaining_files and target_index is not None:
         existing_files = enriched_output[target_index].get("files")
         enriched_output[target_index]["files"] = _merge_generated_file_entries(
@@ -3339,6 +3503,587 @@ def _extract_generated_files_from_choices(choices: Any) -> list[dict]:
                     generated_files.append(normalized)
 
     return generated_files
+
+
+def _merge_embed_entries(*groups: Any) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for item in group:
+            normalized = str(item or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
+
+    return merged
+
+
+_SOURCE_INLINE_IMAGE_SRC_RE = re.compile(
+    r"<img\b[^>]*\bsrc\s*=\s*(['\"])(?P<url>.+?)\1",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_SOURCE_INLINE_TABLE_RE = re.compile(
+    r"<table\b[\s\S]*?</table>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_SOURCE_MARKDOWN_IMAGE_RE = re.compile(
+    r"!\[[^\]]*\]\((?P<url>[^)\s]+)",
+    flags=re.IGNORECASE,
+)
+_SOURCE_MARKDOWN_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+(?:\s*:?-{3,}:?\s*)?$"
+)
+_SOURCE_HTML_TABLE_ROW_RE = re.compile(
+    r"<tr\b[^>]*>(?P<row>[\s\S]*?)</tr>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_SOURCE_HTML_TABLE_CELL_RE = re.compile(
+    r"<(?:td|th)\b[^>]*>(?P<cell>[\s\S]*?)</(?:td|th)>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_SOURCE_HTML_BREAK_RE = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
+_SOURCE_HTML_TAG_RE = re.compile(r"<[^>]+>", flags=re.IGNORECASE)
+_SOURCE_FENCED_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
+_VISUAL_REQUEST_HINTS = (
+    "图片",
+    "配图",
+    "附图",
+    "原图",
+    "图示",
+    "流程图",
+    "示意图",
+    "架构图",
+    "表格",
+    "图表",
+    "image",
+    "figure",
+    "table",
+    "chart",
+)
+
+
+def _text_requests_visual_rendering(text: Any) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    return any(term in normalized for term in _VISUAL_REQUEST_HINTS)
+
+
+def _normalize_visual_match_text(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return ""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", normalized)
+
+
+def _visual_text_overlap_score(reference: Any, candidate: Any) -> float:
+    normalized_reference = _normalize_visual_match_text(reference)
+    normalized_candidate = _normalize_visual_match_text(candidate)
+    if not normalized_reference or not normalized_candidate:
+        return 0.0
+    if normalized_reference in normalized_candidate:
+        return 1.0
+    if len(normalized_reference) < 2 or len(normalized_candidate) < 2:
+        return 0.0
+
+    reference_ngrams = {
+        normalized_reference[index : index + 2]
+        for index in range(len(normalized_reference) - 1)
+    }
+    candidate_ngrams = {
+        normalized_candidate[index : index + 2]
+        for index in range(len(normalized_candidate) - 1)
+    }
+    if not reference_ngrams or not candidate_ngrams:
+        return 0.0
+    return len(reference_ngrams.intersection(candidate_ngrams)) / len(reference_ngrams)
+
+
+def _resolve_source_visual_url(
+    config: Any,
+    value: Any,
+    *,
+    knowflow_source: bool,
+) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    if knowflow_source or normalized.startswith("/minio/"):
+        return resolve_knowflow_asset_url(config, normalized)
+    return normalized
+
+
+def _resolve_source_visual_html(
+    config: Any,
+    value: Any,
+    *,
+    knowflow_source: bool,
+) -> str:
+    html_content = str(value or "").strip()
+    if not html_content:
+        return ""
+    if knowflow_source or "/minio/" in html_content:
+        return resolve_knowflow_html_content(config, html_content)
+    return html_content
+
+
+def _extract_source_visual_assets(
+    source_item: dict[str, Any],
+    document: Any,
+    metadata: dict[str, Any],
+    config: Any,
+) -> tuple[list[dict], list[str]]:
+    source_meta = source_item.get("source") if isinstance(source_item, dict) else {}
+    source_name = str(
+        metadata.get("name")
+        or metadata.get("source")
+        or (source_meta or {}).get("name")
+        or "Knowledge visual"
+    ).strip() or "Knowledge visual"
+    source_label = str(
+        metadata.get("source") or (source_meta or {}).get("name") or ""
+    ).strip()
+    knowflow_source = source_label.lower() == "knowflow"
+
+    image_files: list[dict] = []
+    table_embeds: list[str] = []
+
+    primary_url = _resolve_source_visual_url(
+        config,
+        metadata.get("url") or metadata.get("embed_url"),
+        knowflow_source=knowflow_source,
+    )
+    if primary_url and is_knowflow_image_ref(primary_url):
+        image_files.append(
+            {
+                "type": "image",
+                "url": primary_url,
+                "name": source_name,
+                "filename": source_name,
+            }
+        )
+
+    raw_fragments: list[str] = []
+    html_content = _resolve_source_visual_html(
+        config, metadata.get("html_content"), knowflow_source=knowflow_source
+    )
+    if html_content:
+        raw_fragments.append(html_content)
+
+    document_text = str(document or "").strip()
+    if "<" in document_text:
+        raw_fragments.append(
+            _resolve_source_visual_html(
+                config, document_text, knowflow_source=knowflow_source
+            )
+        )
+
+    for fragment in raw_fragments:
+        for match in _SOURCE_INLINE_IMAGE_SRC_RE.finditer(fragment):
+            resolved_url = _resolve_source_visual_url(
+                config,
+                match.group("url"),
+                knowflow_source=knowflow_source,
+            )
+            if not resolved_url or not is_knowflow_image_ref(resolved_url):
+                continue
+            image_files.append(
+                {
+                    "type": "image",
+                    "url": resolved_url,
+                    "name": source_name,
+                    "filename": source_name,
+                }
+            )
+
+        for match in _SOURCE_INLINE_TABLE_RE.finditer(fragment):
+            table_html = _resolve_source_visual_html(
+                config,
+                match.group(0),
+                knowflow_source=knowflow_source,
+            )
+            if table_html:
+                table_embeds.append(table_html)
+
+    for match in _SOURCE_MARKDOWN_IMAGE_RE.finditer(document_text):
+        resolved_url = _resolve_source_visual_url(
+            config,
+            match.group("url"),
+            knowflow_source=knowflow_source,
+        )
+        if not resolved_url or not is_knowflow_image_ref(resolved_url):
+            continue
+        image_files.append(
+            {
+                "type": "image",
+                "url": resolved_url,
+                "name": source_name,
+                "filename": source_name,
+            }
+        )
+
+    return _merge_generated_file_entries(image_files), _merge_embed_entries(table_embeds)
+
+
+def _normalize_visual_image_ref(value: Any) -> str:
+    normalized = html.unescape(str(value or "").strip())
+    if not normalized:
+        return ""
+
+    normalized_entry = _normalize_generated_file_entry({"url": normalized})
+    if not normalized_entry:
+        return normalized
+
+    ref_key = _generated_file_ref_key(normalized_entry)
+    if ref_key:
+        return ref_key
+
+    return str(normalized_entry.get("url") or normalized).strip()
+
+
+def _normalize_visual_table_cell(value: Any) -> str:
+    normalized = html.unescape(str(value or ""))
+    if not normalized:
+        return ""
+
+    normalized = _SOURCE_HTML_BREAK_RE.sub(" ", normalized)
+    normalized = _SOURCE_HTML_TAG_RE.sub(" ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return ""
+
+    return _normalize_visual_match_text(normalized)
+
+
+def _parse_markdown_table_row(line: str) -> list[str]:
+    normalized = str(line or "").strip()
+    if not normalized or "|" not in normalized:
+        return []
+
+    if normalized.startswith("|"):
+        normalized = normalized[1:]
+    if normalized.endswith("|"):
+        normalized = normalized[:-1]
+
+    return [cell.replace("\\|", "|").strip() for cell in re.split(r"(?<!\\)\|", normalized)]
+
+
+def _build_visual_table_signature(rows: list[list[str]]) -> str:
+    normalized_rows: list[str] = []
+
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+
+        normalized_cells = [_normalize_visual_table_cell(cell) for cell in row]
+        while normalized_cells and not normalized_cells[0]:
+            normalized_cells = normalized_cells[1:]
+        while normalized_cells and not normalized_cells[-1]:
+            normalized_cells = normalized_cells[:-1]
+        if not normalized_cells:
+            continue
+
+        normalized_rows.append("|".join(normalized_cells))
+
+    return "||".join(normalized_rows)
+
+
+def _extract_html_table_signature(table_html: Any) -> str:
+    normalized = str(table_html or "").strip()
+    if not normalized:
+        return ""
+
+    rows: list[list[str]] = []
+    for row_match in _SOURCE_HTML_TABLE_ROW_RE.finditer(normalized):
+        cells = [
+            cell_match.group("cell")
+            for cell_match in _SOURCE_HTML_TABLE_CELL_RE.finditer(row_match.group("row"))
+        ]
+        if cells:
+            rows.append(cells)
+
+    return _build_visual_table_signature(rows)
+
+
+def _collect_markdown_table_signatures(document_text: Any) -> set[str]:
+    normalized = _SOURCE_FENCED_CODE_BLOCK_RE.sub("", str(document_text or ""))
+    if not normalized:
+        return set()
+
+    signatures: set[str] = set()
+    lines = normalized.splitlines()
+    index = 0
+
+    while index + 2 < len(lines):
+        header_line = lines[index]
+        separator_line = lines[index + 1].strip()
+        if "|" not in header_line or not _SOURCE_MARKDOWN_TABLE_SEPARATOR_RE.match(
+            separator_line
+        ):
+            index += 1
+            continue
+
+        rows = [_parse_markdown_table_row(header_line)]
+        body_row_count = 0
+        next_index = index + 2
+
+        while next_index < len(lines):
+            candidate_line = lines[next_index]
+            candidate_text = candidate_line.strip()
+            if (
+                not candidate_text
+                or candidate_text.startswith("```")
+                or "|" not in candidate_line
+            ):
+                break
+
+            candidate_row = _parse_markdown_table_row(candidate_line)
+            if not candidate_row:
+                break
+
+            rows.append(candidate_row)
+            body_row_count += 1
+            next_index += 1
+
+        if body_row_count:
+            signature = _build_visual_table_signature(rows)
+            if signature:
+                signatures.add(signature)
+            index = next_index
+            continue
+
+        index += 1
+
+    return signatures
+
+
+def _collect_inline_content_visual_signatures(
+    content: Any,
+) -> tuple[set[str], set[str]]:
+    document_text = _SOURCE_FENCED_CODE_BLOCK_RE.sub("", str(content or ""))
+    if not document_text:
+        return set(), set()
+
+    image_refs: set[str] = set()
+    for match in _SOURCE_MARKDOWN_IMAGE_RE.finditer(document_text):
+        ref_key = _normalize_visual_image_ref(match.group("url"))
+        if ref_key:
+            image_refs.add(ref_key)
+
+    if "<" in document_text:
+        for match in _SOURCE_INLINE_IMAGE_SRC_RE.finditer(document_text):
+            ref_key = _normalize_visual_image_ref(match.group("url"))
+            if ref_key:
+                image_refs.add(ref_key)
+
+    table_signatures = _collect_markdown_table_signatures(document_text)
+    if "<" in document_text:
+        for match in _SOURCE_INLINE_TABLE_RE.finditer(document_text):
+            signature = _extract_html_table_signature(match.group(0))
+            if signature:
+                table_signatures.add(signature)
+
+    return image_refs, table_signatures
+
+
+def _filter_content_duplicated_retrieval_visuals(
+    response_content: Any,
+    generated_files: list[dict],
+    embeds: list[str],
+) -> tuple[list[dict], list[str]]:
+    inline_image_refs, inline_table_signatures = (
+        _collect_inline_content_visual_signatures(response_content)
+    )
+    if not inline_image_refs and not inline_table_signatures:
+        return (
+            _merge_generated_file_entries(generated_files),
+            _merge_embed_entries(embeds),
+        )
+
+    filtered_files: list[dict] = []
+    for item in generated_files:
+        normalized_item = _normalize_generated_file_entry(item)
+        if not normalized_item:
+            continue
+
+        ref_key = _generated_file_ref_key(normalized_item)
+        if ref_key and ref_key in inline_image_refs:
+            continue
+
+        filtered_files.append(normalized_item)
+
+    filtered_embeds: list[str] = []
+    for embed in embeds:
+        normalized_embed = str(embed or "").strip()
+        if not normalized_embed:
+            continue
+
+        signature = _extract_html_table_signature(normalized_embed)
+        if signature and signature in inline_table_signatures:
+            continue
+
+        filtered_embeds.append(normalized_embed)
+
+    return (
+        _merge_generated_file_entries(filtered_files),
+        _merge_embed_entries(filtered_embeds),
+    )
+
+
+def _select_retrieval_source_visual_payloads(
+    metadata: Optional[dict],
+    response_content: Any,
+    config: Any,
+) -> tuple[list[dict], list[str]]:
+    if not isinstance(metadata, dict):
+        return [], []
+
+    sources = metadata.get("sources")
+    if not isinstance(sources, list) or not sources:
+        return [], []
+
+    prompt_text = str(metadata.get("user_prompt") or "").strip()
+    if not prompt_text:
+        return [], []
+
+    prompt_requests_visuals = _text_requests_visual_rendering(prompt_text)
+    response_requests_visuals = _text_requests_visual_rendering(response_content)
+
+    candidates: list[dict[str, Any]] = []
+    for source_item in sources:
+        if not isinstance(source_item, dict):
+            continue
+
+        documents = source_item.get("document")
+        metadatas = source_item.get("metadata")
+        distances = source_item.get("distances")
+        if not isinstance(documents, list):
+            continue
+
+        for index, document in enumerate(documents):
+            document_metadata = (
+                metadatas[index]
+                if isinstance(metadatas, list)
+                and index < len(metadatas)
+                and isinstance(metadatas[index], dict)
+                else {}
+            )
+            image_files, table_embeds = _extract_source_visual_assets(
+                source_item,
+                document,
+                document_metadata,
+                config,
+            )
+            if not image_files and not table_embeds:
+                continue
+
+            prompt_overlap = _visual_text_overlap_score(prompt_text, document)
+            response_overlap = _visual_text_overlap_score(response_content, document)
+
+            similarity_value = None
+            if isinstance(distances, list) and index < len(distances):
+                similarity_value = distances[index]
+            if similarity_value is None:
+                similarity_value = document_metadata.get("similarity")
+
+            try:
+                similarity_score = float(similarity_value)
+            except (TypeError, ValueError):
+                similarity_score = 0.0
+
+            candidates.append(
+                {
+                    "file_id": str(document_metadata.get("file_id") or "").strip(),
+                    "images": image_files,
+                    "embeds": table_embeds,
+                    "prompt_overlap": prompt_overlap,
+                    "response_overlap": response_overlap,
+                    "similarity": similarity_score,
+                    "total_score": (prompt_overlap * 2.0)
+                    + (response_overlap * 0.5)
+                    + (max(0.0, min(similarity_score, 1.0)) * 0.05),
+                }
+            )
+
+    if not candidates:
+        return [], []
+
+    candidates.sort(
+        key=lambda item: (
+            item["total_score"],
+            item["prompt_overlap"],
+            item["response_overlap"],
+            item["similarity"],
+            len(item["images"]) + len(item["embeds"]),
+        ),
+        reverse=True,
+    )
+
+    best_candidate = candidates[0]
+    if best_candidate["prompt_overlap"] < 0.08:
+        return [], []
+    if not prompt_requests_visuals and not response_requests_visuals:
+        return [], []
+
+    best_file_id = str(best_candidate.get("file_id") or "").strip()
+    selected_candidates = (
+        [
+            item
+            for item in candidates
+            if str(item.get("file_id") or "").strip() == best_file_id
+            and item["prompt_overlap"] >= best_candidate["prompt_overlap"] * 0.5
+        ]
+        if best_file_id
+        else []
+    )
+    if not selected_candidates:
+        selected_candidates = [best_candidate]
+
+    return _filter_content_duplicated_retrieval_visuals(
+        response_content,
+        _merge_generated_file_entries(
+            *[item.get("images") for item in selected_candidates]
+        ),
+        _merge_embed_entries(*[item.get("embeds") for item in selected_candidates]),
+    )
+
+
+def _extract_embeds_from_choices(choices: Any) -> list[str]:
+    if not isinstance(choices, list):
+        return []
+
+    embeds: list[str] = []
+    seen: set[str] = set()
+
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+
+        metadata_candidates = []
+        for key in ("message", "delta"):
+            node = choice.get(key)
+            if not isinstance(node, dict):
+                continue
+            metadata = node.get("metadata")
+            if isinstance(metadata, dict):
+                metadata_candidates.append(metadata)
+
+        for metadata in metadata_candidates:
+            items = metadata.get("embeds")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                normalized = str(item or "").strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                embeds.append(normalized)
+
+    return embeds
 
 
 def _default_client_capabilities(
@@ -3390,6 +4135,14 @@ def _default_client_capabilities(
             "mode": "inline_or_modal",
             "types": list(CLIENT_CAPABILITIES_PREVIEW_TYPES),
         },
+        "diagram_render": {
+            "enabled": True,
+            "engines": ["mermaid", "vega", "vega-lite"],
+            "surfaces": ["assistant_message"],
+            "assistant_message_engines": ["mermaid", "vega", "vega-lite"],
+            "file_preview_engines": ["mermaid"],
+            "file_extensions": [".md", ".markdown", ".mdx", ".mermaid", ".mmd"],
+        },
         "workspace_tool_draft": {
             "enabled": tool_draft_enabled,
             "mode": "confirm_then_edit",
@@ -3421,6 +4174,7 @@ def _resolve_client_capabilities(
         "generated_file_download",
         "chat_share",
         "file_preview",
+        "diagram_render",
         "workspace_tool_draft",
         "workspace_skill_draft",
     ):
@@ -3437,7 +4191,7 @@ def _resolve_client_capabilities(
             if isinstance(item, str) and item.strip():
                 sanitized_types.append(item.strip())
         resolved["file_preview"]["types"] = (
-            sanitized_types[:12] if sanitized_types else list(CLIENT_CAPABILITIES_PREVIEW_TYPES)
+            sanitized_types[:24] if sanitized_types else list(CLIENT_CAPABILITIES_PREVIEW_TYPES)
         )
 
     if isinstance(metadata, dict):
@@ -3450,24 +4204,89 @@ def _build_client_capabilities_system_prompt(client_capabilities: Optional[dict]
     if not isinstance(client_capabilities, dict):
         return ""
 
+    def _string_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+
+        sanitized: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            normalized = item.strip()
+            if normalized and normalized not in sanitized:
+                sanitized.append(normalized)
+
+        return sanitized
+
     generated_file_download = client_capabilities.get("generated_file_download") or {}
     chat_share = client_capabilities.get("chat_share") or {}
     file_preview = client_capabilities.get("file_preview") or {}
+    diagram_render = client_capabilities.get("diagram_render") or {}
     workspace_tool_draft = client_capabilities.get("workspace_tool_draft") or {}
     workspace_skill_draft = client_capabilities.get("workspace_skill_draft") or {}
 
     download_enabled = bool(generated_file_download.get("enabled"))
     share_enabled = bool(chat_share.get("enabled"))
     preview_enabled = bool(file_preview.get("enabled"))
+    diagram_enabled = bool(diagram_render.get("enabled"))
     tool_draft_enabled = bool(workspace_tool_draft.get("enabled"))
     skill_draft_enabled = bool(workspace_skill_draft.get("enabled"))
     preview_types = ", ".join(file_preview.get("types") or [])
+    diagram_engines_list = _string_list(diagram_render.get("engines"))
+    diagram_surfaces_list = _string_list(diagram_render.get("surfaces"))
+    diagram_extensions_list = _string_list(diagram_render.get("file_extensions"))
+    assistant_message_engines_list = _string_list(
+        diagram_render.get("assistant_message_engines")
+    )
+    if (
+        not assistant_message_engines_list
+        and "assistant_message" in diagram_surfaces_list
+    ):
+        assistant_message_engines_list = list(diagram_engines_list)
+
+    file_preview_engines_list = _string_list(diagram_render.get("file_preview_engines"))
+    if not file_preview_engines_list and "file_preview" in diagram_surfaces_list:
+        file_preview_engines_list = list(diagram_engines_list)
+    if not file_preview_engines_list and diagram_extensions_list:
+        if any(engine.lower() == "mermaid" for engine in diagram_engines_list):
+            file_preview_engines_list = ["mermaid"]
+
+    assistant_message_engines = ", ".join(assistant_message_engines_list)
+    file_preview_engines = ", ".join(file_preview_engines_list)
+    diagram_extensions = ", ".join(diagram_extensions_list)
+    assistant_supports_vega = any(
+        engine.lower() in {"vega", "vega-lite"}
+        for engine in assistant_message_engines_list
+    )
+    preview_supports_vega = any(
+        engine.lower() in {"vega", "vega-lite"}
+        for engine in file_preview_engines_list
+    )
+
+    diagram_summary = "不要承诺前端会直接渲染 Mermaid、Vega 或 Vega-Lite 图表。"
+    if diagram_enabled and assistant_message_engines:
+        diagram_parts = [f"聊天消息代码块可渲染：{assistant_message_engines}。"]
+        if file_preview_engines:
+            file_preview_suffix = (
+                f"（文件扩展名：{diagram_extensions}）" if diagram_extensions else ""
+            )
+            diagram_parts.append(
+                f"文件预览可渲染：{file_preview_engines}{file_preview_suffix}。"
+            )
+        else:
+            diagram_parts.append("当前不要承诺文件预览中的图表渲染能力。")
+        if assistant_supports_vega and not preview_supports_vega:
+            diagram_parts.append(
+                "Vega/Vega-Lite 仅支持聊天消息渲染，不支持文件预览渲染。"
+            )
+        diagram_summary = " ".join(diagram_parts)
 
     lines = [
         "以下是当前中电慧语聊天前端的能力边界，请将其视为准确的产品事实。",
         f"- generated_file_download.enabled={'true' if download_enabled else 'false'}：当 assistant 消息已附带标准文件引用时，界面会显示可下载文件链接。",
         f"- chat_share.enabled={'true' if share_enabled else 'false'}：{'当前会话可通过界面分享链接共享' if share_enabled else '当前会话不应向用户承诺可直接分享'}。",
         f"- file_preview.enabled={'true' if preview_enabled else 'false'}：{'界面可预览这些类型：' + preview_types if preview_enabled and preview_types else '不要承诺界面预览能力'}。",
+        f"- diagram_render.enabled={'true' if diagram_enabled else 'false'}：{diagram_summary}",
         f"- workspace_tool_draft.enabled={'true' if tool_draft_enabled else 'false'}：{'当用户要求创建新工具时，你可以在回答中给出 1 个完整的工具草稿代码块；界面会提供确认创建入口，确认后再进入工具编辑器。' if tool_draft_enabled else '不要承诺可以在聊天中起草并创建工具'}",
         f"- workspace_skill_draft.enabled={'true' if skill_draft_enabled else 'false'}：{'当用户要求创建新技能时，你可以在回答中给出 1 个完整的技能草稿代码块；界面会提供确认创建入口，确认后再进入技能编辑器。' if skill_draft_enabled else '不要承诺可以在聊天中起草并创建技能'}",
         "回答规则：",
@@ -3480,6 +4299,9 @@ def _build_client_capabilities_system_prompt(client_capabilities: Optional[dict]
         "7. 工具草稿格式：返回 1 个 ```python 代码块，内容必须包含 `class Tools:`；如需元信息，可在代码开头使用三引号 frontmatter，例如 `title:`、`description:`、`requirements:`、`required_open_webui_version:`。",
         "8. 技能草稿格式：返回 1 个 ```markdown 代码块，内容使用 `---` frontmatter，至少包含 `name`，可附带 `description`、`visibility`、`published`、`dependencies`，其后紧跟技能正文。",
         "9. 当用户要求生成、导出、填写、转换或提供 Excel/PDF/DOCX/PPTX/表格模板等可下载文件时，必须先调用对应文档工具；只有本轮消息已经返回标准文件引用时，才能说“已生成”“可下载”或“界面已提供文件”。若本轮没有返回文件引用，必须明确说明文件尚未生成成功，不能假装文件已经在界面中。",
+        "10. 当 diagram_render.enabled=true 且用户要结构图（流程、架构、时序、依赖、树等）时，默认输出 ```mermaid 代码块。",
+        "11. 当 diagram_render.enabled=true 且用户要定量图（柱状、折线、面积、散点、直方图、饼图等）时，默认输出 ```vega-lite 代码块；仅在确有必要时再用 ```vega。",
+        "12. 当 diagram_render.enabled=true 时，可承诺聊天消息支持 Mermaid 与 Vega/Vega-Lite 渲染；但若 capability 未声明 Vega/Vega-Lite 文件预览支持，不要承诺文件预览里可渲染 Vega/Vega-Lite。",
     ]
 
     return "\n".join(lines)
@@ -4644,6 +5466,20 @@ def _prepend_file_context_to_message(message: dict, files: list[dict]) -> None:
         message["content"] = file_context + content
 
 
+def _align_stored_user_messages_for_file_context(
+    request_user_messages: list[dict],
+    stored_user_messages: list[dict],
+) -> list[tuple[dict, dict]]:
+    if not request_user_messages or not stored_user_messages:
+        return []
+
+    if len(request_user_messages) <= len(stored_user_messages):
+        start_index = len(stored_user_messages) - len(request_user_messages)
+        return list(zip(request_user_messages, stored_user_messages[start_index:]))
+
+    return list(zip(request_user_messages, stored_user_messages))
+
+
 def add_file_context(
     messages: list,
     chat_id: str,
@@ -4654,25 +5490,51 @@ def add_file_context(
     """
     Add file URLs to messages for native function calling.
     """
-    if not chat_id or chat_id.startswith("local:"):
+    if not messages:
         return messages
 
-    stored_messages = _get_stored_chat_messages(chat_id, user, message_id)
-    if not stored_messages:
-        return messages
+    stored_messages = []
+    if chat_id and not chat_id.startswith("local:"):
+        stored_messages = _get_stored_chat_messages(chat_id, user, message_id)
 
     injected_file_keys = set()
 
-    request_user_messages = [message for message in messages if message.get("role") == "user"]
+    request_user_messages = [
+        message
+        for message in messages
+        if str(message.get("role") or "").strip().lower() == "user"
+    ]
     stored_user_messages = [
         stored_message
         for stored_message in stored_messages
         if str(stored_message.get("role") or "").strip().lower() == "user"
     ]
 
-    for message, stored_message in zip(request_user_messages, stored_user_messages):
+    stored_files_by_message = {
+        id(message): stored_message.get("files", [])
+        for message, stored_message in _align_stored_user_messages_for_file_context(
+            request_user_messages, stored_user_messages
+        )
+    }
+
+    for message in request_user_messages:
         files_for_message = []
-        for file_item in stored_message.get("files", []):
+        combined_message_files = _dedupe_file_context_items(
+            [
+                *(
+                    message.get("files", [])
+                    if isinstance(message.get("files"), list)
+                    else []
+                ),
+                *(
+                    stored_files_by_message.get(id(message), [])
+                    if isinstance(stored_files_by_message.get(id(message)), list)
+                    else []
+                ),
+            ]
+        )
+
+        for file_item in combined_message_files:
             if not _resolve_file_context_url(file_item):
                 continue
             files_for_message.append(file_item)
@@ -5226,6 +6088,61 @@ def _should_prepare_chat_file(file_item: Any) -> bool:
     return True
 
 
+def _should_retry_failed_chat_file_processing(file_data: Optional[dict]) -> bool:
+    if not isinstance(file_data, dict):
+        return False
+
+    if str(file_data.get("content") or "").strip():
+        return False
+
+    if str(file_data.get("status") or "").strip().lower() != "failed":
+        return False
+
+    error_text = " ".join(
+        str(file_data.get(key) or "").strip() for key in ("error", "retrieval_error")
+    ).lower()
+    if not error_text:
+        return False
+
+    retry_markers = (
+        "no module named",
+        "punkt_tab",
+        "averaged_perceptron_tagger_eng",
+    )
+    return any(marker in error_text for marker in retry_markers)
+
+
+def _should_retry_failed_chat_file_retrieval(
+    file_data: Optional[dict],
+    file_meta: Optional[dict],
+) -> bool:
+    if not isinstance(file_data, dict):
+        return False
+
+    if not str(file_data.get("content") or "").strip():
+        return False
+
+    if str(file_meta.get("collection_name") or "").strip():
+        return False
+
+    if str(file_data.get("retrieval_status") or "").strip().lower() != "failed":
+        return False
+
+    error_text = " ".join(
+        str(file_data.get(key) or "").strip() for key in ("retrieval_error", "error")
+    ).lower()
+    if not error_text:
+        return False
+
+    retry_markers = (
+        "local sentence-transformers embeddings are unavailable",
+        "no module named 'sentence_transformers'",
+        "no module named 'transformers'",
+        "no module named 'torch'",
+    )
+    return any(marker in error_text for marker in retry_markers)
+
+
 def _prepare_chat_file_sync(
     request: Request,
     file_item: dict,
@@ -5278,7 +6195,35 @@ def _prepare_chat_file_sync(
                 content = str(file_data.get("content") or "").strip()
                 status = str(file_data.get("status") or "").strip().lower()
 
-        if not content and status not in {"processing", "uploading", "failed"}:
+        if content and _should_retry_failed_chat_file_retrieval(file_data, file_meta):
+            try:
+                process_file(
+                    request,
+                    ProcessFileForm(file_id=file_id),
+                    user=user,
+                    db=db,
+                )
+                file = (
+                    Files.get_file_by_id(file_id, db=db)
+                    if user.role == "admin"
+                    else Files.get_file_by_id_and_user_id(file_id, user.id, db=db)
+                )
+                if file is not None:
+                    file_data = file.data or {}
+                    file_meta = file.meta or {}
+                    content = str(file_data.get("content") or "").strip()
+                    status = str(file_data.get("status") or "").strip().lower()
+            except Exception as exc:
+                log.warning(
+                    "Failed to retry retrieval indexing for chat attachment %s: %s",
+                    file_id,
+                    exc,
+                )
+
+        if not content and (
+            status not in {"processing", "uploading", "failed"}
+            or _should_retry_failed_chat_file_processing(file_data)
+        ):
             try:
                 process_file(
                     request,
@@ -5714,6 +6659,53 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         except:
             pass
 
+    chat_id = metadata.get("chat_id")
+    chat_meta: dict[str, Any] = {}
+    session_user_facts: list[dict[str, str]] = []
+    if chat_id and isinstance(chat_id, str) and not chat_id.startswith("local:"):
+        chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
+        if chat:
+            chat_meta = dict(chat.meta or {})
+
+    stored_session_user_facts = normalize_session_user_facts(
+        chat_meta.get("session_user_facts", [])
+    )
+    extracted_session_user_facts = extract_session_user_facts(form_data.get("messages"))
+    session_user_facts = (
+        extracted_session_user_facts or stored_session_user_facts
+    )
+
+    if (
+        chat_id
+        and isinstance(chat_id, str)
+        and not chat_id.startswith("local:")
+        and session_user_facts != stored_session_user_facts
+    ):
+        session_user_facts_updated_at = int(time.time())
+        Chats.update_chat_meta_by_id(
+            chat_id,
+            {
+                "session_user_facts": session_user_facts,
+                "session_user_facts_updated_at": session_user_facts_updated_at,
+            },
+        )
+        chat_meta = {
+            **chat_meta,
+            "session_user_facts": session_user_facts,
+            "session_user_facts_updated_at": session_user_facts_updated_at,
+        }
+
+    session_user_memory_prompt = build_session_user_memory_prompt(
+        form_data.get("messages"),
+        stored_facts=session_user_facts,
+    )
+    if session_user_memory_prompt:
+        form_data["messages"] = add_or_update_system_message(
+            session_user_memory_prompt,
+            form_data["messages"],
+            append=True,
+        )
+
     form_data = await convert_url_images_to_base64(form_data)
 
     event_emitter = get_event_emitter(metadata)
@@ -6031,21 +7023,55 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             + "\n".join(notes)
         )
 
+    def _build_dynamic_skill_loading_prompt(skill_count: int) -> str:
+        if skill_count <= 0:
+            return ""
+
+        return (
+            "【技能动态加载】当前工作区存在可按需调用的技能。"
+            "当你怀疑某个技能能帮助当前任务时，先调用 `list_skills` 查找相关技能，"
+            "再调用 `view_skill` 读取完整说明，然后按技能要求执行；"
+            "不要在未读取技能正文前臆测技能细节。"
+        )
+
+    def _infer_referenced_skill_ids(
+        latest_user_text: str, indexed_skill_map: dict[str, Any]
+    ) -> set[str]:
+        normalized_text = str(latest_user_text or "").strip().lower()
+        if not normalized_text:
+            return set()
+
+        matched_skill_ids: set[str] = set()
+        for skill_id, skill in indexed_skill_map.items():
+            candidates = []
+            for value in (skill_id, getattr(skill, "name", None)):
+                if not isinstance(value, str):
+                    continue
+                candidate = value.strip()
+                if candidate:
+                    candidates.append(candidate)
+
+            for candidate in candidates:
+                normalized_candidate = candidate.lower()
+                if len(normalized_candidate) < 3 and normalized_candidate.isascii():
+                    continue
+                if normalized_candidate in normalized_text:
+                    matched_skill_ids.add(skill_id)
+                    break
+
+        return matched_skill_ids
+
     tool_ids = form_data.pop("tool_ids", None)
     terminal_id = form_data.pop("terminal_id", None)
     files = form_data.pop("files", None)
 
     from open_webui.models.resource_installations import ResourceInstallations
 
-    chat_id = metadata.get("chat_id")
     session_tool_ids: list[str] = []
     session_skill_ids: set[str] = set()
     if chat_id and isinstance(chat_id, str) and not chat_id.startswith("local:"):
-        chat = Chats.get_chat_by_id_and_user_id(chat_id, user.id)
-        if chat:
-            chat_meta = chat.meta or {}
-            session_tool_ids = list(chat_meta.get("session_tool_ids", []) or [])
-            session_skill_ids = set(chat_meta.get("session_skill_ids", []) or [])
+        session_tool_ids = list(chat_meta.get("session_tool_ids", []) or [])
+        session_skill_ids = set(chat_meta.get("session_skill_ids", []) or [])
 
     installed_tool_ids = list(
         ResourceInstallations.get_installed_resource_ids(user.id, "tool")
@@ -6057,6 +7083,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # Caller-provided OpenAI-style tools take precedence over server-side
     # tool resolution (tool_ids, MCP servers, builtin tools).
     payload_tools = form_data.get("tools", None)
+    builtin_tools_enabled = (
+        model.get("info", {}).get("meta", {}).get("capabilities") or {}
+    ).get("builtin_tools", True)
+    native_function_calling = metadata.get("params", {}).get("function_calling") == "native"
 
     # Skills
     user_skill_ids = set(
@@ -6074,8 +7104,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     indexed_skills = {}
     inferred_skill_ids: set[str] = set()
+    dynamic_skill_ids: set[str] = set()
     latest_user_text = _extract_latest_user_message_text(form_data.get("messages"))
-    if user_skill_ids or model_skill_ids or latest_user_text:
+    if user_skill_ids or model_skill_ids or latest_user_text or (
+        native_function_calling and builtin_tools_enabled
+    ):
         from open_webui.models.skills import Skills as SkillsModel
 
         indexed_skills = {
@@ -6087,6 +7120,13 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 getattr(skill, "meta", None), getattr(skill, "access_grants", [])
             )
         }
+        referenced_skill_ids = _infer_referenced_skill_ids(
+            latest_user_text,
+            indexed_skills,
+        )
+        if referenced_skill_ids:
+            user_skill_ids |= referenced_skill_ids
+        dynamic_skill_ids = set(indexed_skills.keys()) - user_skill_ids
         if latest_user_text:
             inferred_skill_ids = _infer_document_skill_ids(
                 form_data.get("messages"), set(indexed_skills.keys())
@@ -6126,6 +7166,18 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         if inferred_skill_prompt:
             form_data["messages"] = add_or_update_system_message(
                 inferred_skill_prompt,
+                form_data["messages"],
+                append=True,
+            )
+
+    dynamic_skill_loading_prompt = ""
+    if native_function_calling and builtin_tools_enabled:
+        dynamic_skill_loading_prompt = _build_dynamic_skill_loading_prompt(
+            len(dynamic_skill_ids)
+        )
+        if dynamic_skill_loading_prompt:
+            form_data["messages"] = add_or_update_system_message(
+                dynamic_skill_loading_prompt,
                 form_data["messages"],
                 append=True,
             )
@@ -6244,6 +7296,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         "terminal_id": terminal_id,
         "files": files,
     }
+    if native_function_calling and builtin_tools_enabled and dynamic_skill_ids:
+        metadata[DEEPAGENT_RUNTIME_SKILL_IDS_METADATA_KEY] = sorted(dynamic_skill_ids)
+    else:
+        metadata.pop(DEEPAGENT_RUNTIME_SKILL_IDS_METADATA_KEY, None)
+    metadata["deepagent_runtime_tools"] = build_deepagent_runtime_tool_snapshot(
+        tool_ids,
+        user,
+        files=files,
+        metadata=metadata,
+    )
     form_data["metadata"] = metadata
 
     # Keep explicit file refs in outbound payload for OpenAI-compatible providers.
@@ -6461,11 +7523,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
         # Inject builtin tools for native function calling based on enabled features and model capability
         # Check if builtin_tools capability is enabled for this model (defaults to True if not specified)
-        builtin_tools_enabled = (
-            model.get("info", {}).get("meta", {}).get("capabilities") or {}
-        ).get("builtin_tools", True)
         if (
-            metadata.get("params", {}).get("function_calling") == "native"
+            native_function_calling
             and builtin_tools_enabled
         ):
             # Add file context to user messages
@@ -6482,9 +7541,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 {
                     **extra_params,
                     "__event_emitter__": event_emitter,
-                    "__skill_ids__": [
-                        s.id for s in available_skills if s.id not in user_skill_ids
-                    ],
+                    "__skill_ids__": sorted(dynamic_skill_ids),
                 },
                 features,
                 model,
@@ -6919,6 +7976,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                 message = response_data["choices"][0]["message"]
                 content = message.get("content")
                 bridge_generated_files = []
+                bridge_embeds = _extract_embeds_from_choices([{"message": message}])
                 message_files = None
 
                 if content:
@@ -6973,6 +8031,21 @@ async def non_streaming_chat_response_handler(response, ctx):
                         }
                     )
 
+                if bridge_embeds:
+                    message_metadata = message.get("metadata")
+                    if not isinstance(message_metadata, dict):
+                        message_metadata = {}
+                        message["metadata"] = message_metadata
+                    message_metadata["embeds"] = bridge_embeds
+                    await event_emitter(
+                        {
+                            "type": "embeds",
+                            "data": {
+                                "embeds": bridge_embeds,
+                            },
+                        }
+                    )
+
                 await event_emitter(
                     {
                         "type": "chat:completion",
@@ -7010,6 +8083,10 @@ async def non_streaming_chat_response_handler(response, ctx):
                     bridge_generated_files,
                     output_generated_files,
                 )
+                combined_embeds = _merge_embed_entries(
+                    bridge_embeds,
+                    _extract_embeds_from_choices([{"message": message}]),
+                )
                 if combined_generated_files:
                     message_metadata = message.get("metadata")
                     if not isinstance(message_metadata, dict):
@@ -7024,8 +8101,49 @@ async def non_streaming_chat_response_handler(response, ctx):
                     )
                     if not isinstance(message_files, list) or not message_files:
                         message_files = combined_generated_files
+                if combined_embeds:
+                    message_metadata = message.get("metadata")
+                    if not isinstance(message_metadata, dict):
+                        message_metadata = {}
+                        message["metadata"] = message_metadata
+                    message_metadata["embeds"] = combined_embeds
 
                 content = response_payload.get("content", content or "") or ""
+                retrieval_generated_files, retrieval_embeds = (
+                    _select_retrieval_source_visual_payloads(
+                        metadata,
+                        content,
+                        request.app.state.config,
+                    )
+                )
+                if retrieval_generated_files:
+                    combined_generated_files = _merge_generated_file_entries(
+                        combined_generated_files,
+                        retrieval_generated_files,
+                    )
+                    message_metadata = message.get("metadata")
+                    if not isinstance(message_metadata, dict):
+                        message_metadata = {}
+                        message["metadata"] = message_metadata
+                    message_metadata["generated_files"] = combined_generated_files
+                    message_files = Chats.add_message_files_by_id_and_message_id(
+                        metadata["chat_id"],
+                        metadata["message_id"],
+                        combined_generated_files,
+                    )
+                    if not isinstance(message_files, list) or not message_files:
+                        message_files = combined_generated_files
+                if retrieval_embeds:
+                    combined_embeds = _merge_embed_entries(
+                        combined_embeds,
+                        retrieval_embeds,
+                    )
+                if combined_embeds:
+                    message_metadata = message.get("metadata")
+                    if not isinstance(message_metadata, dict):
+                        message_metadata = {}
+                        message["metadata"] = message_metadata
+                    message_metadata["embeds"] = combined_embeds
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
 
@@ -7044,6 +8162,11 @@ async def non_streaming_chat_response_handler(response, ctx):
                             **(
                                 {"metadata": {"generated_files": combined_generated_files}}
                                 if combined_generated_files
+                                else {}
+                            ),
+                            **(
+                                {"embeds": combined_embeds}
+                                if combined_embeds
                                 else {}
                             ),
                             "title": title,
@@ -7066,6 +8189,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                             if isinstance(message_files, list) and message_files
                             else {}
                         ),
+                        **({"embeds": combined_embeds} if combined_embeds else {}),
                         **({"usage": usage} if usage else {}),
                     },
                 )
@@ -7538,6 +8662,7 @@ async def streaming_chat_response_handler(response, ctx):
                     )
                     last_delta_data = None
                     emitted_generated_file_refs: set[str] = set()
+                    emitted_embed_refs: set[str] = set()
 
                     async def apply_bridge_output_events(raw_events: Any) -> bool:
                         nonlocal output
@@ -7785,6 +8910,9 @@ async def streaming_chat_response_handler(response, ctx):
                                             [{"delta": delta}]
                                         )
                                     )
+                                    delta_embeds = _extract_embeds_from_choices(
+                                        [{"delta": delta}]
+                                    )
                                     new_generated_files = []
                                     if delta_generated_files:
                                         for file_item in delta_generated_files:
@@ -7807,6 +8935,29 @@ async def streaming_chat_response_handler(response, ctx):
                                                 delta_metadata["generated_files"] = (
                                                     new_generated_files
                                                 )
+
+                                    if delta_embeds:
+                                        normalized_embeds = []
+                                        for embed in _merge_embed_entries(delta_embeds):
+                                            if embed in emitted_embed_refs:
+                                                continue
+                                            emitted_embed_refs.add(embed)
+                                            normalized_embeds.append(embed)
+                                        if not normalized_embeds:
+                                            normalized_embeds = []
+                                        delta_metadata = delta.get("metadata")
+                                        if isinstance(delta_metadata, dict):
+                                            delta_metadata["embeds"] = normalized_embeds
+                                        if normalized_embeds:
+                                            await clear_waiting_status()
+                                            await event_emitter(
+                                                {
+                                                    "type": "embeds",
+                                                    "data": {
+                                                        "embeds": normalized_embeds,
+                                                    },
+                                                }
+                                            )
 
                                     if new_generated_files:
                                         await clear_waiting_status()
@@ -8897,14 +10048,35 @@ async def streaming_chat_response_handler(response, ctx):
                     metadata,
                     user,
                 )
-                if stabilized_generated_files:
+                combined_generated_files = _merge_generated_file_entries(
+                    stabilized_generated_files
+                )
+                combined_embeds = _merge_embed_entries()
+                retrieval_generated_files, retrieval_embeds = (
+                    _select_retrieval_source_visual_payloads(
+                        metadata,
+                        final_payload.get("content", ""),
+                        request.app.state.config,
+                    )
+                )
+                if retrieval_generated_files:
+                    combined_generated_files = _merge_generated_file_entries(
+                        combined_generated_files,
+                        retrieval_generated_files,
+                    )
+                if retrieval_embeds:
+                    combined_embeds = _merge_embed_entries(
+                        combined_embeds,
+                        retrieval_embeds,
+                    )
+                if combined_generated_files:
                     message_files = Chats.add_message_files_by_id_and_message_id(
                         metadata["chat_id"],
                         metadata["message_id"],
-                        stabilized_generated_files,
+                        combined_generated_files,
                     )
                     if not isinstance(message_files, list) or not message_files:
-                        message_files = stabilized_generated_files
+                        message_files = combined_generated_files
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
                 output, final_payload = _build_chat_completion_payload(output, fallback_content=content)
@@ -8923,6 +10095,7 @@ async def streaming_chat_response_handler(response, ctx):
                         if isinstance(message_files, list) and message_files
                         else {}
                     ),
+                    **({"embeds": combined_embeds} if combined_embeds else {}),
                     "title": title,
                 }
 
@@ -8940,6 +10113,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 if isinstance(message_files, list) and message_files
                                 else {}
                             ),
+                            **({"embeds": combined_embeds} if combined_embeds else {}),
                             **({"usage": usage} if usage else {}),
                         },
                     )

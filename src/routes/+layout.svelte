@@ -68,7 +68,6 @@
 
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
 	import AppSidebar from '$lib/components/app/AppSidebar.svelte';
-	import SyncStatsModal from '$lib/components/chat/Settings/SyncStatsModal.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { getUserSettings } from '$lib/apis/users';
 	import dayjs from 'dayjs';
@@ -96,6 +95,41 @@
 		return `vite-preload-reload:${appEntryHref ?? window.location.pathname}`;
 	};
 
+	const CLIENT_SYNC_RELOAD_PREFIX = 'client-sync-reload:';
+
+	const clearClientSyncReloadGuards = () => {
+		for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
+			const key = sessionStorage.key(index);
+			if (key?.startsWith(CLIENT_SYNC_RELOAD_PREFIX)) {
+				sessionStorage.removeItem(key);
+			}
+		}
+	};
+
+	const requestConvergentReload = async (reason, signature, targetHref = location.href) => {
+		const reloadKey = `${CLIENT_SYNC_RELOAD_PREFIX}${reason}:${signature}`;
+
+		if (sessionStorage.getItem(reloadKey)) {
+			console.error('Skipping repeated forced reload after persistent sync mismatch:', {
+				reason,
+				signature,
+				targetHref
+			});
+			return false;
+		}
+
+		console.warn('Forcing one-time reload to resync client state:', {
+			reason,
+			signature,
+			targetHref
+		});
+		sessionStorage.setItem(reloadKey, '1');
+
+		await unregisterServiceWorkers();
+		location.href = targetHref;
+		return true;
+	};
+
 	const preloadErrorHandler = async (event) => {
 		const reloadKey = getPreloadReloadKey();
 
@@ -116,8 +150,7 @@
 	// handle frontend updates (https://svelte.dev/docs/kit/configuration#version)
 	beforeNavigate(async ({ willUnload, to }) => {
 		if (updated.current && !willUnload && to?.url) {
-			await unregisterServiceWorkers();
-			location.href = to.url.href;
+			await requestConvergentReload('svelte-updated', to.url.href, to.url.href);
 		}
 	});
 
@@ -129,9 +162,6 @@
 	let tokenTimer = null;
 
 	let showRefresh = false;
-
-	let showSyncStatsModal = false;
-	let syncStatsEventData = null;
 
 	let heartbeatInterval = null;
 
@@ -156,9 +186,9 @@
 		_socket.on('connect', async () => {
 			console.log('connected', _socket.id);
 			if (await updated.check()) {
-				await unregisterServiceWorkers();
-				location.href = location.href;
-				return;
+				if (await requestConvergentReload('svelte-updated', location.href)) {
+					return;
+				}
 			}
 
 			const res = await getVersion(localStorage.token);
@@ -166,18 +196,44 @@
 			const deploymentId = res?.deployment_id ?? null;
 			const version = res?.version ?? null;
 			const buildHash = res?.build_hash ?? null;
+			const expectsBuildHashMatch =
+				typeof WEBUI_BUILD_HASH === 'string' &&
+				WEBUI_BUILD_HASH.trim() !== '' &&
+				WEBUI_BUILD_HASH !== 'dev-build';
 
-			if (version !== null || deploymentId !== null || buildHash !== null) {
-				if (
-					($WEBUI_VERSION !== null && version !== $WEBUI_VERSION) ||
-					($WEBUI_DEPLOYMENT_ID !== null && deploymentId !== $WEBUI_DEPLOYMENT_ID) ||
-					(buildHash !== null && buildHash !== WEBUI_BUILD_HASH)
-				) {
-					await unregisterServiceWorkers();
-					location.href = location.href;
+			const mismatchReasons = [];
+			if ($WEBUI_VERSION !== null && version !== $WEBUI_VERSION) {
+				mismatchReasons.push(`version:${$WEBUI_VERSION}->${version ?? 'null'}`);
+			}
+			if ($WEBUI_DEPLOYMENT_ID !== null && deploymentId !== $WEBUI_DEPLOYMENT_ID) {
+				mismatchReasons.push(
+					`deployment:${$WEBUI_DEPLOYMENT_ID}->${deploymentId ?? 'null'}`
+				);
+			}
+			if (expectsBuildHashMatch && buildHash !== null && buildHash !== WEBUI_BUILD_HASH) {
+				mismatchReasons.push(`build_hash:${WEBUI_BUILD_HASH}->${buildHash}`);
+			}
+
+			if (mismatchReasons.length > 0) {
+				if (await requestConvergentReload('socket-sync', mismatchReasons.join('|'))) {
 					return;
 				}
+
+				console.error(
+					'Persistent frontend/backend sync mismatch remained after reload; continuing without another forced reload.',
+					{
+						mismatchReasons,
+						server: { version, deploymentId, buildHash },
+						client: {
+							version: $WEBUI_VERSION,
+							deploymentId: $WEBUI_DEPLOYMENT_ID,
+							buildHash: WEBUI_BUILD_HASH
+						}
+					}
+				);
 			}
+
+			clearClientSyncReloadGuards();
 
 			// Send heartbeat every 30 seconds
 			heartbeatInterval = setInterval(() => {
@@ -739,23 +795,7 @@
 		}
 	};
 
-	const windowMessageEventHandler = async (event) => {
-		if (
-			!['https://openwebui.com', 'https://www.openwebui.com', 'http://localhost:9999'].includes(
-				event.origin
-			)
-		) {
-			return;
-		}
-
-		if (event.data === 'export:stats' || event.data?.type === 'export:stats') {
-			syncStatsEventData = event.data;
-			showSyncStatsModal = true;
-		}
-	};
-
 	onMount(async () => {
-		window.addEventListener('message', windowMessageEventHandler);
 		window.addEventListener('vite:preloadError', preloadErrorHandler);
 
 		let touchstartY = 0;
@@ -995,18 +1035,8 @@
 			loaded = true;
 		}
 
-		// Auto-show SyncStatsModal when opened with ?sync=true (from community)
-		if (
-			(window.opener ?? false) &&
-			$page.url.searchParams.get('sync') === 'true' &&
-			($config?.features?.enable_community_sharing ?? false)
-		) {
-			showSyncStatsModal = true;
-		}
-
 		return () => {
 			window.removeEventListener('resize', onResize);
-			window.removeEventListener('message', windowMessageEventHandler);
 			window.removeEventListener('vite:preloadError', preloadErrorHandler);
 			document.removeEventListener('touchstart', touchstartHandler);
 			document.removeEventListener('touchmove', touchmoveHandler);
@@ -1064,10 +1094,6 @@
 	{:else}
 		<slot />
 	{/if}
-{/if}
-
-{#if $config?.features.enable_community_sharing}
-	<SyncStatsModal bind:show={showSyncStatsModal} eventData={syncStatsEventData} />
 {/if}
 
 <Toaster

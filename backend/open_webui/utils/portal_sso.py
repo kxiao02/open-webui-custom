@@ -13,7 +13,6 @@ from starlette.responses import RedirectResponse
 
 from open_webui.config import (
     JWT_EXPIRES_IN,
-    OAUTH_MERGE_ACCOUNTS_BY_EMAIL,
     PORTAL_SSO_AUTO_SIGNUP,
     PORTAL_SSO_APP_INITIATED_ENABLED,
     PORTAL_SSO_ENTRY_URL_TEMPLATE,
@@ -85,6 +84,12 @@ class PortalSSOManager:
         query = urllib.parse.urlencode(params)
         base = f"{self._webui_base_url(request)}/auth"
         return f"{base}?{query}" if query else base
+
+    def _build_post_login_redirect_url(
+        self, request, *, redirect_path: Optional[str] = None
+    ) -> str:
+        safe_redirect = self._sanitize_redirect_path(redirect_path) or "/"
+        return f"{self._webui_base_url(request)}{safe_redirect}"
 
     def _build_callback_url(self, request, redirect_path: Optional[str]) -> str:
         params = []
@@ -231,6 +236,7 @@ class PortalSSOManager:
     def _find_user_for_profile(self, profile: dict, db) -> Optional[object]:
         portal_sub = profile["portal_sub"]
         account_no = profile.get("account_no") or ""
+        email = (profile.get("email") or "").lower()
 
         user = Users.get_user_by_oauth_sub("portal", portal_sub, db=db)
         if user:
@@ -244,6 +250,11 @@ class PortalSSOManager:
             user = Users.get_user_by_oauth_provider_field(
                 "portal", "account_no", account_no, db=db
             )
+            if user:
+                return user
+
+        if email:
+            user = Users.get_user_by_email(email, db=db)
             if user:
                 return user
 
@@ -300,31 +311,6 @@ class PortalSSOManager:
                             )
                             user.email = real_email
                 else:
-                    if real_email and OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value:
-                        user = Users.get_user_by_email(real_email, db=db_session)
-                        if user:
-                            Users.update_user_oauth_by_id(
-                                user.id,
-                                "portal",
-                                profile["portal_sub"],
-                                payload=payload,
-                                db=db_session,
-                                commit=False,
-                            )
-
-                            if actual_name and actual_name != user.name:
-                                Users.update_user_by_id(
-                                    user.id,
-                                    {"name": actual_name},
-                                    db=db_session,
-                                    commit=False,
-                                )
-                                user.name = actual_name
-
-                    if user:
-                        db_session.commit()
-                        return user
-
                     if not PORTAL_SSO_AUTO_SIGNUP.value:
                         raise HTTPException(
                             status_code=status.HTTP_403_FORBIDDEN,
@@ -381,7 +367,7 @@ class PortalSSOManager:
             data={"id": user.id},
             expires_delta=parse_duration(expires_in),
         )
-        redirect_url = self._build_auth_redirect_url(
+        redirect_url = self._build_post_login_redirect_url(
             request, redirect_path=redirect_path
         )
         response = RedirectResponse(url=redirect_url)

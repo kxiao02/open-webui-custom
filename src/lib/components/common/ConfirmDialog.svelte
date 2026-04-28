@@ -181,7 +181,7 @@
 						{cancelLabel}
 					</button>
 					<button
-						class="text-sm bg-gradient-to-r from-[#ef5b6d] to-[#4a87ff] hover:from-[#e45166] hover:to-[#3f79f1] text-white dark:text-white font-medium w-full py-2 rounded-3xl transition shadow-sm shadow-[#4a87ff]/25"
+						class="text-sm bg-black hover:bg-gray-900 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 font-medium w-full py-2 rounded-3xl transition"
 						on:click={() => {
 							confirmHandler();
 						}}

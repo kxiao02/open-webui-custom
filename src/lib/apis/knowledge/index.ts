@@ -1,6 +1,126 @@
 // @ts-nocheck
 import { WEBUI_API_BASE_URL } from '$lib/constants';
 
+const toArray = (value: any) => (Array.isArray(value) ? value : []);
+
+const getString = (...values: any[]) => {
+	for (const value of values) {
+		if (typeof value === 'string' && value.trim().length > 0) {
+			return value;
+		}
+	}
+	return '';
+};
+
+const getNumber = (...values: any[]) => {
+	for (const value of values) {
+		const num = Number(value);
+		if (!Number.isNaN(num) && Number.isFinite(num)) {
+			return num;
+		}
+	}
+	return null;
+};
+
+const inferSharedState = (item: any) => {
+	if (item?.visibility === 'shared' || item?.scope === 'shared') {
+		return true;
+	}
+	if (item?.visibility === 'private' || item?.scope === 'private') {
+		return false;
+	}
+	if (typeof item?.is_shared === 'boolean') {
+		return item.is_shared;
+	}
+	if (typeof item?.shared === 'boolean') {
+		return item.shared;
+	}
+	if (Array.isArray(item?.access_grants)) {
+		return item.access_grants.length > 0;
+	}
+	return false;
+};
+
+const normalizeKnowledgeItem = (item: any = {}) => {
+	const isShared = inferSharedState(item);
+	const name = getString(item?.name, item?.dataset_name, item?.title);
+	const description = getString(item?.description, item?.desc, item?.introduction);
+
+	return {
+		...item,
+		id: getString(item?.id, item?.kb_id, item?.dataset_id),
+		name,
+		description,
+		write_access:
+			typeof item?.write_access === 'boolean'
+				? item.write_access
+				: typeof item?.can_write === 'boolean'
+					? item.can_write
+					: typeof item?.editable === 'boolean'
+						? item.editable
+						: false,
+		visibility: isShared ? 'shared' : 'private',
+		is_shared: isShared,
+		files_count: getNumber(item?.files_count, item?.document_count, item?.files?.length),
+		updated_at: getNumber(item?.updated_at, item?.updatedAt, item?.update_time, item?.ts)
+	};
+};
+
+const normalizeKnowledgeListResponse = (json: any = {}) => {
+	const rawItems = toArray(json?.items?.length ? json.items : json?.data?.items ?? json?.data ?? []);
+	const items = rawItems.map((item) => normalizeKnowledgeItem(item));
+	const total = getNumber(json?.total, json?.count, json?.data?.total, items.length) ?? items.length;
+
+	return {
+		...json,
+		items,
+		total
+	};
+};
+
+const normalizeKnowledgeFile = (file: any = {}) => {
+	const fileName = getString(file?.meta?.name, file?.name, file?.filename, file?.title, file?.document_name);
+	const updatedAt = getNumber(file?.updated_at, file?.updatedAt, file?.update_time, file?.ts);
+	const createdAt = getNumber(file?.created_at, file?.createdAt, file?.create_time);
+	const size = getNumber(file?.meta?.size, file?.size, file?.bytes);
+
+	return {
+		...file,
+		id: getString(file?.id, file?.file_id, file?.document_id, file?.doc_id),
+		name: getString(file?.name, fileName),
+		meta: {
+			...(file?.meta ?? {}),
+			name: fileName,
+			size
+		},
+		updated_at: updatedAt ?? file?.updated_at,
+		created_at: createdAt ?? file?.created_at
+	};
+};
+
+const normalizeKnowledgeFilesResponse = (json: any = {}) => {
+	const rawItems = toArray(json?.items?.length ? json.items : json?.data?.items ?? json?.data ?? []);
+	const items = rawItems.map((file) => normalizeKnowledgeFile(file));
+	const total = getNumber(json?.total, json?.count, json?.data?.total, items.length) ?? items.length;
+
+	return {
+		...json,
+		items,
+		total
+	};
+};
+
+const normalizeKnowledgeDetails = (json: any = {}) => {
+	const files = toArray(json?.files?.length ? json.files : json?.documents ?? []).map((file) =>
+		normalizeKnowledgeFile(file)
+	);
+
+	return {
+		...normalizeKnowledgeItem(json),
+		files
+	};
+};
+
 export const createNewKnowledge = async (
 	token: string,
 	name: string,
@@ -58,7 +178,7 @@ export const getKnowledgeBases = async (token: string = '', page: number | null 
 			return res.json();
 		})
 		.then((json) => {
-			return json;
+			return normalizeKnowledgeListResponse(json);
 		})
 		.catch((err) => {
 			error = err.detail;
@@ -99,7 +219,7 @@ export const searchKnowledgeBases = async (
 			return res.json();
 		})
 		.then((json) => {
-			return json;
+			return normalizeKnowledgeListResponse(json);
 		})
 		.catch((err) => {
 			error = err.detail;
@@ -147,7 +267,7 @@ export const searchKnowledgeFiles = async (
 			return res.json();
 		})
 		.then((json) => {
-			return json;
+			return normalizeKnowledgeFilesResponse(json);
 		})
 		.catch((err) => {
 			error = err.detail;
@@ -179,7 +299,7 @@ export const getKnowledgeById = async (token: string, id: string) => {
 			return res.json();
 		})
 		.then((json) => {
-			return json;
+			return normalizeKnowledgeDetails(json);
 		})
 		.catch((err) => {
 			error = err.detail;
@@ -229,7 +349,7 @@ export const searchKnowledgeFilesById = async (
 			return res.json();
 		})
 		.then((json) => {
-			return json;
+			return normalizeKnowledgeFilesResponse(json);
 		})
 		.catch((err) => {
 			error = err.detail;

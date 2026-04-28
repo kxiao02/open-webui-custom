@@ -242,6 +242,7 @@ def _get_retrieval_runtime_signature(app) -> tuple:
     return (
         app.state.config.RAG_EMBEDDING_ENGINE,
         app.state.config.RAG_EMBEDDING_MODEL,
+        app.state.config.RAG_EMBEDDING_FALLBACK_MODEL,
         app.state.config.RAG_OPENAI_API_BASE_URL,
         app.state.config.RAG_OPENAI_API_KEY,
         app.state.config.RAG_OLLAMA_BASE_URL,
@@ -251,6 +252,8 @@ def _get_retrieval_runtime_signature(app) -> tuple:
         app.state.config.RAG_AZURE_OPENAI_API_VERSION,
         app.state.config.RAG_EMBEDDING_BATCH_SIZE,
         app.state.config.ENABLE_ASYNC_EMBEDDING,
+        app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
+        app.state.config.RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL,
         app.state.config.ENABLE_RAG_HYBRID_SEARCH,
         app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL,
         app.state.config.RAG_RERANKING_ENGINE,
@@ -322,6 +325,9 @@ def initialize_retrieval_runtime(app, force: bool = False):
             else None
         ),
         enable_async=app.state.config.ENABLE_ASYNC_EMBEDDING,
+        concurrent_requests=app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
+        fallback_to_local=app.state.config.RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL,
+        fallback_embedding_model=app.state.config.RAG_EMBEDDING_FALLBACK_MODEL,
     )
     app.state.RERANKING_FUNCTION = get_reranking_function(
         app.state.config.RAG_RERANKING_ENGINE,

@@ -1,3 +1,5 @@
+import { normalizeHtmlMediaUrls, normalizeMediaUrl } from '$lib/utils/knowflowAssets';
+
 const KNOWN_THEME_CLASSES = ['light', 'dark', 'her'] as const;
 const FILE_CONTENT_URL_REGEX =
 	/^(?:https?:\/\/[^/]+)?\/?(?:api\/v1|openai\/v1|v1)\/files\/[^/?#]+\/content(?:\/html)?(?:[?#].*)?$/i;
@@ -18,6 +20,7 @@ const SYNCED_ROOT_CSS_VARIABLES = [
 ] as const;
 
 export const IFRAME_THEME_MESSAGE_TYPE = 'open-webui:theme';
+const IFRAME_HEIGHT_PADDING_PX = 20;
 
 export type IframeThemeSnapshot = {
 	theme: string;
@@ -95,7 +98,7 @@ const THEME_BRIDGE_STYLES = `
 
 	html,
 	body {
-		min-height: 100%;
+		height: auto;
 	}
 
 	body {
@@ -111,6 +114,36 @@ const THEME_BRIDGE_STYLES = `
 	select,
 	textarea {
 		font: inherit;
+	}
+
+	img {
+		display: block;
+		max-width: 100%;
+		height: auto;
+	}
+
+	table {
+		width: 100%;
+		border-collapse: collapse;
+		border-spacing: 0;
+	}
+
+	caption {
+		margin-bottom: 0.5rem;
+		text-align: left;
+		font-weight: 600;
+	}
+
+	th,
+	td {
+		border: 1px solid var(--color-gray-200, #e5e7eb);
+		padding: 0.5rem 0.75rem;
+		vertical-align: top;
+		text-align: left;
+	}
+
+	th {
+		background: var(--color-gray-50, #f9fafb);
 	}
 
 	html.light,
@@ -129,6 +162,11 @@ const THEME_BRIDGE_STYLES = `
 		--owui-frame-foreground: #f9fafb;
 	}
 
+	html.dark th,
+	html[data-open-webui-theme='dark'] th {
+		background: var(--color-gray-850, #202020);
+	}
+
 	.font-primary {
 		font-family: var(--owui-font-primary);
 	}
@@ -145,12 +183,44 @@ const createThemeBridgeScript = (theme: IframeThemeSnapshot) => {
 <script id="open-webui-iframe-bridge">
 	(() => {
 		const THEME_MESSAGE_TYPE = '${IFRAME_THEME_MESSAGE_TYPE}'
+		const HEIGHT_PADDING_PX = ${IFRAME_HEIGHT_PADDING_PX}
 		const KNOWN_THEME_CLASSES = ${JSON.stringify(KNOWN_THEME_CLASSES)}
 		const initialTheme = ${initialTheme}
 		const root = document.documentElement
 		let resizeObserver = null
 		let mutationObserver = null
 		let queuedHeightFrame = null
+
+		const measureDocumentHeight = () => {
+			const body = document.body
+			if (!body) {
+				return 0
+			}
+
+			const bodyRect = body.getBoundingClientRect()
+			let rangeHeight = 0
+			try {
+				const range = document.createRange()
+				range.selectNodeContents(body)
+				rangeHeight = Math.ceil(range.getBoundingClientRect().height)
+			} catch {}
+
+			const childBottom = Array.from(body.children).reduce((maxHeight, child) => {
+				return Math.max(maxHeight, Math.ceil(child.getBoundingClientRect().bottom - bodyRect.top))
+			}, 0)
+
+			if (rangeHeight > 0 || childBottom > 0) {
+				return Math.max(rangeHeight, childBottom)
+			}
+
+			const docEl = document.documentElement
+			return Math.max(
+				docEl?.scrollHeight ?? 0,
+				body.scrollHeight ?? 0,
+				docEl?.offsetHeight ?? 0,
+				body.offsetHeight ?? 0
+			)
+		}
 
 		const applyTheme = (theme) => {
 			if (!theme || !root) {
@@ -192,16 +262,12 @@ const createThemeBridgeScript = (theme: IframeThemeSnapshot) => {
 
 			queuedHeightFrame = requestAnimationFrame(() => {
 				queuedHeightFrame = null
-				const body = document.body
-				const docEl = document.documentElement
-				const height = Math.max(
-					docEl?.scrollHeight ?? 0,
-					body?.scrollHeight ?? 0,
-					docEl?.offsetHeight ?? 0,
-					body?.offsetHeight ?? 0
-				)
+				const height = measureDocumentHeight()
 
-				window.parent?.postMessage({ type: 'iframe:height', height: height + 20 }, '*')
+				window.parent?.postMessage(
+					{ type: 'iframe:height', height: height + HEIGHT_PADDING_PX },
+					'*'
+				)
 			})
 		}
 
@@ -254,7 +320,7 @@ export const resolveIframeUrl = (value: string) => {
 	}
 
 	try {
-		return new URL(value, window.location.href).toString();
+		return new URL(normalizeMediaUrl(value), window.location.href).toString();
 	} catch {
 		return null;
 	}
@@ -326,6 +392,43 @@ export const captureIframeThemeSnapshot = (): IframeThemeSnapshot => {
 	};
 };
 
+export const measureIframeDocumentHeight = (doc: Document | null | undefined): number => {
+	if (!doc?.body) {
+		return 0;
+	}
+
+	const body = doc.body;
+	const bodyRect = body.getBoundingClientRect();
+
+	let rangeHeight = 0;
+	try {
+		const range = doc.createRange();
+		range.selectNodeContents(body);
+		rangeHeight = Math.ceil(range.getBoundingClientRect().height);
+	} catch {
+		rangeHeight = 0;
+	}
+
+	const childBottom = Array.from(body.children).reduce((maxHeight, child) => {
+		return Math.max(maxHeight, Math.ceil(child.getBoundingClientRect().bottom - bodyRect.top));
+	}, 0);
+
+	if (rangeHeight > 0 || childBottom > 0) {
+		return Math.max(rangeHeight, childBottom);
+	}
+
+	const docEl = doc.documentElement;
+	return Math.max(
+		docEl?.scrollHeight ?? 0,
+		body.scrollHeight ?? 0,
+		docEl?.offsetHeight ?? 0,
+		body.offsetHeight ?? 0
+	);
+};
+
+export const getIframeHeightWithPadding = (height: number): number =>
+	Math.max(0, Math.ceil(height)) + IFRAME_HEIGHT_PADDING_PX;
+
 export const buildThemedIframeDocument = ({
 	html,
 	baseHref = null,
@@ -337,5 +440,5 @@ export const buildThemedIframeDocument = ({
 		.filter(Boolean)
 		.join('\n');
 
-	return injectIntoHead(html, additions);
+	return injectIntoHead(normalizeHtmlMediaUrls(html), additions);
 };

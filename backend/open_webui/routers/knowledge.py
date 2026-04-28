@@ -31,6 +31,15 @@ from open_webui.constants import ERROR_MESSAGES
 from open_webui.utils.auth import get_verified_user, get_admin_user
 from open_webui.utils.access_control import has_permission, filter_allowed_access_grants
 from open_webui.models.access_grants import AccessGrants
+from open_webui.models.groups import Groups
+from open_webui.utils.knowflow import (
+    KnowflowError,
+    get_accessible_knowledge_base as knowflow_get_accessible_knowledge_base,
+    is_knowflow_enabled,
+    list_accessible_knowledge_bases as knowflow_list_accessible_knowledge_bases,
+    list_knowledge_documents as knowflow_list_knowledge_documents,
+    search_accessible_documents as knowflow_search_accessible_documents,
+)
 
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
@@ -39,6 +48,19 @@ from open_webui.models.models import Models, ModelForm
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+KNOWFLOW_READ_ONLY_ERROR_DETAIL = (
+    "Knowflow-backed knowledge management is read-only in 中电慧语 for now. "
+    "Use 管理知识库 in Knowflow."
+)
+
+
+def _raise_knowflow_read_only_if_enabled(request: Request):
+    if is_knowflow_enabled(request.app.state.config):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=KNOWFLOW_READ_ONLY_ERROR_DETAIL,
+        )
 
 
 def _can_access_workspace_content(user, owner_user_id: str) -> bool:
@@ -104,6 +126,9 @@ def remove_knowledge_base_metadata_embedding(knowledge_base_id: str) -> bool:
 
 class KnowledgeAccessResponse(KnowledgeUserResponse):
     write_access: Optional[bool] = False
+    visibility: Optional[str] = None
+    is_shared: Optional[bool] = None
+    files_count: Optional[int] = None
 
 
 class KnowledgeAccessListResponse(BaseModel):
@@ -113,6 +138,7 @@ class KnowledgeAccessListResponse(BaseModel):
 
 @router.get("/", response_model=KnowledgeAccessListResponse)
 async def get_knowledge_bases(
+    request: Request,
     page: Optional[int] = 1,
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
@@ -120,6 +146,29 @@ async def get_knowledge_bases(
     page = max(page, 1)
     limit = PAGE_ITEM_COUNT
     skip = (page - 1) * limit
+
+    if is_knowflow_enabled(request.app.state.config):
+        try:
+            result = await knowflow_list_accessible_knowledge_bases(
+                request.app.state.config,
+                user,
+                page=page,
+                page_size=limit,
+                db=db,
+            )
+        except KnowflowError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+
+        return KnowledgeAccessListResponse(
+            items=[
+                KnowledgeAccessResponse.model_validate(item)
+                for item in (result.get("items") or [])
+            ],
+            total=result.get("total") or 0,
+        )
 
     filter = {}
     groups = Groups.get_groups_by_member_id(user.id, db=db)
@@ -164,6 +213,7 @@ async def get_knowledge_bases(
 
 @router.get("/search", response_model=KnowledgeAccessListResponse)
 async def search_knowledge_bases(
+    request: Request,
     query: Optional[str] = None,
     view_option: Optional[str] = None,
     page: Optional[int] = 1,
@@ -173,6 +223,31 @@ async def search_knowledge_bases(
     page = max(page, 1)
     limit = PAGE_ITEM_COUNT
     skip = (page - 1) * limit
+
+    if is_knowflow_enabled(request.app.state.config):
+        try:
+            result = await knowflow_list_accessible_knowledge_bases(
+                request.app.state.config,
+                user,
+                query=query,
+                view_option=view_option,
+                page=page,
+                page_size=limit,
+                db=db,
+            )
+        except KnowflowError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+
+        return KnowledgeAccessListResponse(
+            items=[
+                KnowledgeAccessResponse.model_validate(item)
+                for item in (result.get("items") or [])
+            ],
+            total=result.get("total") or 0,
+        )
 
     filter = {}
     if query:
@@ -222,6 +297,7 @@ async def search_knowledge_bases(
 
 @router.get("/search/files", response_model=KnowledgeFileListResponse)
 async def search_knowledge_files(
+    request: Request,
     query: Optional[str] = None,
     page: Optional[int] = 1,
     user=Depends(get_verified_user),
@@ -230,6 +306,27 @@ async def search_knowledge_files(
     page = max(page, 1)
     limit = PAGE_ITEM_COUNT
     skip = (page - 1) * limit
+
+    if is_knowflow_enabled(request.app.state.config):
+        try:
+            result = await knowflow_search_accessible_documents(
+                request.app.state.config,
+                user,
+                query=query,
+                page=page,
+                page_size=limit,
+                db=db,
+            )
+        except KnowflowError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+
+        return KnowledgeFileListResponse(
+            items=result.get("items") or [],
+            total=result.get("total") or 0,
+        )
 
     filter = {}
     if query:
@@ -259,6 +356,8 @@ async def create_new_knowledge(
     # Database operations (has_permission, filter_allowed_access_grants, insert_new_knowledge) manage their own sessions.
     # This prevents holding a connection during embed_knowledge_base_metadata()
     # which makes external embedding API calls (1-5+ seconds).
+    _raise_knowflow_read_only_if_enabled(request)
+
     if user.role != "admin" and not has_permission(
         user.id, "workspace.knowledge", request.app.state.config.USER_PERMISSIONS
     ):
@@ -304,6 +403,8 @@ async def reindex_knowledge_files(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
+    _raise_knowflow_read_only_if_enabled(request)
+
     if user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -378,6 +479,8 @@ async def reindex_knowledge_base_metadata_embeddings(
     for each one, making N external embedding API calls. Holding a session during
     this entire operation would exhaust the connection pool.
     """
+    _raise_knowflow_read_only_if_enabled(request)
+
     knowledge_bases = Knowledges.get_knowledge_bases()
     log.info(f"Reindexing embeddings for {len(knowledge_bases)} knowledge bases")
 
@@ -398,12 +501,40 @@ async def reindex_knowledge_base_metadata_embeddings(
 class KnowledgeFilesResponse(KnowledgeResponse):
     files: Optional[list[FileMetadataResponse]] = None
     write_access: Optional[bool] = False
+    visibility: Optional[str] = None
+    is_shared: Optional[bool] = None
+    files_count: Optional[int] = None
 
 
 @router.get("/{id}", response_model=Optional[KnowledgeFilesResponse])
 async def get_knowledge_by_id(
-    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+    request: Request,
+    id: str,
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
 ):
+    if is_knowflow_enabled(request.app.state.config):
+        try:
+            knowledge = await knowflow_get_accessible_knowledge_base(
+                request.app.state.config,
+                user,
+                id,
+                db=db,
+            )
+        except KnowflowError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+
+        if knowledge is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
+
+        return KnowledgeFilesResponse.model_validate(knowledge)
+
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
 
     if knowledge:
@@ -461,6 +592,8 @@ async def update_knowledge_by_id(
     # Database operations manage their own short-lived sessions internally.
     # This prevents holding a connection during embed_knowledge_base_metadata()
     # which makes external embedding API calls (1-5+ seconds).
+    _raise_knowflow_read_only_if_enabled(request)
+
     knowledge = Knowledges.get_knowledge_by_id(id=id)
     if not knowledge:
         raise HTTPException(
@@ -528,6 +661,8 @@ async def update_knowledge_access_by_id(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
+    _raise_knowflow_read_only_if_enabled(request)
+
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
@@ -574,6 +709,7 @@ async def update_knowledge_access_by_id(
 
 @router.get("/{id}/files", response_model=KnowledgeFileListResponse)
 async def get_knowledge_files_by_id(
+    request: Request,
     id: str,
     query: Optional[str] = None,
     view_option: Optional[str] = None,
@@ -583,6 +719,31 @@ async def get_knowledge_files_by_id(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
+    if is_knowflow_enabled(request.app.state.config):
+        page = max(page, 1)
+        limit = 30
+        try:
+            result = await knowflow_list_knowledge_documents(
+                request.app.state.config,
+                user,
+                id,
+                query=query,
+                order_by=order_by,
+                direction=direction,
+                page=page,
+                page_size=limit,
+                db=db,
+            )
+        except KnowflowError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+
+        return KnowledgeFileListResponse(
+            items=result.get("items") or [],
+            total=result.get("total") or 0,
+        )
 
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
@@ -644,6 +805,8 @@ def add_file_to_knowledge_by_id(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
+    _raise_knowflow_read_only_if_enabled(request)
+
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
@@ -719,6 +882,8 @@ def update_file_from_knowledge_by_id(
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
+    _raise_knowflow_read_only_if_enabled(request)
+
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
@@ -795,12 +960,15 @@ def update_file_from_knowledge_by_id(
 
 @router.post("/{id}/file/remove", response_model=Optional[KnowledgeFilesResponse])
 def remove_file_from_knowledge_by_id(
+    request: Request,
     id: str,
     form_data: KnowledgeFileIdForm,
     delete_file: bool = Query(True),
     user=Depends(get_verified_user),
     db: Session = Depends(get_session),
 ):
+    _raise_knowflow_read_only_if_enabled(request)
+
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
@@ -889,8 +1057,13 @@ def remove_file_from_knowledge_by_id(
 
 @router.delete("/{id}/delete", response_model=bool)
 async def delete_knowledge_by_id(
-    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+    request: Request,
+    id: str,
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
 ):
+    _raise_knowflow_read_only_if_enabled(request)
+
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
@@ -964,8 +1137,13 @@ async def delete_knowledge_by_id(
 
 @router.post("/{id}/reset", response_model=Optional[KnowledgeResponse])
 async def reset_knowledge_by_id(
-    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+    request: Request,
+    id: str,
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
 ):
+    _raise_knowflow_read_only_if_enabled(request)
+
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
@@ -1015,6 +1193,8 @@ async def add_files_to_knowledge_batch(
     """
     Add multiple files to a knowledge base
     """
+    _raise_knowflow_read_only_if_enabled(request)
+
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
         raise HTTPException(
@@ -1098,12 +1278,16 @@ async def add_files_to_knowledge_batch(
 
 @router.get("/{id}/export")
 async def export_knowledge_by_id(
-    id: str, user=Depends(get_admin_user), db: Session = Depends(get_session)
+    request: Request,
+    id: str,
+    user=Depends(get_admin_user),
+    db: Session = Depends(get_session),
 ):
     """
     Export a knowledge base as a zip file containing .txt files.
     Admin only.
     """
+    _raise_knowflow_read_only_if_enabled(request)
 
     knowledge = Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:

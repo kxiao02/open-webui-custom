@@ -7,8 +7,10 @@
 		buildIframeRequestHeaders,
 		buildThemedIframeDocument,
 		captureIframeThemeSnapshot,
+		getIframeHeightWithPadding,
 		isHtmlLikeResponse,
 		isIframeMarkup,
+		measureIframeDocumentHeight,
 		resolveIframeUrl,
 		shouldFetchIframeUrl
 	} from '$lib/utils/iframe';
@@ -232,9 +234,12 @@ window.Chart = parent.Chart
 		try {
 			const doc = iframe.contentDocument || iframe.contentWindow?.document;
 			if (!doc) return;
-			const height = Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0);
+			const height = measureIframeDocumentHeight(doc);
 			if (height > 0) {
-				iframe.style.height = height + 20 + 'px';
+				const nextHeight = `${getIframeHeightWithPadding(height)}px`;
+				if (iframe.style.height !== nextHeight) {
+					iframe.style.height = nextHeight;
+				}
 			}
 		} catch {
 			// Cross-origin documents report their own height via postMessage.
@@ -246,7 +251,10 @@ window.Chart = parent.Chart
 
 		const data = event.data || {};
 		if (data?.type === 'iframe:height' && typeof data.height === 'number') {
-			iframe.style.height = Math.max(0, data.height) + 'px';
+			const nextHeight = `${Math.max(0, Math.ceil(data.height))}px`;
+			if (iframe.style.height !== nextHeight) {
+				iframe.style.height = nextHeight;
+			}
 		}
 
 		if (data?.type === 'pong') {

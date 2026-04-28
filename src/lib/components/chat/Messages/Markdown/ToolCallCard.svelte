@@ -31,7 +31,7 @@
 	import Document from '$lib/components/icons/Document.svelte';
 	import CommandLine from '$lib/components/icons/CommandLine.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
-	import { resolveToolDisplay } from '$lib/utils/tool-display';
+	import { isHiddenHelperToolCall, resolveToolDisplay } from '$lib/utils/tool-display';
 
 	const i18n = getContext<Writable<i18nType>>('i18n');
 	const TOOL_FILE_LIST_SUPPRESSED_TOOL_IDS = new Set([
@@ -226,8 +226,16 @@
 	$: argumentsText = prettyValue(argumentsParsed);
 	$: resultText = prettyValue(resultParsed);
 	$: embedsText = prettyValue(embedsParsed);
+	$: suppressFileList =
+		TOOL_FILE_LIST_SUPPRESSED_TOOL_IDS.has(meta?.toolId ?? '') ||
+		isHiddenHelperToolCall({
+			toolId: meta?.toolId,
+			toolName: token?.attributes?.tool_name,
+			legacyName: token?.attributes?.name,
+			parsedArgs: argsRecord
+		});
 	$: showFilesSection =
-		filesParsed.length > 0 && !TOOL_FILE_LIST_SUPPRESSED_TOOL_IDS.has(meta?.toolId ?? '');
+		filesParsed.length > 0 && !suppressFileList;
 
 	$: hasBody = !!argumentsText || !!resultText || showFilesSection || !!embedsText;
 	$: if (!hasBody) {

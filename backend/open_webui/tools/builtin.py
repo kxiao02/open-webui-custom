@@ -42,10 +42,31 @@ from open_webui.models.groups import Groups
 from open_webui.models.memories import Memories
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 from open_webui.utils.sanitize import sanitize_code
+from open_webui.utils.knowflow import (
+    KnowflowError,
+    build_knowflow_markdown_image,
+    get_knowflow_asset_ref_key,
+    get_knowflow_chunk_content,
+    get_knowflow_chunk_file_id,
+    get_knowflow_chunk_render_metadata,
+    get_knowflow_chunk_similarity,
+    get_knowflow_chunk_source_name,
+    is_knowflow_enabled,
+    is_knowflow_image_ref,
+    knowflow_content_has_inline_visuals,
+    list_accessible_knowledge_bases as knowflow_list_accessible_knowledge_bases,
+    list_knowledge_documents as knowflow_list_knowledge_documents,
+    retrieve_from_knowledge,
+    search_accessible_documents as knowflow_search_accessible_documents,
+)
 
 log = logging.getLogger(__name__)
 
 MAX_KNOWLEDGE_BASE_SEARCH_ITEMS = 10_000
+KNOWFLOW_KB_READ_ONLY_MESSAGE = (
+    "Knowflow-backed knowledge management is read-only in 中电慧语 for now. "
+    "Use 管理知识库 in Knowflow."
+)
 
 # =============================================================================
 # TIME UTILITIES
@@ -1453,7 +1474,44 @@ async def list_knowledge_bases(
     if not __user__:
         return json.dumps({"error": "User context not available"})
 
+    if isinstance(count, str):
+        try:
+            count = int(count)
+        except ValueError:
+            count = 10
+    if isinstance(skip, str):
+        try:
+            skip = int(skip)
+        except ValueError:
+            skip = 0
+
+    count = max(1, count)
+    skip = max(0, skip)
+
     try:
+        if is_knowflow_enabled(__request__.app.state.config):
+            result = await knowflow_list_accessible_knowledge_bases(
+                __request__.app.state.config,
+                UserModel(**__user__),
+                page=1,
+                page_size=skip + count,
+            )
+            items = (result.get("items") or [])[skip : skip + count]
+            knowledge_bases = [
+                {
+                    "id": kb.get("id"),
+                    "name": kb.get("name") or "",
+                    "description": kb.get("description") or "",
+                    "file_count": kb.get("files_count")
+                    or kb.get("meta", {}).get("document_count")
+                    or 0,
+                    "updated_at": kb.get("updated_at"),
+                    "visibility": kb.get("visibility") or "private",
+                }
+                for kb in items
+            ]
+            return json.dumps(knowledge_bases, ensure_ascii=False)
+
         from open_webui.models.knowledge import Knowledges
 
         user_id = __user__.get("id")
@@ -1512,7 +1570,45 @@ async def search_knowledge_bases(
     if not __user__:
         return json.dumps({"error": "User context not available"})
 
+    if isinstance(count, str):
+        try:
+            count = int(count)
+        except ValueError:
+            count = 5
+    if isinstance(skip, str):
+        try:
+            skip = int(skip)
+        except ValueError:
+            skip = 0
+
+    count = max(1, count)
+    skip = max(0, skip)
+
     try:
+        if is_knowflow_enabled(__request__.app.state.config):
+            result = await knowflow_list_accessible_knowledge_bases(
+                __request__.app.state.config,
+                UserModel(**__user__),
+                query=query,
+                page=1,
+                page_size=skip + count,
+            )
+            items = (result.get("items") or [])[skip : skip + count]
+            knowledge_bases = [
+                {
+                    "id": kb.get("id"),
+                    "name": kb.get("name") or "",
+                    "description": kb.get("description") or "",
+                    "file_count": kb.get("files_count")
+                    or kb.get("meta", {}).get("document_count")
+                    or 0,
+                    "updated_at": kb.get("updated_at"),
+                    "visibility": kb.get("visibility") or "private",
+                }
+                for kb in items
+            ]
+            return json.dumps(knowledge_bases, ensure_ascii=False)
+
         from open_webui.models.knowledge import Knowledges
 
         user_id = __user__.get("id")
@@ -1573,7 +1669,58 @@ async def search_knowledge_files(
     if not __user__:
         return json.dumps({"error": "User context not available"})
 
+    if isinstance(count, str):
+        try:
+            count = int(count)
+        except ValueError:
+            count = 5
+    if isinstance(skip, str):
+        try:
+            skip = int(skip)
+        except ValueError:
+            skip = 0
+
+    count = max(1, count)
+    skip = max(0, skip)
+
     try:
+        if is_knowflow_enabled(__request__.app.state.config):
+            user = UserModel(**__user__)
+            page_size = skip + count
+            if knowledge_id:
+                result = await knowflow_list_knowledge_documents(
+                    __request__.app.state.config,
+                    user,
+                    knowledge_id,
+                    query=query,
+                    page=1,
+                    page_size=page_size,
+                )
+            else:
+                result = await knowflow_search_accessible_documents(
+                    __request__.app.state.config,
+                    user,
+                    query=query,
+                    page=1,
+                    page_size=page_size,
+                )
+
+            files = []
+            for file in (result.get("items") or [])[skip : skip + count]:
+                file_info = {
+                    "id": file.get("id"),
+                    "filename": file.get("filename")
+                    or file.get("meta", {}).get("name", ""),
+                    "updated_at": file.get("updated_at"),
+                }
+                collection = file.get("collection") or {}
+                if collection:
+                    file_info["knowledge_id"] = collection.get("id", "")
+                    file_info["knowledge_name"] = collection.get("name", "")
+                files.append(file_info)
+
+            return json.dumps(files, ensure_ascii=False)
+
         from open_webui.models.knowledge import Knowledges
 
         user_id = __user__.get("id")
@@ -1697,6 +1844,44 @@ async def view_knowledge_file(
         return json.dumps({"error": "User context not available"})
 
     try:
+        if is_knowflow_enabled(__request__.app.state.config):
+            user = UserModel(**__user__)
+            knowledge_result = await knowflow_list_accessible_knowledge_bases(
+                __request__.app.state.config,
+                user,
+                page=1,
+                page_size=100,
+            )
+            for knowledge_base in knowledge_result.get("items") or []:
+                documents_result = await knowflow_list_knowledge_documents(
+                    __request__.app.state.config,
+                    user,
+                    str(knowledge_base.get("id") or ""),
+                    page=1,
+                    page_size=1000,
+                )
+                for file_item in documents_result.get("items") or []:
+                    if str(file_item.get("id") or "") != str(file_id):
+                        continue
+
+                    return json.dumps(
+                        {
+                            "id": file_item.get("id"),
+                            "filename": file_item.get("filename")
+                            or file_item.get("meta", {}).get("name", ""),
+                            "content": "",
+                            "updated_at": file_item.get("updated_at"),
+                            "created_at": file_item.get("created_at"),
+                            "knowledge_id": knowledge_base.get("id"),
+                            "knowledge_name": knowledge_base.get("name"),
+                            "read_only": True,
+                            "message": KNOWFLOW_KB_READ_ONLY_MESSAGE,
+                        },
+                        ensure_ascii=False,
+                    )
+
+            return json.dumps({"error": "File not found"})
+
         from open_webui.models.files import Files
         from open_webui.models.knowledge import Knowledges
         from open_webui.models.access_grants import AccessGrants
@@ -1762,6 +1947,10 @@ async def query_knowledge_files(
     __request__: Request = None,
     __user__: dict = None,
     __model_knowledge__: list[dict] = None,
+    __event_emitter__: callable = None,
+    __chat_id__: str = None,
+    __message_id__: str = None,
+    __metadata__: dict = None,
 ) -> str:
     """
     Search knowledge base files using semantic/vector search. Searches across collections (KBs),
@@ -1797,7 +1986,215 @@ async def query_knowledge_files(
                 # Treat as single ID
                 knowledge_ids = [knowledge_ids]
 
+    metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+    defer_visual_rendering = (
+        str(metadata.get("deepagent_visual_selection_mode") or "").strip().lower()
+        == "langgraph"
+    )
+
+    def normalize_knowflow_chunk_result(chunk: dict) -> Optional[dict]:
+        content = get_knowflow_chunk_content(chunk)
+        source_name = get_knowflow_chunk_source_name(chunk)
+        file_id = get_knowflow_chunk_file_id(chunk)
+        render_metadata = get_knowflow_chunk_render_metadata(
+            chunk, __request__.app.state.config
+        )
+        has_inline_visuals = knowflow_content_has_inline_visuals(content)
+
+        render_markdown = str(render_metadata.get("render_markdown") or "").strip()
+        render_url = str(render_metadata.get("url") or "").strip()
+        if (
+            not render_markdown
+            and render_url
+            and is_knowflow_image_ref(render_url)
+            and not has_inline_visuals
+        ):
+            render_markdown = build_knowflow_markdown_image(render_url, source_name)
+            render_metadata["render_markdown"] = render_markdown
+
+        if render_markdown:
+            content = (
+                render_markdown
+                if not content
+                else content
+                if render_markdown in content
+                else f"{content}\n\n{render_markdown}"
+            )
+        elif not content:
+            content = str(render_metadata.get("html_content") or "").strip()
+
+        if not content:
+            return None
+
+        chunk_info = {
+            "content": content,
+            "source": source_name,
+            "file_id": file_id,
+            **render_metadata,
+        }
+
+        similarity = get_knowflow_chunk_similarity(chunk)
+        if similarity is not None:
+            chunk_info["distance"] = similarity
+
+        return chunk_info
+
+    def collect_render_assets(chunk_result: dict) -> tuple[list[dict], list[str]]:
+        files: list[dict] = []
+        embeds: list[str] = []
+
+        asset_url = str(chunk_result.get("url") or "").strip()
+        html_content = str(chunk_result.get("html_content") or "").strip()
+
+        if asset_url and is_knowflow_image_ref(asset_url):
+            files.append({"type": "image", "url": asset_url})
+        elif asset_url:
+            embeds.append(asset_url)
+
+        if html_content:
+            embeds.append(html_content)
+
+        return files, embeds
+
     try:
+        if is_knowflow_enabled(__request__.app.state.config):
+            from open_webui.models.notes import Notes
+            from open_webui.models.access_grants import AccessGrants
+
+            user = UserModel(**__user__)
+            user_id = user.id
+            user_role = user.role
+            user_group_ids = [group.id for group in Groups.get_groups_by_member_id(user_id)]
+
+            dataset_ids: list[str] = []
+            document_ids: list[str] = []
+            note_results = []
+
+            if __model_knowledge__:
+                for item in __model_knowledge__:
+                    item_type = item.get("type")
+                    item_id = str(item.get("id") or "").strip()
+                    if not item_id:
+                        continue
+
+                    if item_type == "collection":
+                        dataset_ids.append(item_id)
+                    elif item_type == "file":
+                        document_ids.append(item_id)
+                    elif item_type == "note":
+                        note = Notes.get_note_by_id(item_id)
+                        if note and (
+                            user_role == "admin"
+                            or note.user_id == user_id
+                            or AccessGrants.has_access(
+                                user_id=user_id,
+                                resource_type="note",
+                                resource_id=note.id,
+                                permission="read",
+                                user_group_ids=set(user_group_ids),
+                            )
+                        ):
+                            note_results.append(
+                                {
+                                    "content": note.data.get("content", {}).get("md", ""),
+                                    "source": note.title,
+                                    "note_id": note.id,
+                                    "type": "note",
+                                }
+                            )
+            elif knowledge_ids:
+                dataset_ids = [str(knowledge_id) for knowledge_id in knowledge_ids if knowledge_id]
+            else:
+                knowledge_result = await knowflow_list_accessible_knowledge_bases(
+                    __request__.app.state.config,
+                    user,
+                    page=1,
+                    page_size=200,
+                )
+                dataset_ids = [
+                    str(item.get("id"))
+                    for item in (knowledge_result.get("items") or [])
+                    if item.get("id")
+                ]
+
+            knowflow_chunks = await retrieve_from_knowledge(
+                __request__.app.state.config,
+                user,
+                query,
+                dataset_ids=list(dict.fromkeys(dataset_ids)) or None,
+                document_ids=list(dict.fromkeys(document_ids)) or None,
+                page_size=max(1, count),
+            )
+
+            chunks = list(note_results)
+            for chunk in knowflow_chunks or []:
+                chunk_info = normalize_knowflow_chunk_result(chunk)
+                if chunk_info is None:
+                    continue
+
+                chunks.append(chunk_info)
+
+            final_chunks = chunks[:count]
+            emitted_image_files: list[dict] = []
+            emitted_embeds: list[str] = []
+            emitted_asset_keys: set[str] = set()
+            for chunk_result in final_chunks:
+                image_files, embeds = collect_render_assets(chunk_result)
+                if image_files or embeds:
+                    chunk_result["asset_visible_in_chat"] = True
+                for image_file in image_files:
+                    asset_ref = get_knowflow_asset_ref_key(image_file.get("url"))
+                    dedupe_key = (
+                        f"image::{asset_ref}"
+                        if asset_ref
+                        else json.dumps(image_file, sort_keys=True, ensure_ascii=False)
+                    )
+                    if dedupe_key in emitted_asset_keys:
+                        continue
+                    emitted_asset_keys.add(dedupe_key)
+                    emitted_image_files.append(image_file)
+
+                for embed in embeds:
+                    normalized_embed = embed.strip()
+                    if not normalized_embed:
+                        continue
+                    dedupe_key = f"embed::{normalized_embed}"
+                    if dedupe_key in emitted_asset_keys:
+                        continue
+                    emitted_asset_keys.add(dedupe_key)
+                    emitted_embeds.append(normalized_embed)
+
+            if not defer_visual_rendering and __chat_id__ and __message_id__ and emitted_image_files:
+                db_files = Chats.add_message_files_by_id_and_message_id(
+                    __chat_id__,
+                    __message_id__,
+                    emitted_image_files,
+                )
+                if db_files is not None:
+                    emitted_image_files = db_files
+
+            if not defer_visual_rendering and __event_emitter__ and emitted_image_files:
+                await __event_emitter__(
+                    {
+                        "type": "chat:message:files",
+                        "data": {
+                            "files": emitted_image_files,
+                        },
+                    }
+                )
+
+            if not defer_visual_rendering and __event_emitter__ and emitted_embeds:
+                await __event_emitter__(
+                    {
+                        "type": "chat:message:embeds",
+                        "data": {
+                            "embeds": emitted_embeds,
+                        },
+                    }
+                )
+
+            return json.dumps(final_chunks, ensure_ascii=False)
+
         from open_webui.models.knowledge import Knowledges
         from open_webui.models.files import Files
         from open_webui.models.notes import Notes
@@ -1958,7 +2355,110 @@ async def query_knowledge_bases(
     if not __user__:
         return json.dumps({"error": "User context not available"})
 
+    if isinstance(count, str):
+        try:
+            count = int(count)
+        except ValueError:
+            count = 5
+
+    count = max(1, count)
+
     try:
+        if is_knowflow_enabled(__request__.app.state.config):
+            user = UserModel(**__user__)
+            knowledge_result = await knowflow_list_accessible_knowledge_bases(
+                __request__.app.state.config,
+                user,
+                page=1,
+                page_size=max(count, 200),
+            )
+            knowledge_bases = knowledge_result.get("items") or []
+
+            dataset_scores: dict[str, float] = {}
+            if query and knowledge_bases:
+                dataset_ids = [
+                    str(knowledge_base.get("id") or "").strip()
+                    for knowledge_base in knowledge_bases
+                    if str(knowledge_base.get("id") or "").strip()
+                ]
+                knowflow_chunks = await retrieve_from_knowledge(
+                    __request__.app.state.config,
+                    user,
+                    query,
+                    dataset_ids=dataset_ids or None,
+                    page_size=max(count * 3, 10),
+                )
+
+                for chunk in knowflow_chunks or []:
+                    dataset_id = str(
+                        chunk.get("dataset_id")
+                        or chunk.get("kb_id")
+                        or chunk.get("knowledge_id")
+                        or chunk.get("resource_id")
+                        or ""
+                    ).strip()
+                    if not dataset_id:
+                        continue
+
+                    similarity = chunk.get("similarity")
+                    if similarity is None:
+                        similarity = chunk.get("score")
+
+                    try:
+                        score = float(similarity if similarity is not None else 0.0)
+                    except (TypeError, ValueError):
+                        score = 0.0
+
+                    dataset_scores[dataset_id] = max(
+                        score,
+                        dataset_scores.get(dataset_id, float("-inf")),
+                    )
+
+            if dataset_scores:
+                knowledge_bases = [
+                    knowledge_base
+                    for knowledge_base in knowledge_bases
+                    if str(knowledge_base.get("id") or "").strip() in dataset_scores
+                ]
+                knowledge_bases.sort(
+                    key=lambda knowledge_base: (
+                        dataset_scores.get(
+                            str(knowledge_base.get("id") or "").strip(),
+                            0.0,
+                        ),
+                        knowledge_base.get("updated_at") or 0,
+                    ),
+                    reverse=True,
+                )
+            elif query:
+                filtered_result = await knowflow_list_accessible_knowledge_bases(
+                    __request__.app.state.config,
+                    user,
+                    query=query,
+                    page=1,
+                    page_size=count,
+                )
+                knowledge_bases = filtered_result.get("items") or []
+
+            payload = [
+                {
+                    "id": knowledge_base.get("id"),
+                    "name": knowledge_base.get("name") or "",
+                    "description": knowledge_base.get("description") or "",
+                    "file_count": knowledge_base.get("files_count")
+                    or knowledge_base.get("meta", {}).get("document_count")
+                    or 0,
+                    "updated_at": knowledge_base.get("updated_at"),
+                    "visibility": knowledge_base.get("visibility") or "private",
+                    "similarity": dataset_scores.get(
+                        str(knowledge_base.get("id") or "").strip(),
+                        None,
+                    ),
+                }
+                for knowledge_base in knowledge_bases[:count]
+            ]
+            return json.dumps(payload, ensure_ascii=False)
+
         import heapq
         from open_webui.models.knowledge import Knowledges
         from open_webui.routers.knowledge import KNOWLEDGE_BASES_COLLECTION
@@ -2049,16 +2549,127 @@ async def query_knowledge_bases(
 # =============================================================================
 
 
+def _get_runtime_accessible_skills(
+    __user__: dict | None,
+    *,
+    allowed_skill_ids: list[str] | None = None,
+):
+    if not __user__:
+        return []
+
+    from open_webui.models.skills import Skills
+    from open_webui.utils.catalog import (
+        filter_visible_skills,
+        is_catalog_runtime_activatable,
+    )
+
+    user_id = __user__.get("id")
+    user_role = __user__.get("role", "user")
+    viewer = type("SkillViewer", (), {"id": user_id, "role": user_role})()
+
+    allowed_set = {
+        str(skill_id).strip()
+        for skill_id in (allowed_skill_ids or [])
+        if str(skill_id).strip()
+    }
+    skills = [
+        skill
+        for skill in filter_visible_skills(
+            Skills.get_skills(), viewer, require_active=True
+        )
+        if is_catalog_runtime_activatable(
+            getattr(skill, "meta", None), getattr(skill, "access_grants", [])
+        )
+    ]
+    if allowed_set:
+        skills = [skill for skill in skills if skill.id in allowed_set]
+
+    return skills
+
+
+async def list_skills(
+    query: str = "",
+    limit: int = 20,
+    __request__: Request = None,
+    __user__: dict = None,
+    __skill_ids__: list[str] | None = None,
+) -> str:
+    """
+    List the available skills you can load on demand.
+    Use this before view_skill when you need to discover which workspace skill is relevant.
+
+    :param query: Optional search text for skill id, name, description, category, or tags
+    :param limit: Maximum number of matching skills to return
+    :return: JSON array of available skills
+    """
+    if __request__ is None:
+        return json.dumps({"error": "Request context not available"})
+
+    if not __user__:
+        return json.dumps({"error": "User context not available"})
+
+    try:
+        if isinstance(limit, str):
+            try:
+                limit = int(limit)
+            except ValueError:
+                limit = 20
+
+        limit = max(1, min(limit, 50))
+        normalized_query = str(query or "").strip().lower()
+
+        skills = _get_runtime_accessible_skills(
+            __user__,
+            allowed_skill_ids=__skill_ids__,
+        )
+        if normalized_query:
+            skills = [
+                skill
+                for skill in skills
+                if normalized_query in (skill.id or "").lower()
+                or normalized_query in (skill.name or "").lower()
+                or normalized_query in (skill.description or "").lower()
+                or normalized_query
+                in str(getattr(skill.meta, "category", "") or "").lower()
+                or any(
+                    normalized_query in str(tag or "").lower()
+                    for tag in (getattr(skill.meta, "tags", []) or [])
+                )
+            ]
+
+        payload = [
+            {
+                "id": skill.id,
+                "name": skill.name,
+                "description": skill.description or "",
+                "category": getattr(skill.meta, "category", None),
+                "tags": list(getattr(skill.meta, "tags", []) or []),
+            }
+            for skill in sorted(
+                skills,
+                key=lambda skill: (
+                    str(skill.name or "").lower(),
+                    str(skill.id or "").lower(),
+                ),
+            )[:limit]
+        ]
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception as e:
+        log.exception(f"list_skills error: {e}")
+        return json.dumps({"error": str(e)})
+
+
 async def view_skill(
     name: str,
     __request__: Request = None,
     __user__: dict = None,
+    __skill_ids__: list[str] | None = None,
 ) -> str:
     """
-    Load the full instructions of a skill by its name from the available skills manifest.
-    Use this when you need detailed instructions for a skill listed in <available_skills>.
+    Load the full instructions of a skill by its id or name from the available skill catalog.
+    Use this after list_skills or when you need detailed instructions for a referenced skill.
 
-    :param name: The name of the skill to load (as shown in the manifest)
+    :param name: The skill id or name to load
     :return: The full skill instructions as markdown content
     """
     if __request__ is None:
@@ -2068,28 +2679,30 @@ async def view_skill(
         return json.dumps({"error": "User context not available"})
 
     try:
-        from open_webui.models.skills import Skills
-        from open_webui.utils.catalog import get_user_group_ids, is_skill_catalog_visible
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            return json.dumps({"error": "Skill name is required"})
 
-        user_id = __user__.get("id")
-
-        # Direct DB lookup by unique name
-        skill = Skills.get_skill_by_name(name)
-
-        if not skill or not skill.is_active:
-            return json.dumps({"error": f"Skill '{name}' not found"})
-
-        user_role = __user__.get("role", "user")
-        if not is_skill_catalog_visible(
-            skill,
-            type("SkillViewer", (), {"id": user_id, "role": user_role})(),
-            get_user_group_ids(user_id),
-            require_active=True,
-        ):
-            return json.dumps({"error": "Access denied"})
+        skills = _get_runtime_accessible_skills(
+            __user__,
+            allowed_skill_ids=__skill_ids__,
+        )
+        skill = next(
+            (
+                item
+                for item in skills
+                if item.id == normalized_name or item.name == normalized_name
+            ),
+            None,
+        )
+        if not skill:
+            return json.dumps(
+                {"error": f"Skill '{normalized_name}' not found or not accessible"}
+            )
 
         return json.dumps(
             {
+                "id": skill.id,
                 "name": skill.name,
                 "content": skill.content,
             },

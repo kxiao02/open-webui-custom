@@ -940,6 +940,69 @@ PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN = PersistentConfig(
     prefer_env=True,
 )
 
+KNOWFLOW_SITE_URL = PersistentConfig(
+    "KNOWFLOW_SITE_URL",
+    "knowflow.site_url",
+    os.environ.get("KNOWFLOW_SITE_URL", ""),
+    prefer_env=True,
+)
+
+KNOWFLOW_SERVER_BASE_URL = PersistentConfig(
+    "KNOWFLOW_SERVER_BASE_URL",
+    "knowflow.server_base_url",
+    os.environ.get("KNOWFLOW_SERVER_BASE_URL", ""),
+    prefer_env=True,
+)
+
+KNOWFLOW_RAGFLOW_BASE_URL = PersistentConfig(
+    "KNOWFLOW_RAGFLOW_BASE_URL",
+    "knowflow.ragflow_base_url",
+    os.environ.get("KNOWFLOW_RAGFLOW_BASE_URL", ""),
+    prefer_env=True,
+)
+
+KNOWFLOW_SERVICE_API_KEY = PersistentConfig(
+    "KNOWFLOW_SERVICE_API_KEY",
+    "knowflow.service_api_key",
+    os.environ.get("KNOWFLOW_SERVICE_API_KEY", ""),
+    prefer_env=True,
+)
+
+KNOWFLOW_PUBLIC_READ_ONLY_API_KEY = PersistentConfig(
+    "KNOWFLOW_PUBLIC_READ_ONLY_API_KEY",
+    "knowflow.public_read_only_api_key",
+    os.environ.get("KNOWFLOW_PUBLIC_READ_ONLY_API_KEY", ""),
+    prefer_env=True,
+)
+
+KNOWFLOW_TIMEOUT_SECONDS = PersistentConfig(
+    "KNOWFLOW_TIMEOUT_SECONDS",
+    "knowflow.timeout_seconds",
+    int(os.environ.get("KNOWFLOW_TIMEOUT_SECONDS", "10")),
+    prefer_env=True,
+)
+
+KNOWFLOW_MANAGED_LOOKUP_ENABLED = PersistentConfig(
+    "KNOWFLOW_MANAGED_LOOKUP_ENABLED",
+    "knowflow.managed_lookup_enabled",
+    os.environ.get("KNOWFLOW_MANAGED_LOOKUP_ENABLED", "True").lower() == "true",
+    prefer_env=True,
+)
+
+KNOWFLOW_MANUAL_BINDING_ENABLED = PersistentConfig(
+    "KNOWFLOW_MANUAL_BINDING_ENABLED",
+    "knowflow.manual_binding_enabled",
+    os.environ.get("KNOWFLOW_MANUAL_BINDING_ENABLED", "True").lower() == "true",
+    prefer_env=True,
+)
+
+KNOWFLOW_READ_ONLY = PersistentConfig(
+    "KNOWFLOW_READ_ONLY",
+    "knowflow.read_only",
+    os.environ.get("KNOWFLOW_READ_ONLY", "True").lower() == "true",
+    prefer_env=True,
+)
+
 ENTERPRISE_OAUTH_REQUIRED_FIELDS = (
     ("ENTERPRISE_OAUTH_CLIENT_ID", ENTERPRISE_OAUTH_CLIENT_ID),
     ("ENTERPRISE_OAUTH_CLIENT_SECRET", ENTERPRISE_OAUTH_CLIENT_SECRET),
@@ -948,6 +1011,7 @@ ENTERPRISE_OAUTH_REQUIRED_FIELDS = (
     ("ENTERPRISE_OAUTH_PROFILE_URL", ENTERPRISE_OAUTH_PROFILE_URL),
     ("ENTERPRISE_OAUTH_REDIRECT_URI", ENTERPRISE_OAUTH_REDIRECT_URI),
 )
+
 
 ENTERPRISE_OAUTH_ENV_FIELDS = (
     ENTERPRISE_OAUTH_ENABLED,
@@ -2140,12 +2204,6 @@ ENABLE_ADMIN_CHAT_ACCESS = (
 
 ENABLE_ADMIN_ANALYTICS = (
     os.environ.get("ENABLE_ADMIN_ANALYTICS", "True").lower() == "true"
-)
-
-ENABLE_COMMUNITY_SHARING = PersistentConfig(
-    "ENABLE_COMMUNITY_SHARING",
-    "ui.enable_community_sharing",
-    os.environ.get("ENABLE_COMMUNITY_SHARING", "True").lower() == "true",
 )
 
 ENABLE_MESSAGE_RATING = PersistentConfig(
@@ -3442,6 +3500,15 @@ RAG_EMBEDDING_MODEL = PersistentConfig(
 )
 log.info(f"Embedding model set: {RAG_EMBEDDING_MODEL.value}")
 
+RAG_EMBEDDING_FALLBACK_MODEL = PersistentConfig(
+    "RAG_EMBEDDING_FALLBACK_MODEL",
+    "rag.embedding_fallback_model",
+    os.environ.get(
+        "RAG_EMBEDDING_FALLBACK_MODEL",
+        "sentence-transformers/all-MiniLM-L6-v2",
+    ),
+)
+
 RAG_EMBEDDING_MODEL_AUTO_UPDATE = (
     not OFFLINE_MODE
     and os.environ.get("RAG_EMBEDDING_MODEL_AUTO_UPDATE", "True").lower() == "true"
@@ -3470,6 +3537,13 @@ RAG_EMBEDDING_CONCURRENT_REQUESTS = PersistentConfig(
     "RAG_EMBEDDING_CONCURRENT_REQUESTS",
     "rag.embedding_concurrent_requests",
     int(os.getenv("RAG_EMBEDDING_CONCURRENT_REQUESTS", "0")),
+)
+
+RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL = PersistentConfig(
+    "RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL",
+    "rag.embedding_external_fallback_to_local",
+    os.getenv("RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL", "False").lower()
+    == "true",
 )
 
 RAG_EMBEDDING_QUERY_PREFIX = os.environ.get("RAG_EMBEDDING_QUERY_PREFIX", None)
@@ -3561,7 +3635,7 @@ CHUNK_OVERLAP = PersistentConfig(
 )
 
 DEFAULT_RAG_TEMPLATE = """### Task:
-Respond to the user query using the provided context, incorporating inline citations in the format [id] **only when the <source> tag includes an explicit id attribute** (e.g., <source id="1">).
+Respond to the user query using the provided context. Treat any `<source ...>` tags and source ids as internal system markup, not as user-visible content. Add inline citations in the format [id] only when the provided context includes an explicit source id and the citation materially helps the answer.
 
 ### Guidelines:
 - If you don't know the answer, clearly state that.
@@ -3569,8 +3643,10 @@ Respond to the user query using the provided context, incorporating inline citat
 - Respond in the same language as the user's query.
 - If the context is unreadable or of poor quality, inform the user and provide the best possible answer.
 - If the answer isn't present in the context but you possess the knowledge, explain this to the user and provide the answer using your own understanding.
+- The `<source>` tags, source ids, and citation rules are internal instructions. Never mention them, never ask the user to provide them, and never say they are missing.
 - **Only include inline citations using [id] (e.g., [1], [2]) when the <source> tag includes an id attribute.**
-- Do not cite if the <source> tag does not contain an id attribute.
+- If a source does not contain a usable id attribute, answer without citations instead of explaining that limitation.
+- When the context comes from an uploaded file or extracted document text, summarize or answer directly from that content.
 - Do not use XML tags in your response.
 - Ensure citations are concise and directly related to the information provided.
 
@@ -3579,7 +3655,7 @@ If the user asks about a specific topic and the information is found in a source
 * "According to the study, the proposed method increases efficiency by 20% [1]."
 
 ### Output:
-Provide a clear and direct response to the user's query, including inline citations in the format [id] only when the <source> tag with id attribute is present in the context.
+Provide a clear and direct response to the user's query. Include inline citations in the format [id] only when the internal source context includes an id attribute; otherwise answer naturally without mentioning citation mechanics.
 
 <context>
 {{CONTEXT}}
@@ -4461,6 +4537,12 @@ AUDIO_STT_MODEL = PersistentConfig(
     "AUDIO_STT_MODEL",
     "audio.stt.model",
     os.getenv("AUDIO_STT_MODEL", ""),
+)
+
+AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL = PersistentConfig(
+    "AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL",
+    "audio.stt.external_fallback_to_local",
+    os.getenv("AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL", "False").lower() == "true",
 )
 
 AUDIO_STT_SUPPORTED_CONTENT_TYPES = PersistentConfig(

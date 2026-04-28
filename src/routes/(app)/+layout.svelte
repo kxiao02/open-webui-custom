@@ -254,8 +254,25 @@
 		tools.set(toolsData);
 	};
 
+	const hasSessionCredential = () =>
+		Boolean(localStorage.token || document.cookie.match(/(?:^|; )token=/));
+
+	const waitForSessionBootstrap = async () => {
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			if ($user) {
+				return true;
+			}
+			if (!hasSessionCredential()) {
+				return false;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+
+		return Boolean($user);
+	};
+
 	onMount(async () => {
-		if ($user === undefined || $user === null) {
+		if (($user === undefined || $user === null) && !(await waitForSessionBootstrap())) {
 			await goto('/auth');
 			return;
 		}

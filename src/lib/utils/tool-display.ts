@@ -1,10 +1,12 @@
 export type ToolDisplayCategory = 'web' | 'file' | 'code' | 'time' | 'utility';
+export type ToolDisplayVisibility = 'visible' | 'hidden_helper';
 
 export type ToolDisplayDefinition = {
 	toolId: string;
 	toolName: string;
 	aliases?: string[];
 	category: ToolDisplayCategory;
+	visibility?: ToolDisplayVisibility;
 };
 
 export const TOOL_DISPLAY_DEFINITIONS: ToolDisplayDefinition[] = [
@@ -39,6 +41,13 @@ export const TOOL_DISPLAY_DEFINITIONS: ToolDisplayDefinition[] = [
 		category: 'utility'
 	},
 	{
+		toolId: 'attach_visuals',
+		toolName: '附加可视素材',
+		aliases: ['show_images', 'show_tables', 'render_visuals', 'attach_images'],
+		category: 'utility',
+		visibility: 'hidden_helper'
+	},
+	{
 		toolId: 'read_structured_file',
 		toolName: '读取结构化文件',
 		aliases: ['读取结构化文件'],
@@ -54,6 +63,60 @@ export const TOOL_DISPLAY_DEFINITIONS: ToolDisplayDefinition[] = [
 		toolId: 'gotenberg_convert',
 		toolName: 'PDF 转换',
 		aliases: ['PDF转换', 'PDF 转换'],
+		category: 'file'
+	},
+	{
+		toolId: 'pdf_create_document',
+		toolName: '创建 PDF',
+		aliases: ['pdf_create', 'create_pdf_document'],
+		category: 'file'
+	},
+	{
+		toolId: 'pdf_inspect_form',
+		toolName: '读取 PDF 表单',
+		aliases: ['pdf_inspect', 'inspect_pdf_form'],
+		category: 'file'
+	},
+	{
+		toolId: 'pdf_fill_form_tool',
+		toolName: '填写 PDF 表单',
+		aliases: ['pdf_fill_form', 'fill_pdf_form'],
+		category: 'file'
+	},
+	{
+		toolId: 'pdf_reformat_document',
+		toolName: '重排 PDF 文档',
+		aliases: ['pdf_reformat', 'reformat_pdf_document'],
+		category: 'file'
+	},
+	{
+		toolId: 'docx_export_document',
+		toolName: '导出 Word 文档',
+		aliases: ['docx_export', 'export_docx_document'],
+		category: 'file'
+	},
+	{
+		toolId: 'pptx_export_presentation',
+		toolName: '导出 PPT',
+		aliases: ['pptx_export', 'export_pptx_presentation'],
+		category: 'file'
+	},
+	{
+		toolId: 'xlsx_create_workbook',
+		toolName: '创建 Excel 工作簿',
+		aliases: ['xlsx_create', 'create_xlsx_workbook'],
+		category: 'file'
+	},
+	{
+		toolId: 'xlsx_add_column_tool',
+		toolName: 'Excel 新增列',
+		aliases: ['xlsx_add_column', 'add_xlsx_column'],
+		category: 'file'
+	},
+	{
+		toolId: 'xlsx_insert_row_tool',
+		toolName: 'Excel 插入行',
+		aliases: ['xlsx_insert_row', 'insert_xlsx_row'],
 		category: 'file'
 	},
 	{
@@ -132,6 +195,7 @@ const TOOL_ID_BY_ALIAS = new Map<string, string>();
 
 for (const definition of TOOL_DISPLAY_DEFINITIONS) {
 	TOOL_ID_BY_ALIAS.set(definition.toolId.toLowerCase(), definition.toolId);
+	TOOL_ID_BY_ALIAS.set(definition.toolName.toLowerCase(), definition.toolId);
 	for (const alias of definition.aliases ?? []) {
 		TOOL_ID_BY_ALIAS.set(alias.toLowerCase(), definition.toolId);
 	}
@@ -276,6 +340,7 @@ export const resolveToolDisplay = ({
 	toolId: string;
 	toolName: string;
 	category: ToolDisplayCategory;
+	visibility: ToolDisplayVisibility;
 } => {
 	const normalizedToolId =
 		normalizeToolId(toolId) ||
@@ -295,11 +360,16 @@ export const resolveToolDisplay = ({
 	return {
 		toolId: normalizedToolId || fallbackName,
 		toolName: resolvedToolName,
+		visibility: definition?.visibility ?? 'visible',
 		category:
 			definition?.category ??
 			(normalizedToolId === 'read_file' || normalizedToolId === 'write_file' ? 'file' : 'utility')
 	};
 };
+
+export const isHiddenHelperToolCall = (
+	input: ResolveToolDisplayInput
+): boolean => resolveToolDisplay(input).visibility === 'hidden_helper';
 
 export const getToolDisplayName = (
 	value: string | undefined | null,

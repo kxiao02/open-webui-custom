@@ -125,11 +125,11 @@
 	export let hasBlockingGeneration = false;
 
 	export let prompt = '';
-	export let files = [];
+	export let files: any[] = [];
 
-	export let selectedToolIds = [];
-	export let lockedToolIds = [];
-	export let selectedFilterIds = [];
+	export let selectedToolIds: string[] = [];
+	export let lockedToolIds: string[] = [];
+	export let selectedFilterIds: string[] = [];
 
 	export let imageGenerationEnabled = false;
 	export let webSearchEnabled = false;
@@ -178,6 +178,27 @@
 		codeInterpreterEnabled,
 		thinkingModeEnabled
 	});
+
+	const normalizeUploadFingerprintPart = (value: unknown): string =>
+		typeof value === 'string'
+			? value.trim().toLowerCase()
+			: value === null || value === undefined
+				? ''
+				: String(value);
+
+	const buildUploadFingerprint = (
+		file: Pick<File, 'name' | 'type' | 'size' | 'lastModified'> | null | undefined
+	): string =>
+		[
+			normalizeUploadFingerprintPart(file?.name),
+			normalizeUploadFingerprintPart(file?.type),
+			normalizeUploadFingerprintPart(file?.size),
+			normalizeUploadFingerprintPart(file?.lastModified)
+		].join('::');
+
+	const hasUploadFingerprint = (uploadFingerprint: string): boolean =>
+		uploadFingerprint !== '' &&
+		files.some((item) => item?.uploadFingerprint === uploadFingerprint && item?.status !== 'error');
 
 	const dispatchSubmit = (promptOverride: string = prompt) => {
 		dispatch('submit', {
@@ -554,7 +575,11 @@
 		});
 	};
 
-	const uploadFileHandler = async (file, process = false, itemData = {}) => {
+	const uploadFileHandler = async (
+		file,
+		process = false,
+		itemData: { uploadFingerprint?: string; [key: string]: any } = {}
+	) => {
 		if ($_user?.role !== 'admin' && !($_user?.permissions?.chat?.file_upload ?? true)) {
 			toast.error($i18n.t('You do not have permission to upload files.'));
 			return null;
@@ -562,6 +587,12 @@
 
 		if (fileUploadCapableModels.length !== selectedModels.length) {
 			toast.error($i18n.t('Model(s) do not support file upload'));
+			return null;
+		}
+
+		const uploadFingerprint =
+			normalizeUploadFingerprintPart(itemData?.uploadFingerprint) || buildUploadFingerprint(file);
+		if (hasUploadFingerprint(uploadFingerprint)) {
 			return null;
 		}
 
@@ -577,6 +608,7 @@
 			size: file.size,
 			error: '',
 			itemId: tempItemId,
+			uploadFingerprint,
 			...itemData
 		};
 
@@ -751,25 +783,33 @@
 					// Compress the image if settings or config require it
 					imageUrl = await compressImageHandler(imageUrl, $settings, $config);
 
+					const uploadFingerprint = buildUploadFingerprint(file);
+					if (hasUploadFingerprint(uploadFingerprint)) {
+						return;
+					}
+
 					if ($temporaryChatEnabled) {
 						files = [
 							...files,
 							{
 								type: 'image',
-								url: imageUrl
+								url: imageUrl,
+								uploadFingerprint
 							}
 						];
 					} else {
 						const blob = await (await fetch(imageUrl)).blob();
 						const compressedFile = new File([blob], file.name, { type: file.type });
 
-						uploadFileHandler(compressedFile, false);
+						uploadFileHandler(compressedFile, false, { uploadFingerprint });
 					}
 				};
 
 				reader.readAsDataURL(file['type'] === 'image/heic' ? await convertHeicToJpeg(file) : file);
 			} else {
-				uploadFileHandler(file, false);
+				uploadFileHandler(file, false, {
+					uploadFingerprint: buildUploadFingerprint(file)
+				});
 			}
 		});
 	};

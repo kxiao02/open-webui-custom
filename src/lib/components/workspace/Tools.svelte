@@ -329,7 +329,7 @@
 					>
 						<button
 							type="button"
-							class="px-2 py-1.5 rounded-xl bg-black text-white hover:bg-gray-900 dark:bg-white dark:text-black dark:hover:bg-gray-100 transition font-medium text-sm flex items-center"
+							class="px-2.5 py-1.5 rounded-xl border border-gray-200/80 bg-gray-100/90 text-gray-700 hover:bg-gray-200/80 hover:text-gray-900 dark:border-gray-800 dark:bg-gray-850/90 dark:text-gray-200 dark:hover:bg-gray-800 dark:hover:text-white transition font-medium text-sm flex items-center"
 						>
 							<Plus className="size-3" strokeWidth="2.5" />
 

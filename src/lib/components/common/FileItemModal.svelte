@@ -9,6 +9,13 @@
 	import { getKnowledgeById } from '$lib/apis/knowledge';
 	import { getFileById, getFileContentById } from '$lib/apis/files';
 	import { extractOpenWebUiFileId, normalizeOpenWebUiFileUrl } from '$lib/utils/generated-files';
+	import {
+		isMarkdownPreviewContentType,
+		isMarkdownPreviewPath,
+		isMermaidPreviewContentType,
+		isMermaidPreviewPath,
+		prepareMarkdownPreviewSource
+	} from '$lib/utils/markdownPreview';
 
 	import CodeBlock from '$lib/components/chat/Messages/CodeBlock.svelte';
 	import Markdown from '$lib/components/chat/Messages/Markdown.svelte';
@@ -42,6 +49,7 @@
 	let isExcel = false;
 	let isDocx = false;
 	let isPptx = false;
+	let isMermaid = false;
 
 	let selectedTab = '';
 	let excelWorkbook: WorkBook | null = null;
@@ -52,6 +60,7 @@
 	let rowCount = 0;
 	let itemRef: string | null = null;
 	let itemUrl: string | null = null;
+	let itemName: string | null = null;
 
 	const normalizeFileRef = (value: unknown): string | null => {
 		if (typeof value !== 'string') {
@@ -108,9 +117,16 @@
 		item?.meta?.content_type === 'application/pdf' ||
 		(item?.name && item?.name.toLowerCase().endsWith('.pdf'));
 
+	$: itemName =
+		item?.name ?? item?.filename ?? item?.file?.filename ?? item?.file?.meta?.name ?? null;
+
+	$: isMermaid =
+		isMermaidPreviewContentType(item?.meta?.content_type) || isMermaidPreviewPath(itemName);
+
 	$: isMarkdown =
-		item?.meta?.content_type === 'text/markdown' ||
-		(item?.name && item?.name.toLowerCase().endsWith('.md'));
+		isMermaid ||
+		isMarkdownPreviewContentType(item?.meta?.content_type) ||
+		isMarkdownPreviewPath(itemName);
 
 	$: isCode =
 		item?.name &&
@@ -505,7 +521,10 @@
 								class="max-h-96 overflow-scroll scrollbar-hidden text-sm prose dark:prose-invert max-w-full"
 							>
 								<Markdown
-									content={isTruncated ? rawContent.slice(0, CONTENT_PREVIEW_LIMIT) : rawContent}
+									content={prepareMarkdownPreviewSource(
+										isTruncated ? rawContent.slice(0, CONTENT_PREVIEW_LIMIT) : rawContent,
+										{ mermaid: isMermaid }
+									)}
 									id="file-preview"
 								/>
 							</div>
@@ -537,7 +556,10 @@
 								class="max-h-96 overflow-scroll scrollbar-hidden text-sm prose dark:prose-invert max-w-full"
 							>
 								<Markdown
-									content={isTruncated ? rawContent.slice(0, CONTENT_PREVIEW_LIMIT) : rawContent}
+									content={prepareMarkdownPreviewSource(
+										isTruncated ? rawContent.slice(0, CONTENT_PREVIEW_LIMIT) : rawContent,
+										{ mermaid: isMermaid }
+									)}
 									id="file-preview-content"
 								/>
 							</div>
@@ -621,7 +643,12 @@
 						<div
 							class="max-h-[60vh] overflow-scroll scrollbar-hidden text-sm prose dark:prose-invert max-w-full"
 						>
-							<Markdown content={item.file.data.content} id="markdown-viewer" />
+							<Markdown
+								content={prepareMarkdownPreviewSource(item.file.data.content, {
+									mermaid: isMermaid
+								})}
+								id="markdown-viewer"
+							/>
 						</div>
 					{:else if isDocx}
 						{#if docxError}

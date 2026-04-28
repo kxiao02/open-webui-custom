@@ -9,6 +9,7 @@
 	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { settings } from '$lib/stores';
 	import { copyToClipboard, unescapeHtml } from '$lib/utils';
 
 	import Image from '$lib/components/common/Image.svelte';
@@ -105,7 +106,12 @@
 			>
 		{/if}
 	{:else if token.type === 'image'}
-		<Image src={token.href} alt={token.text} />
+		<Image
+			src={token.href}
+			alt={token.text}
+			className={`block max-w-full ${($settings?.highContrastMode ?? false) ? '' : 'outline-hidden focus:outline-hidden'}`}
+			imageClassName="h-auto max-w-full w-auto rounded-lg object-contain bg-white dark:bg-gray-950"
+		/>
 	{:else if token.type === 'strong'}
 		<strong><svelte:self id={`${id}-strong`} tokens={token.tokens} {onSourceClick} /></strong>
 	{:else if token.type === 'em'}
