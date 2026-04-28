@@ -6,7 +6,10 @@
 
   const config = window.CPECC_CHAT_WIDGET || {};
   const currentScript = document.currentScript;
-  const fallbackScriptUrl = 'https://chat.cpecc.net/embed/iframe-loader.js';
+  const fallbackScriptUrl = new URL(
+    config.baseUrl || config.appBaseUrl || '/embed/iframe-loader.js',
+    window.location.href
+  ).toString();
   const scriptUrl = (() => {
     try {
       return new URL(currentScript && currentScript.src ? currentScript.src : fallbackScriptUrl, window.location.href);
@@ -32,7 +35,7 @@
     } catch {
       fallbackUrl = new URL(fallbackScriptUrl);
     }
-    const safeFallback = isWebUrl(fallbackUrl) ? fallbackUrl.toString() : 'https://chat.cpecc.net/';
+    const safeFallback = isWebUrl(fallbackUrl) ? fallbackUrl.toString() : window.location.origin;
     if (!value) return safeFallback;
 
     try {
@@ -44,7 +47,7 @@
   };
 
   const iframeUrl = toWebUrl(config.iframeUrl || config.src, appBaseUrl);
-  const homeUrl = toWebUrl(config.homeUrl, appBaseUrl);
+  let homeUrl = toWebUrl(config.homeUrl, appBaseUrl);
   const logoUrl = toWebUrl(config.logoUrl, new URL('static/logo.png', appBaseUrl).toString());
   const zIndex = Number.isFinite(Number(config.zIndex)) ? Number(config.zIndex) : 2147483647;
   const desktopBreakpoint = Number.isFinite(Number(config.desktopBreakpoint))
@@ -62,6 +65,15 @@
   const fallbackLogoWidth = 68;
   const fallbackLogoHeight = 68;
   const viewportPadding = 16;
+
+  const readConfiguredHomeUrl = (payload) => {
+    const candidates = [
+      payload?.sso?.home_url,
+      payload?.oauth?.enterprise_home_url,
+      payload?.oauth?.enterprise?.home_url
+    ];
+    return candidates.find((value) => typeof value === 'string' && value.trim()) || null;
+  };
 
   const mount = () => {
     if (!document.body || document.getElementById('cpecc-chat-widget-loader-root')) {
@@ -356,7 +368,7 @@
       <section class="cpecc-panel" role="dialog" aria-label="中电慧语 iframe window" aria-hidden="true" inert>
         <header class="cpecc-toolbar">
           <div class="cpecc-actions left">
-            <button class="cpecc-action cpecc-home" type="button" title="Open chat.cpecc.net" aria-label="Open chat.cpecc.net">
+            <button class="cpecc-action cpecc-home" type="button" title="Open 中电慧语" aria-label="Open 中电慧语">
               <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M3 10.8 12 3l9 7.8" stroke-linecap="round" stroke-linejoin="round"></path>
                 <path d="M5.5 10.2V21h13V10.2" stroke-linecap="round" stroke-linejoin="round"></path>
@@ -413,6 +425,26 @@
     let draggingPanel = null;
     let resizingPanel = null;
     let previousCursor = null;
+
+    async function loadConfiguredHomeUrl() {
+      if (config.homeUrl || !window.fetch) return;
+
+      try {
+        const response = await fetch(new URL('api/config', appBaseUrl).toString(), {
+          cache: 'no-store',
+          credentials: 'omit'
+        });
+        if (!response.ok) return;
+
+        const payload = await response.json();
+        const configuredHomeUrl = readConfiguredHomeUrl(payload);
+        if (configuredHomeUrl) {
+          homeUrl = toWebUrl(configuredHomeUrl, appBaseUrl);
+        }
+      } catch {
+        // The script URL origin remains the safe fallback when public config is unavailable.
+      }
+    }
 
     function clamp(value, min, max) {
       if (max < min) return min;
@@ -799,6 +831,7 @@
     });
 
     applyLauncherPosition();
+    loadConfiguredHomeUrl();
 
     window.CPECCChatWidget = {
       open: openWidget,

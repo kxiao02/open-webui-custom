@@ -2376,6 +2376,46 @@ async def list_tasks_by_chat_id_endpoint(
 ##################################
 
 
+def _public_base_url_from_redirect_uri(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+
+    parsed = urlparse(str(value).strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    callback_suffix = "/oauth/enterprise/callback"
+    base_path = ""
+    if parsed.path.endswith(callback_suffix):
+        base_path = parsed.path[: -len(callback_suffix)].rstrip("/")
+
+    return f"{parsed.scheme}://{parsed.netloc}{base_path}/"
+
+
+def _public_base_url_from_url(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+
+    parsed = urlparse(str(value).strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+
+    base_path = parsed.path.rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}{base_path}/"
+
+
+def get_sso_public_home_url(request: Request) -> str:
+    # Keep embed/home navigation tied to the deployment-managed SSO callback host.
+    return (
+        _public_base_url_from_redirect_uri(
+            request.app.state.config.ENTERPRISE_OAUTH_REDIRECT_URI
+        )
+        or _public_base_url_from_url(request.app.state.config.WEBUI_URL)
+        or _public_base_url_from_url(str(request.base_url))
+        or "/"
+    )
+
+
 @app.get("/api/config")
 async def get_app_config(request: Request):
     user = None
@@ -2424,6 +2464,9 @@ async def get_app_config(request: Request):
             "enabled": PORTAL_SSO_ENABLED.value,
             "app_initiated_enabled": PORTAL_SSO_APP_INITIATED_ENABLED.value,
             "provider_name": PORTAL_SSO_PROVIDER_NAME.value,
+        },
+        "sso": {
+            "home_url": get_sso_public_home_url(request),
         },
         "knowflow": get_knowflow_public_config(app.state.config),
         "features": {

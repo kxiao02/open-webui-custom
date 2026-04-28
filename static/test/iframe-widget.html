@@ -404,8 +404,8 @@
           id="homeButton"
           class="widget-action"
           type="button"
-          title="Open chat.cpecc.net"
-          aria-label="Open chat.cpecc.net"
+          title="Open 中电慧语"
+          aria-label="Open 中电慧语"
         >
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M3 10.8 12 3l9 7.8" stroke-linecap="round" stroke-linejoin="round" />
@@ -462,7 +462,7 @@
       const retractButton = document.getElementById('retract');
       const resizeHandles = Array.from(document.querySelectorAll('.resize-handle'));
       const storageKey = 'cpecc-iframe-widget-launcher-position';
-      const homeUrl = 'https://chat.cpecc.net/';
+      const homeUrl = new URL('/', window.location.href).toString();
       const viewportPadding = 16;
       const desktopBreakpoint = 860;
       const minPanelWidth = 360;
