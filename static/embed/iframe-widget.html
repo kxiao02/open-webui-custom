@@ -1,0 +1,890 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>中电慧语 iframe Widget Test</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --card: #ffffff;
+      --ink: #172033;
+      --muted: #6b7280;
+      --brand: #1f5fe8;
+      --brand-2: #e60012;
+      --ring: rgba(31, 95, 232, 0.25);
+      --shadow: 0 28px 80px rgba(15, 23, 42, 0.24);
+      --radius: 24px;
+      --control-bg: #ffffff;
+    }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      width: 100%;
+      min-height: 100%;
+      margin: 0;
+    }
+
+    body {
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 12% 18%, rgba(31, 95, 232, 0.16), transparent 30rem),
+        radial-gradient(circle at 88% 78%, rgba(230, 0, 18, 0.11), transparent 24rem),
+        linear-gradient(135deg, #ffffff 0%, var(--bg) 54%, #eef3ff 100%);
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    body.is-widget-interacting,
+    body.is-widget-interacting * {
+      user-select: none;
+    }
+
+    .page-shell {
+      display: grid;
+      min-height: 100vh;
+      place-items: center;
+      padding: 32px;
+    }
+
+    .demo-card {
+      max-width: 760px;
+      border: 1px solid rgba(31, 95, 232, 0.16);
+      border-radius: 30px;
+      background: rgba(255, 255, 255, 0.72);
+      box-shadow: 0 18px 60px rgba(15, 23, 42, 0.08);
+      padding: clamp(24px, 4vw, 44px);
+      backdrop-filter: blur(18px);
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--brand);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 12ch;
+      font-size: clamp(38px, 7vw, 72px);
+      line-height: 0.94;
+      letter-spacing: -0.055em;
+    }
+
+    .demo-card p {
+      max-width: 58ch;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.65;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .pill {
+      border: 1px solid rgba(31, 95, 232, 0.16);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.78);
+      color: #334155;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .launcher {
+      position: fixed;
+      left: 0;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 68px;
+      height: 68px;
+      border: 0;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.9);
+      box-shadow: 0 16px 44px rgba(15, 23, 42, 0.18);
+      color: var(--ink);
+      cursor: grab;
+      padding: 0;
+      user-select: none;
+      touch-action: none;
+      transition: box-shadow 180ms ease, opacity 180ms ease;
+      backdrop-filter: blur(16px);
+      will-change: transform;
+    }
+
+    .launcher:hover,
+    .launcher:focus-visible {
+      box-shadow: 0 20px 54px rgba(31, 95, 232, 0.22);
+      outline: none;
+      transform: translate3d(var(--launcher-x, 0), var(--launcher-y, 0), 0) scale(1.02);
+    }
+
+    .launcher:active { cursor: grabbing; }
+
+    .launcher.is-hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .logo-disc {
+      display: grid;
+      width: 52px;
+      height: 52px;
+      flex: 0 0 auto;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--control-bg);
+      box-shadow: none;
+      pointer-events: none;
+    }
+
+    .logo-disc img {
+      display: block;
+      width: 38px;
+      height: 38px;
+      object-fit: contain;
+      pointer-events: none;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+
+    .widget-window {
+      position: fixed;
+      z-index: 30;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
+      border: 0;
+      border-radius: var(--radius);
+      background: var(--card);
+      box-shadow: 0 30px 90px rgba(15, 23, 42, 0.2);
+      opacity: 0;
+      pointer-events: none;
+      transform-origin: center center;
+      backdrop-filter: blur(20px);
+      will-change: left, top, width, height, transform;
+    }
+
+    .widget-window.is-open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .widget-header {
+      position: relative;
+      z-index: 4;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      min-height: 50px;
+      border-bottom: 0;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(248, 250, 252, 0.56));
+      cursor: grab;
+      padding: 4px 12px;
+      touch-action: none;
+      user-select: none;
+    }
+
+    .widget-header:active { cursor: grabbing; }
+
+    .widget-actions {
+      position: relative;
+      z-index: 8;
+      display: flex;
+      align-items: center;
+      flex: 0 0 auto;
+      gap: 18px;
+    }
+
+    .widget-actions.left {
+      margin-left: 4px;
+    }
+
+    .widget-actions.right {
+      margin-right: 4px;
+    }
+
+    .widget-action {
+      appearance: none;
+      border: 0;
+      border-radius: 50%;
+      background: var(--control-bg);
+      box-shadow: none;
+      color: #334155;
+      cursor: pointer;
+      display: grid;
+      width: 40px;
+      height: 40px;
+      place-items: center;
+      font: inherit;
+      padding: 0;
+      transition:
+        background 160ms ease,
+        border-color 160ms ease,
+        color 160ms ease;
+    }
+
+    .widget-action:hover,
+    .widget-action:focus-visible {
+      border-color: rgba(31, 95, 232, 0.32);
+      background: rgba(31, 95, 232, 0.1);
+      color: var(--brand);
+      outline: none;
+    }
+
+    .widget-action svg {
+      width: 22px;
+      height: 22px;
+      stroke: currentColor;
+      stroke-width: 1.9;
+    }
+
+    .widget-action.retract {
+      color: #1f2937;
+    }
+
+    .assistant-frame {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #ffffff;
+    }
+
+    .resize-handle {
+      position: absolute;
+      z-index: 5;
+      background: transparent;
+      touch-action: none;
+    }
+
+    .resize-handle[data-resize-handle="top-left"] {
+      left: 0;
+      top: 0;
+      width: 12px;
+      height: 12px;
+      cursor: nwse-resize;
+    }
+
+    .resize-handle[data-resize-handle="top"] {
+      left: 14px;
+      right: 14px;
+      top: 0;
+      height: 6px;
+      cursor: ns-resize;
+    }
+
+    .resize-handle[data-resize-handle="top-right"] {
+      right: 0;
+      top: 0;
+      width: 12px;
+      height: 12px;
+      cursor: nesw-resize;
+    }
+
+    .resize-handle[data-resize-handle="right"] {
+      right: 0;
+      top: 14px;
+      bottom: 14px;
+      width: 8px;
+      cursor: ew-resize;
+    }
+
+    .resize-handle[data-resize-handle="bottom-right"] {
+      right: 0;
+      bottom: 0;
+      width: 12px;
+      height: 12px;
+      cursor: nwse-resize;
+    }
+
+    .resize-handle[data-resize-handle="bottom"] {
+      left: 14px;
+      right: 14px;
+      bottom: 0;
+      height: 8px;
+      cursor: ns-resize;
+    }
+
+    .resize-handle[data-resize-handle="bottom-left"] {
+      left: 0;
+      bottom: 0;
+      width: 12px;
+      height: 12px;
+      cursor: nesw-resize;
+    }
+
+    .resize-handle[data-resize-handle="left"] {
+      left: 0;
+      top: 14px;
+      bottom: 14px;
+      width: 8px;
+      cursor: ew-resize;
+    }
+
+    body.is-widget-interacting .assistant-frame {
+      pointer-events: none;
+    }
+
+    body.is-widget-interacting .launcher,
+    body.is-widget-interacting .widget-window {
+      transition: none !important;
+    }
+
+    .hint {
+      position: fixed;
+      left: 50%;
+      bottom: 18px;
+      z-index: 10;
+      transform: translateX(-50%);
+      border: 1px solid rgba(15, 23, 42, 0.08);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.76);
+      color: var(--muted);
+      padding: 8px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      backdrop-filter: blur(14px);
+    }
+
+    @media (max-width: 860px) {
+      body { overflow: auto; }
+      .demo-card { margin-bottom: 130px; }
+      .widget-window { border-radius: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page-shell" aria-label="Iframe widget smoke-test host">
+    <section class="demo-card">
+      <p class="eyebrow">Iframe launcher smoke test</p>
+      <h1>中电慧语 embedded UI</h1>
+      <p>
+        Drag the floating logo anywhere on this page, click it to expand the 中电慧语 UI in an iframe,
+        resize or move the iframe window, then retract it back to the draggable logo at any time.
+      </p>
+      <div class="pill-row" aria-hidden="true">
+        <span class="pill">Default iframe width: 40vw</span>
+        <span class="pill">Default iframe height: 100vh</span>
+        <span class="pill">Header drag enabled</span>
+        <span class="pill">All-edge resize enabled</span>
+      </div>
+    </section>
+  </main>
+
+  <button id="launcher" class="launcher" type="button" aria-label="Open 中电慧语 iframe widget">
+    <span class="logo-disc"><img src="/static/logo.png" alt="" draggable="false" /></span>
+  </button>
+
+  <section
+    id="widget"
+    class="widget-window"
+    role="dialog"
+    aria-label="中电慧语 iframe window"
+    aria-hidden="true"
+    inert
+  >
+    <header id="widgetHeader" class="widget-header">
+      <div class="widget-actions left">
+        <button
+          id="homeButton"
+          class="widget-action"
+          type="button"
+          title="Open chat.cpecc.net"
+          aria-label="Open chat.cpecc.net"
+        >
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M3 10.8 12 3l9 7.8" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M5.5 10.2V21h13V10.2" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M9.5 21v-6h5v6" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+      <div class="widget-actions right">
+        <button id="refreshButton" class="widget-action" type="button" title="Refresh" aria-label="Refresh">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M20 12a8 8 0 1 1-2.35-5.65" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M20 4v5h-5" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+        <button id="retract" class="widget-action retract" type="button" title="Retract" aria-label="Retract">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="m4.5 4.5 5 5" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M9.5 5.5v4h-4" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="m19.5 19.5-5-5" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M14.5 18.5v-4h4" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+    </header>
+    <iframe
+      id="assistantFrame"
+      class="assistant-frame"
+      title="中电慧语"
+      src="about:blank"
+      allow="clipboard-read; clipboard-write; microphone; camera; fullscreen"
+      referrerpolicy="strict-origin-when-cross-origin"
+    ></iframe>
+    <div class="resize-handle" data-resize-handle="top-left" aria-hidden="true"></div>
+    <div class="resize-handle" data-resize-handle="top" aria-hidden="true"></div>
+    <div class="resize-handle" data-resize-handle="top-right" aria-hidden="true"></div>
+    <div class="resize-handle" data-resize-handle="right" aria-hidden="true"></div>
+    <div class="resize-handle" data-resize-handle="bottom-right" aria-hidden="true"></div>
+    <div class="resize-handle" data-resize-handle="bottom" aria-hidden="true"></div>
+    <div class="resize-handle" data-resize-handle="bottom-left" aria-hidden="true"></div>
+    <div class="resize-handle" data-resize-handle="left" aria-hidden="true"></div>
+  </section>
+
+  <div class="hint">Smoke URL target can be changed with <code>?src=/some/path</code></div>
+
+  <script>
+    (() => {
+      const launcher = document.getElementById('launcher');
+      const widget = document.getElementById('widget');
+      const widgetHeader = document.getElementById('widgetHeader');
+      const iframe = document.getElementById('assistantFrame');
+      const homeButton = document.getElementById('homeButton');
+      const refreshButton = document.getElementById('refreshButton');
+      const retractButton = document.getElementById('retract');
+      const resizeHandles = Array.from(document.querySelectorAll('.resize-handle'));
+      const storageKey = 'cpecc-iframe-widget-launcher-position';
+      const homeUrl = 'https://chat.cpecc.net/';
+      const viewportPadding = 16;
+      const desktopBreakpoint = 860;
+      const minPanelWidth = 360;
+      const minPanelHeight = 360;
+      const fallbackLogoWidth = 68;
+      const fallbackLogoHeight = 68;
+
+      let isOpen = false;
+      let launcherPosition = readLauncherPosition();
+      let panelPosition = { x: 0, y: 0 };
+      let panelSize = getDefaultPanelSize();
+      let panelGeometryInitialized = false;
+      let draggingLauncher = null;
+      let draggingPanel = null;
+      let resizingPanel = null;
+
+      function clamp(value, min, max) {
+        if (max < min) return min;
+        return Math.min(Math.max(value, min), max);
+      }
+
+      function safeJsonParse(value) {
+        try { return JSON.parse(value); } catch { return null; }
+      }
+
+      function getIframeTarget() {
+        const params = new URLSearchParams(window.location.search);
+        const raw = params.get('src') || '/';
+        try {
+          const target = new URL(raw, window.location.origin);
+          if (target.origin === window.location.origin && target.pathname === window.location.pathname) {
+            return new URL('/', window.location.origin).toString();
+          }
+          return target.toString();
+        } catch {
+          return new URL('/', window.location.origin).toString();
+        }
+      }
+
+      function getDefaultPanelSize() {
+        const widthRatio = window.innerWidth <= desktopBreakpoint ? 0.92 : 0.4;
+        const width = Math.round(window.innerWidth * widthRatio);
+        const height = window.innerHeight;
+        return constrainSize({ width, height });
+      }
+
+      function constrainSize(size) {
+        return {
+          width: clamp(size.width, Math.min(minPanelWidth, window.innerWidth), window.innerWidth),
+          height: clamp(size.height, Math.min(minPanelHeight, window.innerHeight), window.innerHeight)
+        };
+      }
+
+      function constrainLauncherPosition(position) {
+        const launcherSize = getLauncherSize();
+        return {
+          x: clamp(position.x, viewportPadding, window.innerWidth - launcherSize.width - viewportPadding),
+          y: clamp(position.y, viewportPadding, window.innerHeight - launcherSize.height - viewportPadding)
+        };
+      }
+
+      function constrainPanelPosition(position, size = panelSize) {
+        return {
+          x: clamp(position.x, 0, window.innerWidth - size.width),
+          y: clamp(position.y, 0, window.innerHeight - size.height)
+        };
+      }
+
+      function readLauncherPosition() {
+        const saved = safeJsonParse(localStorage.getItem(storageKey));
+        const fallback = {
+          x: window.innerWidth - getLauncherSize().width - 28,
+          y: window.innerHeight - getLauncherSize().height - 28
+        };
+        if (!saved || typeof saved.x !== 'number' || typeof saved.y !== 'number') {
+          return constrainLauncherPosition(fallback);
+        }
+        return constrainLauncherPosition(saved);
+      }
+
+      function saveLauncherPosition() {
+        localStorage.setItem(storageKey, JSON.stringify(launcherPosition));
+      }
+
+      function applyLauncherPosition() {
+        launcher.style.setProperty('--launcher-x', `${launcherPosition.x}px`);
+        launcher.style.setProperty('--launcher-y', `${launcherPosition.y}px`);
+        launcher.style.transform = `translate3d(${launcherPosition.x}px, ${launcherPosition.y}px, 0)`;
+      }
+
+      function applyPanelGeometry() {
+        widget.style.left = `${panelPosition.x}px`;
+        widget.style.top = `${panelPosition.y}px`;
+        widget.style.width = `${panelSize.width}px`;
+        widget.style.height = `${panelSize.height}px`;
+      }
+
+      function getLogoCenter() {
+        const launcherSize = getLauncherSize();
+        return {
+          x: launcherPosition.x + launcherSize.width / 2,
+          y: launcherPosition.y + launcherSize.height / 2
+        };
+      }
+
+      function getLauncherSize() {
+        return {
+          width: launcher.offsetWidth || fallbackLogoWidth,
+          height: launcher.offsetHeight || fallbackLogoHeight
+        };
+      }
+
+      function getCenteredPanelPosition(size) {
+        const origin = getLogoCenter();
+        return constrainPanelPosition({ x: origin.x - size.width / 2, y: origin.y - size.height / 2 }, size);
+      }
+
+      function ensureIframeLoaded() {
+        if (iframe.getAttribute('src') === 'about:blank') {
+          iframe.setAttribute('src', getIframeTarget());
+        }
+      }
+
+      function animateWidget(opening, done) {
+        const origin = getLogoCenter();
+        const panelCenter = {
+          x: panelPosition.x + panelSize.width / 2,
+          y: panelPosition.y + panelSize.height / 2
+        };
+        const from = `translate3d(${origin.x - panelCenter.x}px, ${origin.y - panelCenter.y}px, 0) scale(0.08)`;
+        const to = 'translate3d(0, 0, 0) scale(1)';
+        const keyframes = opening
+          ? [{ opacity: 0, transform: from }, { opacity: 1, transform: to }]
+          : [{ opacity: 1, transform: to }, { opacity: 0, transform: from }];
+        const animation = widget.animate(keyframes, {
+          duration: opening ? 360 : 240,
+          easing: opening ? 'cubic-bezier(.2,.9,.2,1)' : 'cubic-bezier(.4,0,1,1)',
+          fill: 'forwards'
+        });
+        animation.onfinish = done;
+      }
+
+      function openWidget() {
+        if (isOpen) return;
+        isOpen = true;
+        ensureIframeLoaded();
+        if (!panelGeometryInitialized) {
+          panelSize = getDefaultPanelSize();
+          panelPosition = getCenteredPanelPosition(panelSize);
+          panelGeometryInitialized = true;
+        } else {
+          panelSize = constrainSize(panelSize);
+          panelPosition = constrainPanelPosition(panelPosition, panelSize);
+        }
+        applyPanelGeometry();
+        widget.classList.add('is-open');
+        widget.setAttribute('aria-hidden', 'false');
+        widget.inert = false;
+        launcher.classList.add('is-hidden');
+        launcher.setAttribute('aria-hidden', 'true');
+        launcher.inert = true;
+        animateWidget(true, () => {
+          widget.style.opacity = '1';
+          widget.style.transform = 'none';
+          retractButton.focus({ preventScroll: true });
+        });
+      }
+
+      function retractWidget() {
+        if (!isOpen) return;
+        isOpen = false;
+        animateWidget(false, () => {
+          widget.classList.remove('is-open');
+          widget.setAttribute('aria-hidden', 'true');
+          widget.inert = true;
+          widget.style.opacity = '';
+          widget.style.transform = '';
+          launcher.classList.remove('is-hidden');
+          launcher.removeAttribute('aria-hidden');
+          launcher.inert = false;
+          launcher.focus({ preventScroll: true });
+        });
+      }
+
+      function resetPanelSize() {
+        panelSize = getDefaultPanelSize();
+        panelPosition = getCenteredPanelPosition(panelSize);
+        applyPanelGeometry();
+      }
+
+      function goHome() {
+        const newTab = window.open(homeUrl, '_blank');
+        if (newTab) {
+          newTab.opener = null;
+        }
+      }
+
+      function refreshIframe() {
+        try {
+          iframe.contentWindow?.location.reload();
+        } catch {
+          const currentSrc = iframe.getAttribute('src') || getIframeTarget();
+          iframe.setAttribute('src', currentSrc);
+        }
+      }
+
+      function setWidgetInteraction(active, cursor = '') {
+        document.body.classList.toggle('is-widget-interacting', active);
+        document.body.style.cursor = active ? cursor : '';
+      }
+
+      function stopWidgetInteractionIfIdle() {
+        if (!draggingLauncher && !draggingPanel && !resizingPanel) {
+          setWidgetInteraction(false);
+        }
+      }
+
+      function updateLauncherDrag(event) {
+        if (!draggingLauncher || draggingLauncher.pointerId !== event.pointerId) return;
+        const dx = event.clientX - draggingLauncher.startX;
+        const dy = event.clientY - draggingLauncher.startY;
+        if (Math.abs(dx) + Math.abs(dy) > 4) draggingLauncher.moved = true;
+        launcherPosition = constrainLauncherPosition({
+          x: draggingLauncher.originX + dx,
+          y: draggingLauncher.originY + dy
+        });
+        applyLauncherPosition();
+      }
+
+      function finishLauncherDrag(event) {
+        if (!draggingLauncher || draggingLauncher.pointerId !== event.pointerId) return;
+        try {
+          launcher.releasePointerCapture(event.pointerId);
+        } catch {}
+        const shouldOpen = !draggingLauncher.moved;
+        draggingLauncher = null;
+        saveLauncherPosition();
+        stopWidgetInteractionIfIdle();
+        if (shouldOpen) openWidget();
+      }
+
+      function updatePanelDrag(event) {
+        if (!draggingPanel || draggingPanel.pointerId !== event.pointerId) return;
+        panelPosition = constrainPanelPosition({
+          x: draggingPanel.originX + event.clientX - draggingPanel.startX,
+          y: draggingPanel.originY + event.clientY - draggingPanel.startY
+        });
+        applyPanelGeometry();
+      }
+
+      function finishPanelDrag(event) {
+        if (!draggingPanel || draggingPanel.pointerId !== event.pointerId) return;
+        try {
+          widgetHeader.releasePointerCapture(event.pointerId);
+        } catch {}
+        draggingPanel = null;
+        stopWidgetInteractionIfIdle();
+      }
+
+      function updatePanelResize(event) {
+        if (!resizingPanel || resizingPanel.pointerId !== event.pointerId) return;
+        const dx = event.clientX - resizingPanel.startX;
+        const dy = event.clientY - resizingPanel.startY;
+        const handle = resizingPanel.handle || '';
+        const fromLeft = handle.includes('left');
+        const fromRight = handle.includes('right');
+        const fromTop = handle.includes('top');
+        const fromBottom = handle.includes('bottom');
+        const rightEdge = resizingPanel.startPanelX + resizingPanel.startWidth;
+        const bottomEdge = resizingPanel.startPanelY + resizingPanel.startHeight;
+        let nextX = fromLeft ? resizingPanel.startPanelX + dx : resizingPanel.startPanelX;
+        let nextY = fromTop ? resizingPanel.startPanelY + dy : resizingPanel.startPanelY;
+        let nextWidth = resizingPanel.startWidth;
+        let nextHeight = resizingPanel.startHeight;
+
+        if (fromLeft) {
+          nextWidth = rightEdge - nextX;
+        } else if (fromRight) {
+          nextWidth = resizingPanel.startWidth + dx;
+        }
+
+        if (fromTop) {
+          nextHeight = bottomEdge - nextY;
+        } else if (fromBottom) {
+          nextHeight = resizingPanel.startHeight + dy;
+        }
+
+        nextWidth = clamp(nextWidth, Math.min(minPanelWidth, window.innerWidth), window.innerWidth);
+        nextHeight = clamp(nextHeight, Math.min(minPanelHeight, window.innerHeight), window.innerHeight);
+
+        if (fromLeft) nextX = rightEdge - nextWidth;
+        if (fromTop) nextY = bottomEdge - nextHeight;
+
+        panelSize = { width: nextWidth, height: nextHeight };
+        panelPosition = constrainPanelPosition({ x: nextX, y: nextY }, panelSize);
+        applyPanelGeometry();
+      }
+
+      function finishPanelResize(event) {
+        if (!resizingPanel || resizingPanel.pointerId !== event.pointerId) return;
+        const activeHandle = resizeHandles.find(
+          (resizeHandle) => resizeHandle.dataset.resizeHandle === resizingPanel.handle
+        );
+        try {
+          activeHandle?.releasePointerCapture(event.pointerId);
+        } catch {}
+        resizingPanel = null;
+        stopWidgetInteractionIfIdle();
+      }
+
+      function handleGlobalPointerMove(event) {
+        updateLauncherDrag(event);
+        updatePanelDrag(event);
+        updatePanelResize(event);
+      }
+
+      function handleGlobalPointerEnd(event) {
+        finishLauncherDrag(event);
+        finishPanelDrag(event);
+        finishPanelResize(event);
+        stopWidgetInteractionIfIdle();
+      }
+
+      launcher.addEventListener('pointerdown', (event) => {
+        if (isOpen || event.button !== 0) return;
+        event.preventDefault();
+        launcher.setPointerCapture(event.pointerId);
+        setWidgetInteraction(true, 'grabbing');
+        draggingLauncher = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          originX: launcherPosition.x,
+          originY: launcherPosition.y,
+          moved: false
+        };
+      });
+
+      launcher.addEventListener('pointerup', (event) => {
+        finishLauncherDrag(event);
+      });
+
+      launcher.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          openWidget();
+        }
+      });
+
+      launcher.addEventListener('dragstart', (event) => {
+        event.preventDefault();
+      });
+
+      widgetHeader.addEventListener('pointerdown', (event) => {
+        if (
+          event.button !== 0 ||
+          (event.target instanceof Element && event.target.closest('button'))
+        ) {
+          return;
+        }
+        widgetHeader.setPointerCapture(event.pointerId);
+        setWidgetInteraction(true, 'grabbing');
+        draggingPanel = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          originX: panelPosition.x,
+          originY: panelPosition.y
+        };
+      });
+
+      widgetHeader.addEventListener('pointerup', (event) => {
+        finishPanelDrag(event);
+      });
+
+      resizeHandles.forEach((resizeHandle) => {
+        resizeHandle.addEventListener('pointerdown', (event) => {
+          if (event.button !== 0) return;
+          event.preventDefault();
+          resizeHandle.setPointerCapture(event.pointerId);
+          setWidgetInteraction(true, getComputedStyle(resizeHandle).cursor || 'default');
+          resizingPanel = {
+            pointerId: event.pointerId,
+            handle: resizeHandle.dataset.resizeHandle,
+            startX: event.clientX,
+            startY: event.clientY,
+            startPanelX: panelPosition.x,
+            startPanelY: panelPosition.y,
+            startWidth: panelSize.width,
+            startHeight: panelSize.height
+          };
+        });
+
+        resizeHandle.addEventListener('pointerup', (event) => {
+          finishPanelResize(event);
+        });
+      });
+
+      homeButton.addEventListener('click', goHome);
+      refreshButton.addEventListener('click', refreshIframe);
+      retractButton.addEventListener('click', retractWidget);
+
+      window.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && isOpen) retractWidget();
+      });
+
+      window.addEventListener('pointermove', handleGlobalPointerMove);
+      window.addEventListener('pointerup', handleGlobalPointerEnd);
+      window.addEventListener('pointercancel', handleGlobalPointerEnd);
+
+      window.addEventListener('resize', () => {
+        launcherPosition = constrainLauncherPosition(launcherPosition);
+        applyLauncherPosition();
+        if (isOpen) {
+          panelSize = constrainSize(panelSize);
+          panelPosition = constrainPanelPosition(panelPosition, panelSize);
+          applyPanelGeometry();
+        }
+      });
+
+      applyLauncherPosition();
+    })();
+  </script>
+</body>
+</html>

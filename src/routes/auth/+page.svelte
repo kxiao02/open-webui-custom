@@ -36,13 +36,17 @@
 	let modeInitialized = false;
 	let onboardingInitialized = false;
 	let autoSignInAttempted = false;
+	let defaultSsoRedirectAttempted = false;
+	let oauthCallbackInProgress = false;
 	let configReady = false;
 	let loginFormEnabled = false;
+	let manualAuthOverride = false;
 	let portalSsoConfigured = false;
 	let providersEnabled = false;
 	let portalSsoEnabled = false;
 	let externalSignInEnabled = false;
 	let authRedirectInProgress = false;
+	let authRedirectProviderName = '';
 	let trustedHeaderAuth = false;
 
 	let form = null;
@@ -141,17 +145,22 @@
 			return;
 		}
 
-		const sessionUser = await getSessionUser(token).catch((error) => {
-			toast.error(`${error}`);
-			return null;
-		});
+		oauthCallbackInProgress = true;
+		try {
+			const sessionUser = await getSessionUser(token).catch((error) => {
+				toast.error(`${error}`);
+				return null;
+			});
 
-		if (!sessionUser) {
-			return;
+			if (!sessionUser) {
+				return;
+			}
+
+			localStorage.token = token;
+			await setSessionUser(sessionUser, localStorage.getItem('redirectPath') || null);
+		} finally {
+			oauthCallbackInProgress = false;
 		}
-
-		localStorage.token = token;
-		await setSessionUser(sessionUser, localStorage.getItem('redirectPath') || null);
 	};
 
 	let onboarding = false;
@@ -241,6 +250,61 @@
 		localStorage.removeItem('redirectPath');
 	};
 
+	const hasManualAuthOverride = () => {
+		return manualAuthOverride;
+	};
+
+	const buildPortalSsoLoginUrl = () => {
+		const query = new URLSearchParams();
+		const redirectPath =
+			normalizeRedirectPath($page.url.searchParams.get('redirect')) ||
+			normalizeRedirectPath(localStorage.getItem('redirectPath'));
+
+		if (redirectPath && redirectPath !== '/') {
+			query.set('redirect', redirectPath);
+		}
+
+		const search = query.toString();
+		return `${WEBUI_BASE_URL}/sso/portal/login${search ? `?${search}` : ''}`;
+	};
+
+	const resolveDefaultSsoTarget = () => {
+		if (
+			!configReady ||
+			hasManualAuthOverride() ||
+			onboarding ||
+			authRedirectInProgress ||
+			oauthCallbackInProgress ||
+			$page.url.searchParams.get('error') ||
+			extractPortalTicketContext()
+		) {
+			return null;
+		}
+
+		if (portalSsoEnabled) {
+			return {
+				url: buildPortalSsoLoginUrl(),
+				providerName: $config?.portal_sso?.provider_name ?? 'AI 门户'
+			};
+		}
+
+		const oauthProviders = $config?.oauth?.providers ?? {};
+		if (oauthProviders.enterprise) {
+			return {
+				url: `${WEBUI_BASE_URL}/oauth/enterprise/login`,
+				providerName: oauthProviders.enterprise
+			};
+		}
+		if (oauthProviders.oidc) {
+			return {
+				url: `${WEBUI_BASE_URL}/oauth/oidc/login`,
+				providerName: oauthProviders.oidc
+			};
+		}
+
+		return null;
+	};
+
 	const maybePortalSsoCallback = async () => {
 		if (authRedirectInProgress || !portalSsoConfigured) {
 			return;
@@ -260,18 +324,44 @@
 		}
 
 		authRedirectInProgress = true;
+		authRedirectProviderName = $config?.portal_sso?.provider_name ?? 'AI 门户';
 		persistRedirectPath(ticketContext.redirectPath);
 		window.location.replace(`${WEBUI_BASE_URL}/sso/portal/callback?${query.toString()}`);
 	};
 
 	const maybeAutoSignIn = async () => {
-		if (autoSignInAttempted || !configReady || authRedirectInProgress) {
+		if (autoSignInAttempted || !configReady || authRedirectInProgress || oauthCallbackInProgress) {
 			return;
 		}
 		if (trustedHeaderAuth) {
 			autoSignInAttempted = true;
 			await signInHandler();
 		}
+	};
+
+	const maybeDefaultSsoRedirect = () => {
+		if (
+			defaultSsoRedirectAttempted ||
+			!configReady ||
+			authRedirectInProgress ||
+			oauthCallbackInProgress
+		) {
+			return;
+		}
+		if ($user !== undefined) {
+			return;
+		}
+
+		const defaultSsoTarget = resolveDefaultSsoTarget();
+		if (!defaultSsoTarget) {
+			return;
+		}
+
+		defaultSsoRedirectAttempted = true;
+		authRedirectInProgress = true;
+		authRedirectProviderName = defaultSsoTarget.providerName;
+		persistRedirectPath(resolveRequestedRedirectPath());
+		window.location.replace(defaultSsoTarget.url);
 	};
 
 	async function setLogoImage() {
@@ -314,9 +404,15 @@
 	});
 
 	$: form = $page.url.searchParams.get('form');
+	$: manualAuthOverride =
+		Boolean($page.url.searchParams.get('form')) || $page.url.searchParams.get('manual') === '1';
 	$: configReady = $configStatus === 'ready' && !!$config;
 	$: loginFormEnabled =
-		configReady && ($config?.features.enable_login_form || $config?.features.enable_ldap || form);
+		configReady &&
+		($config?.features.enable_login_form ||
+			$config?.features.enable_ldap ||
+			form ||
+			manualAuthOverride);
 	$: portalSsoConfigured = configReady && ($config?.portal_sso?.enabled ?? false);
 	$: providersEnabled = configReady && Object.keys($config?.oauth?.providers ?? {}).length > 0;
 	$: portalSsoEnabled =
@@ -344,6 +440,7 @@
 	$: if (configReady) {
 		maybePortalSsoCallback();
 		maybeAutoSignIn();
+		maybeDefaultSsoRedirect();
 	}
 </script>
 
@@ -392,7 +489,7 @@
 							<div>
 								{$i18n.t('Signing in to {{WEBUI_NAME}}', {
 									WEBUI_NAME: authRedirectInProgress
-										? ($config?.portal_sso?.provider_name ?? $WEBUI_NAME)
+										? (authRedirectProviderName || $WEBUI_NAME)
 										: $WEBUI_NAME
 								})}
 							</div>
@@ -602,16 +699,7 @@
 										<button
 											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
 											on:click={() => {
-												const query = new URLSearchParams();
-												const redirectPath =
-													$page.url.searchParams.get('redirect') ||
-													localStorage.getItem('redirectPath') ||
-													'';
-												if (redirectPath) {
-													query.set('redirect', redirectPath);
-												}
-												const search = query.toString();
-												window.location.href = `${WEBUI_BASE_URL}/sso/portal/login${search ? `?${search}` : ''}`;
+												window.location.href = buildPortalSsoLoginUrl();
 											}}
 										>
 											<span
