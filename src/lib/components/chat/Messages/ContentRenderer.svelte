@@ -27,6 +27,7 @@
 
 	export let done = true;
 	export let model = null;
+	/** @type {any} */
 	export let sources = null;
 
 	export let save = false;
@@ -44,16 +45,79 @@
 	let contentContainerElement;
 	let floatingButtonsElement;
 
+	/** @type {string[]} */
 	let sourceIds = [];
 	$: getSourceIds(sources);
 
+	/** @param {any} value */
+	const toArray = (value) => {
+		if (Array.isArray(value)) return value;
+		if (value === undefined || value === null) return [];
+		return [value];
+	};
+
+	/**
+	 * @param {any} source
+	 * @param {any} metadata
+	 * @returns {string}
+	 */
+	const sourceIdentity = (source, metadata = {}) => {
+		const sourceMeta = source?.source && typeof source.source === 'object' ? source.source : {};
+		return String(
+			metadata?.source ??
+				metadata?.url ??
+				sourceMeta?.id ??
+				sourceMeta?.url ??
+				sourceMeta?.name ??
+				source?.id ??
+				source?.url ??
+				source?.name ??
+				'N/A'
+		);
+	};
+
+	/**
+	 * @param {any} value
+	 * @returns {any[]}
+	 */
+	const normalizeSourceList = (value) => {
+		return toArray(value).flatMap((rawSource) => {
+			if (!rawSource || typeof rawSource !== 'object') {
+				return [];
+			}
+
+			const nestedSources = ['sources', 'citations', 'references'].flatMap((key) =>
+				normalizeSourceList(rawSource?.[key])
+			);
+			if (nestedSources.length > 0) {
+				return nestedSources;
+			}
+
+			const source =
+				rawSource?.data && typeof rawSource.data === 'object' ? rawSource.data : rawSource;
+			return source?.type === 'code_execution' ? [] : [source];
+		});
+	};
+
+	/** @param {any} sources */
 	const getSourceIds = (sources) => {
 		const indexBySourceId = new Map();
+		/** @type {string[]} */
 		const result = [];
-		for (const source of sources ?? []) {
-			for (let index = 0; index < (source.document ?? []).length; index++) {
-				const metadata = source.metadata?.[index];
-				const sourceId = String(metadata?.source ?? source?.source?.id ?? 'N/A');
+		for (const source of normalizeSourceList(sources)) {
+			const documents = toArray(source.document ?? source.documents);
+			const metadataItems = toArray(source.metadata ?? source.metadatas).filter(
+				(metadata) => metadata && typeof metadata === 'object'
+			);
+			const sourceCount = Math.max(
+				documents.length,
+				metadataItems.length,
+				sourceIdentity(source) !== 'N/A' ? 1 : 0
+			);
+
+			for (let index = 0; index < sourceCount; index++) {
+				const metadata = metadataItems[index];
+				const sourceId = sourceIdentity(source, metadata);
 				if (indexBySourceId.has(sourceId)) {
 					continue;
 				}

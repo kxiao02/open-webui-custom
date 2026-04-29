@@ -58,6 +58,31 @@ log = logging.getLogger(__name__)
 
 REDIS = None
 
+
+def _iter_source_event_items(value):
+    if isinstance(value, list):
+        items = []
+        for item in value:
+            items.extend(_iter_source_event_items(item))
+        return items
+
+    if not isinstance(value, dict):
+        return []
+
+    nested_items = []
+    for key in ("sources", "citations", "references"):
+        nested_items.extend(_iter_source_event_items(value.get(key)))
+    if nested_items:
+        return nested_items
+
+    data = value.get("data")
+    if isinstance(data, (dict, list)):
+        data_items = _iter_source_event_items(data)
+        if data_items:
+            return data_items
+
+    return [value]
+
 # Configure CORS for Socket.IO
 SOCKETIO_CORS_ORIGINS = "*" if CORS_ALLOW_ORIGIN == ["*"] else CORS_ALLOW_ORIGIN
 
@@ -915,15 +940,22 @@ def get_event_emitter(request_info, update_db=True):
 
             elif event_type in ("source", "citation"):
                 data = event_data.get("data", {})
-                if data.get("type") is None:
+                source_items = [
+                    item
+                    for item in _iter_source_event_items(data)
+                    if isinstance(item, dict) and item.get("type") != "code_execution"
+                ]
+                if source_items:
                     message = await asyncio.to_thread(
                         Chats.get_message_by_id_and_message_id,
                         request_info["chat_id"],
                         request_info["message_id"],
                     )
 
-                    sources = message.get("sources", [])
-                    sources.append(data)
+                    sources = message.get("sources", []) if isinstance(message, dict) else []
+                    if not isinstance(sources, list):
+                        sources = []
+                    sources.extend(source_items)
 
                     await asyncio.to_thread(
                         Chats.upsert_message_to_chat_by_id_and_message_id,

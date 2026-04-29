@@ -11,21 +11,21 @@
 	export let id = '';
 	export let chatId = '';
 
-	export let sources = [];
+	export let sources: any = [];
 	export let readOnly = false;
 
-	let citations = [];
+	let citations: any[] = [];
 	let showPercentage = false;
 	let showRelevance = true;
 
-	let citationModal = null;
+	let citationModal: any = null;
 
 	let showCitations = false;
 	let showCitationModal = false;
 
 	let selectedCitation: any = null;
 
-	export const showSourceModal = (sourceId) => {
+	export const showSourceModal = (sourceId: string | number) => {
 		let index;
 		let suffix = null;
 		let sourceIdentifier = null;
@@ -58,8 +58,6 @@
 		}
 
 		if (citations[index]) {
-			console.log('Showing citation modal for:', citations[index]);
-
 			if (citations[index]?.source?.embed_url) {
 				const embedUrl = citations[index].source.embed_url;
 				if (embedUrl) {
@@ -115,18 +113,120 @@
 		return distances.every((d) => d !== undefined && d >= -1 && d <= 1);
 	}
 
+	const toArray = (value: any) => {
+		if (Array.isArray(value)) {
+			return value;
+		}
+		if (value === undefined || value === null) {
+			return [];
+		}
+		return [value];
+	};
+
+	const compactString = (value: any) => (typeof value === 'string' ? value.trim() : '');
+
+	const getSourceIdentity = (source: any, metadata: any = {}) => {
+		const sourceMeta = source?.source && typeof source.source === 'object' ? source.source : {};
+		return (
+			compactString(metadata?.source) ||
+			compactString(metadata?.url) ||
+			compactString(sourceMeta?.id) ||
+			compactString(sourceMeta?.url) ||
+			compactString(sourceMeta?.name) ||
+			compactString(source?.id) ||
+			compactString(source?.url) ||
+			compactString(source?.name)
+		);
+	};
+
+	const normalizeSourceEntry = (rawSource: any): any | null => {
+		if (!rawSource || typeof rawSource !== 'object') {
+			return null;
+		}
+
+		const source = rawSource?.data && typeof rawSource.data === 'object' ? rawSource.data : rawSource;
+		if (source?.type === 'code_execution') {
+			return null;
+		}
+		const rawSourceMeta = source?.source && typeof source.source === 'object' ? source.source : {};
+		const sourceMeta = {
+			...rawSourceMeta,
+			...(source?.id && !rawSourceMeta.id ? { id: source.id } : {}),
+			...(source?.name && !rawSourceMeta.name ? { name: source.name } : {}),
+			...(source?.title && !rawSourceMeta.title ? { title: source.title } : {}),
+			...(source?.url && !rawSourceMeta.url ? { url: source.url } : {}),
+			...(source?.type && !rawSourceMeta.type ? { type: source.type } : {})
+		};
+
+		let documents = toArray(source?.document ?? source?.documents).filter(
+			(document) => document !== undefined && document !== null
+		);
+		let metadata = toArray(source?.metadata ?? source?.metadatas).filter(
+			(item) => item && typeof item === 'object'
+		);
+		const distances = toArray(source?.distances ?? source?.distance).filter(
+			(distance) => distance !== undefined && distance !== null
+		);
+
+		const identity = getSourceIdentity({ ...source, source: sourceMeta }, metadata[0]);
+		if (documents.length === 0 && identity) {
+			documents = [compactString(source?.content) || compactString(source?.text) || ''];
+		}
+		if (metadata.length === 0 && identity) {
+			metadata = [
+				{
+					source: sourceMeta?.url ?? sourceMeta?.id ?? identity,
+					name: sourceMeta?.title ?? sourceMeta?.name ?? identity,
+					...(sourceMeta?.url ? { url: sourceMeta.url } : {})
+				}
+			];
+		}
+
+		if (documents.length === 0 && metadata.length === 0 && !identity) {
+			return null;
+		}
+
+		return {
+			...source,
+			source: sourceMeta,
+			document: documents,
+			metadata,
+			...(distances.length > 0 ? { distances } : {})
+		};
+	};
+
+	const normalizeSources = (value: any): any[] => {
+		return toArray(value)
+			.flatMap((rawSource: any): any[] => {
+				if (!rawSource || typeof rawSource !== 'object') {
+					return [];
+				}
+
+				const nestedSources: any[] = ['sources', 'citations', 'references'].flatMap((key) =>
+					normalizeSources(rawSource?.[key])
+				);
+				if (nestedSources.length > 0) {
+					return nestedSources;
+				}
+
+				const normalizedSource = normalizeSourceEntry(rawSource);
+				return normalizedSource ? [normalizedSource] : [];
+			})
+			.filter(Boolean);
+	};
+
 	$: {
-		citations = sources.reduce((acc, source) => {
+		citations = normalizeSources(sources).reduce((acc: any[], source: any) => {
 			if (Object.keys(source).length === 0) {
 				return acc;
 			}
 
-			source?.document?.forEach((document, index) => {
+			source.document.forEach((document: any, index: number) => {
 				const metadata = source?.metadata?.[index];
 				const distance = source?.distances?.[index];
 
 				// Within the same citation there could be multiple documents
-				const id = metadata?.source ?? source?.source?.id ?? 'N/A';
+				const id = getSourceIdentity(source, metadata) || 'N/A';
 				let _source = source?.source;
 
 				if (metadata?.name) {
@@ -137,7 +237,7 @@
 					_source = { ..._source, title: _source?.name ?? metadata?.name ?? id, name: id, url: id };
 				}
 
-				const existingSource = acc.find((item) => item.id === id);
+				const existingSource = acc.find((item: any) => item.id === id);
 
 				if (existingSource) {
 					existingSource.document.push(document);
@@ -156,7 +256,6 @@
 
 			return acc;
 		}, []);
-		console.log('citations', citations);
 
 		showRelevance = calculateShowRelevance(citations);
 		showPercentage = shouldShowPercentage(citations);
@@ -180,13 +279,13 @@
 		}
 	};
 
-	const getCitationKind = (citation) => {
+	const getCitationKind = (citation: any) => {
 		const sourceUrl = citation?.source?.url ?? '';
 		const sourceName = citation?.source?.name ?? '';
 		return isHttpUrl(sourceUrl) || isHttpUrl(sourceName) ? 'web' : 'knowledge';
 	};
 
-	const getCitationTitle = (citation) => {
+	const getCitationTitle = (citation: any) => {
 		const sourceTitle = citation?.source?.title ?? citation?.metadata?.[0]?.name ?? '';
 		if (sourceTitle && !isHttpUrl(sourceTitle)) {
 			return decodeString(sourceTitle);
@@ -196,7 +295,7 @@
 		return isHttpUrl(fallback) ? getDomain(fallback) : decodeString(fallback);
 	};
 
-	const getCitationSubtitle = (citation) => {
+	const getCitationSubtitle = (citation: any) => {
 		if (getCitationKind(citation) === 'web') {
 			return decodeString(citation?.source?.url ?? citation?.source?.name ?? '');
 		}

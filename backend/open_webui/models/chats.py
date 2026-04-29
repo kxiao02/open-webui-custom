@@ -1425,6 +1425,114 @@ class ChatTable:
 
         return merged_files
 
+    def _iter_source_items(self, value: object) -> list[dict]:
+        if isinstance(value, list):
+            items: list[dict] = []
+            for item in value:
+                items.extend(self._iter_source_items(item))
+            return items
+
+        if not isinstance(value, dict):
+            return []
+
+        nested_items: list[dict] = []
+        for key in ("sources", "citations", "references"):
+            nested_items.extend(self._iter_source_items(value.get(key)))
+        if nested_items:
+            return nested_items
+
+        data = value.get("data")
+        if isinstance(data, (dict, list)):
+            data_items = self._iter_source_items(data)
+            if data_items:
+                return data_items
+
+        return [value]
+
+    def _source_signature(self, source: object) -> str:
+        if not isinstance(source, dict):
+            return ""
+
+        if isinstance(source.get("data"), dict):
+            source = source["data"]
+
+        try:
+            return json.dumps(source, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            source_meta = source.get("source") if isinstance(source.get("source"), dict) else {}
+            metadata = (
+                source.get("metadata")
+                if isinstance(source.get("metadata"), list)
+                else source.get("metadatas")
+                if isinstance(source.get("metadatas"), list)
+                else []
+            )
+            document = (
+                source.get("document")
+                if isinstance(source.get("document"), list)
+                else source.get("documents")
+                if isinstance(source.get("documents"), list)
+                else []
+            )
+            return json.dumps(
+                {
+                    "id": source.get("id"),
+                    "source_id": source_meta.get("id"),
+                    "source_name": source_meta.get("name"),
+                    "source_url": source_meta.get("url"),
+                    "metadata": metadata,
+                    "document": document,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+
+    def _merge_message_sources(
+        self, existing_sources: object, incoming_sources: object
+    ) -> list:
+        merged: list[dict] = []
+        seen: set[str] = set()
+
+        for group in (existing_sources, incoming_sources):
+            for source in self._iter_source_items(group):
+                if not isinstance(source, dict):
+                    continue
+                if source.get("type") == "code_execution":
+                    continue
+                signature = self._source_signature(source)
+                if not signature or signature in seen:
+                    continue
+                seen.add(signature)
+                merged.append(source)
+
+        return merged
+
+    def _merge_runtime_message_references(
+        self, existing_message: object, incoming_message: object
+    ) -> object:
+        if not isinstance(existing_message, dict) or not isinstance(incoming_message, dict):
+            return incoming_message
+
+        merged = incoming_message
+        for key in ("sources", "citations"):
+            existing_sources = existing_message.get(key)
+            incoming_sources = incoming_message.get(key)
+            if not isinstance(existing_sources, (list, dict)) and not isinstance(
+                incoming_sources, (list, dict)
+            ):
+                continue
+
+            merged_sources = self._merge_message_sources(existing_sources, incoming_sources)
+            if not merged_sources:
+                continue
+
+            if merged is incoming_message:
+                merged = dict(incoming_message)
+            merged[key] = merged_sources
+
+        return merged
+
     def _message_output_item_key(self, item: object) -> str:
         if not isinstance(item, dict):
             return ""
@@ -1596,6 +1704,16 @@ class ChatTable:
                 role,
             )
 
+        for key in ("sources", "citations"):
+            if isinstance(existing_message.get(key), (list, dict)) or isinstance(
+                incoming_message.get(key), (list, dict)
+            ):
+                merged_sources = self._merge_message_sources(
+                    existing_message.get(key), incoming_message.get(key)
+                )
+                if merged_sources:
+                    merged_message[key] = merged_sources
+
         if isinstance(existing_message.get("output"), list) or isinstance(
             incoming_message.get("output"), list
         ):
@@ -1716,12 +1834,128 @@ class ChatTable:
             },
         }, True
 
+    def _hydrate_chat_message_sources(
+        self, chat_payload: dict, chat_id: str, db: Optional[Session] = None
+    ) -> tuple[dict, bool]:
+        if not isinstance(chat_payload, dict):
+            return chat_payload, False
+
+        history = chat_payload.get("history")
+        if not isinstance(history, dict):
+            return chat_payload, False
+
+        messages = history.get("messages")
+        if not isinstance(messages, dict) or not messages:
+            return chat_payload, False
+
+        message_sources: dict[str, list[dict]] = {}
+
+        with get_db_context(db) as db:
+            try:
+                chat_messages = ChatMessages.get_messages_by_chat_id(chat_id, db=db)
+                for chat_message in chat_messages:
+                    message_id = self._extract_chat_message_id(chat_id, chat_message.id)
+                    if not message_id or not isinstance(chat_message.sources, list):
+                        continue
+                    if not chat_message.sources:
+                        continue
+                    message_sources.setdefault(message_id, []).extend(chat_message.sources)
+            except Exception as e:
+                log.warning(
+                    "Failed to load chat_message sources for chat %s: %s", chat_id, e
+                )
+
+        if not message_sources:
+            return chat_payload, False
+
+        hydrated_messages: Optional[dict] = None
+        changed = False
+
+        for message_id, supplemental_sources in message_sources.items():
+            message = messages.get(message_id)
+            if not isinstance(message, dict) or not supplemental_sources:
+                continue
+
+            merged_sources = self._merge_message_sources(
+                message.get("sources"), supplemental_sources
+            )
+            if merged_sources == message.get("sources"):
+                continue
+
+            if hydrated_messages is None:
+                hydrated_messages = dict(messages)
+
+            hydrated_messages[message_id] = {**message, "sources": merged_sources}
+            changed = True
+
+        if not changed or hydrated_messages is None:
+            return chat_payload, False
+
+        return {
+            **chat_payload,
+            "history": {
+                **history,
+                "messages": hydrated_messages,
+            },
+        }, True
+
+    def _preserve_runtime_message_references(
+        self, existing_chat_payload: object, incoming_chat_payload: object
+    ) -> object:
+        if not isinstance(existing_chat_payload, dict) or not isinstance(
+            incoming_chat_payload, dict
+        ):
+            return incoming_chat_payload
+
+        existing_history = existing_chat_payload.get("history")
+        incoming_history = incoming_chat_payload.get("history")
+        if not isinstance(existing_history, dict) or not isinstance(incoming_history, dict):
+            return incoming_chat_payload
+
+        existing_messages = existing_history.get("messages")
+        incoming_messages = incoming_history.get("messages")
+        if not isinstance(existing_messages, dict) or not isinstance(incoming_messages, dict):
+            return incoming_chat_payload
+
+        merged_messages = incoming_messages
+        changed = False
+
+        for message_id, incoming_message in incoming_messages.items():
+            existing_message = existing_messages.get(message_id)
+            merged_message = self._merge_runtime_message_references(
+                existing_message, incoming_message
+            )
+            if merged_message is incoming_message:
+                continue
+            if merged_messages is incoming_messages:
+                merged_messages = dict(incoming_messages)
+            merged_messages[message_id] = merged_message
+            changed = True
+
+        if not changed:
+            return incoming_chat_payload
+
+        return {
+            **incoming_chat_payload,
+            "history": {
+                **incoming_history,
+                "messages": merged_messages,
+            },
+        }
+
     def _prepare_chat_row_for_read(
         self, chat_item: Chat, db: Session
     ) -> Chat:
         changed = self._sanitize_chat_row(chat_item)
 
         hydrated_chat, hydrated_changed = self._hydrate_chat_message_files(
+            chat_item.chat, chat_item.id, db=db
+        )
+        if hydrated_changed:
+            chat_item.chat = hydrated_chat
+            changed = True
+
+        hydrated_chat, hydrated_changed = self._hydrate_chat_message_sources(
             chat_item.chat, chat_item.id, db=db
         )
         if hydrated_changed:
@@ -2017,6 +2251,12 @@ class ChatTable:
         try:
             with get_db_context(db) as db:
                 chat_item = db.get(Chat, id)
+                existing_chat_payload, _ = self._hydrate_chat_message_sources(
+                    chat_item.chat, id, db=db
+                )
+                chat = self._preserve_runtime_message_references(
+                    existing_chat_payload, chat
+                )
                 chat_item.chat = self._clean_null_bytes(
                     self._normalize_chat_payload_for_storage(chat, id)
                 )

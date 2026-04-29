@@ -134,7 +134,8 @@
 		status?: MessageStatus;
 		done: boolean;
 		error?: boolean | { content: string };
-		sources?: string[];
+		sources?: unknown[] | Record<string, unknown> | null;
+		citations?: unknown[] | Record<string, unknown> | null;
 		code_executions?: {
 			uuid: string;
 			name: string;
@@ -310,15 +311,16 @@
 		if (!source) return '';
 		const info = source.info ?? {};
 		const status = source.status ?? {};
-		const annotation = source.annotation ?? {};
+		const annotation = (source.annotation ?? {}) as any;
 		const outputSignature = buildOutputSignature((source as any).output);
 		const filesSignature = buildMessageFileSignature((source as any).files);
 		const followUpsLength = Array.isArray((source as any).followUps)
 			? (source as any).followUps.length
 			: 0;
-		const sourcesLength = Array.isArray((source as any).sources)
-			? (source as any).sources.length
-			: 0;
+		const referencesSignature = buildStructuredSignature({
+			sources: (source as any).sources,
+			citations: (source as any).citations
+		});
 		const statusHistorySignature = buildStructuredSignature((source as any).statusHistory);
 		const codeExecutionsLength = Array.isArray((source as any).code_executions)
 			? (source as any).code_executions.length
@@ -333,7 +335,7 @@
 			outputSignature,
 			filesSignature,
 			followUpsLength,
-			sourcesLength,
+			referencesSignature,
 			codeExecutionsLength,
 			embedsSignature,
 			`${annotation?.type ?? ''}:${annotation?.rating ?? ''}`,
@@ -359,6 +361,20 @@
 			}
 		}
 	}
+
+	const toReferenceList = (value: unknown): unknown[] => {
+		if (Array.isArray(value)) return value;
+		return value && typeof value === 'object' ? [value] : [];
+	};
+
+	const getMessageReferences = (source: MessageType | null | undefined): unknown[] => {
+		return [...toReferenceList(source?.sources), ...toReferenceList(source?.citations)].filter(
+			(item: any) => item && typeof item === 'object' && item?.type !== 'code_execution'
+		);
+	};
+
+	let messageReferences: unknown[] = [];
+	$: messageReferences = getMessageReferences(message);
 
 	const isVisibleMessageStatus = (
 		status: MessageStatus | null | undefined
@@ -417,7 +433,7 @@
 	export let editCodeBlock = true;
 	export let topPadding = false;
 
-	let citationsElement: HTMLDivElement;
+	let citationsElement: any;
 
 	let contentContainerElement: HTMLDivElement;
 	let buttonsContainerElement: HTMLDivElement;
@@ -3314,7 +3330,7 @@
 											{history}
 											{selectedModels}
 											content={finalContentBeforeGeneratedFiles}
-											sources={message.sources}
+											sources={messageReferences}
 											floatingButtons={false}
 											save={!readOnly}
 											preview={!readOnly}
@@ -3353,7 +3369,7 @@
 										{history}
 										{selectedModels}
 										content={finalMessageContent}
-										sources={message.sources}
+										sources={messageReferences}
 										floatingButtons={message?.done &&
 											!readOnly &&
 											($settings?.showFloatingActionButtons ?? true)}
@@ -3489,7 +3505,7 @@
 										{history}
 										{selectedModels}
 										content={finalContentAfterGeneratedFiles}
-										sources={message.sources}
+										sources={messageReferences}
 										floatingButtons={message?.done &&
 											!readOnly &&
 											($settings?.showFloatingActionButtons ?? true)}
@@ -3615,12 +3631,12 @@
 								</div>
 							{/if}
 
-							{#if (message?.sources || message?.citations) && (model?.info?.meta?.capabilities?.citations ?? true)}
+							{#if messageReferences.length > 0 && (model?.info?.meta?.capabilities?.citations ?? true)}
 								<Citations
 									bind:this={citationsElement}
 									id={message?.id}
 									{chatId}
-									sources={message?.sources ?? message?.citations}
+									sources={messageReferences}
 									{readOnly}
 								/>
 							{/if}
