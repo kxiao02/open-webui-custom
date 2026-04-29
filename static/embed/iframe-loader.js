@@ -28,6 +28,11 @@
   };
   const appBaseUrl = getAppBaseUrl();
 
+  const toFiniteNumber = (value, fallback) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  };
+
   const toWebUrl = (value, fallback) => {
     let fallbackUrl;
     try {
@@ -47,23 +52,31 @@
   };
 
   const iframeUrl = toWebUrl(config.iframeUrl || config.src, appBaseUrl);
+  const hasCustomLogoUrl = typeof config.logoUrl === 'string' && config.logoUrl.trim() !== '';
   let homeUrl = toWebUrl(config.homeUrl, appBaseUrl);
   const logoUrl = toWebUrl(config.logoUrl, new URL('static/logo.png', appBaseUrl).toString());
-  const zIndex = Number.isFinite(Number(config.zIndex)) ? Number(config.zIndex) : 2147483647;
-  const desktopBreakpoint = Number.isFinite(Number(config.desktopBreakpoint))
-    ? Number(config.desktopBreakpoint)
-    : 860;
-  const minPanelWidth = Number.isFinite(Number(config.minWidth)) ? Number(config.minWidth) : 360;
-  const minPanelHeight = Number.isFinite(Number(config.minHeight)) ? Number(config.minHeight) : 360;
-  const defaultWidthRatio = Number.isFinite(Number(config.widthRatio)) ? Number(config.widthRatio) : 0.4;
-  const mobileWidthRatio = Number.isFinite(Number(config.mobileWidthRatio))
-    ? Number(config.mobileWidthRatio)
-    : 0.92;
-  const defaultHeightRatio = Number.isFinite(Number(config.heightRatio))
-    ? Number(config.heightRatio)
-    : 1;
-  const fallbackLogoWidth = 68;
-  const fallbackLogoHeight = 68;
+  const zIndex = toFiniteNumber(config.zIndex, 2147483647);
+  const desktopBreakpoint = toFiniteNumber(config.desktopBreakpoint, 860);
+  const minPanelWidth = toFiniteNumber(config.minWidth, 360);
+  const minPanelHeight = toFiniteNumber(config.minHeight, 360);
+  const defaultWidthRatio = toFiniteNumber(config.widthRatio, 0.4);
+  const mobileWidthRatio = toFiniteNumber(config.mobileWidthRatio, 0.92);
+  const defaultHeightRatio = toFiniteNumber(config.heightRatio, 1);
+  const fallbackLogoWidth = Math.max(24, toFiniteNumber(config.launcherWidth || config.logoWidth, 68));
+  const fallbackLogoHeight = Math.max(24, toFiniteNumber(config.launcherHeight || config.logoHeight, 68));
+  const logoPath = (() => {
+    try {
+      return new URL(logoUrl, scriptUrl).pathname.toLowerCase();
+    } catch {
+      return '';
+    }
+  })();
+  const launcherImageMode = String(config.launcherImageMode || 'auto').toLowerCase();
+  const useRawLauncherImage =
+    config.launcherBare === true ||
+    launcherImageMode === 'raw' ||
+    launcherImageMode === 'bare' ||
+    (launcherImageMode === 'auto' && hasCustomLogoUrl && logoPath.endsWith('.gif'));
   const viewportPadding = 16;
 
   const readConfiguredHomeUrl = (payload) => {
@@ -118,8 +131,8 @@
         top: 0;
         z-index: 20;
         display: flex;
-        width: 68px;
-        height: 68px;
+        width: ${fallbackLogoWidth}px;
+        height: ${fallbackLogoHeight}px;
         align-items: center;
         justify-content: center;
         border: 0;
@@ -136,11 +149,23 @@
         will-change: transform;
       }
 
+      .cpecc-launcher.is-image-raw {
+        overflow: visible;
+        border-radius: 0;
+        background: transparent;
+        box-shadow: none;
+      }
+
       .cpecc-launcher:hover,
       .cpecc-launcher:focus-visible {
         box-shadow: 0 20px 54px rgba(31, 95, 232, 0.22);
         outline: none;
         transform: translate3d(var(--launcher-x, 0), var(--launcher-y, 0), 0) scale(1.02);
+      }
+
+      .cpecc-launcher.is-image-raw:hover,
+      .cpecc-launcher.is-image-raw:focus-visible {
+        box-shadow: none;
       }
 
       .cpecc-launcher:active {
@@ -154,8 +179,8 @@
 
       .cpecc-logo-disc {
         display: grid;
-        width: 52px;
-        height: 52px;
+        width: min(52px, 76%);
+        height: min(52px, 76%);
         flex: 0 0 auto;
         place-items: center;
         border-radius: 50%;
@@ -164,14 +189,26 @@
         pointer-events: none;
       }
 
+      .cpecc-launcher.is-image-raw .cpecc-logo-disc {
+        width: 100%;
+        height: 100%;
+        border-radius: 0;
+        background: transparent;
+      }
+
       .cpecc-logo-disc img {
         display: block;
-        width: 38px;
-        height: 38px;
+        width: min(38px, 56%);
+        height: min(38px, 56%);
         object-fit: contain;
         pointer-events: none;
         user-select: none;
         -webkit-user-drag: none;
+      }
+
+      .cpecc-launcher.is-image-raw .cpecc-logo-disc img {
+        width: 100%;
+        height: 100%;
       }
 
       .cpecc-panel {
@@ -362,7 +399,7 @@
     const root = document.createElement('div');
     root.className = 'cpecc-widget-root';
     root.innerHTML = `
-      <button class="cpecc-launcher" type="button" aria-label="Open 中电慧语 iframe widget">
+      <button class="cpecc-launcher${useRawLauncherImage ? ' is-image-raw' : ''}" type="button" aria-label="Open 中电慧语 iframe widget">
         <span class="cpecc-logo-disc"><img src="${logoUrl}" alt="" draggable="false"></span>
       </button>
       <section class="cpecc-panel" role="dialog" aria-label="中电慧语 iframe window" aria-hidden="true" inert>
