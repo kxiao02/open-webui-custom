@@ -13,6 +13,8 @@
       --brand: #1f5fe8;
       --radius: 24px;
       --control-bg: #ffffff;
+      --launcher-width: clamp(144px, 15vw, 256px);
+      --launcher-height: clamp(81px, 8.4375vw, 144px);
     }
 
     * { box-sizing: border-box; }
@@ -47,8 +49,8 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      width: 256px;
-      height: 144px;
+      width: var(--launcher-width);
+      height: var(--launcher-height);
       border: 0;
       border-radius: 0;
       background: transparent;
@@ -75,6 +77,107 @@
     .launcher.is-hidden {
       opacity: 0;
       pointer-events: none;
+    }
+
+    .launcher.has-bubble-pop {
+      animation: launcher-bubble-pop 520ms cubic-bezier(.18,.9,.22,1.2);
+    }
+
+    .launcher-bubble {
+      position: fixed;
+      left: 0;
+      top: 0;
+      z-index: 26;
+      display: grid;
+      max-width: min(286px, calc(100vw - 32px));
+      min-width: 168px;
+      gap: 4px;
+      border: 1px solid rgba(31, 95, 232, 0.14);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 18px 48px rgba(15, 23, 42, 0.2);
+      color: #0f172a;
+      cursor: pointer;
+      font: inherit;
+      line-height: 1.35;
+      opacity: 0;
+      padding: 12px 14px;
+      pointer-events: none;
+      text-align: left;
+      transform: translate3d(var(--bubble-x, 0), var(--bubble-y, 0), 0) translateY(8px) scale(.92);
+      transform-origin: var(--bubble-arrow-x, calc(100% - 26px)) 100%;
+      transition: opacity 160ms ease, transform 180ms cubic-bezier(.2,.9,.2,1);
+      user-select: none;
+      will-change: transform, opacity;
+    }
+
+    .launcher-bubble::after {
+      position: absolute;
+      bottom: -6px;
+      left: var(--bubble-arrow-x, calc(100% - 26px));
+      width: 12px;
+      height: 12px;
+      border-right: 1px solid rgba(31, 95, 232, 0.14);
+      border-bottom: 1px solid rgba(31, 95, 232, 0.14);
+      background: rgba(255, 255, 255, 0.96);
+      content: "";
+      transform: translateX(-50%) rotate(45deg);
+    }
+
+    .launcher-bubble.is-below {
+      transform-origin: var(--bubble-arrow-x, calc(100% - 26px)) 0;
+    }
+
+    .launcher-bubble.is-below::after {
+      top: -6px;
+      bottom: auto;
+      border: 0;
+      border-left: 1px solid rgba(31, 95, 232, 0.14);
+      border-top: 1px solid rgba(31, 95, 232, 0.14);
+    }
+
+    .launcher-bubble.is-visible {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translate3d(var(--bubble-x, 0), var(--bubble-y, 0), 0) translateY(0) scale(1);
+    }
+
+    .launcher-bubble.is-popping {
+      animation: bubble-pop 460ms cubic-bezier(.16,.9,.28,1.18);
+    }
+
+    .launcher.is-hidden + .launcher-bubble {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .bubble-title {
+      display: block;
+      color: #1f5fe8;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .01em;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .bubble-title:empty {
+      display: none;
+    }
+
+    .bubble-content {
+      display: -webkit-box;
+      overflow: hidden;
+      color: #1e293b;
+      font-size: 13px;
+      font-weight: 600;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 3;
+    }
+
+    .bubble-content:empty {
+      display: none;
     }
 
     .logo-disc {
@@ -273,6 +376,46 @@
       cursor: ew-resize;
     }
 
+    @keyframes bubble-pop {
+      0% {
+        opacity: 0;
+        transform: translate3d(var(--bubble-x, 0), var(--bubble-y, 0), 0) translateY(10px) scale(.76);
+      }
+
+      58% {
+        opacity: 1;
+        transform: translate3d(var(--bubble-x, 0), var(--bubble-y, 0), 0) translateY(-2px) scale(1.05);
+      }
+
+      100% {
+        opacity: 1;
+        transform: translate3d(var(--bubble-x, 0), var(--bubble-y, 0), 0) translateY(0) scale(1);
+      }
+    }
+
+    @keyframes launcher-bubble-pop {
+      0% {
+        transform: translate3d(var(--launcher-x, 0), var(--launcher-y, 0), 0) scale(1);
+      }
+
+      42% {
+        transform: translate3d(var(--launcher-x, 0), var(--launcher-y, 0), 0) scale(1.1);
+      }
+
+      100% {
+        transform: translate3d(var(--launcher-x, 0), var(--launcher-y, 0), 0) scale(1);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .launcher,
+      .widget-window,
+      .launcher-bubble {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+
     body.is-widget-interacting .assistant-frame {
       pointer-events: none;
     }
@@ -292,6 +435,10 @@
   <button id="launcher" class="launcher" type="button" aria-label="Open 中电慧语 iframe widget">
     <span class="logo-disc"><img src="/embed/cpecc-mascot.webp" alt="" draggable="false" /></span>
   </button>
+  <button id="launcherBubble" class="launcher-bubble" type="button" aria-live="polite" aria-hidden="true">
+    <span id="bubbleTitle" class="bubble-title"></span>
+    <span id="bubbleContent" class="bubble-content"></span>
+  </button>
 
   <section
     id="widget"
@@ -304,18 +451,19 @@
     <header id="widgetHeader" class="widget-header">
       <div class="widget-actions left">
         <button
-          id="homeButton"
-          class="widget-action"
-          type="button"
-          title="Open 中电慧语"
-          aria-label="Open 中电慧语"
-        >
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M3 10.8 12 3l9 7.8" stroke-linecap="round" stroke-linejoin="round" />
-            <path d="M5.5 10.2V21h13V10.2" stroke-linecap="round" stroke-linejoin="round" />
-            <path d="M9.5 21v-6h5v6" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-        </button>
+	          id="homeButton"
+	          class="widget-action"
+	          type="button"
+	          title="Open 中电慧语 in browser"
+	          aria-label="Open 中电慧语 in browser"
+	        >
+	          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+	            <circle cx="12" cy="12" r="8.5" />
+	            <path d="M3.5 12h17" />
+	            <path d="M12 3.5c2.2 2.35 3.4 5.08 3.4 8.5s-1.2 6.15-3.4 8.5" />
+	            <path d="M12 3.5C9.8 5.85 8.6 8.58 8.6 12s1.2 6.15 3.4 8.5" />
+	          </svg>
+	        </button>
       </div>
       <div class="widget-actions right">
         <button id="refreshButton" class="widget-action" type="button" title="Refresh" aria-label="Refresh">
@@ -355,6 +503,9 @@
   <script>
     (() => {
       const launcher = document.getElementById('launcher');
+      const bubble = document.getElementById('launcherBubble');
+      const bubbleTitle = document.getElementById('bubbleTitle');
+      const bubbleContent = document.getElementById('bubbleContent');
       const widget = document.getElementById('widget');
       const widgetHeader = document.getElementById('widgetHeader');
       const iframe = document.getElementById('assistantFrame');
@@ -370,8 +521,15 @@
       const minPanelHeight = 360;
       const fallbackLogoWidth = 256;
       const fallbackLogoHeight = 144;
+      const mascotNotificationEvent = 'cpecc:mascot-notification';
+      const widgetStateEvent = 'cpecc:widget-state';
+      const widgetReadyEvent = 'cpecc:widget-ready';
+      const bubbleDuration = 9000;
+      const welcomeBubbleDelay = 900;
+      const welcomeBubble = { title: '中电慧语', content: '您好，我是中电慧语' };
 
       let isOpen = false;
+      let pendingWidgetTarget = null;
       let launcherPosition = readLauncherPosition();
       let panelPosition = { x: 0, y: 0 };
       let panelSize = getDefaultPanelSize();
@@ -379,6 +537,9 @@
       let draggingLauncher = null;
       let draggingPanel = null;
       let resizingPanel = null;
+      let bubbleHideTimer = null;
+      let bubblePopTimer = null;
+      let currentBubbleTarget = null;
 
       function clamp(value, min, max) {
         if (max < min) return min;
@@ -387,6 +548,20 @@
 
       function safeJsonParse(value) {
         try { return JSON.parse(value); } catch { return null; }
+      }
+
+      function getUrlOrigin(value) {
+        try {
+          return new URL(value, window.location.href).origin;
+        } catch {
+          return null;
+        }
+      }
+
+      function getNotificationOrigins() {
+        return new Set(
+          [window.location.origin, getUrlOrigin(homeUrl), getUrlOrigin(getIframeTarget())].filter(Boolean)
+        );
       }
 
       function getIframeTarget() {
@@ -401,6 +576,69 @@
         } catch {
           return new URL('/', window.location.origin).toString();
         }
+      }
+
+      function sanitizeBubbleText(value, limit) {
+        const text = `${value ?? ''}`.replace(/\s+/g, ' ').trim();
+        return text.length > limit ? `${text.slice(0, Math.max(0, limit - 3))}...` : text;
+      }
+
+      function toWidgetTargetUrl(value) {
+        if (typeof value !== 'string' || !value.trim()) return null;
+
+        try {
+          const url = new URL(value, getIframeTarget());
+          return getNotificationOrigins().has(url.origin) ? url.toString() : null;
+        } catch {
+          return null;
+        }
+      }
+
+      function normalizeBubblePayload(payload) {
+        if (typeof payload === 'string') {
+          const content = sanitizeBubbleText(payload, 180);
+          return content ? { title: '', content, target: null, duration: null, status: '', clear: false } : null;
+        }
+
+        if (!payload || typeof payload !== 'object') return null;
+
+        const title = sanitizeBubbleText(payload.title, 80);
+        const content = sanitizeBubbleText(payload.content ?? payload.message ?? payload.body, 180);
+        const target = toWidgetTargetUrl(payload.path ?? payload.href ?? payload.url);
+        const durationValue = Number(payload.duration ?? payload.bubbleDuration);
+        const duration = Number.isFinite(durationValue) ? Math.max(0, durationValue) : null;
+        const status = sanitizeBubbleText(payload.status ?? payload.state, 32).toLowerCase();
+        const clear = payload.clear === true || payload.action === 'clear';
+
+        if (!title && !content && !clear) return null;
+        return { title, content, target, duration, status, clear };
+      }
+
+      function getIframeMessageTargetOrigin() {
+        const src = iframe.getAttribute('src');
+        if (!src || src === 'about:blank') return '*';
+
+        try {
+          return new URL(src, window.location.href).origin;
+        } catch {
+          return '*';
+        }
+      }
+
+      function publishWidgetState() {
+        if (!iframe.contentWindow || iframe.getAttribute('src') === 'about:blank') return;
+
+        iframe.contentWindow.postMessage(
+          {
+            type: widgetStateEvent,
+            payload: {
+              avatarPresent: !isOpen,
+              launcherVisible: !isOpen,
+              widgetActive: isOpen
+            }
+          },
+          getIframeMessageTargetOrigin()
+        );
       }
 
       function getDefaultPanelSize() {
@@ -452,6 +690,84 @@
         launcher.style.setProperty('--launcher-x', `${launcherPosition.x}px`);
         launcher.style.setProperty('--launcher-y', `${launcherPosition.y}px`);
         launcher.style.transform = `translate3d(${launcherPosition.x}px, ${launcherPosition.y}px, 0)`;
+        applyBubblePosition();
+      }
+
+      function applyBubblePosition() {
+        if (!bubble.classList.contains('is-visible')) return;
+
+        const launcherSize = getLauncherSize();
+        const bubbleWidth = bubble.offsetWidth || 260;
+        const bubbleHeight = bubble.offsetHeight || 72;
+        const gap = 12;
+        const anchorX = launcherPosition.x + launcherSize.width - Math.min(18, launcherSize.width / 3);
+        let x = anchorX - bubbleWidth + 18;
+        let y = launcherPosition.y - bubbleHeight - gap;
+        const isBelow = y < viewportPadding;
+
+        if (isBelow) {
+          y = launcherPosition.y + launcherSize.height + gap;
+        }
+
+        x = clamp(x, viewportPadding, window.innerWidth - bubbleWidth - viewportPadding);
+        y = clamp(y, viewportPadding, window.innerHeight - bubbleHeight - viewportPadding);
+
+        const arrowX = clamp(anchorX - x, 20, bubbleWidth - 20);
+        bubble.style.setProperty('--bubble-x', `${Math.round(x)}px`);
+        bubble.style.setProperty('--bubble-y', `${Math.round(y)}px`);
+        bubble.style.setProperty('--bubble-arrow-x', `${Math.round(arrowX)}px`);
+        bubble.classList.toggle('is-below', isBelow);
+      }
+
+      function hideBubble() {
+        if (bubbleHideTimer) {
+          window.clearTimeout(bubbleHideTimer);
+          bubbleHideTimer = null;
+        }
+        bubble.classList.remove('is-visible', 'is-popping', 'is-below');
+        delete bubble.dataset.status;
+        bubble.setAttribute('aria-hidden', 'true');
+      }
+
+      function showBubble(payload) {
+        const normalized = normalizeBubblePayload(payload);
+        if (!normalized) return;
+        if (normalized.clear) {
+          if (!normalized.status || bubble.dataset.status === normalized.status) {
+            hideBubble();
+          }
+          return;
+        }
+        if (isOpen) return;
+
+        currentBubbleTarget = normalized.target;
+        bubbleTitle.textContent = normalized.title;
+        bubbleContent.textContent = normalized.content;
+        if (normalized.status) {
+          bubble.dataset.status = normalized.status;
+        } else {
+          delete bubble.dataset.status;
+        }
+        bubble.classList.remove('is-popping');
+        bubble.classList.add('is-visible');
+        bubble.setAttribute('aria-hidden', 'false');
+        applyBubblePosition();
+
+        void bubble.offsetWidth;
+        bubble.classList.add('is-popping');
+        launcher.classList.add('has-bubble-pop');
+
+        if (bubblePopTimer) window.clearTimeout(bubblePopTimer);
+        bubblePopTimer = window.setTimeout(() => {
+          bubble.classList.remove('is-popping');
+          launcher.classList.remove('has-bubble-pop');
+        }, 560);
+
+        if (bubbleHideTimer) window.clearTimeout(bubbleHideTimer);
+        const hideAfter = normalized.duration ?? bubbleDuration;
+        if (hideAfter > 0) {
+          bubbleHideTimer = window.setTimeout(hideBubble, hideAfter);
+        }
       }
 
       function applyPanelGeometry() {
@@ -482,6 +798,12 @@
       }
 
       function ensureIframeLoaded() {
+        if (pendingWidgetTarget) {
+          iframe.setAttribute('src', pendingWidgetTarget);
+          pendingWidgetTarget = null;
+          return;
+        }
+
         if (iframe.getAttribute('src') === 'about:blank') {
           iframe.setAttribute('src', getIframeTarget());
         }
@@ -506,10 +828,16 @@
         animation.onfinish = done;
       }
 
-      function openWidget() {
+      function openWidget(options = {}) {
         if (isOpen) return;
+        if (options && typeof options === 'object' && 'targetUrl' in options) {
+          pendingWidgetTarget = toWidgetTargetUrl(options.targetUrl);
+        }
+
         isOpen = true;
+        hideBubble();
         ensureIframeLoaded();
+        publishWidgetState();
         if (!panelGeometryInitialized) {
           panelSize = getDefaultPanelSize();
           panelPosition = getCenteredPanelPosition(panelSize);
@@ -535,6 +863,7 @@
       function retractWidget() {
         if (!isOpen) return;
         isOpen = false;
+        publishWidgetState();
         animateWidget(false, () => {
           widget.classList.remove('is-open');
           widget.setAttribute('aria-hidden', 'true');
@@ -568,6 +897,30 @@
           const currentSrc = iframe.getAttribute('src') || getIframeTarget();
           iframe.setAttribute('src', currentSrc);
         }
+      }
+
+      function openBubbleTarget() {
+        openWidget({ targetUrl: currentBubbleTarget });
+      }
+
+      function handleMascotNotificationMessage(event) {
+        if (!getNotificationOrigins().has(event.origin)) return;
+
+        const data = event.data;
+        if (!data || typeof data !== 'object' || data.type !== mascotNotificationEvent) return;
+        showBubble(data.payload ?? data.detail ?? data.notification);
+      }
+
+      function handleMascotNotificationEvent(event) {
+        showBubble(event.detail);
+      }
+
+      function handleWidgetReadyMessage(event) {
+        if (event.source !== iframe.contentWindow) return;
+
+        const data = event.data;
+        if (!data || typeof data !== 'object' || data.type !== widgetReadyEvent) return;
+        publishWidgetState();
       }
 
       function setWidgetInteraction(active, cursor = '') {
@@ -765,11 +1118,15 @@
       homeButton.addEventListener('click', goHome);
       refreshButton.addEventListener('click', refreshIframe);
       retractButton.addEventListener('click', retractWidget);
+      bubble.addEventListener('click', openBubbleTarget);
 
       window.addEventListener('keydown', (event) => {
         if (event.key === 'Escape' && isOpen) retractWidget();
       });
 
+      window.addEventListener('message', handleMascotNotificationMessage);
+      window.addEventListener('message', handleWidgetReadyMessage);
+      window.addEventListener(mascotNotificationEvent, handleMascotNotificationEvent);
       window.addEventListener('pointermove', handleGlobalPointerMove);
       window.addEventListener('pointerup', handleGlobalPointerEnd);
       window.addEventListener('pointercancel', handleGlobalPointerEnd);
@@ -784,7 +1141,14 @@
         }
       });
 
+      iframe.addEventListener('load', publishWidgetState);
+
       applyLauncherPosition();
+      window.setTimeout(() => {
+        if (!bubble.classList.contains('is-visible')) {
+          showBubble(welcomeBubble);
+        }
+      }, welcomeBubbleDelay);
     })();
   </script>
 </body>

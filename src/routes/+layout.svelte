@@ -166,6 +166,139 @@
 	let heartbeatInterval = null;
 
 	const BREAKPOINT = 768;
+	const MASCOT_NOTIFICATION_EVENT = 'cpecc:mascot-notification';
+	const MASCOT_WIDGET_STATE_EVENT = 'cpecc:widget-state';
+	const MASCOT_WIDGET_READY_EVENT = 'cpecc:widget-ready';
+	let mascotWidgetState = {
+		avatarPresent: false,
+		widgetActive: true,
+		lastSeenAt: 0
+	};
+	const mascotActiveChats = new Map();
+	const mascotRunningChatIds = new Set();
+
+	const truncateMascotNotificationText = (value, limit) => {
+		const text = toPlainNotificationText(`${value ?? ''}`)
+			.replace(/\s+/g, ' ')
+			.trim();
+		return text.length > limit ? `${text.slice(0, Math.max(0, limit - 3))}...` : text;
+	};
+
+	const emitMascotNotificationBubble = ({ title, content, path, status, duration, clear }) => {
+		if (typeof window === 'undefined') {
+			return false;
+		}
+
+		const payload = {
+			source: 'cpecc',
+			title: truncateMascotNotificationText(title, 80),
+			content: truncateMascotNotificationText(content, 180),
+			path: typeof path === 'string' ? path : '',
+			status: typeof status === 'string' ? status : '',
+			duration: Number.isFinite(Number(duration)) ? Math.max(0, Number(duration)) : undefined,
+			clear: clear === true
+		};
+
+		if (!payload.title && !payload.content && !payload.clear) {
+			return false;
+		}
+
+		window.dispatchEvent(new CustomEvent(MASCOT_NOTIFICATION_EVENT, { detail: payload }));
+
+		if (window.parent && window.parent !== window) {
+			window.parent.postMessage({ type: MASCOT_NOTIFICATION_EVENT, payload }, '*');
+		}
+
+		return true;
+	};
+
+	const getMascotChatKey = (event, data = {}) => {
+		const chatKey = event?.chat_id ?? data?.chat_id ?? data?.id;
+		return typeof chatKey === 'string' && chatKey ? chatKey : 'current';
+	};
+
+	const getMascotChatMeta = (event, data = {}) => {
+		const chatId = event?.chat_id ?? data?.chat_id;
+		return {
+			title: data?.title ?? '中电慧语',
+			path: typeof chatId === 'string' && !chatId.startsWith('local:') ? `/c/${chatId}` : ''
+		};
+	};
+
+	const rememberMascotActiveChat = (event, data = {}) => {
+		const chatKey = getMascotChatKey(event, data);
+		const meta = getMascotChatMeta(event, data);
+		mascotActiveChats.set(chatKey, meta);
+		return { chatKey, meta };
+	};
+
+	const emitMascotRunningBubble = (chatKey, meta = {}) => {
+		if (!chatKey || !shouldRouteNotificationToMascot() || mascotRunningChatIds.has(chatKey)) {
+			return;
+		}
+
+		mascotRunningChatIds.add(chatKey);
+		emitMascotNotificationBubble({
+			title: meta.title ?? '中电慧语',
+			content: '...',
+			path: meta.path ?? '',
+			status: 'running',
+			duration: 0
+		});
+	};
+
+	const clearMascotRunningBubble = (chatKey) => {
+		if (!mascotRunningChatIds.delete(chatKey) || !shouldRouteNotificationToMascot()) {
+			return;
+		}
+
+		emitMascotNotificationBubble({
+			status: 'running',
+			clear: true
+		});
+	};
+
+	const shouldRouteNotificationToMascot = () => {
+		return (
+			typeof window !== 'undefined' &&
+			window.parent &&
+			window.parent !== window &&
+			mascotWidgetState.avatarPresent === true &&
+			mascotWidgetState.widgetActive === false
+		);
+	};
+
+	const announceMascotWidgetReady = () => {
+		if (typeof window === 'undefined' || !window.parent || window.parent === window) {
+			return;
+		}
+
+		window.parent.postMessage({ type: MASCOT_WIDGET_READY_EVENT }, '*');
+	};
+
+	const handleMascotWidgetStateMessage = (event) => {
+		if (!window.parent || window.parent === window || event.source !== window.parent) {
+			return;
+		}
+
+		const data = event.data;
+		if (!data || typeof data !== 'object' || data.type !== MASCOT_WIDGET_STATE_EVENT) {
+			return;
+		}
+
+		const payload = data.payload ?? {};
+		mascotWidgetState = {
+			avatarPresent: payload.avatarPresent === true || payload.launcherVisible === true,
+			widgetActive: payload.widgetActive === true || payload.active === true,
+			lastSeenAt: Date.now()
+		};
+
+		if (shouldRouteNotificationToMascot()) {
+			for (const [chatKey, meta] of mascotActiveChats) {
+				emitMascotRunningBubble(chatKey, meta);
+			}
+		}
+	};
 
 	const setupSocket = async (enableWebsocket) => {
 		const _socket = io(`${WEBUI_BASE_URL}` || undefined, {
@@ -527,7 +660,29 @@
 		const type = event?.data?.type ?? null;
 		const data = event?.data?.data ?? null;
 
-		if (type === 'chat:completion' && (!isCurrentChat || !isWindowFocused)) {
+		const routeNotificationToMascot = shouldRouteNotificationToMascot();
+
+		if (type === 'chat:active') {
+			const chatKey = getMascotChatKey(event, data);
+			if (data?.active === true) {
+				const activeChat = rememberMascotActiveChat(event, data);
+				emitMascotRunningBubble(activeChat.chatKey, activeChat.meta);
+			} else if (data?.active === false) {
+				mascotActiveChats.delete(chatKey);
+				clearMascotRunningBubble(chatKey);
+			}
+		} else if (type === 'chat:completion') {
+			const chatKey = getMascotChatKey(event, data);
+			if (data?.done === true) {
+				mascotActiveChats.delete(chatKey);
+				mascotRunningChatIds.delete(chatKey);
+			} else {
+				const activeChat = rememberMascotActiveChat(event, data);
+				emitMascotRunningBubble(activeChat.chatKey, activeChat.meta);
+			}
+		}
+
+		if (type === 'chat:completion' && (!isCurrentChat || !isWindowFocused || routeNotificationToMascot)) {
 			const { done, content, title } = data;
 
 			if (done) {
@@ -552,17 +707,25 @@
 					}
 				}
 
-				toast.custom(NotificationToast, {
-					componentProps: {
-						onClick: () => {
-							goto(`/c/${event.chat_id}`);
-						},
-						content: notificationContent,
-						title: title
-					},
-					duration: 15000,
-					unstyled: true
+				emitMascotNotificationBubble({
+					title,
+					content: notificationContent,
+					path: `/c/${event.chat_id}`
 				});
+
+				if (!routeNotificationToMascot) {
+					toast.custom(NotificationToast, {
+						componentProps: {
+							onClick: () => {
+								goto(`/c/${event.chat_id}`);
+							},
+							content: notificationContent,
+							title: title
+						},
+						duration: 15000,
+						unstyled: true
+					});
+				}
 			}
 		}
 
@@ -708,7 +871,9 @@
 			}
 		}
 
-		if ((!channel || isFocused) && event?.user?.id !== $user?.id) {
+		const routeNotificationToMascot = shouldRouteNotificationToMascot();
+
+		if ((!channel || isFocused || routeNotificationToMascot) && event?.user?.id !== $user?.id) {
 			await tick();
 			const type = event?.data?.type ?? null;
 			const data = event?.data?.data ?? null;
@@ -759,17 +924,25 @@
 					}
 				}
 
-				toast.custom(NotificationToast, {
-					componentProps: {
-						onClick: () => {
-							goto(`/channels/${event.channel_id}`);
-						},
-						content: notificationContent,
-						title: `${title}`
-					},
-					duration: 15000,
-					unstyled: true
+				emitMascotNotificationBubble({
+					title,
+					content: notificationContent,
+					path: `/channels/${event.channel_id}`
 				});
+
+				if (!routeNotificationToMascot) {
+					toast.custom(NotificationToast, {
+						componentProps: {
+							onClick: () => {
+								goto(`/channels/${event.channel_id}`);
+							},
+							content: notificationContent,
+							title: `${title}`
+						},
+						duration: 15000,
+						unstyled: true
+					});
+				}
 			}
 		}
 	};
@@ -797,6 +970,9 @@
 
 	onMount(async () => {
 		window.addEventListener('vite:preloadError', preloadErrorHandler);
+		window.addEventListener('message', handleMascotWidgetStateMessage);
+		announceMascotWidgetReady();
+		window.setTimeout(announceMascotWidgetReady, 250);
 
 		let touchstartY = 0;
 
@@ -1038,6 +1214,7 @@
 		return () => {
 			window.removeEventListener('resize', onResize);
 			window.removeEventListener('vite:preloadError', preloadErrorHandler);
+			window.removeEventListener('message', handleMascotWidgetStateMessage);
 			document.removeEventListener('touchstart', touchstartHandler);
 			document.removeEventListener('touchmove', touchmoveHandler);
 			document.removeEventListener('touchend', touchendHandler);

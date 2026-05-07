@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { WEBUI_API_BASE_URL } from '$lib/constants';
+import { parseJsonResponse, parseResponseError } from '$lib/apis/response';
 
 const toArray = (value: any) => (Array.isArray(value) ? value : []);
 
@@ -67,9 +68,12 @@ const normalizeKnowledgeItem = (item: any = {}) => {
 };
 
 const normalizeKnowledgeListResponse = (json: any = {}) => {
-	const rawItems = toArray(json?.items?.length ? json.items : json?.data?.items ?? json?.data ?? []);
+	const rawItems = toArray(
+		json?.items?.length ? json.items : (json?.data?.items ?? json?.data ?? [])
+	);
 	const items = rawItems.map((item) => normalizeKnowledgeItem(item));
-	const total = getNumber(json?.total, json?.count, json?.data?.total, items.length) ?? items.length;
+	const total =
+		getNumber(json?.total, json?.count, json?.data?.total, items.length) ?? items.length;
 
 	return {
 		...json,
@@ -79,7 +83,13 @@ const normalizeKnowledgeListResponse = (json: any = {}) => {
 };
 
 const normalizeKnowledgeFile = (file: any = {}) => {
-	const fileName = getString(file?.meta?.name, file?.name, file?.filename, file?.title, file?.document_name);
+	const fileName = getString(
+		file?.meta?.name,
+		file?.name,
+		file?.filename,
+		file?.title,
+		file?.document_name
+	);
 	const updatedAt = getNumber(file?.updated_at, file?.updatedAt, file?.update_time, file?.ts);
 	const createdAt = getNumber(file?.created_at, file?.createdAt, file?.create_time);
 	const size = getNumber(file?.meta?.size, file?.size, file?.bytes);
@@ -99,9 +109,12 @@ const normalizeKnowledgeFile = (file: any = {}) => {
 };
 
 const normalizeKnowledgeFilesResponse = (json: any = {}) => {
-	const rawItems = toArray(json?.items?.length ? json.items : json?.data?.items ?? json?.data ?? []);
+	const rawItems = toArray(
+		json?.items?.length ? json.items : (json?.data?.items ?? json?.data ?? [])
+	);
 	const items = rawItems.map((file) => normalizeKnowledgeFile(file));
-	const total = getNumber(json?.total, json?.count, json?.data?.total, items.length) ?? items.length;
+	const total =
+		getNumber(json?.total, json?.count, json?.data?.total, items.length) ?? items.length;
 
 	return {
 		...json,
@@ -111,7 +124,7 @@ const normalizeKnowledgeFilesResponse = (json: any = {}) => {
 };
 
 const normalizeKnowledgeDetails = (json: any = {}) => {
-	const files = toArray(json?.files?.length ? json.files : json?.documents ?? []).map((file) =>
+	const files = toArray(json?.files?.length ? json.files : (json?.documents ?? [])).map((file) =>
 		normalizeKnowledgeFile(file)
 	);
 
@@ -142,10 +155,7 @@ export const createNewKnowledge = async (
 			access_grants: accessGrants
 		})
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.catch((err) => {
 			error = err.detail;
 			console.error(err);
@@ -173,10 +183,7 @@ export const getKnowledgeBases = async (token: string = '', page: number | null 
 			authorization: `Bearer ${token}`
 		}
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return normalizeKnowledgeListResponse(json);
 		})
@@ -214,10 +221,7 @@ export const searchKnowledgeBases = async (
 			authorization: `Bearer ${token}`
 		}
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return normalizeKnowledgeListResponse(json);
 		})
@@ -262,10 +266,7 @@ export const searchKnowledgeFiles = async (
 			}
 		}
 	)
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return normalizeKnowledgeFilesResponse(json);
 		})
@@ -294,10 +295,7 @@ export const getKnowledgeById = async (token: string, id: string) => {
 			authorization: `Bearer ${token}`
 		}
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return normalizeKnowledgeDetails(json);
 		})
@@ -344,10 +342,7 @@ export const searchKnowledgeFilesById = async (
 			}
 		}
 	)
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return normalizeKnowledgeFilesResponse(json);
 		})
@@ -389,10 +384,7 @@ export const updateKnowledgeById = async (token: string, id: string, form: Knowl
 			access_grants: form.access_grants
 		})
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return json;
 		})
@@ -426,10 +418,7 @@ export const updateKnowledgeAccessGrants = async (
 		},
 		body: JSON.stringify({ access_grants: accessGrants })
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.catch((err) => {
 			error = err.detail;
 			console.error(err);
@@ -457,10 +446,7 @@ export const addFileToKnowledgeById = async (token: string, id: string, fileId: 
 			file_id: fileId
 		})
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return json;
 		})
@@ -492,10 +478,7 @@ export const updateFileFromKnowledgeById = async (token: string, id: string, fil
 			file_id: fileId
 		})
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return json;
 		})
@@ -527,10 +510,7 @@ export const removeFileFromKnowledgeById = async (token: string, id: string, fil
 			file_id: fileId
 		})
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return json;
 		})
@@ -559,10 +539,7 @@ export const resetKnowledgeById = async (token: string, id: string) => {
 			authorization: `Bearer ${token}`
 		}
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return json;
 		})
@@ -591,10 +568,7 @@ export const deleteKnowledgeById = async (token: string, id: string) => {
 			authorization: `Bearer ${token}`
 		}
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.then((json) => {
 			return json;
 		})
@@ -623,10 +597,7 @@ export const reindexKnowledgeFiles = async (token: string) => {
 			authorization: `Bearer ${token}`
 		}
 	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
+		.then(parseJsonResponse)
 		.catch((err) => {
 			error = err.detail;
 			console.error(err);
@@ -650,7 +621,7 @@ export const exportKnowledgeById = async (token: string, id: string) => {
 		}
 	})
 		.then(async (res) => {
-			if (!res.ok) throw await res.json();
+			if (!res.ok) throw await parseResponseError(res);
 			return res.blob();
 		})
 		.catch((err) => {

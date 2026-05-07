@@ -426,6 +426,7 @@ class KnowflowClient:
 
     def _headers(self) -> dict[str, str]:
         return {
+            "Accept": "application/json",
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
@@ -791,7 +792,15 @@ def resolve_public_read_only_context(config: Any) -> Optional[KnowflowContext]:
 async def resolve_user_knowflow_context(
     config: Any, user, db=None
 ) -> Optional[KnowflowContext]:
-    managed_context = await resolve_managed_context(config, user)
+    try:
+        managed_context = await resolve_managed_context(config, user)
+    except KnowflowError as exc:
+        log.warning(
+            "Knowflow managed user lookup failed; falling back to other bindings: %s",
+            exc,
+        )
+        managed_context = None
+
     if managed_context is not None:
         return managed_context
 
