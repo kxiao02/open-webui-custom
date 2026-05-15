@@ -1,10 +1,12 @@
 import ast
+import hashlib
 import logging
 import json
 import re
 import time
 import uuid
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 from sqlalchemy.orm import Session
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
@@ -14,6 +16,11 @@ from open_webui.models.chat_messages import ChatMessage, ChatMessages
 from open_webui.models.files import Files
 from open_webui.utils.misc import sanitize_data_for_db, sanitize_text_for_db
 from open_webui.utils.knowflow import get_knowflow_asset_ref_key
+from open_webui.utils.telemetry.llm_observability import (
+    diagnostic_classification_counts,
+    diagnostic_reason_codes,
+    observe_llm_event,
+)
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import (
@@ -41,6 +48,30 @@ DEFAULT_CHAT_TAIL_MESSAGES = 50
 MAX_CHAT_TAIL_MESSAGES = 200
 LEAKED_VISION_SPECIALIST_KEYS = {"observations", "uncertainties", "summary"}
 COLLAPSIBLE_DOCUMENT_FILE_EXTENSIONS = {"pdf", "docx", "pptx", "xlsx"}
+SECOND_PASS_RETRIEVAL_TOOL_NAMES = {
+    "query_selected_knowledge_files",
+    "read_selected_file",
+}
+WEBPAGE_TOOL_NAMES = {
+    "visit_webpage",
+    "fetch_url",
+}
+_WEB_REFERENCE_TEXT_LIMIT = 1600
+_SAFE_QUERY_TEXT_LIMIT = 240
+_OFFICIAL_WEB_HOST_SUFFIXES = (
+    ".gov",
+    ".gov.cn",
+    ".gov.hk",
+    ".gov.mo",
+    ".gov.uk",
+    ".go.jp",
+    ".gc.ca",
+)
+_SUPPRESSED_REFERENCE_CITATION_PATTERN = re.compile(
+    r"\s*\[(?:\d+\s*(?:,\s*\d+\s*)*)\]"
+)
+_SUPPRESSED_REFERENCE_PUNCTUATION_PATTERN = re.compile(r"[ \t]+([,.;:!?，。！？；：])")
+_SUPPRESSED_REFERENCE_DOUBLE_SPACE_PATTERN = re.compile(r"[ \t]{2,}")
 
 
 def _normalize_message_file_ref(value: object) -> str:
@@ -489,6 +520,178 @@ _SEARCH_TOOL_NAME_LOOKUP = {candidate.lower() for candidate in _SEARCH_TOOL_NAME
 
 def _is_search_tool_name(tool_name: str) -> bool:
     return str(tool_name or "").strip().lower() in _SEARCH_TOOL_NAME_LOOKUP
+
+
+def _is_webpage_tool_name(tool_name: str) -> bool:
+    return str(tool_name or "").strip().lower() in WEBPAGE_TOOL_NAMES
+
+
+def _parse_function_call_arguments(value: object) -> dict:
+    parsed = _parse_tool_output_payload(value)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _function_call_context_by_call_id(output: object) -> dict[str, dict[str, object]]:
+    context_by_call_id: dict[str, dict[str, object]] = {}
+    if not isinstance(output, list):
+        return context_by_call_id
+
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        call_id = str(item.get("call_id") or item.get("id") or "").strip()
+        if not call_id:
+            continue
+        context_by_call_id[call_id] = {
+            "name": str(item.get("name") or "").strip(),
+            "arguments": _parse_function_call_arguments(item.get("arguments")),
+        }
+
+    return context_by_call_id
+
+
+def _coalesce_mapping_value(*mappings: object, keys: tuple[str, ...]) -> object:
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            continue
+        for key in keys:
+            value = mapping.get(key)
+            if value not in (None, "", [], {}):
+                return value
+    return None
+
+
+def _collapse_reference_text(value: object, *, limit: int = _WEB_REFERENCE_TEXT_LIMIT) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(limit - 1, 0)].rstrip()}…"
+
+
+def _web_query_digest(value: object) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip())
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_query_provenance_fields(value: object) -> dict[str, str]:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip())
+    if not normalized:
+        return {}
+
+    fields = {"query_digest": _web_query_digest(normalized)}
+    if len(normalized) <= _SAFE_QUERY_TEXT_LIMIT:
+        fields["query"] = normalized
+    return fields
+
+
+def _looks_like_official_web_url(value: object) -> bool:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return False
+
+    host = urlparse(normalized).netloc.strip().lower()
+    if not host:
+        return False
+    if host.startswith("www."):
+        host = host[4:]
+
+    return host.endswith(_OFFICIAL_WEB_HOST_SUFFIXES) or host in {
+        "gov.cn",
+        "www.gov.cn",
+    }
+
+
+def _normalize_web_source_class(value: object, *, url: object = "", authority: object = "") -> str:
+    normalized = (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if normalized in {
+        "official",
+        "official_web",
+        "government",
+        "gov",
+        "primary_source",
+        "official_primary",
+    }:
+        return "official_web"
+    if normalized in {"generic", "generic_web", "web", "online", "website", "webpage"}:
+        return "generic_web"
+
+    normalized_authority = (
+        str(authority or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if normalized_authority in {"official", "government", "gov", "primary", "authoritative"}:
+        return "official_web"
+
+    if _looks_like_official_web_url(url):
+        return "official_web"
+    if str(url or "").strip():
+        return "generic_web"
+    return ""
+
+
+def _normalize_web_authority(value: object, *, source_class: str = "") -> str:
+    normalized = (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if normalized in {"official", "government", "gov", "primary", "authoritative"}:
+        return "official"
+    if normalized in {"generic", "public", "web"}:
+        return "generic"
+    if source_class == "official_web":
+        return "official"
+    if source_class == "generic_web":
+        return "generic"
+    return ""
+
+
+def _web_reference_domain(value: object) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    host = urlparse(normalized).netloc.strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _normalize_web_reference_url(value: object) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+
+    parsed = urlparse(normalized)
+    if not parsed.scheme or not parsed.netloc:
+        return normalized
+
+    path = parsed.path.rstrip("/")
+    if path == "/":
+        path = ""
+
+    return urlunparse(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            path,
+            "",
+            parsed.query,
+            "",
+        )
+    )
 
 
 def _normalize_search_tool_io_pair(
@@ -1129,11 +1332,14 @@ class ChatTable:
         for message_id, message in messages.items():
             if not isinstance(message_id, str) or not isinstance(message, dict):
                 continue
-            if message.get("id") == message_id:
+            normalized_message = self._normalize_message_reference_sidecar(message)
+            if not isinstance(normalized_message, dict):
+                normalized_message = message
+            if normalized_message.get("id") == message_id and normalized_message == message:
                 continue
             if normalized_messages is messages:
                 normalized_messages = dict(messages)
-            normalized_messages[message_id] = {**message, "id": message_id}
+            normalized_messages[message_id] = {**normalized_message, "id": message_id}
             changed = True
 
         normalized_history = history
@@ -1425,6 +1631,2173 @@ class ChatTable:
 
         return merged_files
 
+    def _is_retrieval_diagnostic_item(self, value: object) -> bool:
+        if not isinstance(value, dict):
+            return False
+        return str(value.get("kind") or "").strip().lower() == "retrieval_quality"
+
+    def _is_second_pass_retrieval_tool_name(self, value: object) -> bool:
+        return (
+            str(value or "").strip().lower()
+            in SECOND_PASS_RETRIEVAL_TOOL_NAMES
+        )
+
+    def _retrieval_tool_name_from_payload(self, value: object) -> str:
+        if not isinstance(value, dict):
+            return ""
+
+        for key in ("tool_name", "function_name", "registered_name", "name"):
+            candidate = str(value.get(key) or "").strip()
+            if self._is_second_pass_retrieval_tool_name(candidate):
+                return candidate
+
+        for item in value.get("retrieval_diagnostics") or []:
+            if not isinstance(item, dict):
+                continue
+            candidate = str(item.get("tool_name") or "").strip()
+            if self._is_second_pass_retrieval_tool_name(candidate):
+                return candidate
+
+        for reference in value.get("canonical_references") or []:
+            if not isinstance(reference, dict):
+                continue
+            provenance = reference.get("provenance")
+            if isinstance(provenance, dict):
+                candidate = str(provenance.get("tool_name") or "").strip()
+                if self._is_second_pass_retrieval_tool_name(candidate):
+                    return candidate
+            for metadata in reference.get("metadata") or []:
+                if not isinstance(metadata, dict):
+                    continue
+                candidate = str(
+                    metadata.get("retrieval_tool_name")
+                    or metadata.get("tool_name")
+                    or ""
+                ).strip()
+                if self._is_second_pass_retrieval_tool_name(candidate):
+                    return candidate
+
+        return ""
+
+    def _looks_like_retrieval_tool_payload(
+        self, value: object, fallback_tool_name: str = ""
+    ) -> bool:
+        if not isinstance(value, dict):
+            return False
+        if self._is_second_pass_retrieval_tool_name(fallback_tool_name):
+            return True
+        if self._retrieval_tool_name_from_payload(value):
+            return True
+        if value.get("tool_id") == "builtin:retrieval":
+            return True
+        return False
+
+    def _diagnostic_from_retrieval_tool_payload(
+        self, payload: dict, fallback_tool_name: str = ""
+    ) -> Optional[dict]:
+        if not isinstance(payload, dict):
+            return None
+        if isinstance(payload.get("retrieval_diagnostics"), list) and payload.get(
+            "retrieval_diagnostics"
+        ):
+            return None
+
+        status = str(payload.get("status") or "").strip().lower()
+        if not status and any(
+            payload.get(key) not in (None, "", [], {})
+            for key in ("error", "code", "message", "reason")
+        ):
+            status = "error"
+        if status in {"", "success", "evidence"}:
+            return None
+
+        tool_name = (
+            self._retrieval_tool_name_from_payload(payload)
+            or str(fallback_tool_name or "").strip()
+        )
+        if not self._is_second_pass_retrieval_tool_name(tool_name):
+            return None
+
+        reason = str(
+            payload.get("reason")
+            or payload.get("code")
+            or payload.get("error")
+            or payload.get("message")
+            or f"retrieval_{status}"
+        ).strip()
+        if not reason:
+            reason = f"retrieval_{status}"
+
+        classification = "no_evidence" if status in {"empty", "weak", "denied"} else "diagnostics"
+        diagnostic = {
+            "kind": "retrieval_quality",
+            "classification": classification,
+            "reason": reason,
+            "tool_name": tool_name,
+        }
+        query = str(payload.get("query") or "").strip()
+        if query:
+            diagnostic["query"] = query
+        retrieval_round = payload.get("retrieval_round")
+        if retrieval_round not in (None, "", [], {}):
+            diagnostic["retrieval_round"] = retrieval_round
+        detail = payload.get("detail")
+        if detail not in (None, "", [], {}):
+            diagnostic["detail"] = detail
+        return diagnostic
+
+    def _iter_retrieval_tool_output_payloads(self, output: object) -> list[dict]:
+        if not isinstance(output, list):
+            return []
+
+        function_context_by_call_id = _function_call_context_by_call_id(output)
+
+        payloads: list[dict] = []
+        dropped_canonical_references_count = 0
+        malformed_payload_count = 0
+        non_success_payload_count = 0
+        status_counts: dict[str, int] = {}
+        synthesized_diagnostic_count = 0
+        tool_names: set[str] = set()
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "function_call_output":
+                continue
+            call_id = str(item.get("call_id") or item.get("id") or "").strip()
+            function_context = function_context_by_call_id.get(call_id) or {}
+            fallback_tool_name = str(
+                item.get("name")
+                or function_context.get("name")
+                or ""
+            ).strip()
+            parsed_payload = _extract_function_call_output_payload(item)
+            if not isinstance(parsed_payload, dict):
+                malformed_payload_count += 1
+                continue
+            if not self._looks_like_retrieval_tool_payload(
+                parsed_payload, fallback_tool_name
+            ):
+                continue
+
+            payload = json.loads(
+                json.dumps(parsed_payload, ensure_ascii=False, default=str)
+            )
+            for alias in ("sources", "citations", "references", "documents"):
+                payload.pop(alias, None)
+            status = str(payload.get("status") or "").strip().lower()
+            status_counts[status or "unknown"] = status_counts.get(status or "unknown", 0) + 1
+            if status and status not in {"success", "evidence"}:
+                non_success_payload_count += 1
+                if payload.get("canonical_references") not in (None, "", [], {}):
+                    dropped_canonical_references_count += 1
+                payload.pop("canonical_references", None)
+            if fallback_tool_name and not payload.get("tool_name"):
+                payload["tool_name"] = fallback_tool_name
+            tool_name = self._retrieval_tool_name_from_payload(payload)
+            if tool_name:
+                tool_names.add(tool_name)
+            diagnostic = self._diagnostic_from_retrieval_tool_payload(
+                payload, fallback_tool_name
+            )
+            if diagnostic:
+                synthesized_diagnostic_count += 1
+                payload["retrieval_diagnostics"] = [
+                    *(payload.get("retrieval_diagnostics") or []),
+                    diagnostic,
+                ]
+            payloads.append(payload)
+
+        if payloads or malformed_payload_count:
+            observe_llm_event(
+                "retrieval.second_pass_payload.normalize",
+                {
+                    "payload_count": len(payloads),
+                    "malformed_payload_count": malformed_payload_count,
+                    "non_success_payload_count": non_success_payload_count,
+                    "dropped_canonical_references_count": (
+                        dropped_canonical_references_count
+                    ),
+                    "synthesized_diagnostic_count": synthesized_diagnostic_count,
+                    "status_counts": status_counts,
+                    "tool_names": sorted(tool_names),
+                },
+            )
+
+        return payloads
+
+    def _web_reference_diagnostic(
+        self,
+        *,
+        tool_name: str,
+        status: str,
+        reason: str,
+        query: str = "",
+        query_digest: str = "",
+        url: str = "",
+        retrieval_round: object = None,
+        provider: str = "",
+        source_class: str = "",
+        authority: str = "",
+        detail: object = None,
+    ) -> dict:
+        classification = (
+            "no_evidence" if status in {"empty", "weak", "denied"} else "diagnostics"
+        )
+        diagnostic = {
+            "kind": "retrieval_quality",
+            "classification": classification,
+            "reason": reason,
+            "tool_name": tool_name,
+        }
+        if query:
+            diagnostic["query"] = query
+        elif query_digest:
+            diagnostic["query_digest"] = query_digest
+        if url:
+            diagnostic["url"] = url
+        if retrieval_round not in (None, "", [], {}):
+            diagnostic["retrieval_round"] = retrieval_round
+        if provider:
+            diagnostic["provider"] = provider
+        if source_class:
+            diagnostic["source_class"] = source_class
+        if authority:
+            diagnostic["authority"] = authority
+        if detail not in (None, "", [], {}):
+            diagnostic["detail"] = detail
+        return diagnostic
+
+    def _normalize_web_reference(
+        self,
+        *,
+        tool_name: str,
+        url: object,
+        title: object,
+        content: object,
+        query: object = "",
+        retrieval_round: object = None,
+        provider: object = "",
+        source_class: object = "",
+        authority: object = "",
+        as_of: object = None,
+        freshness: object = None,
+    ) -> Optional[dict]:
+        normalized_url = str(url or "").strip()
+        if not normalized_url:
+            return None
+
+        normalized_source_class = _normalize_web_source_class(
+            source_class,
+            url=normalized_url,
+            authority=authority,
+        )
+        normalized_authority = _normalize_web_authority(
+            authority,
+            source_class=normalized_source_class,
+        )
+        normalized_title = str(title or normalized_url).strip() or normalized_url
+        normalized_content = _collapse_reference_text(
+            content or title or normalized_url
+        )
+        if not normalized_content:
+            return None
+
+        metadata = {
+            "source": normalized_url,
+            "name": normalized_title,
+            "url": normalized_url,
+            "tool_name": tool_name,
+            "retrieval_tool_name": tool_name,
+        }
+        metadata.update(_safe_query_provenance_fields(query))
+
+        normalized_provider = str(provider or "").strip()
+        if normalized_provider:
+            metadata["provider"] = normalized_provider
+
+        if retrieval_round not in (None, "", [], {}):
+            metadata["retrieval_round"] = retrieval_round
+
+        normalized_as_of = str(as_of or "").strip()
+        if normalized_as_of:
+            metadata["as_of"] = normalized_as_of
+
+        normalized_freshness = str(freshness or "").strip()
+        if normalized_freshness:
+            metadata["freshness"] = normalized_freshness
+
+        if normalized_source_class:
+            metadata["source_class"] = normalized_source_class
+
+        if normalized_authority:
+            metadata["authority"] = normalized_authority
+
+        domain = _web_reference_domain(normalized_url)
+        if domain:
+            metadata["domain"] = domain
+
+        reference: dict[str, object] = {
+            "source": {
+                "id": normalized_url,
+                "name": normalized_title,
+                "url": normalized_url,
+                "type": normalized_source_class or "web",
+            },
+            "document": [normalized_content],
+            "metadata": [metadata],
+        }
+
+        if normalized_source_class:
+            reference["source_class"] = normalized_source_class
+        if normalized_authority:
+            reference["authority"] = normalized_authority
+            reference["source"]["authority"] = normalized_authority
+        if normalized_as_of:
+            reference["as_of"] = normalized_as_of
+        if normalized_freshness:
+            reference["freshness"] = normalized_freshness
+
+        return reference
+
+    def _web_reference_has_acceptance_markers(
+        self,
+        reference: dict,
+        *,
+        source_info: dict,
+        provenance: dict,
+    ) -> bool:
+        if reference.get("type") == "retrieval_reference":
+            return True
+
+        provenance_source_class = (
+            str(provenance.get("source_class") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        if provenance_source_class in {
+            "official",
+            "official_web",
+            "government",
+            "gov",
+            "primary_source",
+            "official_primary",
+            "generic",
+            "generic_web",
+        }:
+            return True
+
+        provenance_authority = (
+            str(provenance.get("authority") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        if provenance_authority in {
+            "official",
+            "government",
+            "gov",
+            "primary",
+            "authoritative",
+            "generic",
+            "public",
+        }:
+            return True
+
+        if any(
+            provenance.get(key) not in (None, "", [], {})
+            for key in (
+                "tool_name",
+                "provider",
+                "query",
+                "query_digest",
+                "retrieval_round",
+                "domain",
+                "as_of",
+                "freshness",
+                "published_at",
+                "page",
+                "section",
+                "chunk_id",
+            )
+        ):
+            return True
+
+        source_type = str(source_info.get("type") or "").strip().lower()
+        if source_type in {"official_web", "generic_web"}:
+            return True
+
+        explicit_source_class = (
+            str(reference.get("source_class") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        if explicit_source_class in {
+            "official",
+            "official_web",
+            "government",
+            "gov",
+            "primary_source",
+            "official_primary",
+            "generic",
+            "generic_web",
+        }:
+            return True
+
+        explicit_authority = (
+            str(reference.get("authority") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        if explicit_authority in {"official", "government", "gov", "primary", "authoritative", "generic", "public"}:
+            return True
+
+        if any(reference.get(key) not in (None, "", [], {}) for key in ("as_of", "freshness")):
+            return True
+
+        for metadata in reference.get("metadata") or []:
+            if not isinstance(metadata, dict):
+                continue
+            if any(
+                metadata.get(key) not in (None, "", [], {})
+                for key in (
+                    "tool_name",
+                    "retrieval_tool_name",
+                    "provider",
+                    "query",
+                    "query_digest",
+                    "retrieval_round",
+                    "source_class",
+                    "authority",
+                    "domain",
+                    "as_of",
+                    "freshness",
+                    "published_at",
+                    "page",
+                    "section",
+                    "chunk_id",
+                )
+            ):
+                return True
+
+        return False
+
+    def _enrich_normalized_web_reference(
+        self,
+        reference: dict,
+        *,
+        tool_name: str,
+        query: str = "",
+        retrieval_round: object = None,
+        provider: object = "",
+        as_of: object = None,
+        freshness: object = None,
+    ) -> Optional[dict]:
+        if not isinstance(reference, dict):
+            return None
+
+        source_info = reference.get("source")
+        source_info = dict(source_info) if isinstance(source_info, dict) else {}
+        metadata_items = [
+            dict(item)
+            for item in (reference.get("metadata") or [])
+            if isinstance(item, dict)
+        ]
+        provenance = (
+            dict(reference.get("provenance"))
+            if isinstance(reference.get("provenance"), dict)
+            else {}
+        )
+
+        metadata_url = ""
+        metadata_name = ""
+        metadata_source_class = ""
+        metadata_authority = ""
+        metadata_domain = ""
+        for item in metadata_items:
+            if not metadata_url and item.get("url") not in (None, "", [], {}):
+                metadata_url = str(item.get("url") or "").strip()
+            if not metadata_name and item.get("name") not in (None, "", [], {}):
+                metadata_name = str(item.get("name") or "").strip()
+            if (
+                not metadata_source_class
+                and item.get("source_class") not in (None, "", [], {})
+            ):
+                metadata_source_class = str(item.get("source_class") or "").strip()
+            if not metadata_authority and item.get("authority") not in (None, "", [], {}):
+                metadata_authority = str(item.get("authority") or "").strip()
+            if not metadata_domain and item.get("domain") not in (None, "", [], {}):
+                metadata_domain = str(item.get("domain") or "").strip()
+
+        normalized_url = _normalize_web_reference_url(
+            source_info.get("url")
+            or reference.get("url")
+            or metadata_url
+            or (
+                source_info.get("id")
+                if str(source_info.get("id") or "").strip().startswith(("http://", "https://"))
+                else ""
+            )
+            or (
+                provenance.get("source_id")
+                if str(provenance.get("source_id") or "").strip().startswith(("http://", "https://"))
+                else ""
+            )
+        )
+        normalized_title = str(
+            source_info.get("name")
+            or reference.get("title")
+            or metadata_name
+            or normalized_url
+        ).strip() or normalized_url
+        normalized_source_class = _normalize_web_source_class(
+            reference.get("source_class")
+            or provenance.get("source_class")
+            or metadata_source_class
+            or source_info.get("type"),
+            url=normalized_url,
+            authority=reference.get("authority")
+            or provenance.get("authority")
+            or metadata_authority
+            or source_info.get("authority"),
+        )
+        normalized_authority = _normalize_web_authority(
+            reference.get("authority")
+            or provenance.get("authority")
+            or metadata_authority
+            or source_info.get("authority"),
+            source_class=normalized_source_class,
+        )
+        is_web_reference = bool(normalized_url) and bool(normalized_source_class)
+
+        if not is_web_reference:
+            return reference
+
+        if not self._web_reference_has_acceptance_markers(
+            reference,
+            source_info=source_info,
+            provenance=provenance,
+        ):
+            return None
+
+        source_info["id"] = str(source_info.get("id") or normalized_url).strip() or normalized_url
+        source_info["url"] = normalized_url
+        if normalized_title:
+            source_info["name"] = normalized_title
+        if normalized_source_class:
+            source_info["type"] = normalized_source_class
+            reference["source_class"] = normalized_source_class
+            provenance["source_class"] = normalized_source_class
+            provenance["source_type"] = normalized_source_class
+        if normalized_authority:
+            source_info["authority"] = normalized_authority
+            reference["authority"] = normalized_authority
+            provenance["authority"] = normalized_authority
+
+        normalized_provider = str(provider or "").strip()
+        normalized_as_of = str(as_of or "").strip()
+        normalized_freshness = str(freshness or "").strip()
+        domain = metadata_domain or _web_reference_domain(normalized_url)
+
+        if not metadata_items:
+            metadata_items = [
+                {
+                    "source": normalized_url,
+                    "name": normalized_title,
+                    "url": normalized_url,
+                }
+            ]
+
+        primary_metadata = metadata_items[0]
+        primary_metadata.setdefault("source", normalized_url)
+        primary_metadata.setdefault("name", normalized_title)
+        primary_metadata.setdefault("url", normalized_url)
+        if tool_name:
+            primary_metadata.setdefault("tool_name", tool_name)
+            primary_metadata.setdefault("retrieval_tool_name", tool_name)
+        if normalized_provider:
+            primary_metadata.setdefault("provider", normalized_provider)
+        if retrieval_round not in (None, "", [], {}):
+            primary_metadata.setdefault("retrieval_round", retrieval_round)
+        if normalized_source_class:
+            primary_metadata.setdefault("source_class", normalized_source_class)
+        if normalized_authority:
+            primary_metadata.setdefault("authority", normalized_authority)
+        if normalized_as_of:
+            primary_metadata.setdefault("as_of", normalized_as_of)
+        if normalized_freshness:
+            primary_metadata.setdefault("freshness", normalized_freshness)
+        if domain:
+            primary_metadata.setdefault("domain", domain)
+        for key, value in _safe_query_provenance_fields(query).items():
+            primary_metadata.setdefault(key, value)
+
+        if tool_name:
+            provenance.setdefault("tool_name", tool_name)
+        if normalized_provider:
+            provenance.setdefault("provider", normalized_provider)
+        if retrieval_round not in (None, "", [], {}):
+            provenance.setdefault("retrieval_round", retrieval_round)
+        if normalized_as_of:
+            provenance.setdefault("as_of", normalized_as_of)
+        if normalized_freshness:
+            provenance.setdefault("freshness", normalized_freshness)
+        if domain:
+            provenance.setdefault("domain", domain)
+        provenance.setdefault("source_id", source_info["id"])
+        for key, value in _safe_query_provenance_fields(query).items():
+            provenance.setdefault(key, value)
+
+        reference["source"] = source_info
+        reference["metadata"] = metadata_items
+        reference["provenance"] = provenance
+        if normalized_as_of:
+            reference["as_of"] = normalized_as_of
+        if normalized_freshness:
+            reference["freshness"] = normalized_freshness
+
+        return reference
+
+    def _normalize_explicit_web_reference_candidate(
+        self,
+        candidate: object,
+        *,
+        tool_name: str,
+        query: str = "",
+        retrieval_round: object = None,
+        provider: object = "",
+        as_of: object = None,
+        freshness: object = None,
+    ) -> Optional[dict]:
+        if not isinstance(candidate, dict):
+            return None
+
+        if any(
+            key in candidate
+            for key in ("source", "document", "documents", "metadata", "metadatas")
+        ):
+            reference = self._normalize_canonical_reference(candidate)
+            if not reference:
+                return None
+            return self._enrich_normalized_web_reference(
+                reference,
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+                provider=provider,
+                as_of=as_of,
+                freshness=freshness,
+            )
+
+        return self._normalize_web_reference(
+            tool_name=tool_name,
+            url=_coalesce_mapping_value(
+                candidate,
+                keys=("url", "link", "source_url", "sourceUrl"),
+            ),
+            title=_coalesce_mapping_value(
+                candidate,
+                keys=("title", "name", "source_name", "sourceName", "url", "link"),
+            ),
+            content=_coalesce_mapping_value(
+                candidate,
+                keys=("content", "snippet", "summary", "text", "title"),
+            ),
+            query=query,
+            retrieval_round=retrieval_round,
+            provider=_coalesce_mapping_value(
+                candidate,
+                keys=("provider", "search_provider", "engine"),
+            )
+            or provider,
+            source_class=_coalesce_mapping_value(
+                candidate,
+                keys=("source_class", "sourceClass", "source_type", "sourceType", "type"),
+            ),
+            authority=_coalesce_mapping_value(
+                candidate,
+                keys=("authority", "authority_level", "source_authority"),
+            ),
+            as_of=_coalesce_mapping_value(
+                candidate,
+                keys=("as_of", "asOf", "retrieved_at", "retrievedAt", "timestamp"),
+            )
+            or as_of,
+            freshness=_coalesce_mapping_value(
+                candidate,
+                keys=("freshness", "age", "published_at", "publishedAt", "date"),
+            )
+            or freshness,
+        )
+
+    def _filter_retrieval_diagnostics_for_accepted_references(
+        self, diagnostics: list[dict], references: list[dict]
+    ) -> list[dict]:
+        if not references or not diagnostics:
+            return diagnostics
+
+        accepted_web_references = 0
+        for reference in references:
+            if not isinstance(reference, dict):
+                continue
+            source_info = reference.get("source")
+            source_info = source_info if isinstance(source_info, dict) else {}
+            normalized_source_class = _normalize_web_source_class(
+                reference.get("source_class") or source_info.get("type"),
+                url=source_info.get("url") or source_info.get("id") or "",
+                authority=reference.get("authority") or source_info.get("authority") or "",
+            )
+            if normalized_source_class in {"official_web", "generic_web"}:
+                accepted_web_references += 1
+
+        if not accepted_web_references:
+            return diagnostics
+
+        return [
+            item
+            for item in diagnostics
+            if not (
+                isinstance(item, dict)
+                and str(item.get("classification") or "").strip().lower()
+                == "no_evidence"
+            )
+        ]
+
+    def _normalize_web_search_payload(
+        self,
+        *,
+        tool_name: str,
+        payload: object,
+        tool_args: dict,
+    ) -> dict:
+        payload_dict = payload if isinstance(payload, dict) else {}
+        results = []
+        if isinstance(payload_dict.get("results"), list):
+            results = payload_dict.get("results") or []
+        elif isinstance(payload_dict.get("data"), list):
+            results = payload_dict.get("data") or []
+        elif isinstance(payload, list):
+            results = payload
+
+        query = str(
+            tool_args.get("query")
+            or payload_dict.get("query")
+            or payload_dict.get("q")
+            or ""
+        ).strip()
+        query_fields = _safe_query_provenance_fields(query)
+        query_digest = query_fields.get("query_digest", "")
+        status = str(payload_dict.get("status") or "").strip().lower()
+        provider = str(
+            payload_dict.get("provider")
+            or payload_dict.get("search_provider")
+            or payload_dict.get("engine")
+            or ""
+        ).strip()
+        retrieval_round = _coalesce_mapping_value(
+            payload_dict,
+            keys=("retrieval_round", "retrievalRound", "attempt"),
+        )
+        as_of = _coalesce_mapping_value(
+            payload_dict,
+            keys=("as_of", "asOf", "retrieved_at", "retrievedAt", "timestamp"),
+        )
+        freshness = _coalesce_mapping_value(
+            payload_dict,
+            keys=("freshness", "age", "published_at", "publishedAt"),
+        )
+
+        explicit_reason = str(
+            _coalesce_mapping_value(
+                payload_dict,
+                keys=("reason", "code", "error", "message", "detail"),
+            )
+            or ""
+        ).strip()
+        if explicit_reason and not status:
+            status = "error"
+
+        if status in {"error", "failed", "failure", "timeout", "timed_out", "blocked", "denied", "weak", "empty"}:
+            reason = explicit_reason or (
+                "empty_search_results"
+                if status == "empty"
+                else "weak_search_results"
+                if status == "weak"
+                else "search_result_denied"
+                if status == "denied"
+                else "search_result_blocked"
+                if status == "blocked"
+                else "web_search_timeout"
+                if status in {"timeout", "timed_out"}
+                else "web_search_error"
+            )
+            return {
+                "tool_name": tool_name,
+                "retrieval_diagnostics": [
+                    self._web_reference_diagnostic(
+                        tool_name=tool_name,
+                        status=status,
+                        reason=reason,
+                        query=query,
+                        query_digest=query_digest,
+                        retrieval_round=retrieval_round,
+                        provider=provider,
+                        detail=payload_dict.get("detail") or explicit_reason,
+                    )
+                ],
+            }
+
+        explicit_reference_groups = [
+            payload_dict.get("canonical_references"),
+            payload_dict.get("accepted_references"),
+            payload_dict.get("accepted_results"),
+            payload_dict.get("selected_results"),
+            payload_dict.get("used_results"),
+        ]
+        explicit_candidates = []
+        for group in explicit_reference_groups:
+            explicit_candidates.extend(self._iter_source_items(group))
+
+        if explicit_candidates:
+            references: list[dict] = []
+            for candidate in explicit_candidates:
+                reference = self._normalize_explicit_web_reference_candidate(
+                    candidate,
+                    tool_name=tool_name,
+                    query=query,
+                    retrieval_round=retrieval_round,
+                    provider=provider,
+                    as_of=as_of,
+                    freshness=freshness,
+                )
+                if reference:
+                    references.append(reference)
+
+            if references:
+                return {
+                    "tool_name": tool_name,
+                    "canonical_references": references,
+                }
+
+            return {
+                "tool_name": tool_name,
+                "retrieval_diagnostics": [
+                    self._web_reference_diagnostic(
+                        tool_name=tool_name,
+                        status="malformed",
+                        reason="malformed_search_results",
+                        query=query,
+                        query_digest=query_digest,
+                        retrieval_round=retrieval_round,
+                        provider=provider,
+                    )
+                ],
+            }
+
+        if results:
+            return {"tool_name": tool_name}
+
+        return {
+            "tool_name": tool_name,
+            "retrieval_diagnostics": [
+                self._web_reference_diagnostic(
+                    tool_name=tool_name,
+                    status="empty",
+                    reason="empty_search_results",
+                    query=query,
+                    query_digest=query_digest,
+                    retrieval_round=retrieval_round,
+                    provider=provider,
+                )
+            ],
+        }
+
+    def _normalize_webpage_payload(
+        self,
+        *,
+        tool_name: str,
+        payload: object,
+        tool_args: dict,
+    ) -> dict:
+        payload_dict = payload if isinstance(payload, dict) else {}
+        url = str(
+            tool_args.get("url")
+            or payload_dict.get("url")
+            or payload_dict.get("source_url")
+            or ""
+        ).strip()
+        status = str(payload_dict.get("status") or "").strip().lower()
+        provider = str(payload_dict.get("provider") or "").strip()
+        retrieval_round = _coalesce_mapping_value(
+            payload_dict,
+            keys=("retrieval_round", "retrievalRound", "attempt"),
+        )
+        as_of = _coalesce_mapping_value(
+            payload_dict,
+            keys=("as_of", "asOf", "retrieved_at", "retrievedAt", "timestamp"),
+        )
+        freshness = _coalesce_mapping_value(
+            payload_dict,
+            keys=("freshness", "age", "published_at", "publishedAt", "date"),
+        )
+        source_class = _coalesce_mapping_value(
+            payload_dict,
+            keys=("source_class", "sourceClass", "source_type", "sourceType", "type"),
+        )
+        authority = _coalesce_mapping_value(
+            payload_dict,
+            keys=("authority", "authority_level", "source_authority"),
+        )
+        explicit_reason = str(
+            _coalesce_mapping_value(
+                payload_dict,
+                keys=("reason", "code", "error", "message", "detail"),
+            )
+            or ""
+        ).strip()
+        if explicit_reason and not status:
+            status = "error"
+
+        if status in {"error", "failed", "failure", "timeout", "timed_out", "blocked", "denied", "weak", "empty"}:
+            reason = explicit_reason or (
+                "empty_webpage_result"
+                if status == "empty"
+                else "weak_webpage_result"
+                if status == "weak"
+                else "webpage_result_denied"
+                if status == "denied"
+                else "webpage_result_blocked"
+                if status == "blocked"
+                else "webpage_read_timeout"
+                if status in {"timeout", "timed_out"}
+                else "webpage_read_error"
+            )
+            return {
+                "tool_name": tool_name,
+                "retrieval_diagnostics": [
+                    self._web_reference_diagnostic(
+                        tool_name=tool_name,
+                        status=status,
+                        reason=reason,
+                        url=url,
+                        retrieval_round=retrieval_round,
+                        provider=provider,
+                        source_class=str(source_class or ""),
+                        authority=str(authority or ""),
+                        detail=payload_dict.get("detail") or explicit_reason,
+                    )
+                ],
+            }
+
+        content = payload if isinstance(payload, str) else _coalesce_mapping_value(
+            payload_dict,
+            keys=("content", "text", "summary", "snippet", "message", "detail"),
+        )
+        title = _coalesce_mapping_value(
+            payload_dict,
+            keys=("title", "name", "url"),
+        ) or url
+        reference = self._normalize_web_reference(
+            tool_name=tool_name,
+            url=url,
+            title=title,
+            content=content,
+            retrieval_round=retrieval_round,
+            provider=provider,
+            source_class=source_class,
+            authority=authority,
+            as_of=as_of,
+            freshness=freshness,
+        )
+        if reference:
+            return {
+                "tool_name": tool_name,
+                "canonical_references": [reference],
+            }
+
+        return {
+            "tool_name": tool_name,
+            "retrieval_diagnostics": [
+                self._web_reference_diagnostic(
+                    tool_name=tool_name,
+                    status="empty" if not str(content or "").strip() else "malformed",
+                    reason="empty_webpage_result"
+                    if not str(content or "").strip()
+                    else "malformed_webpage_result",
+                    url=url,
+                    retrieval_round=retrieval_round,
+                    provider=provider,
+                    source_class=str(source_class or ""),
+                    authority=str(authority or ""),
+                )
+            ],
+        }
+
+    def _iter_web_tool_output_payloads(self, output: object) -> list[dict]:
+        if not isinstance(output, list):
+            return []
+
+        function_context_by_call_id = _function_call_context_by_call_id(output)
+        payloads: list[dict] = []
+        malformed_payload_count = 0
+
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "function_call_output":
+                continue
+
+            call_id = str(item.get("call_id") or item.get("id") or "").strip()
+            function_context = function_context_by_call_id.get(call_id) or {}
+            tool_name = str(
+                item.get("name")
+                or function_context.get("name")
+                or ""
+            ).strip().lower()
+            if not tool_name or (
+                not _is_search_tool_name(tool_name)
+                and not _is_webpage_tool_name(tool_name)
+            ):
+                continue
+
+            parsed_payload = _extract_function_call_output_payload(item)
+            if parsed_payload in (None, "", []):
+                malformed_payload_count += 1
+                continue
+
+            tool_args = function_context.get("arguments")
+            tool_args = tool_args if isinstance(tool_args, dict) else {}
+            if _is_search_tool_name(tool_name):
+                payloads.append(
+                    self._normalize_web_search_payload(
+                        tool_name=tool_name,
+                        payload=parsed_payload,
+                        tool_args=tool_args,
+                    )
+                )
+            else:
+                payloads.append(
+                    self._normalize_webpage_payload(
+                        tool_name=tool_name,
+                        payload=parsed_payload,
+                        tool_args=tool_args,
+                    )
+                )
+
+        if payloads or malformed_payload_count:
+            observe_llm_event(
+                "reference.web_tool_payload.normalize",
+                {
+                    "payload_count": len(payloads),
+                    "malformed_payload_count": malformed_payload_count,
+                },
+            )
+
+        return payloads
+
+    def _is_chat_completion_source_wrapper(self, value: object) -> bool:
+        if not isinstance(value, dict):
+            return False
+
+        # Realtime completion payloads can be echoed back through legacy
+        # source lanes. Their nested metadata may be useful, but the wrapper
+        # is the assistant response, not citeable retrieval evidence.
+        if not isinstance(value.get("output"), list):
+            return False
+        if value.get("done") is not True and "content" not in value:
+            return False
+
+        has_retrieval_payload = any(
+            value.get(key) not in (None, "", [], {})
+            for key in ("document", "documents")
+        )
+        metadata_payload = value.get("metadata")
+        metadatas_payload = value.get("metadatas")
+        if isinstance(metadata_payload, list) and metadata_payload:
+            has_retrieval_payload = True
+        if isinstance(metadatas_payload, list) and metadatas_payload:
+            has_retrieval_payload = True
+
+        return not has_retrieval_payload
+
+    def _iter_source_items(self, value: object) -> list[dict]:
+        if isinstance(value, list):
+            items: list[dict] = []
+            for item in value:
+                items.extend(self._iter_source_items(item))
+            return items
+
+        if not isinstance(value, dict):
+            return []
+
+        nested_items: list[dict] = []
+        for key in (
+            "canonical_references",
+            "sources",
+            "citations",
+            "references",
+            "retrieval_diagnostics",
+        ):
+            nested_items.extend(self._iter_source_items(value.get(key)))
+        if nested_items:
+            return nested_items
+
+        if self._is_chat_completion_source_wrapper(value):
+            nested_items.extend(self._iter_source_items(value.get("metadata")))
+            nested_items.extend(self._iter_source_items(value.get("data")))
+            return nested_items
+
+        if not any(
+            key in value for key in ("source", "document", "metadata", "metadatas")
+        ):
+            nested_items.extend(self._iter_source_items(value.get("documents")))
+            if nested_items:
+                return nested_items
+
+        data = value.get("data")
+        if isinstance(data, (dict, list)):
+            data_items = self._iter_source_items(data)
+            if data_items:
+                return data_items
+
+        return [value]
+
+    def _normalize_canonical_reference(self, source: object) -> Optional[dict]:
+        if not isinstance(source, dict):
+            return None
+        if self._is_retrieval_diagnostic_item(source):
+            return None
+        if self._is_chat_completion_source_wrapper(source):
+            return None
+        if source.get("type") == "code_execution":
+            return None
+
+        reference = json.loads(json.dumps(source, ensure_ascii=False, default=str))
+        if isinstance(reference.get("data"), dict):
+            reference = reference["data"]
+        if not isinstance(reference, dict):
+            return None
+
+        if self._is_retrieval_diagnostic_item(reference):
+            return None
+        if self._is_chat_completion_source_wrapper(reference):
+            return None
+        if reference.get("type") == "code_execution":
+            return None
+
+        if "document" not in reference and isinstance(reference.get("documents"), list):
+            reference["document"] = reference.get("documents")
+        if "metadata" not in reference and isinstance(reference.get("metadatas"), list):
+            reference["metadata"] = reference.get("metadatas")
+
+        source_info = reference.get("source")
+        if isinstance(source_info, str):
+            source_info = {"name": source_info}
+        elif not isinstance(source_info, dict):
+            source_info = {}
+
+        for source_key, target_key in (
+            ("source_id", "id"),
+            ("id", "id"),
+            ("source_name", "name"),
+            ("name", "name"),
+            ("title", "name"),
+            ("file_name", "name"),
+            ("filename", "name"),
+            ("url", "url"),
+            ("source_url", "url"),
+            ("source_type", "type"),
+            ("type", "type"),
+            ("source_class", "type"),
+            ("authority", "authority"),
+        ):
+            value = reference.get(source_key)
+            if value not in (None, "", [], {}) and not source_info.get(target_key):
+                source_info[target_key] = value
+
+        if source_info:
+            reference["source"] = source_info
+
+        source_class = str(
+            reference.get("source_class")
+            or source_info.get("type")
+            or ""
+        ).strip()
+        if source_class:
+            reference["source_class"] = source_class
+
+        authority = str(
+            reference.get("authority")
+            or source_info.get("authority")
+            or ""
+        ).strip()
+        if authority:
+            reference["authority"] = authority
+
+        provenance = reference.get("provenance")
+        provenance = provenance if isinstance(provenance, dict) else {}
+        for metadata in reference.get("metadata") or []:
+            if not isinstance(metadata, dict):
+                continue
+            for source_key, target_key in (
+                ("retrieval_tool_name", "tool_name"),
+                ("tool_name", "tool_name"),
+                ("retrieval_round", "retrieval_round"),
+                ("query", "query"),
+                ("file_id", "file_id"),
+                ("knowledge_id", "knowledge_id"),
+                ("dataset_id", "dataset_id"),
+                ("document_id", "document_id"),
+                ("chunk_id", "chunk_id"),
+                ("page", "page"),
+                ("section", "section"),
+                ("query_digest", "query_digest"),
+                ("provider", "provider"),
+                ("domain", "domain"),
+                ("source_class", "source_class"),
+                ("authority", "authority"),
+                ("as_of", "as_of"),
+                ("freshness", "freshness"),
+                ("published_at", "published_at"),
+            ):
+                value = metadata.get(source_key)
+                if value not in (None, "", [], {}) and not provenance.get(target_key):
+                    provenance[target_key] = value
+
+        if isinstance(source_info, dict):
+            for source_key, target_key in (
+                ("id", "source_id"),
+                ("file_id", "file_id"),
+                ("knowledge_id", "knowledge_id"),
+                ("note_id", "note_id"),
+                ("type", "source_type"),
+                ("authority", "authority"),
+            ):
+                value = source_info.get(source_key)
+                if value not in (None, "", [], {}) and not provenance.get(target_key):
+                    provenance[target_key] = value
+
+        for source_key, target_key in (
+            ("source_class", "source_class"),
+            ("authority", "authority"),
+            ("as_of", "as_of"),
+            ("freshness", "freshness"),
+        ):
+            value = reference.get(source_key)
+            if value not in (None, "", [], {}) and not provenance.get(target_key):
+                provenance[target_key] = value
+
+        if provenance:
+            reference["provenance"] = provenance
+
+        reference = self._enrich_normalized_web_reference(
+            reference,
+            tool_name=str(provenance.get("tool_name") or "").strip(),
+            query=str(provenance.get("query") or "").strip(),
+            retrieval_round=provenance.get("retrieval_round"),
+            provider=provenance.get("provider") or "",
+            as_of=provenance.get("as_of"),
+            freshness=provenance.get("freshness"),
+        )
+        if not reference:
+            return None
+
+        has_identity = any(
+            value not in (None, "", [], {})
+            for value in (
+                reference.get("source"),
+                reference.get("document"),
+                reference.get("metadata"),
+                reference.get("id"),
+            )
+        )
+        if not has_identity:
+            return None
+
+        reference["type"] = "retrieval_reference"
+        return reference
+
+    def build_canonical_references(self, *reference_groups: object) -> list[dict]:
+        references: list[dict] = []
+        seen: dict[str, int] = {}
+        candidate_count = 0
+        dedupe_count = 0
+        malformed_or_empty_input_count = 0
+
+        for group in reference_groups:
+            for source in self._iter_source_items(group):
+                candidate_count += 1
+                reference = self._normalize_canonical_reference(source)
+                if not reference:
+                    malformed_or_empty_input_count += 1
+                    continue
+                signature = self._source_signature(reference)
+                if not signature:
+                    malformed_or_empty_input_count += 1
+                    continue
+                if signature in seen:
+                    dedupe_count += 1
+                    self._merge_reference_provenance(
+                        references[seen[signature]],
+                        reference,
+                    )
+                    continue
+                seen[signature] = len(references)
+                references.append(reference)
+
+        if candidate_count or references:
+            observe_llm_event(
+                "reference.normalize",
+                {
+                    "input_group_count": len(reference_groups),
+                    "candidate_count": candidate_count,
+                    "canonical_reference_count": len(references),
+                    "dedupe_count": dedupe_count,
+                    "malformed_or_empty_input_count": malformed_or_empty_input_count,
+                },
+            )
+
+        return references
+
+    def _merge_reference_provenance(
+        self, existing_reference: dict, incoming_reference: dict
+    ) -> None:
+        if not isinstance(existing_reference, dict) or not isinstance(
+            incoming_reference, dict
+        ):
+            return
+
+        incoming = incoming_reference.get("provenance")
+        if not isinstance(incoming, dict) or not incoming:
+            return
+
+        existing = existing_reference.get("provenance")
+        if not isinstance(existing, dict):
+            existing_reference["provenance"] = dict(incoming)
+            return
+
+        for key, value in incoming.items():
+            if value in (None, "", [], {}):
+                continue
+            if existing.get(key) in (None, "", [], {}):
+                existing[key] = value
+            elif existing.get(key) != value:
+                additional = existing.setdefault("additional_provenance", [])
+                if isinstance(additional, list) and incoming not in additional:
+                    additional.append(dict(incoming))
+
+    def _merge_retrieval_diagnostics(self, *diagnostic_groups: object) -> list[dict]:
+        diagnostics: list[dict] = []
+        seen: set[str] = set()
+        candidate_count = 0
+        dedupe_count = 0
+        ignored_input_count = 0
+
+        for group in diagnostic_groups:
+            if not isinstance(group, (dict, list)):
+                continue
+            items = self._iter_source_items(group)
+
+            for item in items:
+                candidate_count += 1
+                if not self._is_retrieval_diagnostic_item(item):
+                    ignored_input_count += 1
+                    continue
+                try:
+                    diagnostic = json.loads(
+                        json.dumps(item, ensure_ascii=False, default=str)
+                    )
+                    signature = json.dumps(
+                        diagnostic, ensure_ascii=False, sort_keys=True, default=str
+                    )
+                except (TypeError, ValueError):
+                    ignored_input_count += 1
+                    continue
+                if signature in seen:
+                    dedupe_count += 1
+                    continue
+                seen.add(signature)
+                diagnostics.append(diagnostic)
+
+        if candidate_count or diagnostics:
+            observe_llm_event(
+                "reference.diagnostics.normalize",
+                {
+                    "candidate_count": candidate_count,
+                    "diagnostic_count": len(diagnostics),
+                    "dedupe_count": dedupe_count,
+                    "ignored_input_count": ignored_input_count,
+                    "reason_codes": diagnostic_reason_codes(diagnostics),
+                    "classification_counts": diagnostic_classification_counts(
+                        diagnostics
+                    ),
+                },
+            )
+
+        return diagnostics
+
+    def _active_source_scope_suppresses_references(self, scope: object) -> bool:
+        if not isinstance(scope, dict):
+            return False
+
+        status = str(scope.get("status") or "").strip().lower()
+        source_set_mode = str(scope.get("source_set_mode") or "").strip().lower()
+        return status in {"ambiguous", "expired"} or source_set_mode == "none"
+
+    def _diagnostics_suppress_references(self, diagnostics: object) -> bool:
+        if not isinstance(diagnostics, list):
+            return False
+
+        return any(
+            isinstance(item, dict)
+            and str(item.get("reason") or "").strip().lower()
+            == "ambiguous_retrieval_scope"
+            for item in diagnostics
+        )
+
+    def _diagnostics_indicate_no_evidence(self, diagnostics: object) -> bool:
+        if not isinstance(diagnostics, list):
+            return False
+
+        return any(
+            isinstance(item, dict)
+            and str(item.get("classification") or "").strip().lower()
+            == "no_evidence"
+            for item in diagnostics
+        )
+
+    def _should_suppress_canonical_references(
+        self, *, metadata: object = None, diagnostics: object = None
+    ) -> bool:
+        metadata = metadata if isinstance(metadata, dict) else {}
+        merged_diagnostics = self._merge_retrieval_diagnostics(
+            metadata.get("retrieval_diagnostics"),
+            diagnostics,
+        )
+        return self._active_source_scope_suppresses_references(
+            metadata.get("active_source_scope")
+        ) or self._diagnostics_suppress_references(merged_diagnostics)
+
+    def _should_clear_reference_aliases(
+        self,
+        *,
+        metadata: object = None,
+        diagnostics: object = None,
+        accepted_references: object = None,
+    ) -> bool:
+        metadata = metadata if isinstance(metadata, dict) else {}
+        merged_diagnostics = self._merge_retrieval_diagnostics(
+            metadata.get("retrieval_diagnostics"),
+            diagnostics,
+        )
+
+        if self._active_source_scope_suppresses_references(
+            metadata.get("active_source_scope")
+        ) or self._diagnostics_suppress_references(merged_diagnostics):
+            return True
+
+        accepted_references = (
+            accepted_references if isinstance(accepted_references, list) else []
+        )
+        return (
+            not accepted_references
+            and self._diagnostics_indicate_no_evidence(merged_diagnostics)
+        )
+
+    def _should_hide_retrieval_status_history(
+        self,
+        *,
+        message: dict,
+        canonical_references: list[dict],
+        retrieval_diagnostics: list[dict],
+        metadata: dict,
+    ) -> bool:
+        if not isinstance(message, dict) or message.get("done") is not True:
+            return False
+
+        status_history = message.get("statusHistory")
+        if not isinstance(status_history, list):
+            status_history = message.get("status_history")
+        if not isinstance(status_history, list) or not status_history:
+            return False
+
+        retrieval_status_actions = {
+            "knowledge_search",
+            "queries_generated",
+            "sources_retrieved",
+        }
+        visible_statuses = [
+            status
+            for status in status_history
+            if isinstance(status, dict) and status.get("hidden") is not True
+        ]
+        if not visible_statuses or canonical_references:
+            return False
+
+        visible_actions = {
+            str(status.get("action") or "").strip()
+            for status in visible_statuses
+            if str(status.get("action") or "").strip()
+        }
+        if not visible_actions.intersection(retrieval_status_actions):
+            return False
+        if any(
+            action not in retrieval_status_actions and action != "chat"
+            for action in visible_actions
+        ):
+            return False
+
+        if any(
+            str(status.get("action") or "").strip() == "sources_retrieved"
+            and isinstance(status.get("count"), (int, float))
+            and status.get("count", 0) > 0
+            for status in status_history
+            if isinstance(status, dict)
+        ):
+            return False
+
+        if self._should_suppress_canonical_references(
+            metadata=metadata,
+            diagnostics=retrieval_diagnostics,
+        ):
+            return True
+
+        if any(
+            isinstance(item, dict)
+            and str(item.get("classification") or "").strip().lower()
+            == "no_evidence"
+            for item in retrieval_diagnostics
+        ):
+            return True
+
+        if any(
+            str(status.get("action") or "").strip() == "sources_retrieved"
+            and status.get("count") == 0
+            for status in status_history
+            if isinstance(status, dict)
+        ):
+            return True
+
+        content = message.get("content")
+        return isinstance(content, str) and content.strip() == "NO_FILE_ACCESS"
+
+    def _strip_suppressed_reference_citation_markers(
+        self, content: object
+    ) -> object:
+        if not isinstance(content, str) or "[" not in content:
+            return content
+
+        cleaned = _SUPPRESSED_REFERENCE_CITATION_PATTERN.sub("", content)
+        cleaned = _SUPPRESSED_REFERENCE_PUNCTUATION_PATTERN.sub(r"\1", cleaned)
+        cleaned = _SUPPRESSED_REFERENCE_DOUBLE_SPACE_PATTERN.sub(" ", cleaned)
+        return cleaned.strip()
+
+    def _strip_suppressed_reference_citation_markers_from_output(
+        self, output: object
+    ) -> object:
+        if not isinstance(output, list):
+            return output
+
+        changed = False
+        cleaned_output = []
+
+        for item in output:
+            if not isinstance(item, dict):
+                cleaned_output.append(item)
+                continue
+
+            cleaned_item = dict(item)
+            item_changed = False
+
+            if isinstance(cleaned_item.get("text"), str):
+                cleaned_text = self._strip_suppressed_reference_citation_markers(
+                    cleaned_item.get("text")
+                )
+                if cleaned_text != cleaned_item.get("text"):
+                    cleaned_item["text"] = cleaned_text
+                    item_changed = True
+
+            content = cleaned_item.get("content")
+            if isinstance(content, str):
+                cleaned_content = self._strip_suppressed_reference_citation_markers(
+                    content
+                )
+                if cleaned_content != content:
+                    cleaned_item["content"] = cleaned_content
+                    item_changed = True
+            elif isinstance(content, list):
+                cleaned_content = []
+                content_changed = False
+                for content_item in content:
+                    if not isinstance(content_item, dict):
+                        cleaned_content.append(content_item)
+                        continue
+
+                    cleaned_content_item = dict(content_item)
+                    if isinstance(cleaned_content_item.get("text"), str):
+                        cleaned_text = self._strip_suppressed_reference_citation_markers(
+                            cleaned_content_item.get("text")
+                        )
+                        if cleaned_text != cleaned_content_item.get("text"):
+                            cleaned_content_item["text"] = cleaned_text
+                            content_changed = True
+                    cleaned_content.append(cleaned_content_item)
+
+                if content_changed:
+                    cleaned_item["content"] = cleaned_content
+                    item_changed = True
+
+            cleaned_output.append(cleaned_item if item_changed else item)
+            changed = changed or item_changed
+
+        return cleaned_output if changed else output
+
+    def _hide_retrieval_status_history(self, message: dict) -> tuple[dict, bool]:
+        if not isinstance(message, dict):
+            return message, False
+
+        status_history_key = None
+        status_history = None
+        for key in ("statusHistory", "status_history"):
+            if isinstance(message.get(key), list):
+                status_history_key = key
+                status_history = message.get(key)
+                break
+
+        if not status_history_key or not isinstance(status_history, list):
+            return message, False
+
+        retrieval_status_actions = {
+            "knowledge_search",
+            "queries_generated",
+            "sources_retrieved",
+        }
+        changed = False
+        updated_status_history = []
+
+        for status in status_history:
+            if not isinstance(status, dict):
+                updated_status_history.append(status)
+                continue
+
+            action = str(status.get("action") or "").strip()
+            if action not in retrieval_status_actions or status.get("hidden") is True:
+                updated_status_history.append(status)
+                continue
+
+            updated_status_history.append({**status, "hidden": True})
+            changed = True
+
+        normalized_message = message
+        if changed:
+            normalized_message = {**normalized_message, status_history_key: updated_status_history}
+
+        status = normalized_message.get("status")
+        if isinstance(status, dict):
+            action = str(status.get("action") or "").strip()
+            if action in retrieval_status_actions and status.get("hidden") is not True:
+                if normalized_message is message:
+                    normalized_message = dict(normalized_message)
+                normalized_message["status"] = {**status, "hidden": True}
+                changed = True
+
+        return normalized_message, changed
+
+    def build_reference_metadata_sidecar(
+        self,
+        *,
+        metadata: object = None,
+        sources: object = None,
+        diagnostics: object = None,
+        tool_outputs: object = None,
+    ) -> dict:
+        metadata = metadata if isinstance(metadata, dict) else {}
+        tool_reference_payloads = [
+            *self._iter_retrieval_tool_output_payloads(tool_outputs),
+            *self._iter_web_tool_output_payloads(tool_outputs),
+        ]
+        source_groups = [
+            metadata.get("canonical_references"),
+            metadata.get("references"),
+            metadata.get("sources"),
+            metadata.get("citations"),
+            metadata.get("documents"),
+            sources,
+            tool_reference_payloads,
+        ]
+        explicit_accepted_references = self.build_canonical_references(
+            metadata.get("canonical_references"),
+            tool_reference_payloads,
+        )
+        references = self.build_canonical_references(
+            *source_groups,
+        )
+        retrieval_diagnostics = self._merge_retrieval_diagnostics(
+            metadata.get("retrieval_diagnostics"),
+            diagnostics,
+            *source_groups,
+        )
+        retrieval_diagnostics = (
+            self._filter_retrieval_diagnostics_for_accepted_references(
+                retrieval_diagnostics,
+                explicit_accepted_references,
+            )
+        )
+        if (
+            not explicit_accepted_references
+            and self._diagnostics_indicate_no_evidence(retrieval_diagnostics)
+        ):
+            references = []
+        if self._should_suppress_canonical_references(
+            metadata=metadata,
+            diagnostics=retrieval_diagnostics,
+        ):
+            references = []
+
+        sidecar: dict = {}
+        if references:
+            sidecar["canonical_references"] = references
+        if retrieval_diagnostics:
+            sidecar["retrieval_diagnostics"] = retrieval_diagnostics
+        observe_llm_event(
+            "reference.sidecar.build",
+            {
+                "metadata_present": bool(metadata),
+                "source_group_count": len(source_groups),
+                "retrieval_tool_payload_count": len(tool_reference_payloads),
+                "canonical_reference_count": len(references),
+                "diagnostic_count": len(retrieval_diagnostics),
+                "result_status": (
+                    "mixed"
+                    if references and retrieval_diagnostics
+                    else "references"
+                    if references
+                    else "diagnostics"
+                    if retrieval_diagnostics
+                    else "empty"
+                ),
+            },
+        )
+        return sidecar
+
+    def _merge_message_metadata(
+        self, existing_metadata: object, incoming_metadata: object
+    ) -> dict:
+        metadata: dict = {}
+        if isinstance(existing_metadata, dict):
+            metadata.update(existing_metadata)
+        if isinstance(incoming_metadata, dict):
+            metadata.update(incoming_metadata)
+        return metadata
+
+    def _normalize_message_reference_sidecar(self, message: object) -> object:
+        if not isinstance(message, dict):
+            return message
+
+        normalized_message = dict(message)
+        changed = False
+
+        for key in ("sources", "citations", "references", "documents"):
+            if key not in normalized_message:
+                continue
+
+            value = normalized_message.get(key)
+            if not isinstance(value, (list, dict)):
+                continue
+
+            clean_sources = self._merge_message_sources(None, value)
+            if clean_sources:
+                if clean_sources != value:
+                    normalized_message[key] = clean_sources
+                    changed = True
+            else:
+                normalized_message.pop(key, None)
+                changed = True
+
+        existing_metadata = normalized_message.get("metadata")
+        metadata = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+        sidecar = self.build_reference_metadata_sidecar(
+            metadata=metadata,
+            sources=[
+                normalized_message.get("canonical_references"),
+                normalized_message.get("sources"),
+                normalized_message.get("citations"),
+                normalized_message.get("references"),
+                normalized_message.get("documents"),
+            ],
+            diagnostics=normalized_message.get("retrieval_diagnostics"),
+            tool_outputs=normalized_message.get("output"),
+        )
+        if sidecar or metadata:
+            merged_metadata = dict(metadata)
+            if sidecar.get("canonical_references"):
+                merged_metadata["canonical_references"] = sidecar["canonical_references"]
+            else:
+                merged_metadata.pop("canonical_references", None)
+            if sidecar.get("retrieval_diagnostics"):
+                merged_metadata["retrieval_diagnostics"] = sidecar["retrieval_diagnostics"]
+            else:
+                merged_metadata.pop("retrieval_diagnostics", None)
+            if merged_metadata != existing_metadata:
+                normalized_message["metadata"] = merged_metadata
+                changed = True
+
+        accepted_references = self.build_canonical_references(
+            metadata.get("canonical_references"),
+            normalized_message.get("canonical_references"),
+        )
+
+        if self._should_clear_reference_aliases(
+            metadata=normalized_message.get("metadata"),
+            diagnostics=sidecar.get("retrieval_diagnostics"),
+            accepted_references=accepted_references,
+        ):
+            message_metadata = normalized_message.get("metadata")
+            if (
+                isinstance(message_metadata, dict)
+                and "canonical_references" in message_metadata
+            ):
+                normalized_message["metadata"] = {
+                    key: value
+                    for key, value in message_metadata.items()
+                    if key != "canonical_references"
+                }
+                changed = True
+            for key in (
+                "canonical_references",
+                "sources",
+                "citations",
+                "references",
+                "documents",
+            ):
+                if key in normalized_message:
+                    normalized_message.pop(key, None)
+                    changed = True
+            cleaned_content = self._strip_suppressed_reference_citation_markers(
+                normalized_message.get("content")
+            )
+            if cleaned_content != normalized_message.get("content"):
+                normalized_message["content"] = cleaned_content
+                changed = True
+            cleaned_output = (
+                self._strip_suppressed_reference_citation_markers_from_output(
+                    normalized_message.get("output")
+                )
+            )
+            if cleaned_output != normalized_message.get("output"):
+                normalized_message["output"] = cleaned_output
+                changed = True
+
+        if self._should_hide_retrieval_status_history(
+            message=normalized_message,
+            canonical_references=sidecar.get("canonical_references") or [],
+            retrieval_diagnostics=sidecar.get("retrieval_diagnostics") or [],
+            metadata=normalized_message.get("metadata")
+            if isinstance(normalized_message.get("metadata"), dict)
+            else {},
+        ):
+            normalized_message, status_changed = self._hide_retrieval_status_history(
+                normalized_message
+            )
+            changed = changed or status_changed
+
+        if not changed:
+            if sidecar:
+                observe_llm_event(
+                    "reference.message_hydrate",
+                    {
+                        "role": str(normalized_message.get("role") or ""),
+                        "changed": False,
+                        "metadata_present": bool(metadata),
+                        "canonical_reference_count": len(
+                            sidecar.get("canonical_references") or []
+                        ),
+                        "diagnostic_count": len(
+                            sidecar.get("retrieval_diagnostics") or []
+                        ),
+                    },
+                )
+            return message
+
+        observe_llm_event(
+            "reference.message_hydrate",
+            {
+                "role": str(normalized_message.get("role") or ""),
+                "changed": True,
+                "metadata_present": bool(metadata),
+                "canonical_reference_count": len(
+                    sidecar.get("canonical_references") or []
+                ),
+                "diagnostic_count": len(sidecar.get("retrieval_diagnostics") or []),
+            },
+        )
+
+        return normalized_message
+
+    def _source_signature(self, source: object) -> str:
+        if not isinstance(source, dict):
+            return ""
+
+        if isinstance(source.get("data"), dict):
+            source = source["data"]
+        elif source.get("type") == "retrieval_reference":
+            source = {key: value for key, value in source.items() if key != "type"}
+
+        source_info = source.get("source")
+        source_identity: dict[str, object] = {}
+        if isinstance(source_info, dict):
+            for key in (
+                "id",
+                "file_id",
+                "note_id",
+                "knowledge_id",
+                "name",
+                "url",
+                "type",
+                "authority",
+            ):
+                value = source_info.get(key)
+                if value not in (None, "", [], {}):
+                    source_identity[key] = value
+        elif isinstance(source_info, str) and source_info.strip():
+            source_identity["name"] = source_info.strip()
+
+        metadata_identity: dict[str, object] = {}
+        metadatas = source.get("metadata")
+        if isinstance(metadatas, list):
+            for metadata in metadatas:
+                if not isinstance(metadata, dict):
+                    continue
+                for key in (
+                    "file_id",
+                    "note_id",
+                    "knowledge_id",
+                    "dataset_id",
+                    "source",
+                    "name",
+                    "url",
+                    "source_class",
+                    "authority",
+                ):
+                    value = metadata.get(key)
+                    if value not in (None, "", [], {}) and key not in metadata_identity:
+                        metadata_identity[key] = value
+
+        top_level_identity: dict[str, object] = {}
+        for key in ("source_class", "authority", "as_of", "freshness"):
+            value = source.get(key)
+            if value not in (None, "", [], {}):
+                top_level_identity[key] = value
+
+        provenance = source.get("provenance")
+        provenance = provenance if isinstance(provenance, dict) else {}
+
+        normalized_url = _normalize_web_reference_url(
+            source_identity.get("url")
+            or metadata_identity.get("url")
+            or (
+                source_identity.get("id")
+                if str(source_identity.get("id") or "").strip().startswith(("http://", "https://"))
+                else ""
+            )
+            or (
+                metadata_identity.get("source")
+                if str(metadata_identity.get("source") or "").strip().startswith(("http://", "https://"))
+                else ""
+            )
+            or (
+                provenance.get("source_id")
+                if str(provenance.get("source_id") or "").strip().startswith(("http://", "https://"))
+                else ""
+            )
+        )
+        normalized_source_class = _normalize_web_source_class(
+            source.get("source_class")
+            or provenance.get("source_class")
+            or metadata_identity.get("source_class")
+            or source_identity.get("type"),
+            url=normalized_url,
+            authority=source.get("authority")
+            or provenance.get("authority")
+            or metadata_identity.get("authority")
+            or source_identity.get("authority"),
+        )
+        normalized_authority = _normalize_web_authority(
+            source.get("authority")
+            or provenance.get("authority")
+            or metadata_identity.get("authority")
+            or source_identity.get("authority"),
+            source_class=normalized_source_class,
+        )
+        normalized_domain = (
+            str(provenance.get("domain") or "").strip()
+            or str(metadata_identity.get("domain") or "").strip()
+            or _web_reference_domain(normalized_url)
+        )
+
+        if normalized_url and normalized_source_class in {"official_web", "generic_web"}:
+            try:
+                return json.dumps(
+                    {
+                        "kind": "web",
+                        "source_class": normalized_source_class,
+                        "authority": normalized_authority,
+                        "url": normalized_url,
+                        "domain": normalized_domain,
+                        "chunk_id": provenance.get("chunk_id"),
+                        "page": provenance.get("page"),
+                        "section": provenance.get("section"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            except (TypeError, ValueError):
+                pass
+
+        non_web_source_type = str(
+            source_identity.get("type")
+            or provenance.get("source_type")
+            or source.get("source_class")
+            or ""
+        ).strip()
+        stable_source_id = (
+            source_identity.get("id")
+            or metadata_identity.get("file_id")
+            or metadata_identity.get("note_id")
+            or metadata_identity.get("knowledge_id")
+            or provenance.get("source_id")
+            or provenance.get("file_id")
+            or provenance.get("note_id")
+            or provenance.get("knowledge_id")
+            or provenance.get("document_id")
+        )
+        if stable_source_id or non_web_source_type:
+            try:
+                return json.dumps(
+                    {
+                        "kind": non_web_source_type or "source",
+                        "source_id": stable_source_id,
+                        "dataset_id": metadata_identity.get("dataset_id")
+                        or provenance.get("dataset_id"),
+                        "document_id": provenance.get("document_id"),
+                        "chunk_id": provenance.get("chunk_id"),
+                        "page": provenance.get("page"),
+                        "section": provenance.get("section"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            except (TypeError, ValueError):
+                pass
+
+        if source_identity or metadata_identity or top_level_identity:
+            try:
+                return json.dumps(
+                    {
+                        "source": source_identity,
+                        "metadata": metadata_identity,
+                        "top_level": top_level_identity,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            except (TypeError, ValueError):
+                pass
+
+        try:
+            return json.dumps(source, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            source_meta = source.get("source") if isinstance(source.get("source"), dict) else {}
+            metadata = (
+                source.get("metadata")
+                if isinstance(source.get("metadata"), list)
+                else source.get("metadatas")
+                if isinstance(source.get("metadatas"), list)
+                else []
+            )
+            document = (
+                source.get("document")
+                if isinstance(source.get("document"), list)
+                else source.get("documents")
+                if isinstance(source.get("documents"), list)
+                else []
+            )
+            return json.dumps(
+                {
+                    "id": source.get("id"),
+                    "source_id": source_meta.get("id"),
+                    "source_name": source_meta.get("name"),
+                    "source_url": source_meta.get("url"),
+                    "metadata": metadata,
+                    "document": document,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+
+    def _merge_message_sources(
+        self, existing_sources: object, incoming_sources: object
+    ) -> list:
+        merged: list[dict] = []
+        seen: set[str] = set()
+
+        for group in (existing_sources, incoming_sources):
+            for source in self._iter_source_items(group):
+                if not isinstance(source, dict):
+                    continue
+                if self._is_retrieval_diagnostic_item(source):
+                    continue
+                if source.get("type") == "code_execution":
+                    continue
+                signature = self._source_signature(source)
+                if not signature or signature in seen:
+                    continue
+                seen.add(signature)
+                merged.append(source)
+
+        return merged
+
+    def _merge_runtime_message_references(
+        self, existing_message: object, incoming_message: object
+    ) -> object:
+        if not isinstance(existing_message, dict) or not isinstance(incoming_message, dict):
+            return incoming_message
+
+        merged = incoming_message
+        for key in ("sources", "citations", "references", "documents"):
+            existing_sources = existing_message.get(key)
+            incoming_sources = incoming_message.get(key)
+            if not isinstance(existing_sources, (list, dict)) and not isinstance(
+                incoming_sources, (list, dict)
+            ):
+                continue
+
+            merged_sources = self._merge_message_sources(existing_sources, incoming_sources)
+            if not merged_sources:
+                continue
+
+            if merged is incoming_message:
+                merged = dict(incoming_message)
+            merged[key] = merged_sources
+
+        existing_metadata = existing_message.get("metadata")
+        incoming_metadata = incoming_message.get("metadata")
+        if isinstance(existing_metadata, dict) or isinstance(incoming_metadata, dict):
+            if merged is incoming_message:
+                merged = dict(incoming_message)
+            merged["metadata"] = self._merge_message_metadata(
+                existing_metadata, incoming_metadata
+            )
+
+        return self._normalize_message_reference_sidecar(merged)
+
     def _message_output_item_key(self, item: object) -> str:
         if not isinstance(item, dict):
             return ""
@@ -1578,12 +3951,19 @@ class ChatTable:
         self, existing_message: object, incoming_message: object
     ) -> object:
         if not isinstance(existing_message, dict):
-            return incoming_message
+            return self._normalize_message_reference_sidecar(incoming_message)
         if not isinstance(incoming_message, dict):
-            return existing_message
+            return self._normalize_message_reference_sidecar(existing_message)
 
         merged_message = {**existing_message, **incoming_message}
         role = incoming_message.get("role", existing_message.get("role"))
+
+        if isinstance(existing_message.get("metadata"), dict) or isinstance(
+            incoming_message.get("metadata"), dict
+        ):
+            merged_message["metadata"] = self._merge_message_metadata(
+                existing_message.get("metadata"), incoming_message.get("metadata")
+            )
 
         if isinstance(existing_message.get("files"), list) or isinstance(
             incoming_message.get("files"), list
@@ -1595,6 +3975,16 @@ class ChatTable:
                 else [],
                 role,
             )
+
+        for key in ("sources", "citations", "references", "documents"):
+            if isinstance(existing_message.get(key), (list, dict)) or isinstance(
+                incoming_message.get(key), (list, dict)
+            ):
+                merged_sources = self._merge_message_sources(
+                    existing_message.get(key), incoming_message.get(key)
+                )
+                if merged_sources:
+                    merged_message[key] = merged_sources
 
         if isinstance(existing_message.get("output"), list) or isinstance(
             incoming_message.get("output"), list
@@ -1612,7 +4002,7 @@ class ChatTable:
         if existing_message.get("done") is True and incoming_message.get("done") is not True:
             merged_message["done"] = True
 
-        return merged_message
+        return self._normalize_message_reference_sidecar(merged_message)
 
     def _hydrate_chat_message_files(
         self, chat_payload: dict, chat_id: str, db: Optional[Session] = None
@@ -1716,12 +4106,133 @@ class ChatTable:
             },
         }, True
 
+    def _hydrate_chat_message_sources(
+        self, chat_payload: dict, chat_id: str, db: Optional[Session] = None
+    ) -> tuple[dict, bool]:
+        if not isinstance(chat_payload, dict):
+            return chat_payload, False
+
+        history = chat_payload.get("history")
+        if not isinstance(history, dict):
+            return chat_payload, False
+
+        messages = history.get("messages")
+        if not isinstance(messages, dict) or not messages:
+            return chat_payload, False
+
+        message_sources: dict[str, list[dict]] = {}
+
+        with get_db_context(db) as db:
+            try:
+                chat_messages = ChatMessages.get_messages_by_chat_id(chat_id, db=db)
+                for chat_message in chat_messages:
+                    message_id = self._extract_chat_message_id(chat_id, chat_message.id)
+                    if not message_id or not isinstance(chat_message.sources, list):
+                        continue
+                    if not chat_message.sources:
+                        continue
+                    message_sources.setdefault(message_id, []).extend(chat_message.sources)
+            except Exception as e:
+                log.warning(
+                    "Failed to load chat_message sources for chat %s: %s", chat_id, e
+                )
+
+        if not message_sources:
+            return chat_payload, False
+
+        hydrated_messages: Optional[dict] = None
+        changed = False
+
+        for message_id, supplemental_sources in message_sources.items():
+            message = messages.get(message_id)
+            if not isinstance(message, dict) or not supplemental_sources:
+                continue
+
+            merged_sources = self._merge_message_sources(
+                message.get("sources"), supplemental_sources
+            )
+            hydrated_message = message
+            if merged_sources != message.get("sources"):
+                hydrated_message = {**message, "sources": merged_sources}
+
+            hydrated_message = self._normalize_message_reference_sidecar(hydrated_message)
+            if hydrated_message == message:
+                continue
+
+            if hydrated_messages is None:
+                hydrated_messages = dict(messages)
+
+            hydrated_messages[message_id] = hydrated_message
+            changed = True
+
+        if not changed or hydrated_messages is None:
+            return chat_payload, False
+
+        return {
+            **chat_payload,
+            "history": {
+                **history,
+                "messages": hydrated_messages,
+            },
+        }, True
+
+    def _preserve_runtime_message_references(
+        self, existing_chat_payload: object, incoming_chat_payload: object
+    ) -> object:
+        if not isinstance(existing_chat_payload, dict) or not isinstance(
+            incoming_chat_payload, dict
+        ):
+            return incoming_chat_payload
+
+        existing_history = existing_chat_payload.get("history")
+        incoming_history = incoming_chat_payload.get("history")
+        if not isinstance(existing_history, dict) or not isinstance(incoming_history, dict):
+            return incoming_chat_payload
+
+        existing_messages = existing_history.get("messages")
+        incoming_messages = incoming_history.get("messages")
+        if not isinstance(existing_messages, dict) or not isinstance(incoming_messages, dict):
+            return incoming_chat_payload
+
+        merged_messages = incoming_messages
+        changed = False
+
+        for message_id, incoming_message in incoming_messages.items():
+            existing_message = existing_messages.get(message_id)
+            merged_message = self._merge_runtime_message_references(
+                existing_message, incoming_message
+            )
+            if merged_message is incoming_message:
+                continue
+            if merged_messages is incoming_messages:
+                merged_messages = dict(incoming_messages)
+            merged_messages[message_id] = merged_message
+            changed = True
+
+        if not changed:
+            return incoming_chat_payload
+
+        return {
+            **incoming_chat_payload,
+            "history": {
+                **incoming_history,
+                "messages": merged_messages,
+            },
+        }
+
     def _prepare_chat_row_for_read(
         self, chat_item: Chat, db: Session
     ) -> Chat:
         changed = self._sanitize_chat_row(chat_item)
 
         hydrated_chat, hydrated_changed = self._hydrate_chat_message_files(
+            chat_item.chat, chat_item.id, db=db
+        )
+        if hydrated_changed:
+            chat_item.chat = hydrated_chat
+            changed = True
+
+        hydrated_chat, hydrated_changed = self._hydrate_chat_message_sources(
             chat_item.chat, chat_item.id, db=db
         )
         if hydrated_changed:
@@ -2017,6 +4528,12 @@ class ChatTable:
         try:
             with get_db_context(db) as db:
                 chat_item = db.get(Chat, id)
+                existing_chat_payload, _ = self._hydrate_chat_message_sources(
+                    chat_item.chat, id, db=db
+                )
+                chat = self._preserve_runtime_message_references(
+                    existing_chat_payload, chat
+                )
                 chat_item.chat = self._clean_null_bytes(
                     self._normalize_chat_payload_for_storage(chat, id)
                 )
@@ -2137,7 +4654,9 @@ class ChatTable:
                 message,
             )
         else:
-            history["messages"][message_id] = message
+            history["messages"][message_id] = self._normalize_message_reference_sidecar(
+                message
+            )
 
         history["currentId"] = message_id
 
