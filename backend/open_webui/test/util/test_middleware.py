@@ -745,7 +745,13 @@ def test_selected_source_scope_allows_single_anchor_and_explicit_multi_file_prom
     assert not _selected_source_scope_is_ambiguous("Alpha文件的政策答案是什么？", files)
     assert not _selected_source_scope_is_ambiguous("Beta文件的政策答案是什么？", files)
     assert not _selected_source_scope_is_ambiguous("总结这两个文件", files)
+    assert not _selected_source_scope_is_ambiguous("比较这两个文件", files)
+    assert not _selected_source_scope_is_ambiguous("总结这些文件的差异", files)
     assert not _selected_source_scope_is_ambiguous("summarize these two files", files)
+    assert not _selected_source_scope_is_ambiguous(
+        "summarize the differences in these files",
+        files,
+    )
     assert not _selected_source_scope_is_ambiguous(
         "Alpha和Beta两个文件的政策答案有什么区别？",
         files,
@@ -1422,6 +1428,45 @@ def test_active_scope_allows_explicit_multi_file_prompt():
     assert scope["status"] == "resolved"
     assert scope["source_set_mode"] == "multi"
     assert scope["source_ids"] == ["alpha", "beta"]
+
+
+def test_active_scope_explicit_plural_multi_prompt_overrides_previous_focus():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "active_source_scope": {
+                    "status": "resolved",
+                    "source_set_mode": "single",
+                    "source_ids": ["alpha"],
+                    "sources": [
+                        {"id": "alpha", "name": "alpha-policy.txt", "type": "file"}
+                    ],
+                    "reason": "previous_single_canonical_reference",
+                    "confidence": "high",
+                }
+            },
+        }
+    ]
+
+    for prompt in ("比较这两个文件", "总结这些文件的差异"):
+        scope, resolved_files, blocked = _resolve_active_source_scope(
+            prompt,
+            files,
+            stored_messages=stored_messages,
+            current_files=files,
+        )
+
+        assert not blocked, prompt
+        assert resolved_files == files, prompt
+        assert scope["status"] == "resolved", prompt
+        assert scope["source_set_mode"] == "multi", prompt
+        assert scope["source_ids"] == ["alpha", "beta"], prompt
+        assert scope["reason"] == "explicit_anchor", prompt
 
 
 def test_active_scope_uses_anchor_matches_for_explicit_alpha_beta_multi_prompt():
