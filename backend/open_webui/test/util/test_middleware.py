@@ -1138,6 +1138,172 @@ def test_active_scope_persists_user_clarification_after_ambiguity():
     assert resolved_files == [files[0]]
     assert scope["status"] == "resolved"
     assert scope["reason"] == "user_clarified_deictic_reference"
+    assert scope["source_ids"] == ["alpha"]
+
+
+def test_active_scope_reuses_persisted_user_clarification_after_ambiguity():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "active_source_scope": {
+                    "status": "resolved",
+                    "source_set_mode": "single",
+                    "source_ids": ["alpha"],
+                    "sources": [
+                        {"id": "alpha", "name": "alpha-policy.txt", "type": "file"}
+                    ],
+                    "reason": "user_clarified_deictic_reference",
+                    "confidence": "high",
+                }
+            },
+        }
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "继续",
+        files,
+        stored_messages=stored_messages,
+        current_files=files,
+    )
+
+    assert not blocked
+    assert resolved_files == [files[0]]
+    assert scope["status"] == "resolved"
+    assert scope["source_ids"] == ["alpha"]
+    assert scope["reason"] == "user_clarified_deictic_reference"
+
+
+def test_active_scope_explicit_anchor_overrides_prior_user_clarification():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "active_source_scope": {
+                    "status": "resolved",
+                    "source_set_mode": "single",
+                    "source_ids": ["alpha"],
+                    "sources": [
+                        {"id": "alpha", "name": "alpha-policy.txt", "type": "file"}
+                    ],
+                    "reason": "user_clarified_deictic_reference",
+                    "confidence": "high",
+                }
+            },
+        }
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "请改看 beta-policy.txt",
+        files,
+        stored_messages=stored_messages,
+        current_files=files,
+    )
+
+    assert not blocked
+    assert resolved_files == [files[1]]
+    assert scope["status"] == "resolved"
+    assert scope["source_ids"] == ["beta"]
+    assert scope["reason"] == "explicit_anchor"
+
+
+def test_active_scope_rejects_ambiguous_user_clarification_after_ambiguity():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "active_source_scope": {
+                    "status": "ambiguous",
+                    "source_set_mode": "none",
+                    "reason": "ambiguous_retrieval_scope",
+                    "confidence": "low",
+                }
+            },
+        }
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "alpha beta",
+        files,
+        stored_messages=stored_messages,
+        current_files=files,
+    )
+
+    assert blocked
+    assert resolved_files == []
+    assert scope["status"] == "ambiguous"
+    assert scope["reason"] == "ambiguous_retrieval_scope"
+    sidecar = Chats.build_reference_metadata_sidecar(
+        metadata={"active_source_scope": scope},
+        sources=[
+            {
+                "source": {"id": "alpha", "name": "alpha-policy.txt", "type": "file"},
+                "document": ["alpha evidence"],
+                "metadata": [{"source": "alpha-policy.txt", "file_id": "alpha"}],
+            }
+        ],
+    )
+    assert "canonical_references" not in sidecar
+
+
+def test_active_scope_rejects_unselected_user_clarification_after_ambiguity():
+    selected_files = [
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+        {"id": "gamma", "name": "gamma-policy.txt", "context": "full"},
+    ]
+    all_files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        *selected_files,
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "active_source_scope": {
+                    "status": "ambiguous",
+                    "source_set_mode": "none",
+                    "reason": "ambiguous_retrieval_scope",
+                    "confidence": "low",
+                }
+            },
+        }
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "alpha-policy.txt",
+        selected_files,
+        stored_messages=stored_messages,
+        current_files=selected_files,
+        fallback_candidates=all_files,
+    )
+
+    assert blocked
+    assert resolved_files == []
+    assert scope["status"] == "expired"
+    assert scope["reason"] == "expired_or_conflicting"
+    sidecar = Chats.build_reference_metadata_sidecar(
+        metadata={"active_source_scope": scope},
+        sources=[
+            {
+                "source": {"id": "alpha", "name": "alpha-policy.txt", "type": "file"},
+                "document": ["alpha evidence"],
+                "metadata": [{"source": "alpha-policy.txt", "file_id": "alpha"}],
+            }
+        ],
+    )
+    assert "canonical_references" not in sidecar
 
 
 def test_active_scope_keeps_unfocused_multi_file_deictic_ambiguous():

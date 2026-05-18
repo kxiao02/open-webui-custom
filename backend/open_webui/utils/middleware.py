@@ -6674,6 +6674,16 @@ def _latest_assistant_had_ambiguous_scope(stored_messages: list[dict]) -> bool:
     for message in reversed(stored_messages or []):
         if str(message.get("role") or "").strip().lower() != "assistant":
             continue
+        metadata = message.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        scope = metadata.get("active_source_scope")
+        if isinstance(scope, dict):
+            status = str(scope.get("status") or "").strip().lower()
+            reason = str(
+                scope.get("reason") or scope.get("ambiguity_reason") or ""
+            ).strip()
+            if status == "ambiguous" or reason == "ambiguous_retrieval_scope":
+                return True
         return any(
             str(item.get("reason") or "").strip() == "ambiguous_retrieval_scope"
             for item in _message_retrieval_diagnostics(message)
@@ -6823,6 +6833,9 @@ def _resolve_active_source_scope(
     explicit_multi = bool(intent["explicit_multi"])
     referential_intent = bool(intent["weak_referential_intent"])
     anchor_matches = intent["anchor_matches"]
+    previous_ambiguous_scope = _latest_assistant_had_ambiguous_scope(
+        stored_messages or []
+    )
 
     def finish(scope: dict, resolved_files: list[dict], blocked: bool):
         observe_llm_event(
@@ -6843,6 +6856,46 @@ def _resolve_active_source_scope(
         return scope, resolved_files, blocked
 
     if not selected_candidates:
+        if previous_ambiguous_scope and fallback_candidates:
+            fallback_anchor_matches = _selected_source_anchor_matches(
+                prompt, fallback_candidates
+            )
+            current_fallback_matches = [
+                candidate
+                for candidate in fallback_anchor_matches
+                if _candidate_in_current_scope(candidate, current_values)
+            ]
+            if len(current_fallback_matches) == 1:
+                return finish(
+                    _active_source_scope_metadata(
+                        current_fallback_matches,
+                        status="resolved",
+                        source_set_mode="single",
+                        reason="user_clarified_deictic_reference",
+                        confidence="high",
+                    ),
+                    current_fallback_matches,
+                    False,
+                )
+            if fallback_anchor_matches:
+                reason = (
+                    "expired_or_conflicting"
+                    if not current_fallback_matches
+                    else "ambiguous_retrieval_scope"
+                )
+                status = "expired" if reason == "expired_or_conflicting" else "ambiguous"
+                return finish(
+                    _active_source_scope_metadata(
+                        current_fallback_matches or fallback_anchor_matches,
+                        status=status,
+                        source_set_mode="none",
+                        reason=reason,
+                        confidence="low",
+                    ),
+                    [],
+                    True,
+                )
+
         if referential_intent and fallback_candidates:
             focus, matching_candidates = _first_reliable_matching_focus(
                 _reliable_active_source_focuses(
@@ -6873,10 +6926,20 @@ def _resolve_active_source_scope(
         return finish({}, [], False)
 
     if anchor_matches:
+        if previous_ambiguous_scope and len(anchor_matches) > 1 and not explicit_multi:
+            ambiguous_scope = _active_source_scope_metadata(
+                anchor_matches,
+                status="ambiguous",
+                source_set_mode="none",
+                reason="ambiguous_retrieval_scope",
+                confidence="low",
+            )
+            return finish(ambiguous_scope, [], True)
+
         reason = (
             "user_clarified_deictic_reference"
             if len(anchor_matches) == 1
-            and _latest_assistant_had_ambiguous_scope(stored_messages or [])
+            and previous_ambiguous_scope
             else "explicit_anchor"
         )
         mode = "single" if len(anchor_matches) == 1 else "multi"
@@ -6891,6 +6954,20 @@ def _resolve_active_source_scope(
             anchor_matches,
             False,
         )
+
+    if previous_ambiguous_scope and selected_candidates and fallback_candidates:
+        fallback_anchor_matches = _selected_source_anchor_matches(
+            prompt, fallback_candidates
+        )
+        if fallback_anchor_matches:
+            expired_scope = _active_source_scope_metadata(
+                fallback_anchor_matches,
+                status="expired",
+                source_set_mode="none",
+                reason="expired_or_conflicting",
+                confidence="low",
+            )
+            return finish(expired_scope, [], True)
 
     if explicit_multi:
         return finish(
