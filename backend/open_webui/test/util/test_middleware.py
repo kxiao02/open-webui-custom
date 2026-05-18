@@ -889,6 +889,105 @@ def test_active_scope_reuses_previous_single_reference_for_natural_followup_prom
         assert scope["source_ids"] == ["alpha"], prompt
 
 
+def test_active_scope_reuses_current_preview_focus_for_deictic_prompt():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "这个文件说了什么？",
+        files,
+        stored_messages=[],
+        current_files=files,
+        metadata={"current_preview_source": {"id": "beta", "name": "beta-policy.txt"}},
+    )
+
+    assert not blocked
+    assert resolved_files == [files[1]]
+    assert scope["status"] == "resolved"
+    assert scope["source_set_mode"] == "single"
+    assert scope["source_ids"] == ["beta"]
+    assert scope["reason"] == "current_preview_source"
+
+
+def test_active_scope_reuses_pinned_source_scope_when_still_selected():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "继续",
+        files,
+        stored_messages=[],
+        current_files=files,
+        metadata={
+            "pinned_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["alpha"],
+                "sources": [{"id": "alpha", "name": "alpha-policy.txt"}],
+                "reason": "pinned_source_scope",
+                "confidence": "high",
+            }
+        },
+    )
+
+    assert not blocked
+    assert resolved_files == [files[0]]
+    assert scope["source_ids"] == ["alpha"]
+    assert scope["reason"] == "pinned_source_scope"
+
+
+def test_active_scope_reuses_recent_source_card_interaction():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "后面呢",
+        files,
+        stored_messages=[],
+        current_files=files,
+        metadata={
+            "recent_source_card_interaction": {
+                "source": {"id": "beta", "name": "beta-policy.txt", "type": "file"},
+                "metadata": [{"source": "beta", "name": "beta-policy.txt"}],
+            }
+        },
+    )
+
+    assert not blocked
+    assert resolved_files == [files[1]]
+    assert scope["source_ids"] == ["beta"]
+    assert scope["reason"] == "recent_source_card_interaction"
+
+
+def test_active_scope_reuses_previous_explicit_user_source_mention():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+    stored_messages = [
+        {"role": "user", "content": "请先总结 beta-policy.txt"},
+        {"role": "assistant", "content": "Beta summary."},
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "继续",
+        files,
+        stored_messages=stored_messages,
+        current_files=files,
+    )
+
+    assert not blocked
+    assert resolved_files == [files[1]]
+    assert scope["source_ids"] == ["beta"]
+    assert scope["reason"] == "previous_explicit_user_source_mention"
+
+
 def test_active_scope_explicit_anchor_wins_over_previous_focus():
     files = [
         {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
@@ -914,6 +1013,26 @@ def test_active_scope_explicit_anchor_wins_over_previous_focus():
         files,
         stored_messages=stored_messages,
         current_files=files,
+    )
+
+    assert not blocked
+    assert resolved_files == [files[1]]
+    assert scope["source_ids"] == ["beta"]
+    assert scope["reason"] == "explicit_anchor"
+
+
+def test_active_scope_explicit_anchor_wins_over_current_preview_focus():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "请继续看 beta-policy.txt",
+        files,
+        stored_messages=[],
+        current_files=files,
+        metadata={"current_preview_source": {"id": "alpha", "name": "alpha-policy.txt"}},
     )
 
     assert not blocked
@@ -951,6 +1070,34 @@ def test_active_scope_does_not_reuse_stale_previous_focus():
         active_candidates,
         stored_messages=stored_messages,
         current_files=selected_files,
+    )
+
+    assert blocked
+    assert resolved_files == []
+    assert scope["status"] == "expired"
+    assert scope["reason"] == "expired_or_conflicting"
+
+
+def test_active_scope_does_not_reuse_unselected_pinned_focus():
+    selected_files = [
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+        {"id": "gamma", "name": "gamma-policy.txt", "context": "full"},
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "这个文件说了什么？",
+        selected_files,
+        stored_messages=[],
+        current_files=selected_files,
+        metadata={
+            "pinned_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["alpha"],
+                "sources": [{"id": "alpha", "name": "alpha-policy.txt"}],
+                "reason": "pinned_source_scope",
+            }
+        },
     )
 
     assert blocked

@@ -6517,6 +6517,146 @@ def _active_source_focus_from_scope(scope: object) -> Optional[dict]:
     }
 
 
+def _active_source_focus_from_source(
+    source: object,
+    *,
+    reason: str,
+    confidence: str = "high",
+) -> Optional[dict]:
+    if not isinstance(source, dict):
+        return None
+
+    identity = _active_source_identity_from_file_item(source)
+    if identity is None:
+        identity = _active_source_identity_from_reference(source)
+    if identity is None and isinstance(source.get("source"), dict):
+        identity = _active_source_identity_from_reference(source)
+    if identity is None:
+        return None
+
+    values: set[str] = set()
+    for value in (
+        identity.get("id"),
+        identity.get("name"),
+        source.get("id"),
+        source.get("file_id"),
+        source.get("fileId"),
+        source.get("name"),
+        source.get("filename"),
+        source.get("title"),
+    ):
+        normalized = _normalize_anchor_text(value)
+        if normalized:
+            values.add(normalized)
+
+    values.update(_file_item_scope_values(source))
+    values.update(_source_scope_values(source))
+    if not values:
+        return None
+
+    return {
+        "values": values,
+        "source": identity,
+        "reason": reason,
+        "confidence": confidence,
+    }
+
+
+def _active_source_focus_from_metadata_value(
+    value: object,
+    *,
+    reason: str,
+    confidence: str = "high",
+) -> Optional[dict]:
+    if not isinstance(value, dict):
+        return None
+
+    scope_focus = _active_source_focus_from_scope(value)
+    if scope_focus:
+        return {
+            **scope_focus,
+            "reason": str(scope_focus.get("reason") or reason),
+            "confidence": str(scope_focus.get("confidence") or confidence),
+        }
+
+    return _active_source_focus_from_source(
+        value,
+        reason=reason,
+        confidence=confidence,
+    )
+
+
+def _reliable_active_source_focuses_from_metadata(metadata: object) -> list[dict]:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    focus_specs = (
+        (
+            "current_preview_source",
+            "current_preview_source",
+            "high",
+        ),
+        (
+            "operation_panel_source",
+            "operation_panel_source",
+            "high",
+        ),
+        (
+            "current_source_focus",
+            "current_preview_source",
+            "high",
+        ),
+        (
+            "active_source_selection",
+            "operation_panel_source",
+            "high",
+        ),
+        (
+            "pinned_source_scope",
+            "pinned_source_scope",
+            "high",
+        ),
+        (
+            "pinned_active_source_scope",
+            "pinned_source_scope",
+            "high",
+        ),
+        (
+            "recent_source_card_interaction",
+            "recent_source_card_interaction",
+            "high",
+        ),
+        (
+            "source_card_focus",
+            "recent_source_card_interaction",
+            "high",
+        ),
+        (
+            "active_source_scope",
+            "active_source_scope",
+            "medium",
+        ),
+    )
+
+    focuses: list[dict] = []
+    seen: set[str] = set()
+    for key, reason, confidence in focus_specs:
+        focus = _active_source_focus_from_metadata_value(
+            metadata.get(key),
+            reason=reason,
+            confidence=confidence,
+        )
+        if not focus:
+            continue
+        signature = json.dumps(
+            sorted(str(value) for value in focus.get("values") or []),
+            ensure_ascii=False,
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        focuses.append(focus)
+    return focuses
+
+
 def _message_retrieval_diagnostics(message: object) -> list[dict]:
     if not isinstance(message, dict):
         return []
@@ -6568,6 +6708,46 @@ def _latest_assistant_single_source_focus(
     return None
 
 
+def _latest_user_explicit_source_focus(
+    stored_messages: list[dict],
+    selected_candidates: list[dict],
+) -> Optional[dict]:
+    for message in reversed(stored_messages or []):
+        if str(message.get("role") or "").strip().lower() != "user":
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        matches = _selected_source_anchor_matches(content, selected_candidates)
+        if len(matches) != 1:
+            return None
+        return _active_source_focus_from_source(
+            matches[0],
+            reason="previous_explicit_user_source_mention",
+            confidence="high",
+        )
+    return None
+
+
+def _reliable_active_source_focuses(
+    *,
+    metadata: object,
+    stored_messages: list[dict],
+    candidates: list[dict],
+) -> list[dict]:
+    focuses = [*_reliable_active_source_focuses_from_metadata(metadata)]
+    latest_assistant_focus = _latest_assistant_single_source_focus(stored_messages)
+    if latest_assistant_focus:
+        focuses.append(latest_assistant_focus)
+    latest_user_focus = _latest_user_explicit_source_focus(
+        stored_messages,
+        candidates,
+    )
+    if latest_user_focus:
+        focuses.append(latest_user_focus)
+    return focuses
+
+
 def _current_source_scope_values(current_files: Optional[list[dict]]) -> set[str]:
     values: set[str] = set()
     for file_item in current_files or []:
@@ -6593,6 +6773,35 @@ def _candidate_in_current_scope(candidate: dict, current_values: set[str]) -> bo
     return bool(_file_item_scope_values(candidate).intersection(current_values))
 
 
+def _focus_matching_candidates(
+    focus: dict,
+    candidates: list[dict],
+    current_values: set[str],
+) -> list[dict]:
+    return [
+        candidate
+        for candidate in candidates or []
+        if _candidate_matches_focus(candidate, focus)
+        and _candidate_in_current_scope(candidate, current_values)
+    ]
+
+
+def _first_reliable_matching_focus(
+    focuses: list[dict],
+    candidates: list[dict],
+    current_values: set[str],
+) -> tuple[dict | None, list[dict]]:
+    saw_focus = False
+    for focus in focuses or []:
+        if not isinstance(focus, dict):
+            continue
+        saw_focus = True
+        matches = _focus_matching_candidates(focus, candidates, current_values)
+        if len(matches) == 1:
+            return focus, matches
+    return ({"reason": "expired_or_conflicting"} if saw_focus else None), []
+
+
 def _resolve_active_source_scope(
     prompt: str,
     selected_candidates: list[dict],
@@ -6600,6 +6809,7 @@ def _resolve_active_source_scope(
     stored_messages: Optional[list[dict]] = None,
     current_files: Optional[list[dict]] = None,
     fallback_candidates: Optional[list[dict]] = None,
+    metadata: Optional[dict] = None,
 ) -> tuple[dict, list[dict], bool]:
     selected_candidates = [
         candidate for candidate in selected_candidates or [] if isinstance(candidate, dict)
@@ -6634,14 +6844,16 @@ def _resolve_active_source_scope(
 
     if not selected_candidates:
         if referential_intent and fallback_candidates:
-            focus = _latest_assistant_single_source_focus(stored_messages or [])
-            if focus:
-                matching_candidates = [
-                    candidate
-                    for candidate in fallback_candidates
-                    if _candidate_matches_focus(candidate, focus)
-                    and _candidate_in_current_scope(candidate, current_values)
-                ]
+            focus, matching_candidates = _first_reliable_matching_focus(
+                _reliable_active_source_focuses(
+                    metadata=metadata,
+                    stored_messages=stored_messages or [],
+                    candidates=fallback_candidates,
+                ),
+                fallback_candidates,
+                current_values,
+            )
+            if focus and matching_candidates:
                 if len(matching_candidates) == 1:
                     return finish(
                         _active_source_scope_metadata(
@@ -6707,14 +6919,16 @@ def _resolve_active_source_scope(
         )
 
     if referential_intent:
-        focus = _latest_assistant_single_source_focus(stored_messages or [])
+        focus, matching_candidates = _first_reliable_matching_focus(
+            _reliable_active_source_focuses(
+                metadata=metadata,
+                stored_messages=stored_messages or [],
+                candidates=selected_candidates,
+            ),
+            selected_candidates,
+            current_values,
+        )
         if focus:
-            matching_candidates = [
-                candidate
-                for candidate in selected_candidates
-                if _candidate_matches_focus(candidate, focus)
-                and _candidate_in_current_scope(candidate, current_values)
-            ]
             if len(matching_candidates) == 1:
                 return finish(
                     _active_source_scope_metadata(
@@ -7335,6 +7549,7 @@ async def chat_completion_files_handler(
             active_scope_files,
             stored_messages=stored_messages,
             current_files=current_request_files,
+            metadata=metadata,
             fallback_candidates=[
                 file_item
                 for file_item in files
