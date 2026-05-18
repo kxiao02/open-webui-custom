@@ -52,6 +52,53 @@ SECOND_PASS_RETRIEVAL_TOOL_NAMES = {
     "query_selected_knowledge_files",
     "read_selected_file",
 }
+SECOND_PASS_RETRIEVAL_SUCCESS_STATUSES = {"success", "evidence"}
+SECOND_PASS_RETRIEVAL_STATUS_ALIASES = {
+    "ok": "success",
+    "success": "success",
+    "evidence": "success",
+    "empty": "no_evidence",
+    "no_results": "no_evidence",
+    "no_result": "no_evidence",
+    "not_found": "no_evidence",
+    "no_evidence": "no_evidence",
+    "weak": "weak_evidence",
+    "weak_evidence": "weak_evidence",
+    "weak_results": "weak_evidence",
+    "low_relevance": "low_relevance",
+    "low_relevance_results": "low_relevance",
+    "denied": "permission_denied",
+    "forbidden": "permission_denied",
+    "permission_denied": "permission_denied",
+    "unauthorized": "permission_denied",
+    "unauthorised": "permission_denied",
+    "timeout": "timeout",
+    "timed_out": "timeout",
+    "malformed": "malformed",
+    "invalid": "malformed",
+    "invalid_payload": "malformed",
+}
+SECOND_PASS_RETRIEVAL_FAILURE_CLASSIFICATIONS = {
+    "no_evidence": "no_evidence",
+    "weak_evidence": "no_evidence",
+    "low_relevance": "no_evidence",
+    "permission_denied": "no_evidence",
+    "timeout": "diagnostics",
+    "malformed": "diagnostics",
+    "error": "diagnostics",
+}
+SECOND_PASS_RETRIEVAL_PERMISSION_REASONS = {
+    "permission_denied",
+    "unauthorized",
+    "unauthorised",
+    "forbidden",
+    "denied",
+    "requested_file_out_of_scope",
+    "requested_source_out_of_scope",
+    "source_not_authorized",
+    "source_not_authorised",
+    "not_selected",
+}
 WEBPAGE_TOOL_NAMES = {
     "visit_webpage",
     "fetch_url",
@@ -1701,6 +1748,55 @@ class ChatTable:
             return True
         return False
 
+    def _normalize_second_pass_retrieval_status(self, payload: dict) -> str:
+        raw_status = str(payload.get("status") or "").strip().lower()
+        reason = str(
+            payload.get("reason")
+            or payload.get("code")
+            or payload.get("error")
+            or payload.get("message")
+            or ""
+        ).strip().lower()
+
+        normalized = SECOND_PASS_RETRIEVAL_STATUS_ALIASES.get(raw_status, raw_status)
+        if normalized in SECOND_PASS_RETRIEVAL_SUCCESS_STATUSES:
+            return "success"
+        if reason in SECOND_PASS_RETRIEVAL_PERMISSION_REASONS:
+            return "permission_denied"
+        if reason in SECOND_PASS_RETRIEVAL_STATUS_ALIASES:
+            return SECOND_PASS_RETRIEVAL_STATUS_ALIASES[reason]
+        if normalized in SECOND_PASS_RETRIEVAL_FAILURE_CLASSIFICATIONS:
+            return normalized
+        if not normalized and reason:
+            return "error"
+        return normalized
+
+    def _second_pass_retrieval_diagnostic_reason(
+        self, payload: dict, normalized_status: str
+    ) -> str:
+        raw_reason = str(
+            payload.get("reason")
+            or payload.get("code")
+            or payload.get("error")
+            or payload.get("message")
+            or ""
+        ).strip()
+        if raw_reason:
+            return raw_reason
+        if normalized_status == "no_evidence":
+            return "empty_retrieval_result"
+        if normalized_status == "weak_evidence":
+            return "weak_evidence"
+        if normalized_status == "low_relevance":
+            return "low_relevance"
+        if normalized_status == "permission_denied":
+            return "permission_denied"
+        if normalized_status == "timeout":
+            return "retrieval_timeout"
+        if normalized_status == "malformed":
+            return "malformed_retrieval_output"
+        return f"retrieval_{normalized_status or 'error'}"
+
     def _diagnostic_from_retrieval_tool_payload(
         self, payload: dict, fallback_tool_name: str = ""
     ) -> Optional[dict]:
@@ -1711,13 +1807,13 @@ class ChatTable:
         ):
             return None
 
-        status = str(payload.get("status") or "").strip().lower()
+        status = self._normalize_second_pass_retrieval_status(payload)
         if not status and any(
             payload.get(key) not in (None, "", [], {})
             for key in ("error", "code", "message", "reason")
         ):
             status = "error"
-        if status in {"", "success", "evidence"}:
+        if status in {"", "success"}:
             return None
 
         tool_name = (
@@ -1727,21 +1823,15 @@ class ChatTable:
         if not self._is_second_pass_retrieval_tool_name(tool_name):
             return None
 
-        reason = str(
-            payload.get("reason")
-            or payload.get("code")
-            or payload.get("error")
-            or payload.get("message")
-            or f"retrieval_{status}"
-        ).strip()
-        if not reason:
-            reason = f"retrieval_{status}"
-
-        classification = "no_evidence" if status in {"empty", "weak", "denied"} else "diagnostics"
+        reason = self._second_pass_retrieval_diagnostic_reason(payload, status)
+        classification = SECOND_PASS_RETRIEVAL_FAILURE_CLASSIFICATIONS.get(
+            status, "diagnostics"
+        )
         diagnostic = {
             "kind": "retrieval_quality",
             "classification": classification,
             "reason": reason,
+            "outcome": status,
             "tool_name": tool_name,
         }
         query = str(payload.get("query") or "").strip()
@@ -1751,7 +1841,7 @@ class ChatTable:
         if retrieval_round not in (None, "", [], {}):
             diagnostic["retrieval_round"] = retrieval_round
         detail = payload.get("detail")
-        if detail not in (None, "", [], {}):
+        if status != "permission_denied" and detail not in (None, "", [], {}):
             diagnostic["detail"] = detail
         return diagnostic
 
@@ -1781,6 +1871,26 @@ class ChatTable:
             parsed_payload = _extract_function_call_output_payload(item)
             if not isinstance(parsed_payload, dict):
                 malformed_payload_count += 1
+                if self._is_second_pass_retrieval_tool_name(fallback_tool_name):
+                    payload = {
+                        "status": "malformed",
+                        "tool_name": fallback_tool_name,
+                        "retrieval_diagnostics": [
+                            {
+                                "kind": "retrieval_quality",
+                                "classification": "diagnostics",
+                                "reason": "malformed_retrieval_output",
+                                "outcome": "malformed",
+                                "tool_name": fallback_tool_name,
+                            }
+                        ],
+                    }
+                    payloads.append(payload)
+                    synthesized_diagnostic_count += 1
+                    tool_names.add(fallback_tool_name)
+                    status_counts["malformed"] = (
+                        status_counts.get("malformed", 0) + 1
+                    )
                 continue
             if not self._looks_like_retrieval_tool_payload(
                 parsed_payload, fallback_tool_name
@@ -1792,9 +1902,13 @@ class ChatTable:
             )
             for alias in ("sources", "citations", "references", "documents"):
                 payload.pop(alias, None)
-            status = str(payload.get("status") or "").strip().lower()
-            status_counts[status or "unknown"] = status_counts.get(status or "unknown", 0) + 1
-            if status and status not in {"success", "evidence"}:
+            status = self._normalize_second_pass_retrieval_status(payload)
+            status_counts[status or "unknown"] = (
+                status_counts.get(status or "unknown", 0) + 1
+            )
+            if status:
+                payload["status"] = status
+            if status and status not in {"success"}:
                 non_success_payload_count += 1
                 if payload.get("canonical_references") not in (None, "", [], {}):
                     dropped_canonical_references_count += 1

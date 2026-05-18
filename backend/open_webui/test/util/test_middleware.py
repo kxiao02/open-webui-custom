@@ -2850,6 +2850,88 @@ def test_second_pass_weak_payload_drops_canonical_references():
     assert sidecar["retrieval_diagnostics"][0]["reason"] == "low_relevance"
 
 
+def test_second_pass_selected_source_failure_statuses_normalize_to_diagnostics_only():
+    cases = [
+        ("empty", "no_evidence", "empty_retrieval_result"),
+        ("no_evidence", "no_evidence", "empty_retrieval_result"),
+        ("weak_evidence", "weak_evidence", "weak_evidence"),
+        ("low_relevance", "low_relevance", "low_relevance"),
+        ("timeout", "timeout", "retrieval_timeout"),
+        ("malformed", "malformed", "malformed_retrieval_output"),
+        ("unauthorized", "permission_denied", "permission_denied"),
+        ("permission_denied", "permission_denied", "permission_denied"),
+    ]
+
+    for status, expected_outcome, expected_reason in cases:
+        payload = {
+            "status": status,
+            "tool_name": "query_selected_knowledge_files",
+            "query": f"{status} query",
+            "retrieval_round": 2,
+            "canonical_references": [
+                {
+                    "source": {
+                        "id": f"{status}-file",
+                        "name": f"{status}.txt",
+                        "type": "file",
+                    },
+                    "document": ["must not render"],
+                }
+            ],
+        }
+
+        sidecar = Chats.build_reference_metadata_sidecar(
+            tool_outputs=_tool_output_item("query_selected_knowledge_files", payload)
+        )
+
+        assert "canonical_references" not in sidecar
+        diagnostic = sidecar["retrieval_diagnostics"][0]
+        assert diagnostic["outcome"] == expected_outcome
+        assert diagnostic["reason"] == expected_reason
+        assert diagnostic["tool_name"] == "query_selected_knowledge_files"
+
+
+def test_second_pass_permission_denied_diagnostic_omits_sensitive_detail():
+    payload = {
+        "status": "permission_denied",
+        "tool_name": "read_selected_file",
+        "detail": "secret-file-id exists but is outside this user's scope",
+        "canonical_references": [
+            {
+                "source": {
+                    "id": "secret-file-id",
+                    "name": "secret.txt",
+                    "type": "file",
+                },
+                "document": ["must not render"],
+            }
+        ],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item("read_selected_file", payload)
+    )
+
+    assert "canonical_references" not in sidecar
+    diagnostic = sidecar["retrieval_diagnostics"][0]
+    assert diagnostic["outcome"] == "permission_denied"
+    assert diagnostic["reason"] == "permission_denied"
+    assert "detail" not in diagnostic
+    assert "secret-file-id" not in json.dumps(diagnostic, ensure_ascii=False)
+
+
+def test_second_pass_malformed_tool_output_synthesizes_diagnostic_only():
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item("query_selected_knowledge_files", "not json")
+    )
+
+    assert "canonical_references" not in sidecar
+    diagnostic = sidecar["retrieval_diagnostics"][0]
+    assert diagnostic["outcome"] == "malformed"
+    assert diagnostic["reason"] == "malformed_retrieval_output"
+    assert diagnostic["tool_name"] == "query_selected_knowledge_files"
+
+
 def test_second_pass_denied_payload_synthesizes_diagnostic_only():
     payload = {
         "status": "error",
