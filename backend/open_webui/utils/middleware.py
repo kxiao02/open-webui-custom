@@ -5567,8 +5567,10 @@ def _safe_retrieval_diagnostic(
     candidate_index: int,
     chunk_total: int = 0,
     usable_chunk_total: int = 0,
+    outcome: Optional[str] = None,
+    source_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    return {
+    diagnostic = {
         "kind": "retrieval_quality",
         "classification": classification,
         "reason": reason,
@@ -5576,6 +5578,11 @@ def _safe_retrieval_diagnostic(
         "chunk_total": chunk_total,
         "usable_chunk_total": usable_chunk_total,
     }
+    if outcome:
+        diagnostic["outcome"] = outcome
+    if source_id:
+        diagnostic["source_id"] = source_id
+    return diagnostic
 
 
 def _append_retrieval_diagnostic_once(
@@ -5610,6 +5617,237 @@ def _source_has_explicit_conflict_marker(source: dict) -> bool:
     return any(str(marker or "").strip().lower() == "conflict" for marker in markers)
 
 
+def _metadata_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _metadata_falsey(value: Any) -> bool:
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return value == 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"0", "false", "no", "off"}
+    return False
+
+
+def _source_identifier_values(source: dict, metadata: Optional[dict] = None) -> set[str]:
+    values: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text:
+            values.add(text)
+            values.add(_normalize_focus_match_text(text))
+            values.add(_normalize_anchor_text(text))
+
+    source_info = source.get("source")
+    if isinstance(source_info, dict):
+        for key in (
+            "id",
+            "file_id",
+            "collection_id",
+            "knowledge_id",
+            "name",
+            "filename",
+            "title",
+            "source",
+        ):
+            add(source_info.get(key))
+
+    if isinstance(metadata, dict):
+        for key in (
+            "id",
+            "file_id",
+            "collection_id",
+            "knowledge_id",
+            "name",
+            "filename",
+            "title",
+            "source",
+        ):
+            add(metadata.get(key))
+
+    return {value for value in values if value}
+
+
+def _source_id_for_diagnostic(source: dict, metadata: Optional[dict] = None) -> str:
+    source_info = source.get("source")
+    if isinstance(source_info, dict):
+        for key in ("id", "file_id", "collection_id", "knowledge_id", "name"):
+            value = str(source_info.get(key) or "").strip()
+            if value:
+                return value
+    if isinstance(metadata, dict):
+        for key in ("file_id", "collection_id", "knowledge_id", "id", "source", "name"):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _source_fits_active_scope(source: dict, active_source_scope: Optional[dict]) -> bool:
+    if not isinstance(active_source_scope, dict):
+        return True
+
+    status = str(active_source_scope.get("status") or "").strip().lower()
+    source_set_mode = str(
+        active_source_scope.get("source_set_mode") or ""
+    ).strip().lower()
+    if status != "resolved" or source_set_mode not in {"single", "multi"}:
+        return True
+
+    scope_values = _active_source_scope_values(active_source_scope)
+    if not scope_values:
+        return True
+
+    documents = source.get("document") or []
+    metadatas = source.get("metadata") or []
+    source_values = _source_identifier_values(source)
+    for metadata in metadatas if isinstance(metadatas, list) else []:
+        if isinstance(metadata, dict):
+            source_values.update(_source_identifier_values(source, metadata))
+
+    return bool(source_values.intersection(scope_values))
+
+
+def _metadata_indicates_status(metadata: dict, source: dict, statuses: set[str]) -> bool:
+    markers: list[Any] = []
+    for container in (source, metadata):
+        markers.extend(
+            [
+                container.get("status"),
+                container.get("retrieval_status"),
+                container.get("retrieval_outcome"),
+                container.get("outcome"),
+                container.get("classification"),
+                container.get("evidence_type"),
+                container.get("retrieval_classification"),
+                container.get("reason"),
+            ]
+        )
+    return any(str(marker or "").strip().lower() in statuses for marker in markers)
+
+
+def _rejection_for_retrieval_chunk(
+    *,
+    source: dict,
+    metadata: dict,
+    distance: Any = None,
+    relevance_threshold: Optional[float] = None,
+) -> Optional[tuple[str, str, str]]:
+    if _metadata_indicates_status(metadata, source, {"timeout"}):
+        return ("timeout", "retrieval_timeout", "diagnostics")
+    if _metadata_indicates_status(metadata, source, {"malformed"}):
+        return ("malformed", "malformed_candidate", "diagnostics")
+
+    unauthorized_markers = (
+        metadata.get("authorized"),
+        metadata.get("is_authorized"),
+        metadata.get("has_access"),
+        metadata.get("permission_allowed"),
+        source.get("authorized"),
+        source.get("is_authorized"),
+        source.get("has_access"),
+        source.get("permission_allowed"),
+    )
+    if any(_metadata_falsey(value) for value in unauthorized_markers) or any(
+        _metadata_truthy(value)
+        for value in (
+            metadata.get("unauthorized"),
+            metadata.get("permission_denied"),
+            metadata.get("access_denied"),
+            source.get("unauthorized"),
+            source.get("permission_denied"),
+            source.get("access_denied"),
+        )
+    ):
+        return ("unauthorized", "source_unauthorized", "diagnostics")
+
+    if _metadata_indicates_status(metadata, source, {"stale", "expired"}):
+        return ("stale", "stale_or_expired_source", "diagnostics")
+    if any(
+        _metadata_truthy(value)
+        for value in (
+            metadata.get("stale"),
+            metadata.get("expired"),
+            source.get("stale"),
+            source.get("expired"),
+        )
+    ) or any(
+        _metadata_falsey(value)
+        for value in (
+            metadata.get("current"),
+            metadata.get("is_current"),
+            metadata.get("version_current"),
+            source.get("current"),
+            source.get("is_current"),
+            source.get("version_current"),
+        )
+    ):
+        return ("stale", "stale_or_expired_source", "diagnostics")
+
+    if _source_has_explicit_conflict_marker({**source, "metadata": [metadata]}):
+        return ("conflict", "explicit_conflict_marker", "conflict")
+
+    if _metadata_indicates_status(
+        metadata,
+        source,
+        {"no_evidence", "empty", "empty_kb", "no_results"},
+    ):
+        return ("empty", "no_evidence", "no_evidence")
+
+    weak_markers = (
+        metadata.get("answerable"),
+        metadata.get("is_answerable"),
+        metadata.get("direct"),
+        metadata.get("direct_match"),
+        metadata.get("source_scope_fit"),
+        source.get("answerable"),
+        source.get("is_answerable"),
+        source.get("direct"),
+        source.get("direct_match"),
+        source.get("source_scope_fit"),
+    )
+    if any(_metadata_falsey(value) for value in weak_markers):
+        return ("weak_evidence", "weak_or_indirect_evidence", "no_evidence")
+
+    if _metadata_indicates_status(
+        metadata,
+        source,
+        {"weak", "weak_evidence", "low_relevance", "low_confidence"},
+    ):
+        return ("weak_evidence", "weak_or_indirect_evidence", "no_evidence")
+
+    if relevance_threshold is not None and distance is not None:
+        try:
+            if float(distance) < float(relevance_threshold):
+                return ("weak_evidence", "weak_relevance_score", "no_evidence")
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
+
+def _mark_source_injectable(source: dict) -> dict:
+    marked = copy.deepcopy(source)
+    marked["retrieval_outcome"] = "success"
+    marked["retrieval_classification"] = "injectable"
+    metadatas = marked.get("metadata")
+    if isinstance(metadatas, list):
+        for metadata in metadatas:
+            if isinstance(metadata, dict):
+                metadata.setdefault("retrieval_outcome", "success")
+                metadata.setdefault("retrieval_classification", "injectable")
+    return marked
+
+
 def _filter_source_to_usable_documents(source: dict, usable_indexes: list[int]) -> dict:
     filtered = copy.deepcopy(source)
     documents = source.get("document") or []
@@ -5635,6 +5873,9 @@ def _filter_source_to_usable_documents(source: dict, usable_indexes: list[int]) 
 
 def _gate_retrieval_sources(
     candidates: list,
+    *,
+    active_source_scope: Optional[dict] = None,
+    relevance_threshold: Optional[float] = None,
 ) -> tuple[list[dict], list[dict[str, Any]]]:
     injectable_sources: list[dict] = []
     diagnostics: list[dict[str, Any]] = []
@@ -5646,6 +5887,7 @@ def _gate_retrieval_sources(
                     classification="diagnostics",
                     reason="malformed_candidate",
                     candidate_index=candidate_index,
+                    outcome="malformed",
                 )
             )
             continue
@@ -5656,6 +5898,20 @@ def _gate_retrieval_sources(
                     classification="diagnostics",
                     reason="empty_candidate",
                     candidate_index=candidate_index,
+                    outcome="empty",
+                )
+            )
+            continue
+
+        source_id = _source_id_for_diagnostic(source)
+        if not _source_fits_active_scope(source, active_source_scope):
+            diagnostics.append(
+                _safe_retrieval_diagnostic(
+                    classification="diagnostics",
+                    reason="source_scope_mismatch",
+                    candidate_index=candidate_index,
+                    outcome="unauthorized",
+                    source_id=source_id or None,
                 )
             )
             continue
@@ -5667,6 +5923,8 @@ def _gate_retrieval_sources(
                     classification="no_evidence",
                     reason="missing_document_body",
                     candidate_index=candidate_index,
+                    outcome="empty",
+                    source_id=source_id or None,
                 )
             )
             continue
@@ -5684,6 +5942,8 @@ def _gate_retrieval_sources(
                     reason="blank_document_body",
                     candidate_index=candidate_index,
                     chunk_total=len(documents),
+                    outcome="empty",
+                    source_id=source_id or None,
                 )
             )
             continue
@@ -5696,6 +5956,52 @@ def _gate_retrieval_sources(
                     candidate_index=candidate_index,
                     chunk_total=len(documents),
                     usable_chunk_total=len(usable_indexes),
+                    outcome="conflict",
+                    source_id=source_id or None,
+                )
+            )
+            continue
+
+        metadatas = source.get("metadata") or []
+        distances = source.get("distances") or []
+        accepted_indexes: list[int] = []
+        for index in usable_indexes:
+            metadata = metadatas[index] if index < len(metadatas) else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            distance = distances[index] if index < len(distances) else None
+            rejection = _rejection_for_retrieval_chunk(
+                source=source,
+                metadata=metadata,
+                distance=distance,
+                relevance_threshold=relevance_threshold,
+            )
+            if rejection:
+                outcome, reason, classification = rejection
+                diagnostics.append(
+                    _safe_retrieval_diagnostic(
+                        classification=classification,
+                        reason=reason,
+                        candidate_index=candidate_index,
+                        chunk_total=len(documents),
+                        usable_chunk_total=len(usable_indexes),
+                        outcome=outcome,
+                        source_id=_source_id_for_diagnostic(source, metadata) or None,
+                    )
+                )
+                continue
+            accepted_indexes.append(index)
+
+        if not accepted_indexes:
+            diagnostics.append(
+                _safe_retrieval_diagnostic(
+                    classification="no_evidence",
+                    reason="no_injectable_evidence",
+                    candidate_index=candidate_index,
+                    chunk_total=len(documents),
+                    usable_chunk_total=0,
+                    outcome="empty",
+                    source_id=source_id or None,
                 )
             )
             continue
@@ -5708,11 +6014,15 @@ def _gate_retrieval_sources(
                     candidate_index=candidate_index,
                     chunk_total=len(documents),
                     usable_chunk_total=len(usable_indexes),
+                    outcome="malformed",
+                    source_id=source_id or None,
                 )
             )
 
         injectable_sources.append(
-            _filter_source_to_usable_documents(source, usable_indexes)
+            _mark_source_injectable(
+                _filter_source_to_usable_documents(source, accepted_indexes)
+            )
         )
 
     if candidates and not injectable_sources:
@@ -5721,6 +6031,7 @@ def _gate_retrieval_sources(
                 classification="no_evidence",
                 reason="no_injectable_evidence",
                 candidate_index=-1,
+                outcome="empty",
             )
         )
 
@@ -7856,6 +8167,25 @@ async def chat_completion_files_handler(
                 return retrieved_sources
             except Exception as exc:
                 log.exception(exc)
+                timeout_types = (TimeoutError, asyncio.TimeoutError)
+                _append_retrieval_diagnostic_once(
+                    retrieval_diagnostics,
+                    _safe_retrieval_diagnostic(
+                        classification="diagnostics",
+                        reason=(
+                            "retrieval_timeout"
+                            if isinstance(exc, timeout_types)
+                            else "retrieval_provider_error"
+                        ),
+                        candidate_index=-1,
+                        chunk_total=len(retrieval_candidates),
+                        outcome=(
+                            "timeout"
+                            if isinstance(exc, timeout_types)
+                            else "malformed"
+                        ),
+                    ),
+                )
                 return []
 
         if active_scope_ambiguous:
@@ -7923,7 +8253,11 @@ async def chat_completion_files_handler(
                     sources.extend(await retrieve_sources(remaining_retrieval_files))
 
         query_generation_diagnostics = list(retrieval_diagnostics)
-        sources, gate_diagnostics = _gate_retrieval_sources(sources)
+        sources, gate_diagnostics = _gate_retrieval_sources(
+            sources,
+            active_source_scope=metadata.get("active_source_scope"),
+            relevance_threshold=request.app.state.config.RELEVANCE_THRESHOLD,
+        )
         retrieval_diagnostics = query_generation_diagnostics
         for diagnostic in gate_diagnostics:
             _append_retrieval_diagnostic_once(retrieval_diagnostics, diagnostic)

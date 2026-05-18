@@ -1555,6 +1555,124 @@ def test_no_evidence_gate_keeps_diagnostics_out_of_canonical_references():
     }
 
 
+def test_retrieval_quality_gate_preserves_selected_file_success():
+    candidates = [
+        {
+            "source": {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+            "document": ["Alpha selected-file evidence."],
+            "metadata": [
+                {
+                    "file_id": "alpha-file",
+                    "name": "alpha-policy.txt",
+                    "source": "alpha-policy.txt",
+                }
+            ],
+        }
+    ]
+
+    sources, diagnostics = _gate_retrieval_sources(
+        candidates,
+        active_source_scope={
+            "status": "resolved",
+            "source_set_mode": "single",
+            "source_ids": ["alpha-file"],
+            "sources": [{"id": "alpha-file", "name": "alpha-policy.txt"}],
+        },
+    )
+    sidecar = Chats.build_reference_metadata_sidecar(
+        sources=sources,
+        diagnostics=diagnostics,
+    )
+
+    assert diagnostics == []
+    assert len(sources) == 1
+    assert sources[0]["retrieval_outcome"] == "success"
+    assert sources[0]["retrieval_classification"] == "injectable"
+    assert sidecar["canonical_references"][0]["source"]["id"] == "alpha-file"
+
+
+def test_retrieval_quality_gate_rejects_scope_mismatch_and_weak_candidates():
+    candidates = [
+        {
+            "source": {"id": "beta-file", "name": "beta-policy.txt", "type": "file"},
+            "document": ["Beta evidence should not satisfy alpha focus."],
+            "metadata": [{"file_id": "beta-file", "name": "beta-policy.txt"}],
+        },
+        {
+            "source": {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+            "document": ["Low quality alpha evidence."],
+            "metadata": [
+                {
+                    "file_id": "alpha-file",
+                    "name": "alpha-policy.txt",
+                    "answerable": False,
+                }
+            ],
+        },
+    ]
+
+    sources, diagnostics = _gate_retrieval_sources(
+        candidates,
+        active_source_scope={
+            "status": "resolved",
+            "source_set_mode": "single",
+            "source_ids": ["alpha-file"],
+            "sources": [{"id": "alpha-file", "name": "alpha-policy.txt"}],
+        },
+    )
+    sidecar = Chats.build_reference_metadata_sidecar(
+        sources=sources,
+        diagnostics=diagnostics,
+    )
+
+    assert sources == []
+    assert "canonical_references" not in sidecar
+    assert {item["reason"] for item in sidecar["retrieval_diagnostics"]} >= {
+        "source_scope_mismatch",
+        "weak_or_indirect_evidence",
+        "no_injectable_evidence",
+    }
+    assert {item["outcome"] for item in sidecar["retrieval_diagnostics"]} >= {
+        "unauthorized",
+        "weak_evidence",
+        "empty",
+    }
+
+
+def test_retrieval_quality_gate_keeps_stale_unauthorized_conflict_as_diagnostics():
+    candidates = [
+        {
+            "source": {"id": "stale-file", "name": "stale.txt", "type": "file"},
+            "document": ["Stale evidence."],
+            "metadata": [{"file_id": "stale-file", "stale": True}],
+        },
+        {
+            "source": {"id": "denied-file", "name": "denied.txt", "type": "file"},
+            "document": ["Denied evidence."],
+            "metadata": [{"file_id": "denied-file", "authorized": False}],
+        },
+        {
+            "source": {"id": "conflict-file", "name": "conflict.txt", "type": "file"},
+            "document": ["Conflicting evidence."],
+            "metadata": [{"file_id": "conflict-file", "conflict": True}],
+        },
+    ]
+
+    sources, diagnostics = _gate_retrieval_sources(candidates)
+    sidecar = Chats.build_reference_metadata_sidecar(
+        sources=sources,
+        diagnostics=diagnostics,
+    )
+
+    assert sources == []
+    assert "canonical_references" not in sidecar
+    assert {item["outcome"] for item in sidecar["retrieval_diagnostics"]} >= {
+        "stale",
+        "unauthorized",
+        "conflict",
+    }
+
+
 def test_completion_wrapper_filter_does_not_persist_ambiguous_sources():
     wrapper = {
         "done": True,
