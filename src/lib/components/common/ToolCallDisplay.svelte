@@ -72,6 +72,8 @@
 		'todo list updated',
 		'updated todos'
 	]);
+	const TODO_FAILURE_STATUSES = new Set(['error', 'failed', 'failure', 'denied', 'blocked']);
+	const TODO_TIMEOUT_STATUSES = new Set(['timeout', 'timed_out', 'timed-out']);
 	let expandedResult = false;
 	let visualStatusTick = 0;
 	let visualStatusTimer: ReturnType<typeof setTimeout> | null = null;
@@ -343,6 +345,14 @@
 		return !normalized.startsWith('updated todo list to [');
 	}
 
+	function normalizeTerminalTodoFailureStatus(value: unknown): 'error' | 'timeout' | '' {
+		if (typeof value !== 'string') return '';
+		const normalized = value.trim().toLowerCase();
+		if (TODO_TIMEOUT_STATUSES.has(normalized)) return 'timeout';
+		if (TODO_FAILURE_STATUSES.has(normalized)) return 'error';
+		return '';
+	}
+
 	function getGeneratedTerminalFile(
 		toolName: string | undefined,
 		parsedResult: unknown
@@ -516,16 +526,26 @@
 	$: supportsArtifactInference = isFileGeneratingToolId(normalizedToolId);
 	$: hasResultArtifacts = supportsArtifactInference && getToolCallArtifactEvidence(normalizedAttrs);
 	$: hasArtifactEvidence = hasAnyFiles || Boolean(terminalResultFile) || hasResultArtifacts;
-	$: statusCandidate = resolveToolCallStatus(normalizedAttrs);
+	$: terminalTodoFailureStatus =
+		normalizedToolId === 'write_todos'
+			? normalizeTerminalTodoFailureStatus(attributes?.status)
+			: '';
+	$: statusCandidate = terminalTodoFailureStatus || resolveToolCallStatus(normalizedAttrs);
+	$: hasTerminalTodoFailure =
+		normalizedToolId === 'write_todos' &&
+		(statusCandidate === 'error' || statusCandidate === 'timeout');
 	$: status = getEffectiveStatus(
 		statusCandidate,
 		toolVisualKey,
-		!disableVisualStatusDelay && !hasArtifactEvidence
+		!disableVisualStatusDelay && !hasArtifactEvidence && !hasTerminalTodoFailure
 	);
 	$: isTerminal = status !== 'running';
 	$: isExecuting = status === 'running';
 	$: statusMessage = getStatusMessage(status);
-	$: todoPayload = normalizedToolId === 'write_todos' ? buildTodoPayload(parsedArgs, parsedResult) : null;
+	$: todoPayload =
+		normalizedToolId === 'write_todos' && !hasTerminalTodoFailure
+			? buildTodoPayload(parsedArgs, parsedResult)
+			: null;
 	$: todoGroups = getTodoGroups(todoPayload);
 	$: todoSummary = getTodoSummary(todoPayload, status);
 	$: todoResultMessage = getTodoResultMessage(parsedResult);
