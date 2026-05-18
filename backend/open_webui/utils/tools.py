@@ -994,12 +994,42 @@ def _build_deepagent_registered_tool_name(
     return f"{prefix}{digest}"
 
 
+def _build_deepagent_builtin_function_entry(
+    func: Callable, registered_name: str = ""
+) -> dict[str, Any]:
+    spec = clean_openai_tool_schema(
+        convert_pydantic_model_to_openai_function_spec(
+            convert_function_to_pydantic_model(func)
+        )
+    )
+    function_name = str(spec.get("name") or func.__name__).strip() or func.__name__
+    registered_name = str(registered_name or function_name).strip() or function_name
+    return {
+        "registered_name": registered_name,
+        "function_name": function_name,
+        "description": str(spec.get("description") or function_name),
+        "openai_tool": {
+            "type": "function",
+            "function": {
+                "name": registered_name,
+                "description": str(spec.get("description") or function_name),
+                "parameters": _sanitize_deepagent_runtime_parameters(
+                    spec.get("parameters")
+                    if isinstance(spec.get("parameters"), dict)
+                    else None
+                ),
+            },
+        },
+    }
+
+
 def build_deepagent_runtime_tool_snapshot(
     tool_ids: list[str] | None,
     user: UserModel,
     *,
     files: list[dict] | None = None,
     metadata: dict | None = None,
+    model_knowledge: list[dict] | None = None,
     db=None,
 ) -> dict[str, Any]:
     requested_tool_ids = [
@@ -1076,34 +1106,10 @@ def build_deepagent_runtime_tool_snapshot(
     runtime_skill_ids = get_deepagent_runtime_skill_ids(metadata)
     if runtime_skill_ids:
         revision = compute_deepagent_builtin_skills_revision(runtime_skill_ids)
-        functions: list[dict[str, Any]] = []
-
-        for func in (list_skills, view_skill):
-            spec = clean_openai_tool_schema(
-                convert_pydantic_model_to_openai_function_spec(
-                    convert_function_to_pydantic_model(func)
-                )
-            )
-            function_name = str(spec.get("name") or func.__name__).strip() or func.__name__
-            functions.append(
-                {
-                    "registered_name": function_name,
-                    "function_name": function_name,
-                    "description": str(spec.get("description") or function_name),
-                    "openai_tool": {
-                        "type": "function",
-                        "function": {
-                            "name": function_name,
-                            "description": str(spec.get("description") or function_name),
-                            "parameters": _sanitize_deepagent_runtime_parameters(
-                                spec.get("parameters")
-                                if isinstance(spec.get("parameters"), dict)
-                                else None
-                            ),
-                        },
-                    },
-                }
-            )
+        functions = [
+            _build_deepagent_builtin_function_entry(func)
+            for func in (list_skills, view_skill)
+        ]
 
         runtime_tools.append(
             {
@@ -1127,6 +1133,7 @@ def build_deepagent_runtime_tool_snapshot(
             "session_id": sanitized_metadata.get("session_id"),
             "message_id": sanitized_metadata.get("message_id"),
             "files": copy.deepcopy(files or []),
+            "knowledge": copy.deepcopy(model_knowledge or []),
             "metadata": sanitized_metadata,
         },
     }

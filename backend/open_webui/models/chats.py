@@ -603,6 +603,15 @@ def _looks_like_official_web_url(value: object) -> bool:
     }
 
 
+def _looks_like_http_web_url(value: object) -> bool:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return False
+
+    parsed = urlparse(normalized)
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
 def _normalize_web_source_class(value: object, *, url: object = "", authority: object = "") -> str:
     normalized = (
         str(value or "")
@@ -635,7 +644,7 @@ def _normalize_web_source_class(value: object, *, url: object = "", authority: o
 
     if _looks_like_official_web_url(url):
         return "official_web"
-    if str(url or "").strip():
+    if _looks_like_http_web_url(url):
         return "generic_web"
     return ""
 

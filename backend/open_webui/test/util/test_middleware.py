@@ -1,8 +1,22 @@
+import asyncio
+import json
 from types import SimpleNamespace
 
 from open_webui.utils.middleware import (
+    Chats,
     _attach_generated_files_to_output,
+    chat_completion_files_handler,
+    _selected_source_scope_is_ambiguous,
+    _merge_reference_sidecar_into_metadata,
+    _is_media_file_item,
+    _is_image_file_item,
+    _gate_retrieval_sources,
+    _filter_inline_sources_for_selected_files,
+    _completion_sources_for_persistence,
+    _build_assistant_reference_seed_metadata,
+    _build_assistant_reference_persistence_metadata,
     _build_chat_completion_payload,
+    _resolve_active_source_scope,
     apply_source_context_to_messages,
     handle_responses_streaming_event,
 )
@@ -12,6 +26,77 @@ from open_webui.utils.task import (
     extract_session_user_facts,
     query_generation_template,
 )
+
+
+def _local_file_source(
+    *,
+    file_id: str = "file-1",
+    name: str = "atlas-note.txt",
+    content: str = "Project Atlas note. Owner: Lina Chen. Launch date: 2026-11-03.",
+) -> dict:
+    return {
+        "source": {
+            "id": file_id,
+            "name": name,
+            "url": f"/api/v1/files/{file_id}/content",
+            "type": "file",
+        },
+        "document": [content],
+        "metadata": [
+            {
+                "source": file_id,
+                "name": name,
+                "file_id": file_id,
+            }
+        ],
+    }
+
+
+def _resolved_active_source_scope(
+    *,
+    file_id: str = "file-1",
+    name: str = "atlas-note.txt",
+    reason: str = "explicit_anchor",
+) -> dict:
+    return {
+        "status": "resolved",
+        "source_set_mode": "single",
+        "source_ids": [file_id],
+        "sources": [{"id": file_id, "name": name, "type": "file"}],
+        "reason": reason,
+        "confidence": "high",
+        "expires_on": "new_upload_or_explicit_change",
+    }
+
+
+def _web_tool_output(
+    *,
+    tool_name: str,
+    tool_args: dict,
+    payload: dict,
+) -> list[dict]:
+    return [
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": tool_name,
+            "arguments": json.dumps(tool_args, ensure_ascii=False),
+            "status": "completed",
+        },
+        {
+            "type": "function_call_output",
+            "id": "fco_1",
+            "call_id": "call_1",
+            "output": [
+                {
+                    "type": "input_text",
+                    "text": json.dumps(payload, ensure_ascii=False),
+                }
+            ],
+            "status": "completed",
+        },
+    ]
 
 
 def test_response_completed_keeps_streamed_tool_items_when_final_output_drops_them():
@@ -317,3 +402,1944 @@ def test_apply_source_context_to_messages_adds_follow_up_context_guidance():
         in guidance_message["content"]
     )
     assert "工龄满了30年" in guidance_message["content"]
+
+
+def test_selected_file_reference_persists_when_active_scope_is_resolved():
+    metadata = {
+        "active_source_scope": _resolved_active_source_scope(),
+        "sources": [_local_file_source()],
+    }
+
+    persisted = _build_assistant_reference_persistence_metadata(metadata)
+
+    assert persisted["active_source_scope"]["status"] == "resolved"
+    assert len(persisted["canonical_references"]) == 1
+
+    reference = persisted["canonical_references"][0]
+    assert reference["source"]["id"] == "file-1"
+    assert reference["source"]["name"] == "atlas-note.txt"
+    assert reference["source"]["type"] == "file"
+    assert reference.get("source_class") not in {"official_web", "generic_web"}
+
+
+def test_selected_file_followup_reuses_previous_single_source_focus():
+    previous_assistant = {
+        "role": "assistant",
+        "metadata": {
+            "active_source_scope": _resolved_active_source_scope(
+                file_id="file-2",
+                name="delta-approval.txt",
+                reason="current_turn_upload",
+            )
+        },
+    }
+    fallback_file = {
+        "id": "file-2",
+        "name": "delta-approval.txt",
+        "type": "file",
+        "url": "/api/v1/files/file-2/content",
+        "focus_origin": "history",
+        "focus_tier": "reference",
+    }
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "后面呢",
+        [],
+        stored_messages=[previous_assistant],
+        fallback_candidates=[fallback_file],
+    )
+
+    assert blocked is False
+    assert scope["status"] == "resolved"
+    assert scope["source_ids"] == ["file-2"]
+    assert resolved_files == [fallback_file]
+
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "active_source_scope": scope,
+            "sources": [
+                _local_file_source(
+                    file_id="file-2",
+                    name="delta-approval.txt",
+                    content="3. CFO signoff. 4. Board notice.",
+                )
+            ],
+        }
+    )
+
+    assert persisted["active_source_scope"]["source_ids"] == ["file-2"]
+    assert len(persisted["canonical_references"]) == 1
+    assert persisted["canonical_references"][0]["source"]["id"] == "file-2"
+
+
+def test_mixed_file_and_web_references_persist_once_each():
+    web_sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_web_tool_output(
+            tool_name="visit_webpage",
+            tool_args={
+                "url": "https://travel.state.gov/content/travel/en/passports/how-apply/processing-times.html"
+            },
+            payload={
+                "url": "https://travel.state.gov/content/travel/en/passports/how-apply/processing-times.html",
+                "source_class": "official_web",
+                "authority": "official",
+                "content": "Routine service can take 4 to 6 weeks.",
+                "provider": "browser",
+                "as_of": "2026-05-15",
+            },
+        )
+    )
+    web_reference = web_sidecar["canonical_references"][0]
+
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "active_source_scope": _resolved_active_source_scope(
+                file_id="file-3",
+                name="passport-sla.txt",
+            ),
+            "canonical_references": [web_reference],
+            "sources": [
+                _local_file_source(
+                    file_id="file-3",
+                    name="passport-sla.txt",
+                    content="Internal passport promise: 5 weeks end-to-end.",
+                ),
+                web_reference,
+            ],
+        }
+    )
+
+    references = persisted["canonical_references"]
+    assert len(references) == 2
+    assert sum(ref["source"].get("type") == "file" for ref in references) == 1
+    assert sum(ref.get("source_class") == "official_web" for ref in references) == 1
+
+
+def test_ambiguous_scope_does_not_synthesize_local_references():
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "active_source_scope": {
+                "status": "ambiguous",
+                "source_set_mode": "none",
+                "source_ids": ["file-a", "file-b"],
+                "sources": [
+                    {"id": "file-a", "name": "alpha.txt", "type": "file"},
+                    {"id": "file-b", "name": "beta.txt", "type": "file"},
+                ],
+                "reason": "ambiguous_retrieval_scope",
+                "confidence": "low",
+                "expires_on": "new_upload_or_explicit_change",
+            },
+            "sources": [
+                _local_file_source(file_id="file-a", name="alpha.txt"),
+                _local_file_source(file_id="file-b", name="beta.txt"),
+            ],
+        }
+    )
+
+    assert persisted["active_source_scope"]["status"] == "ambiguous"
+    assert "canonical_references" not in persisted
+
+
+def test_raw_search_results_do_not_become_canonical_references_by_default():
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_web_tool_output(
+            tool_name="search_web",
+            tool_args={"query": "current passport processing time"},
+            payload={
+                "query": "current passport processing time",
+                "results": [
+                    {
+                        "title": "Result A",
+                        "url": "https://example.com/a",
+                        "snippet": "A snippet",
+                    },
+                    {
+                        "title": "Result B",
+                        "url": "https://example.com/b",
+                        "snippet": "B snippet",
+                    },
+                ],
+                "provider": "mock-search",
+            },
+        )
+    )
+
+    assert sidecar == {}
+
+
+def test_visit_webpage_success_persists_one_web_reference_with_provenance():
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_web_tool_output(
+            tool_name="visit_webpage",
+            tool_args={
+                "url": "https://travel.state.gov/content/travel/en/passports/how-apply/processing-times.html"
+            },
+            payload={
+                "url": "https://travel.state.gov/content/travel/en/passports/how-apply/processing-times.html",
+                "source_class": "official_web",
+                "authority": "official",
+                "content": "Routine service can take 4 to 6 weeks.",
+                "provider": "browser",
+                "retrieval_round": 2,
+                "as_of": "2026-05-15",
+                "freshness": "updated_2026-01-28",
+            },
+        )
+    )
+
+    assert len(sidecar["canonical_references"]) == 1
+    reference = sidecar["canonical_references"][0]
+    assert reference["source"]["type"] == "official_web"
+    assert reference["source"]["url"].startswith("https://travel.state.gov/")
+    assert reference["metadata"][0]["tool_name"] == "visit_webpage"
+    assert reference["metadata"][0]["provider"] == "browser"
+    assert reference["metadata"][0]["retrieval_round"] == 2
+    assert reference["metadata"][0]["as_of"] == "2026-05-15"
+    assert reference["metadata"][0]["freshness"] == "updated_2026-01-28"
+
+
+def test_visit_webpage_blocked_persists_diagnostics_only():
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_web_tool_output(
+            tool_name="visit_webpage",
+            tool_args={"url": "https://example.com/restricted"},
+            payload={
+                "url": "https://example.com/restricted",
+                "status": "blocked",
+                "reason": "provider_blocked_url",
+                "detail": "blocked by upstream provider",
+            },
+        )
+    )
+
+    assert "canonical_references" not in sidecar
+    assert len(sidecar["retrieval_diagnostics"]) == 1
+    diagnostic = sidecar["retrieval_diagnostics"][0]
+    assert diagnostic["reason"] == "provider_blocked_url"
+    assert diagnostic["classification"] == "diagnostics"
+
+
+def test_selected_source_scope_blocks_ambiguous_multi_file_deictic_prompt():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt"},
+        {"id": "beta", "name": "beta-policy.txt"},
+    ]
+    prompt_with_injected_file_tags = (
+        '<attached_files>\n'
+        '<file type="file" name="alpha-policy.txt" id="alpha"/>\n'
+        '<file type="file" name="beta-policy.txt" id="beta"/>\n'
+        '</attached_files>\n\n'
+        "这个文件说了什么？"
+    )
+
+    prompts = [
+        "这个文件说了什么？",
+        "What does this file say?",
+        "继续",
+        "后面呢",
+        "然后呢",
+        "再往下看",
+        "接着处理一下",
+        prompt_with_injected_file_tags,
+    ]
+
+    for prompt in prompts:
+        assert _selected_source_scope_is_ambiguous(prompt, files), prompt
+
+
+def test_selected_source_scope_allows_single_anchor_and_explicit_multi_file_prompt():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt"},
+        {"id": "beta", "name": "beta-policy.txt"},
+    ]
+
+    assert not _selected_source_scope_is_ambiguous("这个文件说了什么？", [files[0]])
+    assert not _selected_source_scope_is_ambiguous("alpha-policy.txt 说了什么？", files)
+    assert not _selected_source_scope_is_ambiguous("Alpha文件的政策答案是什么？", files)
+    assert not _selected_source_scope_is_ambiguous("Beta文件的政策答案是什么？", files)
+    assert not _selected_source_scope_is_ambiguous("总结这两个文件", files)
+    assert not _selected_source_scope_is_ambiguous("summarize these two files", files)
+    assert not _selected_source_scope_is_ambiguous(
+        "Alpha和Beta两个文件的政策答案有什么区别？",
+        files,
+    )
+
+
+def test_anchor_filter_keeps_only_matching_inline_source():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt"},
+        {"id": "beta", "name": "beta-policy.txt"},
+    ]
+    sources = [
+        {
+            "source": {"id": "alpha", "name": "alpha-policy.txt"},
+            "document": ["alpha body"],
+            "metadata": [{"source": "alpha"}],
+        },
+        {
+            "source": {"id": "beta", "name": "beta-policy.txt"},
+            "document": ["beta body"],
+            "metadata": [{"source": "beta"}],
+        },
+    ]
+
+    filtered = _filter_inline_sources_for_selected_files(sources, [files[0]])
+
+    assert filtered == [sources[0]]
+
+
+def test_active_scope_reuses_previous_single_reference_for_deictic_prompt():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "canonical_references": [
+                    {
+                        "source": {"id": "alpha", "name": "alpha-policy.txt"},
+                        "document": ["alpha body"],
+                        "metadata": [{"source": "alpha", "name": "alpha-policy.txt"}],
+                    }
+                ]
+            },
+        }
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "这个文件继续总结",
+        files,
+        stored_messages=stored_messages,
+        current_files=files,
+    )
+
+    assert not blocked
+    assert resolved_files == [files[0]]
+    assert scope["status"] == "resolved"
+    assert scope["source_set_mode"] == "single"
+    assert scope["source_ids"] == ["alpha"]
+    assert scope["reason"] == "previous_single_canonical_reference"
+
+
+def test_active_scope_reuses_previous_single_reference_for_bare_continuation_prompt():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "canonical_references": [
+                    {
+                        "source": {"id": "alpha", "name": "alpha-policy.txt"},
+                        "document": ["alpha body"],
+                        "metadata": [{"source": "alpha", "name": "alpha-policy.txt"}],
+                    }
+                ]
+            },
+        }
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "继续",
+        files,
+        stored_messages=stored_messages,
+        current_files=files,
+    )
+
+    assert not blocked
+    assert resolved_files == [files[0]]
+    assert scope["status"] == "resolved"
+    assert scope["source_set_mode"] == "single"
+    assert scope["source_ids"] == ["alpha"]
+    assert scope["reason"] == "previous_single_canonical_reference"
+
+
+def test_active_scope_reuses_previous_single_reference_for_natural_followup_prompts():
+    files = [
+        {"id": "alpha", "name": "langfuse-e2e-alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "langfuse-e2e-beta-policy.txt", "context": "full"},
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "active_source_scope": {
+                    "status": "resolved",
+                    "source_set_mode": "single",
+                    "source_ids": ["alpha"],
+                    "sources": [
+                        {
+                            "id": "alpha",
+                            "name": "langfuse-e2e-alpha-policy.txt",
+                            "type": "file",
+                        }
+                    ],
+                    "reason": "previous_single_canonical_reference",
+                    "confidence": "high",
+                }
+            },
+        }
+    ]
+
+    prompts = ["后面呢", "然后呢", "再往下看", "接着处理一下", "继续"]
+
+    for prompt in prompts:
+        scope, resolved_files, blocked = _resolve_active_source_scope(
+            prompt,
+            files,
+            stored_messages=stored_messages,
+            current_files=files,
+        )
+
+        assert not blocked, prompt
+        assert resolved_files == [files[0]], prompt
+        assert scope["status"] == "resolved", prompt
+        assert scope["source_set_mode"] == "single", prompt
+        assert scope["source_ids"] == ["alpha"], prompt
+
+
+def test_active_scope_explicit_anchor_wins_over_previous_focus():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "canonical_references": [
+                    {
+                        "source": {"id": "alpha", "name": "alpha-policy.txt"},
+                        "document": ["alpha body"],
+                        "metadata": [{"source": "alpha", "name": "alpha-policy.txt"}],
+                    }
+                ]
+            },
+        }
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "请继续看 beta-policy.txt",
+        files,
+        stored_messages=stored_messages,
+        current_files=files,
+    )
+
+    assert not blocked
+    assert resolved_files == [files[1]]
+    assert scope["source_ids"] == ["beta"]
+    assert scope["reason"] == "explicit_anchor"
+
+
+def test_active_scope_does_not_reuse_stale_previous_focus():
+    selected_files = [
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+        {"id": "gamma", "name": "gamma-policy.txt", "context": "full"},
+    ]
+    active_candidates = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        *selected_files,
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "canonical_references": [
+                    {
+                        "source": {"id": "alpha", "name": "alpha-policy.txt"},
+                        "document": ["alpha body"],
+                        "metadata": [{"source": "alpha", "name": "alpha-policy.txt"}],
+                    }
+                ]
+            },
+        }
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "这个文件说了什么？",
+        active_candidates,
+        stored_messages=stored_messages,
+        current_files=selected_files,
+    )
+
+    assert blocked
+    assert resolved_files == []
+    assert scope["status"] == "expired"
+    assert scope["reason"] == "expired_or_conflicting"
+
+
+def test_active_scope_persists_user_clarification_after_ambiguity():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+    stored_messages = [
+        {
+            "role": "assistant",
+            "metadata": {
+                "retrieval_diagnostics": [
+                    {
+                        "kind": "retrieval_quality",
+                        "classification": "diagnostics",
+                        "reason": "ambiguous_retrieval_scope",
+                        "candidate_index": -1,
+                    }
+                ]
+            },
+        }
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "alpha-policy.txt",
+        files,
+        stored_messages=stored_messages,
+        current_files=files,
+    )
+
+    assert not blocked
+    assert resolved_files == [files[0]]
+    assert scope["status"] == "resolved"
+    assert scope["reason"] == "user_clarified_deictic_reference"
+
+
+def test_active_scope_keeps_unfocused_multi_file_deictic_ambiguous():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "这个文件说了什么？",
+        files,
+        stored_messages=[],
+        current_files=files,
+    )
+
+    assert blocked
+    assert resolved_files == []
+    assert scope["status"] == "ambiguous"
+    assert scope["reason"] == "ambiguous_retrieval_scope"
+
+
+def test_active_scope_treats_bare_continuation_as_ambiguous_without_focus():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "继续",
+        files,
+        stored_messages=[],
+        current_files=files,
+    )
+
+    assert blocked
+    assert resolved_files == []
+    assert scope["status"] == "ambiguous"
+    assert scope["source_set_mode"] == "none"
+    assert scope["reason"] == "ambiguous_retrieval_scope"
+
+
+def test_active_scope_treats_natural_followup_prompts_as_ambiguous_without_focus():
+    files = [
+        {"id": "alpha", "name": "langfuse-e2e-alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "langfuse-e2e-beta-policy.txt", "context": "full"},
+    ]
+
+    for prompt in ["后面呢", "然后呢", "再往下看", "接着处理一下", "继续"]:
+        scope, resolved_files, blocked = _resolve_active_source_scope(
+            prompt,
+            files,
+            stored_messages=[],
+            current_files=files,
+        )
+
+        assert blocked, prompt
+        assert resolved_files == [], prompt
+        assert scope["status"] == "ambiguous", prompt
+        assert scope["source_set_mode"] == "none", prompt
+        assert scope["reason"] == "ambiguous_retrieval_scope", prompt
+
+
+def test_active_scope_explicit_alpha_beta_anchors_narrow_to_matching_file():
+    files = [
+        {
+            "id": "alpha-file",
+            "name": "langfuse-e2e-alpha-20260513-observability.txt",
+            "context": "full",
+        },
+        {
+            "id": "beta-file",
+            "name": "langfuse-e2e-beta-20260513-observability.txt",
+            "context": "full",
+        },
+    ]
+
+    alpha_scope, alpha_files, alpha_blocked = _resolve_active_source_scope(
+        "Alpha文件的政策答案是什么？",
+        files,
+        stored_messages=[],
+        current_files=files,
+    )
+    beta_scope, beta_files, beta_blocked = _resolve_active_source_scope(
+        "Beta文件的政策答案是什么？",
+        files,
+        stored_messages=[],
+        current_files=files,
+    )
+
+    assert not alpha_blocked
+    assert alpha_files == [files[0]]
+    assert alpha_scope["source_set_mode"] == "single"
+    assert alpha_scope["source_ids"] == ["alpha-file"]
+
+    assert not beta_blocked
+    assert beta_files == [files[1]]
+    assert beta_scope["source_set_mode"] == "single"
+    assert beta_scope["source_ids"] == ["beta-file"]
+
+
+def test_active_scope_allows_explicit_multi_file_prompt():
+    files = [
+        {"id": "alpha", "name": "alpha-policy.txt", "context": "full"},
+        {"id": "beta", "name": "beta-policy.txt", "context": "full"},
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "compare alpha-policy.txt and beta-policy.txt",
+        files,
+        stored_messages=[],
+        current_files=files,
+    )
+
+    assert not blocked
+    assert resolved_files == files
+    assert scope["status"] == "resolved"
+    assert scope["source_set_mode"] == "multi"
+    assert scope["source_ids"] == ["alpha", "beta"]
+
+
+def test_active_scope_uses_anchor_matches_for_explicit_alpha_beta_multi_prompt():
+    files = [
+        {
+            "id": "alpha-file",
+            "name": "langfuse-e2e-alpha-20260513-observability.txt",
+            "context": "full",
+        },
+        {
+            "id": "beta-file",
+            "name": "langfuse-e2e-beta-20260513-observability.txt",
+            "context": "full",
+        },
+    ]
+
+    scope, resolved_files, blocked = _resolve_active_source_scope(
+        "Alpha和Beta两个文件的政策答案有什么区别？",
+        files,
+        stored_messages=[],
+        current_files=files,
+    )
+
+    assert not blocked
+    assert resolved_files == files
+    assert scope["status"] == "resolved"
+    assert scope["source_set_mode"] == "multi"
+    assert scope["source_ids"] == ["alpha-file", "beta-file"]
+
+
+def test_active_scope_metadata_does_not_become_canonical_reference():
+    sidecar = Chats.build_reference_metadata_sidecar(
+        metadata={
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["alpha"],
+                "sources": [
+                    {"id": "alpha", "name": "alpha-policy.txt", "type": "file"}
+                ],
+                "reason": "previous_single_canonical_reference",
+                "confidence": "high",
+                "expires_on": "new_upload_or_explicit_change",
+            }
+        }
+    )
+
+    assert "canonical_references" not in sidecar
+    assert "retrieval_diagnostics" not in sidecar
+
+
+def test_empty_collection_with_null_meta_is_not_treated_as_media():
+    empty_collection = {
+        "type": "collection",
+        "id": "empty-kb",
+        "name": "Empty KB",
+        "meta": None,
+    }
+
+    assert not _is_media_file_item(empty_collection)
+    assert not _is_image_file_item(empty_collection)
+
+
+def test_no_evidence_gate_keeps_diagnostics_out_of_canonical_references():
+    candidates = [
+        {
+            "source": {"id": "empty-kb", "name": "Empty KB", "type": "collection"},
+            "document": [],
+            "metadata": [],
+        }
+    ]
+
+    sources, diagnostics = _gate_retrieval_sources(candidates)
+    sidecar = Chats.build_reference_metadata_sidecar(
+        sources=sources,
+        diagnostics=diagnostics,
+    )
+
+    assert sources == []
+    assert "canonical_references" not in sidecar
+    assert "retrieval_diagnostics" in sidecar
+    assert {item["reason"] for item in sidecar["retrieval_diagnostics"]} == {
+        "missing_document_body",
+        "no_injectable_evidence",
+    }
+
+
+def test_completion_wrapper_filter_does_not_persist_ambiguous_sources():
+    wrapper = {
+        "done": True,
+        "content": "",
+        "output": [{"type": "message", "content": []}],
+        "metadata": {
+            "retrieval_diagnostics": [
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "diagnostics",
+                    "reason": "ambiguous_retrieval_scope",
+                    "candidate_index": -1,
+                }
+            ]
+        },
+    }
+
+    normalized = Chats._normalize_message_reference_sidecar(
+        {
+            "role": "assistant",
+            "metadata": {
+                "retrieval_diagnostics": [
+                    {
+                        "kind": "retrieval_quality",
+                        "classification": "diagnostics",
+                        "reason": "ambiguous_retrieval_scope",
+                        "candidate_index": -1,
+                    }
+                ]
+            },
+            "sources": [wrapper],
+        }
+    )
+
+    assert "sources" not in normalized
+    metadata = normalized.get("metadata") or {}
+    assert "canonical_references" not in metadata
+    assert metadata.get("retrieval_diagnostics", [])[0]["reason"] == (
+        "ambiguous_retrieval_scope"
+    )
+
+
+def test_ambiguous_scope_strips_stale_sources_and_canonical_references():
+    stale_source = {
+        "source": {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+        "document": ["stale evidence"],
+        "metadata": [{"source": "alpha-policy.txt", "file_id": "alpha-file"}],
+    }
+
+    normalized = Chats._normalize_message_reference_sidecar(
+        {
+            "role": "assistant",
+            "done": True,
+            "sources": [stale_source],
+            "metadata": {
+                "canonical_references": [stale_source],
+                "active_source_scope": {
+                    "status": "ambiguous",
+                    "source_set_mode": "none",
+                    "source_ids": ["alpha-file", "beta-file"],
+                    "sources": [
+                        {
+                            "id": "alpha-file",
+                            "name": "alpha-policy.txt",
+                            "type": "file",
+                        },
+                        {
+                            "id": "beta-file",
+                            "name": "beta-policy.txt",
+                            "type": "file",
+                        },
+                    ],
+                    "reason": "ambiguous_retrieval_scope",
+                    "confidence": "low",
+                },
+                "retrieval_diagnostics": [
+                    {
+                        "kind": "retrieval_quality",
+                        "classification": "diagnostics",
+                        "reason": "ambiguous_retrieval_scope",
+                        "candidate_index": -1,
+                    }
+                ],
+            },
+        }
+    )
+
+    assert "sources" not in normalized
+    metadata = normalized.get("metadata") or {}
+    assert "canonical_references" not in metadata
+    assert metadata["active_source_scope"]["status"] == "ambiguous"
+    assert metadata["retrieval_diagnostics"][0]["reason"] == (
+        "ambiguous_retrieval_scope"
+    )
+
+
+def test_merge_reference_sidecar_drops_stale_canonical_refs_for_ambiguous_scope():
+    stale_source = {
+        "source": {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+        "document": ["stale evidence"],
+        "metadata": [{"source": "alpha-policy.txt", "file_id": "alpha-file"}],
+    }
+    metadata = {
+        "canonical_references": [stale_source],
+        "active_source_scope": {
+            "status": "ambiguous",
+            "source_set_mode": "none",
+            "reason": "ambiguous_retrieval_scope",
+            "confidence": "low",
+        },
+        "retrieval_diagnostics": [
+            {
+                "kind": "retrieval_quality",
+                "classification": "diagnostics",
+                "reason": "ambiguous_retrieval_scope",
+                "candidate_index": -1,
+            }
+        ],
+    }
+
+    sidecar = _merge_reference_sidecar_into_metadata(
+        metadata,
+        sources=[stale_source],
+        diagnostics=metadata["retrieval_diagnostics"],
+    )
+
+    assert "canonical_references" not in sidecar
+    assert "canonical_references" not in metadata
+    assert metadata["retrieval_diagnostics"][0]["reason"] == (
+        "ambiguous_retrieval_scope"
+    )
+
+
+def test_no_evidence_diagnostics_clear_stale_sources_and_canonical_references():
+    stale_source = {
+        "source": {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+        "document": ["stale evidence"],
+        "metadata": [{"source": "alpha-policy.txt", "file_id": "alpha-file"}],
+    }
+
+    normalized = Chats._normalize_message_reference_sidecar(
+        {
+            "role": "assistant",
+            "done": True,
+            "sources": [stale_source],
+            "metadata": {
+                "retrieval_diagnostics": [
+                    {
+                        "kind": "retrieval_quality",
+                        "classification": "no_evidence",
+                        "reason": "no_retrieval_candidates",
+                        "candidate_index": -1,
+                    }
+                ],
+            },
+        }
+    )
+
+    assert "sources" not in normalized
+    metadata = normalized.get("metadata") or {}
+    assert "canonical_references" not in metadata
+    assert metadata["retrieval_diagnostics"][0]["classification"] == "no_evidence"
+
+
+def test_ambiguous_scope_strips_suppressed_inline_citation_markers():
+    stale_source = {
+        "source": {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+        "document": ["stale evidence"],
+        "metadata": [{"source": "alpha-policy.txt", "file_id": "alpha-file"}],
+    }
+
+    normalized = Chats._normalize_message_reference_sidecar(
+        {
+            "role": "assistant",
+            "done": True,
+            "content": (
+                "Because ambiguous deictic references must not choose a file [2], "
+                "please specify which file you mean."
+            ),
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": (
+                                "Because ambiguous deictic references must not choose "
+                                "a file [2], please specify which file you mean."
+                            ),
+                        }
+                    ],
+                }
+            ],
+            "sources": [stale_source],
+            "metadata": {
+                "active_source_scope": {
+                    "status": "ambiguous",
+                    "source_set_mode": "none",
+                    "reason": "ambiguous_retrieval_scope",
+                    "confidence": "low",
+                },
+                "retrieval_diagnostics": [
+                    {
+                        "kind": "retrieval_quality",
+                        "classification": "diagnostics",
+                        "reason": "ambiguous_retrieval_scope",
+                        "candidate_index": -1,
+                    }
+                ],
+            },
+        }
+    )
+
+    assert normalized["content"] == (
+        "Because ambiguous deictic references must not choose a file, "
+        "please specify which file you mean."
+    )
+    assert normalized["output"][0]["content"][0]["text"] == (
+        "Because ambiguous deictic references must not choose a file, "
+        "please specify which file you mean."
+    )
+    assert "sources" not in normalized
+    assert "canonical_references" not in (normalized.get("metadata") or {})
+
+
+def test_assistant_reference_seed_metadata_keeps_ambiguous_scope_without_refs():
+    seed_metadata = _build_assistant_reference_seed_metadata(
+        {
+            "active_source_scope": {
+                "status": "ambiguous",
+                "source_set_mode": "none",
+                "reason": "ambiguous_retrieval_scope",
+                "confidence": "low",
+            },
+            "retrieval_diagnostics": [
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "diagnostics",
+                    "reason": "ambiguous_retrieval_scope",
+                    "candidate_index": -1,
+                }
+            ],
+            "sources": [
+                {
+                    "source": {
+                        "id": "alpha-file",
+                        "name": "alpha-policy.txt",
+                        "type": "file",
+                    },
+                    "document": ["stale evidence"],
+                }
+            ],
+        }
+    )
+
+    assert seed_metadata["active_source_scope"]["status"] == "ambiguous"
+    assert "canonical_references" not in seed_metadata
+    assert seed_metadata["retrieval_diagnostics"][0]["reason"] == (
+        "ambiguous_retrieval_scope"
+    )
+
+
+def test_merge_message_payload_clears_historical_stale_sources_from_seed_metadata():
+    stale_source = {
+        "source": {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+        "document": ["stale evidence"],
+        "metadata": [{"source": "alpha-policy.txt", "file_id": "alpha-file"}],
+    }
+    existing_message = {
+        "role": "assistant",
+        "sources": [stale_source],
+        "metadata": {"canonical_references": [stale_source]},
+    }
+    incoming_message = {
+        "role": "assistant",
+        "metadata": _build_assistant_reference_seed_metadata(
+            {
+                "active_source_scope": {
+                    "status": "ambiguous",
+                    "source_set_mode": "none",
+                    "reason": "ambiguous_retrieval_scope",
+                    "confidence": "low",
+                },
+                "retrieval_diagnostics": [
+                    {
+                        "kind": "retrieval_quality",
+                        "classification": "diagnostics",
+                        "reason": "ambiguous_retrieval_scope",
+                        "candidate_index": -1,
+                    }
+                ],
+            }
+        ),
+    }
+
+    merged = Chats._merge_message_payload(existing_message, incoming_message)
+
+    assert "sources" not in merged
+    assert "canonical_references" not in (merged.get("metadata") or {})
+    assert merged["metadata"]["active_source_scope"]["status"] == "ambiguous"
+
+
+def test_assistant_reference_persistence_metadata_keeps_selected_file_reference():
+    persisted_metadata = _build_assistant_reference_persistence_metadata(
+        {
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["alpha-file"],
+                "sources": [
+                    {
+                        "id": "alpha-file",
+                        "name": "alpha-policy.txt",
+                        "type": "file",
+                    }
+                ],
+                "reason": "current_turn_upload",
+                "confidence": "high",
+            },
+            "sources": [
+                {
+                    "source": {
+                        "id": "alpha-file",
+                        "name": "alpha-policy.txt",
+                        "type": "file",
+                    },
+                    "document": ["alpha evidence"],
+                    "metadata": [
+                        {
+                            "source": "alpha-policy.txt",
+                            "file_id": "alpha-file",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert persisted_metadata["active_source_scope"]["status"] == "resolved"
+    assert len(persisted_metadata["canonical_references"]) == 1
+    assert persisted_metadata["canonical_references"][0]["source"]["id"] == (
+        "alpha-file"
+    )
+
+
+def test_assistant_reference_persistence_metadata_keeps_explicit_multi_scope():
+    persisted_metadata = _build_assistant_reference_persistence_metadata(
+        {
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "multi",
+                "source_ids": ["alpha-file", "beta-file"],
+                "sources": [
+                    {
+                        "id": "alpha-file",
+                        "name": "langfuse-e2e-alpha-policy.txt",
+                        "type": "file",
+                    },
+                    {
+                        "id": "beta-file",
+                        "name": "langfuse-e2e-beta-policy.txt",
+                        "type": "file",
+                    },
+                ],
+                "reason": "explicit_anchor",
+                "confidence": "high",
+            },
+            "sources": [
+                {
+                    "source": {
+                        "id": "alpha-file",
+                        "name": "langfuse-e2e-alpha-policy.txt",
+                        "type": "file",
+                    },
+                    "document": ["alpha evidence"],
+                    "metadata": [
+                        {
+                            "source": "langfuse-e2e-alpha-policy.txt",
+                            "file_id": "alpha-file",
+                        }
+                    ],
+                },
+                {
+                    "source": {
+                        "id": "beta-file",
+                        "name": "langfuse-e2e-beta-policy.txt",
+                        "type": "file",
+                    },
+                    "document": ["beta evidence"],
+                    "metadata": [
+                        {
+                            "source": "langfuse-e2e-beta-policy.txt",
+                            "file_id": "beta-file",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+    assert persisted_metadata["active_source_scope"]["source_set_mode"] == "multi"
+    assert [item["source"]["id"] for item in persisted_metadata["canonical_references"]] == [
+        "alpha-file",
+        "beta-file",
+    ]
+
+
+def test_fresh_multi_selected_explicit_multi_prompt_keeps_active_source_scope(
+    monkeypatch,
+):
+    files = [
+        {"id": "alpha-file", "name": "Alpha文件-verification.txt", "context": "full"},
+        {"id": "beta-file", "name": "Beta文件-verification.txt", "context": "full"},
+    ]
+    inline_sources = [
+        {
+            "source": {
+                "id": "alpha-file",
+                "name": "Alpha文件-verification.txt",
+                "type": "file",
+            },
+            "document": ["alpha evidence"],
+            "metadata": [
+                {
+                    "source": "Alpha文件-verification.txt",
+                    "file_id": "alpha-file",
+                }
+            ],
+        },
+        {
+            "source": {
+                "id": "beta-file",
+                "name": "Beta文件-verification.txt",
+                "type": "file",
+            },
+            "document": ["beta evidence"],
+            "metadata": [
+                {
+                    "source": "Beta文件-verification.txt",
+                    "file_id": "beta-file",
+                }
+            ],
+        },
+    ]
+
+    async def prepare_files(*_args, **_kwargs):
+        return files, inline_sources, [], [], []
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        prepare_files,
+    )
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                config=SimpleNamespace(
+                    TOP_K=4,
+                    TOP_K_RERANKER=4,
+                    RELEVANCE_THRESHOLD=0.0,
+                    HYBRID_BM25_WEIGHT=0.0,
+                    ENABLE_RAG_HYBRID_SEARCH=False,
+                    RAG_FULL_CONTEXT=False,
+                )
+            )
+        )
+    )
+    body = {
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": "Alpha和Beta两个文件的政策答案有什么区别？"}
+        ],
+        "metadata": {"files": files},
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            request,
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted_metadata = _build_assistant_reference_persistence_metadata(flags)
+
+    assert flags["active_source_scope"]["status"] == "resolved"
+    assert flags["active_source_scope"]["source_set_mode"] == "multi"
+    assert flags["active_source_scope"]["source_ids"] == ["alpha-file", "beta-file"]
+    assert persisted_metadata["active_source_scope"]["source_set_mode"] == "multi"
+    assert [item["source"]["id"] for item in persisted_metadata["canonical_references"]] == [
+        "alpha-file",
+        "beta-file",
+    ]
+
+
+def test_zero_source_retrieval_status_history_is_hidden_on_reload_normalization():
+    normalized = Chats._normalize_message_reference_sidecar(
+        {
+            "role": "assistant",
+            "done": True,
+            "content": "NO_FILE_ACCESS",
+            "statusHistory": [
+                {"action": "queries_generated", "queries": ["alpha policy"]},
+                {"action": "sources_retrieved", "count": 0, "hidden": True, "done": True},
+                {"action": "chat", "hidden": True, "done": True},
+            ],
+        }
+    )
+
+    status_history = normalized["statusHistory"]
+    assert status_history[0]["action"] == "queries_generated"
+    assert status_history[0]["hidden"] is True
+
+
+def test_sourced_message_keeps_retrieval_status_history_visible():
+    source = {
+        "source": {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+        "document": ["alpha evidence"],
+        "metadata": [{"source": "alpha-policy.txt", "file_id": "alpha-file"}],
+    }
+
+    normalized = Chats._normalize_message_reference_sidecar(
+        {
+            "role": "assistant",
+            "done": True,
+            "sources": [source],
+            "statusHistory": [
+                {"action": "queries_generated", "queries": ["alpha policy"]},
+                {"action": "sources_retrieved", "count": 1, "done": True},
+            ],
+        }
+    )
+
+    assert normalized["statusHistory"][0].get("hidden") is not True
+    assert len(_completion_sources_for_persistence(normalized.get("metadata") or {})) == 1
+    assert len((normalized.get("metadata") or {}).get("canonical_references") or []) == 1
+
+
+def _tool_output_item(tool_name: str, payload: object, arguments: object = "{}") -> list[dict]:
+    return [
+        {
+            "type": "function_call",
+            "id": "call_1",
+            "call_id": "call_1",
+            "name": tool_name,
+            "arguments": arguments,
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": [
+                {
+                    "type": "input_text",
+                    "text": json.dumps(payload, ensure_ascii=False),
+                }
+            ],
+        },
+    ]
+
+
+def test_second_pass_query_selected_tool_success_persists_canonical_reference():
+    payload = {
+        "status": "success",
+        "tool_name": "query_selected_knowledge_files",
+        "query": "alpha policy requirement",
+        "retrieval_round": 2,
+        "canonical_references": [
+            {
+                "source": {
+                    "id": "alpha-file",
+                    "name": "alpha-policy.txt",
+                    "type": "file",
+                },
+                "document": ["alpha evidence"],
+                "metadata": [
+                    {
+                        "source": "alpha-policy.txt",
+                        "file_id": "alpha-file",
+                        "retrieval_tool_name": "query_selected_knowledge_files",
+                        "retrieval_round": 2,
+                        "query": "alpha policy requirement",
+                        "chunk_id": "chunk-1",
+                    }
+                ],
+            }
+        ],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item("query_selected_knowledge_files", payload)
+    )
+
+    assert len(sidecar["canonical_references"]) == 1
+    reference = sidecar["canonical_references"][0]
+    assert reference["source"]["id"] == "alpha-file"
+    assert reference["provenance"]["tool_name"] == "query_selected_knowledge_files"
+    assert reference["provenance"]["retrieval_round"] == 2
+    assert reference["provenance"]["query"] == "alpha policy requirement"
+    assert "retrieval_diagnostics" not in sidecar
+
+
+def test_search_tool_raw_results_do_not_become_canonical_references():
+    payload = {
+        "status": "success",
+        "provider": "internet_search",
+        "results": [
+            {
+                "title": "原始候选一",
+                "url": "https://example.com/raw-1",
+                "snippet": "候选网页摘要一",
+            },
+            {
+                "title": "原始候选二",
+                "url": "https://example.com/raw-2",
+                "snippet": "候选网页摘要二",
+            },
+        ],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item(
+            "internet_search",
+            payload,
+            arguments={"query": "raw search candidates"},
+        )
+    )
+
+    assert sidecar == {}
+
+
+def test_search_tool_success_normalizes_explicit_accepted_web_evidence():
+    payload = {
+        "status": "success",
+        "provider": "internet_search",
+        "as_of": "2026-05-14",
+        "accepted_results": [
+            {
+                "title": "政策原文",
+                "url": "https://www.gov.cn/policy/2026/example.html",
+                "content": "官方政策原文摘录",
+                "source_class": "official_web",
+            },
+            {
+                "title": "行业解读",
+                "url": "https://example.com/analysis",
+                "snippet": "第三方行业解读摘要",
+                "type": "web",
+            },
+        ],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item(
+            "internet_search",
+            payload,
+            arguments={"query": "latest policy updates"},
+        )
+    )
+
+    assert len(sidecar["canonical_references"]) == 2
+    official_reference = sidecar["canonical_references"][0]
+    generic_reference = sidecar["canonical_references"][1]
+
+    assert official_reference["source"]["type"] == "official_web"
+    assert official_reference["source_class"] == "official_web"
+    assert official_reference["authority"] == "official"
+    assert official_reference["provenance"]["tool_name"] == "internet_search"
+    assert official_reference["provenance"]["provider"] == "internet_search"
+    assert official_reference["provenance"]["query"] == "latest policy updates"
+    assert official_reference["provenance"]["as_of"] == "2026-05-14"
+    assert official_reference["provenance"]["domain"] == "gov.cn"
+    assert generic_reference["source"]["type"] == "generic_web"
+    assert generic_reference["source"]["url"] == "https://example.com/analysis"
+    assert generic_reference["provenance"]["source_class"] == "generic_web"
+    assert "retrieval_diagnostics" not in sidecar
+
+
+def test_legacy_raw_web_sources_do_not_normalize_into_canonical_references():
+    sidecar = Chats.build_reference_metadata_sidecar(
+        sources=[
+            {
+                "source": {
+                    "id": "https://example.com/raw-result",
+                    "url": "https://example.com/raw-result",
+                    "name": "Raw search candidate",
+                    "type": "web",
+                },
+                "document": ["This candidate should not persist as accepted evidence."],
+                "metadata": [
+                    {
+                        "source": "https://example.com/raw-result",
+                        "name": "Raw search candidate",
+                        "url": "https://example.com/raw-result",
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert sidecar == {}
+
+
+def test_search_tool_empty_results_become_diagnostics_only():
+    payload = {
+        "status": "empty",
+        "provider": "internet_search",
+        "results": [],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item(
+            "internet_search",
+            payload,
+            arguments={"query": "missing policy"},
+        )
+    )
+
+    assert "canonical_references" not in sidecar
+    assert sidecar["retrieval_diagnostics"][0]["reason"] == "empty_search_results"
+    assert sidecar["retrieval_diagnostics"][0]["tool_name"] == "internet_search"
+
+
+def test_search_tool_weak_results_become_diagnostics_only():
+    payload = {
+        "status": "weak",
+        "provider": "internet_search",
+        "reason": "low_relevance",
+        "results": [
+            {
+                "title": "候选网页",
+                "url": "https://example.com/weak",
+                "snippet": "相关性不足的候选结果",
+            }
+        ],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item(
+            "internet_search",
+            payload,
+            arguments={"query": "weak policy match"},
+        )
+    )
+
+    assert "canonical_references" not in sidecar
+    assert sidecar["retrieval_diagnostics"][0]["reason"] == "low_relevance"
+    assert sidecar["retrieval_diagnostics"][0]["tool_name"] == "internet_search"
+
+
+def test_webpage_blocked_result_becomes_diagnostics_only():
+    payload = {
+        "status": "blocked",
+        "code": "provider_blocked_url",
+        "detail": "blocked by upstream provider",
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item(
+            "visit_webpage",
+            payload,
+            arguments={"url": "https://example.com/restricted"},
+        )
+    )
+
+    assert "canonical_references" not in sidecar
+    assert sidecar["retrieval_diagnostics"][0]["reason"] == "provider_blocked_url"
+    assert sidecar["retrieval_diagnostics"][0]["url"] == "https://example.com/restricted"
+
+
+def test_webpage_success_normalizes_into_canonical_reference():
+    payload = {
+        "status": "success",
+        "provider": "visit_webpage",
+        "retrieval_round": 3,
+        "as_of": "2026-05-15",
+        "freshness": "current",
+        "content": "网页正文摘录，包含可以引用的政策条款。",
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item(
+            "visit_webpage",
+            payload,
+            arguments={"url": "https://www.gov.cn/policy/example.html"},
+        )
+    )
+
+    assert len(sidecar["canonical_references"]) == 1
+    reference = sidecar["canonical_references"][0]
+    assert reference["source"]["url"] == "https://www.gov.cn/policy/example.html"
+    assert reference["source"]["type"] == "official_web"
+    assert reference["provenance"]["tool_name"] == "visit_webpage"
+    assert reference["provenance"]["provider"] == "visit_webpage"
+    assert reference["provenance"]["retrieval_round"] == 3
+    assert reference["provenance"]["as_of"] == "2026-05-15"
+    assert reference["provenance"]["freshness"] == "current"
+    assert reference["provenance"]["domain"] == "gov.cn"
+    assert "retrieval_diagnostics" not in sidecar
+
+
+def test_successful_page_read_clears_stale_no_evidence_diagnostics():
+    persisted_metadata = _build_assistant_reference_persistence_metadata(
+        {"sources": []},
+        message_metadata={
+            "retrieval_diagnostics": [
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "no_evidence",
+                    "reason": "empty_search_results",
+                    "tool_name": "internet_search",
+                    "query": "passport processing times",
+                }
+            ]
+        },
+        tool_outputs=_tool_output_item(
+            "visit_webpage",
+            {
+                "status": "success",
+                "provider": "visit_webpage",
+                "content": "The official page confirms the current processing times.",
+            },
+            arguments={
+                "url": "https://travel.state.gov/content/travel/en/passports/how-apply/processing-times.html"
+            },
+        ),
+    )
+
+    assert len(persisted_metadata["canonical_references"]) == 1
+    assert persisted_metadata["canonical_references"][0]["source"]["type"] == (
+        "official_web"
+    )
+    assert "retrieval_diagnostics" not in persisted_metadata
+
+
+def test_web_references_dedupe_by_normalized_url_and_source_class():
+    sidecar = Chats.build_reference_metadata_sidecar(
+        metadata={
+            "canonical_references": [
+                {
+                    "type": "retrieval_reference",
+                    "source": {
+                        "id": "https://example.com/policy",
+                        "url": "https://example.com/policy",
+                        "name": "外部政策解读",
+                        "type": "generic_web",
+                    },
+                    "document": ["已接受的第三方网页证据。"],
+                    "metadata": [
+                        {
+                            "source": "https://example.com/policy",
+                            "url": "https://example.com/policy",
+                            "name": "外部政策解读",
+                            "tool_name": "internet_search",
+                            "provider": "internet_search",
+                            "query": "external policy context",
+                            "source_class": "generic_web",
+                        }
+                    ],
+                }
+            ]
+        },
+        sources=[
+            {
+                "source": {
+                    "id": "https://example.com/policy/",
+                    "url": "https://example.com/policy/",
+                    "name": "外部政策解读",
+                    "type": "web",
+                },
+                "document": ["已接受的第三方网页证据。"],
+                "metadata": [
+                    {
+                        "source": "https://example.com/policy/",
+                        "url": "https://example.com/policy/",
+                        "name": "外部政策解读",
+                        "tool_name": "internet_search",
+                        "provider": "internet_search",
+                        "query": "external policy context",
+                    }
+                ],
+                "provenance": {
+                    "tool_name": "internet_search",
+                    "provider": "internet_search",
+                    "query": "external policy context",
+                },
+            }
+        ],
+    )
+
+    assert len(sidecar["canonical_references"]) == 1
+    reference = sidecar["canonical_references"][0]
+    assert reference["source"]["type"] == "generic_web"
+    assert reference["provenance"]["tool_name"] == "internet_search"
+    assert "retrieval_diagnostics" not in sidecar
+
+
+def test_mixed_selected_file_and_web_references_preserve_both_source_classes():
+    persisted_metadata = _build_assistant_reference_persistence_metadata(
+        {
+            "sources": [
+                {
+                    "source": {
+                        "id": "alpha-file",
+                        "name": "alpha-policy.txt",
+                        "type": "file",
+                    },
+                    "document": ["alpha evidence"],
+                    "metadata": [
+                        {
+                            "source": "alpha-policy.txt",
+                            "file_id": "alpha-file",
+                        }
+                    ],
+                },
+                {
+                    "source": {
+                        "id": "https://example.com/policy/",
+                        "url": "https://example.com/policy/",
+                        "name": "外部政策解读",
+                        "type": "web",
+                    },
+                    "document": ["外部网页证据"],
+                    "metadata": [
+                        {
+                            "source": "https://example.com/policy/",
+                            "name": "外部政策解读",
+                            "url": "https://example.com/policy/",
+                            "tool_name": "internet_search",
+                            "provider": "internet_search",
+                            "query": "external policy context",
+                        }
+                    ],
+                    "provenance": {
+                        "tool_name": "internet_search",
+                        "provider": "internet_search",
+                        "query": "external policy context",
+                    },
+                },
+            ]
+        },
+        message_metadata={
+            "canonical_references": [
+                {
+                    "type": "retrieval_reference",
+                    "source": {
+                        "id": "https://example.com/policy",
+                        "url": "https://example.com/policy",
+                        "name": "外部政策解读",
+                        "type": "generic_web",
+                    },
+                    "document": ["外部网页证据"],
+                    "metadata": [
+                        {
+                            "source": "https://example.com/policy",
+                            "name": "外部政策解读",
+                            "url": "https://example.com/policy",
+                            "tool_name": "internet_search",
+                            "provider": "internet_search",
+                            "query": "external policy context",
+                            "source_class": "generic_web",
+                        }
+                    ],
+                }
+            ]
+        },
+        tool_outputs=_tool_output_item(
+            "internet_search",
+            {
+                "status": "success",
+                "accepted_results": [
+                    {
+                        "title": "外部政策解读",
+                        "url": "https://example.com/policy",
+                        "content": "外部网页证据",
+                        "type": "web",
+                    }
+                ],
+            },
+            arguments={"query": "external policy context"},
+        ),
+    )
+
+    assert len(persisted_metadata["canonical_references"]) == 2
+    assert {
+        item["source"].get("type")
+        for item in persisted_metadata["canonical_references"]
+    } == {"file", "generic_web"}
+
+
+def test_second_pass_read_selected_file_success_persists_canonical_reference():
+    payload = {
+        "status": "success",
+        "tool_name": "read_selected_file",
+        "query": "read:alpha-file",
+        "retrieval_round": 3,
+        "canonical_references": [
+            {
+                "source": {
+                    "id": "alpha-file",
+                    "name": "alpha-policy.txt",
+                    "type": "file",
+                },
+                "document": ["bounded excerpt from selected file"],
+                "metadata": [
+                    {
+                        "source": "alpha-policy.txt",
+                        "file_id": "alpha-file",
+                        "retrieval_tool_name": "read_selected_file",
+                        "retrieval_round": 3,
+                        "query": "read:alpha-file",
+                    }
+                ],
+            }
+        ],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item("read_selected_file", payload)
+    )
+
+    assert len(sidecar["canonical_references"]) == 1
+    assert sidecar["canonical_references"][0]["source"]["id"] == "alpha-file"
+    assert sidecar["canonical_references"][0]["provenance"]["tool_name"] == (
+        "read_selected_file"
+    )
+    assert "retrieval_diagnostics" not in sidecar
+
+
+def test_second_pass_empty_result_persists_diagnostics_only():
+    payload = {
+        "status": "empty",
+        "tool_name": "query_selected_knowledge_files",
+        "query": "missing policy",
+        "retrieval_round": 2,
+        "canonical_references": [],
+        "retrieval_diagnostics": [
+            {
+                "kind": "retrieval_quality",
+                "classification": "no_evidence",
+                "reason": "empty_retrieval_result",
+                "tool_name": "query_selected_knowledge_files",
+                "query": "missing policy",
+                "retrieval_round": 2,
+            }
+        ],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item("query_selected_knowledge_files", payload)
+    )
+
+    assert "canonical_references" not in sidecar
+    assert sidecar["retrieval_diagnostics"][0]["reason"] == "empty_retrieval_result"
+
+
+def test_second_pass_weak_payload_drops_canonical_references():
+    payload = {
+        "status": "weak",
+        "tool_name": "query_selected_knowledge_files",
+        "reason": "low_relevance",
+        "canonical_references": [
+            {
+                "source": {
+                    "id": "weak-file",
+                    "name": "weak.txt",
+                    "type": "file",
+                },
+                "document": ["weak evidence must not render"],
+            }
+        ],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item("query_selected_knowledge_files", payload)
+    )
+
+    assert "canonical_references" not in sidecar
+    assert sidecar["retrieval_diagnostics"][0]["reason"] == "low_relevance"
+
+
+def test_second_pass_denied_payload_synthesizes_diagnostic_only():
+    payload = {
+        "status": "error",
+        "tool_id": "builtin:retrieval",
+        "function_name": "read_selected_file",
+        "code": "requested_file_out_of_scope",
+        "detail": "file not selected",
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item("read_selected_file", payload)
+    )
+
+    assert "canonical_references" not in sidecar
+    assert sidecar["retrieval_diagnostics"][0]["reason"] == (
+        "requested_file_out_of_scope"
+    )
+    assert "sources" not in sidecar
+
+
+def test_second_pass_error_payload_without_status_synthesizes_diagnostic_only():
+    payload = {
+        "tool_name": "read_selected_file",
+        "error": "timeout while reading selected file",
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        tool_outputs=_tool_output_item("read_selected_file", payload)
+    )
+
+    assert "canonical_references" not in sidecar
+    assert sidecar["retrieval_diagnostics"][0]["reason"] == (
+        "timeout while reading selected file"
+    )
+
+
+def test_second_pass_reference_dedupes_with_first_pass_source():
+    first_pass = {
+        "source": {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+        "document": ["alpha evidence"],
+        "metadata": [{"source": "alpha-policy.txt", "file_id": "alpha-file"}],
+    }
+    second_pass_payload = {
+        "status": "success",
+        "tool_name": "query_selected_knowledge_files",
+        "query": "alpha policy requirement",
+        "retrieval_round": 2,
+        "canonical_references": [
+            {
+                "source": {
+                    "id": "alpha-file",
+                    "name": "alpha-policy.txt",
+                    "type": "file",
+                },
+                "document": ["alpha evidence"],
+                "metadata": [
+                    {
+                        "source": "alpha-policy.txt",
+                        "file_id": "alpha-file",
+                        "retrieval_tool_name": "query_selected_knowledge_files",
+                        "retrieval_round": 2,
+                        "query": "alpha policy requirement",
+                    }
+                ],
+            }
+        ],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        sources=[first_pass],
+        tool_outputs=_tool_output_item(
+            "query_selected_knowledge_files", second_pass_payload
+        ),
+    )
+
+    assert len(sidecar["canonical_references"]) == 1
+    assert sidecar["canonical_references"][0]["provenance"]["tool_name"] == (
+        "query_selected_knowledge_files"
+    )
+
+
+def test_second_pass_diagnostics_do_not_normalize_into_sources_or_references():
+    diagnostic_payload = {
+        "status": "denied",
+        "tool_name": "query_selected_knowledge_files",
+        "retrieval_diagnostics": [
+            {
+                "kind": "retrieval_quality",
+                "classification": "no_evidence",
+                "reason": "requested_source_out_of_scope",
+                "tool_name": "query_selected_knowledge_files",
+            }
+        ],
+        "sources": [
+            {
+                "kind": "retrieval_quality",
+                "classification": "no_evidence",
+                "reason": "do_not_render",
+            }
+        ],
+    }
+
+    normalized = Chats._normalize_message_reference_sidecar(
+        {
+            "role": "assistant",
+            "output": _tool_output_item(
+                "query_selected_knowledge_files", diagnostic_payload
+            ),
+        }
+    )
+
+    metadata = normalized["metadata"]
+    assert "sources" not in normalized
+    assert "canonical_references" not in metadata
+    assert metadata["retrieval_diagnostics"][0]["reason"] == (
+        "requested_source_out_of_scope"
+    )
+
+
+def test_web_diagnostics_do_not_normalize_into_sources_or_references():
+    diagnostic_payload = {
+        "status": "denied",
+        "reason": "search_provider_denied_query",
+        "results": [
+            {
+                "title": "should not render",
+                "url": "https://example.com/hidden",
+                "content": "hidden result",
+            }
+        ],
+    }
+
+    normalized = Chats._normalize_message_reference_sidecar(
+        {
+            "role": "assistant",
+            "output": _tool_output_item(
+                "internet_search",
+                diagnostic_payload,
+                arguments={"query": "blocked query"},
+            ),
+        }
+    )
+
+    metadata = normalized["metadata"]
+    assert "sources" not in normalized
+    assert "canonical_references" not in metadata
+    assert metadata["retrieval_diagnostics"][0]["reason"] == (
+        "search_provider_denied_query"
+    )

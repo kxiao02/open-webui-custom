@@ -6587,21 +6587,14 @@ def _resolve_active_source_scope(
     *,
     stored_messages: Optional[list[dict]] = None,
     current_files: Optional[list[dict]] = None,
+    fallback_candidates: Optional[list[dict]] = None,
 ) -> tuple[dict, list[dict], bool]:
     selected_candidates = [
         candidate for candidate in selected_candidates or [] if isinstance(candidate, dict)
     ]
-    if not selected_candidates:
-        observe_llm_event(
-            "source_scope.resolve",
-            {
-                "status": "none",
-                "selected_candidate_count": 0,
-                "resolved_candidate_count": 0,
-                "blocked": False,
-            },
-        )
-        return {}, [], False
+    fallback_candidates = [
+        candidate for candidate in fallback_candidates or [] if isinstance(candidate, dict)
+    ]
 
     current_values = _current_source_scope_values(current_files)
     intent = _selected_source_referent_intent(prompt, selected_candidates)
@@ -6626,6 +6619,34 @@ def _resolve_active_source_scope(
             },
         )
         return scope, resolved_files, blocked
+
+    if not selected_candidates:
+        if referential_intent and fallback_candidates:
+            focus = _latest_assistant_single_source_focus(stored_messages or [])
+            if focus:
+                matching_candidates = [
+                    candidate
+                    for candidate in fallback_candidates
+                    if _candidate_matches_focus(candidate, focus)
+                    and _candidate_in_current_scope(candidate, current_values)
+                ]
+                if len(matching_candidates) == 1:
+                    return finish(
+                        _active_source_scope_metadata(
+                            matching_candidates,
+                            status="resolved",
+                            source_set_mode="single",
+                            reason=str(
+                                focus.get("reason")
+                                or "previous_single_canonical_reference"
+                            ),
+                            confidence=str(focus.get("confidence") or "high"),
+                        ),
+                        matching_candidates,
+                        False,
+                    )
+
+        return finish({}, [], False)
 
     if anchor_matches:
         reason = (
@@ -7302,6 +7323,11 @@ async def chat_completion_files_handler(
             active_scope_files,
             stored_messages=stored_messages,
             current_files=current_request_files,
+            fallback_candidates=[
+                file_item
+                for file_item in files
+                if isinstance(file_item, dict) and not _is_media_file_item(file_item)
+            ],
         )
         if active_source_scope:
             metadata["active_source_scope"] = active_source_scope
