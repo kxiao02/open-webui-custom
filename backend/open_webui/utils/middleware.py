@@ -1285,6 +1285,16 @@ def _merge_reference_sidecar_into_metadata(
         metadata["canonical_references"] = sidecar["canonical_references"]
     else:
         metadata.pop("canonical_references", None)
+    if sidecar.get("active_source_scope"):
+        metadata["active_source_scope"] = sidecar["active_source_scope"]
+    elif metadata.get("active_source_scope"):
+        normalized_scope = Chats.normalize_active_source_scope(
+            metadata.get("active_source_scope")
+        )
+        if normalized_scope:
+            metadata["active_source_scope"] = normalized_scope
+        else:
+            metadata.pop("active_source_scope", None)
     if sidecar.get("retrieval_diagnostics"):
         metadata["retrieval_diagnostics"] = sidecar["retrieval_diagnostics"]
     elif sidecar.get("canonical_references"):
@@ -1316,7 +1326,9 @@ def _build_assistant_reference_persistence_metadata(
     if isinstance(message_metadata, dict):
         base_metadata.update(message_metadata)
 
-    active_source_scope = metadata.get("active_source_scope")
+    active_source_scope = Chats.normalize_active_source_scope(
+        metadata.get("active_source_scope")
+    )
     if isinstance(active_source_scope, dict) and active_source_scope:
         base_metadata["active_source_scope"] = active_source_scope
 

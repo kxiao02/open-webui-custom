@@ -422,6 +422,27 @@ def test_selected_file_reference_persists_when_active_scope_is_resolved():
     assert reference.get("source_class") not in {"official_web", "generic_web"}
 
 
+def test_active_source_scope_persists_focus_model_separate_from_citations():
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "active_source_scope": _resolved_active_source_scope(
+                reason="current_turn_upload",
+            ),
+            "sources": [_local_file_source()],
+        }
+    )
+
+    active_scope = persisted["active_source_scope"]
+
+    assert active_scope["focus_state"] == "single"
+    assert active_scope["source_ids"] == ["file-1"]
+    assert active_scope["authority"] == "current_upload"
+    assert active_scope["validity_reason"] == "current_turn_upload"
+    assert active_scope["follow_up"]["reuse"] is True
+    assert "canonical_references" in persisted
+    assert persisted["canonical_references"] is not active_scope
+
+
 def test_selected_file_followup_reuses_previous_single_source_focus():
     previous_assistant = {
         "role": "assistant",
@@ -538,7 +559,72 @@ def test_ambiguous_scope_does_not_synthesize_local_references():
     )
 
     assert persisted["active_source_scope"]["status"] == "ambiguous"
+    assert persisted["active_source_scope"]["focus_state"] == "ambiguous"
+    assert persisted["active_source_scope"]["ambiguity_reason"] == (
+        "ambiguous_retrieval_scope"
+    )
+    assert persisted["active_source_scope"]["follow_up"]["reuse"] is False
     assert "canonical_references" not in persisted
+
+
+def test_no_evidence_diagnostics_preserve_focus_without_source_cards():
+    source = _local_file_source()
+    metadata = {
+        "active_source_scope": _resolved_active_source_scope(),
+        "canonical_references": [source],
+        "sources": [source],
+        "retrieval_diagnostics": [
+            {
+                "kind": "retrieval_quality",
+                "classification": "no_evidence",
+                "reason": "no_retrieval_candidates",
+            }
+        ],
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(metadata=metadata)
+
+    assert sidecar["active_source_scope"]["focus_state"] == "single"
+    assert sidecar["retrieval_diagnostics"][0]["classification"] == "no_evidence"
+    assert "canonical_references" not in sidecar
+
+
+def test_message_hydration_preserves_focus_without_promoting_diagnostics():
+    normalized = Chats._normalize_message_reference_sidecar(
+        {
+            "role": "assistant",
+            "content": "I could not identify the intended file.",
+            "metadata": {
+                "active_source_scope": {
+                    "status": "ambiguous",
+                    "source_set_mode": "none",
+                    "source_ids": ["file-a", "file-b"],
+                    "sources": [
+                        {"id": "file-a", "name": "alpha.txt", "type": "file"},
+                        {"id": "file-b", "name": "beta.txt", "type": "file"},
+                    ],
+                    "reason": "ambiguous_retrieval_scope",
+                    "confidence": "low",
+                },
+                "retrieval_diagnostics": [
+                    {
+                        "kind": "retrieval_quality",
+                        "classification": "diagnostics",
+                        "reason": "ambiguous_retrieval_scope",
+                    }
+                ],
+            },
+        }
+    )
+
+    metadata = normalized["metadata"]
+
+    assert metadata["active_source_scope"]["focus_state"] == "ambiguous"
+    assert metadata["retrieval_diagnostics"][0]["reason"] == (
+        "ambiguous_retrieval_scope"
+    )
+    assert "canonical_references" not in metadata
+    assert "sources" not in normalized
 
 
 def test_raw_search_results_do_not_become_canonical_references_by_default():

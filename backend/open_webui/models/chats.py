@@ -3048,13 +3048,251 @@ class ChatTable:
 
         return diagnostics
 
+    def _normalize_active_source_scope_authority(
+        self, scope: dict, reason: str, sources: list[dict]
+    ) -> str:
+        authority = str(
+            scope.get("authority")
+            or scope.get("source_authority")
+            or scope.get("sourceAuthority")
+            or ""
+        ).strip()
+        if authority:
+            return authority
+
+        reason_key = reason.strip().lower()
+        if reason_key in {"current_turn_upload", "current_preview"}:
+            return "current_upload"
+        if reason_key in {"explicit_anchor", "selected_source"}:
+            return "selected_source"
+        if reason_key == "user_clarified_deictic_reference":
+            return "user_clarification"
+        if reason_key == "previous_single_canonical_reference":
+            return "canonical_reference"
+        if reason_key in {"ambiguous_retrieval_scope", "expired_or_conflicting"}:
+            return "diagnostic"
+        return "selected_source" if sources else "none"
+
+    def _derive_active_source_focus_state(
+        self,
+        *,
+        requested_focus_state: str,
+        status: str,
+        source_set_mode: str,
+        source_ids: list[str],
+        reason: str,
+    ) -> str:
+        if requested_focus_state in {"none", "single", "multi", "ambiguous"}:
+            return requested_focus_state
+        if status == "ambiguous" or reason == "ambiguous_retrieval_scope":
+            return "ambiguous"
+        if status == "resolved":
+            if source_set_mode == "multi" or len(source_ids) > 1:
+                return "multi"
+            if source_set_mode == "single" or len(source_ids) == 1:
+                return "single"
+        return "none"
+
+    def _normalize_active_source_scope_source(
+        self, source: object, fallback_authority: str
+    ) -> Optional[dict]:
+        if not isinstance(source, dict):
+            return None
+
+        source_id = str(
+            source.get("id")
+            or source.get("file_id")
+            or source.get("knowledge_id")
+            or source.get("url")
+            or ""
+        ).strip()
+        name = str(
+            source.get("name")
+            or source.get("filename")
+            or source.get("title")
+            or source_id
+            or ""
+        ).strip()
+        if not source_id and not name:
+            return None
+
+        normalized = {
+            "id": source_id or name,
+            "name": name or source_id,
+            "type": str(source.get("type") or source.get("source_class") or "unknown").strip()
+            or "unknown",
+        }
+        authority = str(
+            source.get("authority")
+            or source.get("source_authority")
+            or fallback_authority
+            or ""
+        ).strip()
+        if authority:
+            normalized["authority"] = authority
+        return normalized
+
+    def normalize_active_source_scope(self, scope: object) -> Optional[dict]:
+        if not isinstance(scope, dict) or not scope:
+            return None
+
+        status = str(scope.get("status") or "").strip().lower()
+        source_set_mode = str(scope.get("source_set_mode") or "").strip().lower()
+        reason = str(
+            scope.get("validity_reason")
+            or scope.get("reason")
+            or scope.get("ambiguity_reason")
+            or scope.get("expiration_reason")
+            or ""
+        ).strip()
+
+        source_ids: list[str] = []
+        for value in scope.get("source_ids") or []:
+            normalized = str(value or "").strip()
+            if normalized and normalized not in source_ids:
+                source_ids.append(normalized)
+
+        preliminary_authority = self._normalize_active_source_scope_authority(
+            scope, reason, []
+        )
+        sources: list[dict] = []
+        seen_sources: set[str] = set()
+        for source in scope.get("sources") or []:
+            normalized_source = self._normalize_active_source_scope_source(
+                source,
+                preliminary_authority,
+            )
+            if not normalized_source:
+                continue
+            signature = json.dumps(
+                normalized_source,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            if signature in seen_sources:
+                continue
+            seen_sources.add(signature)
+            sources.append(normalized_source)
+            source_id = str(normalized_source.get("id") or "").strip()
+            if source_id and source_id not in source_ids:
+                source_ids.append(source_id)
+
+        authority = self._normalize_active_source_scope_authority(
+            scope, reason, sources
+        )
+        focus_state = self._derive_active_source_focus_state(
+            requested_focus_state=str(scope.get("focus_state") or "").strip().lower(),
+            status=status,
+            source_set_mode=source_set_mode,
+            source_ids=source_ids,
+            reason=reason,
+        )
+
+        normalized = dict(scope)
+        normalized["focus_state"] = focus_state
+        normalized["source_ids"] = source_ids
+        normalized["sources"] = sources
+        normalized["authority"] = authority
+
+        if not status:
+            normalized["status"] = (
+                "resolved"
+                if focus_state in {"single", "multi"}
+                else "ambiguous"
+                if focus_state == "ambiguous"
+                else "none"
+            )
+        if not source_set_mode:
+            normalized["source_set_mode"] = (
+                "single"
+                if focus_state == "single"
+                else "multi"
+                if focus_state == "multi"
+                else "none"
+            )
+
+        if focus_state in {"single", "multi"}:
+            normalized["validity_reason"] = (
+                str(scope.get("validity_reason") or reason or "resolved_source_scope")
+                .strip()
+            )
+            normalized.pop("ambiguity_reason", None)
+            normalized.pop("expiration_reason", None)
+        elif focus_state == "ambiguous":
+            normalized["ambiguity_reason"] = (
+                str(scope.get("ambiguity_reason") or reason or "ambiguous_retrieval_scope")
+                .strip()
+            )
+            normalized.pop("validity_reason", None)
+        else:
+            expiration_reason = str(
+                scope.get("expiration_reason")
+                or (
+                    reason
+                    if status in {"expired", "none"}
+                    or source_set_mode == "none"
+                    else ""
+                )
+            ).strip()
+            if expiration_reason:
+                normalized["expiration_reason"] = expiration_reason
+            normalized.pop("validity_reason", None)
+
+        if not str(normalized.get("expires_on") or "").strip():
+            normalized["expires_on"] = "new_upload_or_explicit_change"
+
+        follow_up = (
+            dict(scope.get("follow_up"))
+            if isinstance(scope.get("follow_up"), dict)
+            else {}
+        )
+        follow_up["reuse"] = focus_state in {"single", "multi"}
+        if focus_state in {"single", "multi"}:
+            follow_up.setdefault("reuse_hint", "reuse_if_authorized_and_not_conflicting")
+            follow_up.setdefault(
+                "reject_hints",
+                [
+                    "new_upload",
+                    "explicit_source_change",
+                    "conflicting_anchor",
+                    "permission_invalidation",
+                ],
+            )
+        else:
+            follow_up.setdefault("reuse_hint", "do_not_reuse_without_clarification")
+            follow_up.setdefault(
+                "reject_hints",
+                [
+                    "ambiguous_scope",
+                    "expired_focus",
+                    "unauthorized_source",
+                    "no_evidence",
+                ],
+            )
+        normalized["follow_up"] = follow_up
+
+        return normalized
+
     def _active_source_scope_suppresses_references(self, scope: object) -> bool:
         if not isinstance(scope, dict):
             return False
 
+        focus_state = str(scope.get("focus_state") or "").strip().lower()
+        if focus_state == "ambiguous":
+            return True
+
         status = str(scope.get("status") or "").strip().lower()
         source_set_mode = str(scope.get("source_set_mode") or "").strip().lower()
-        return status in {"ambiguous", "expired"} or source_set_mode == "none"
+        reason = str(
+            scope.get("reason")
+            or scope.get("ambiguity_reason")
+            or scope.get("expiration_reason")
+            or ""
+        ).strip().lower()
+        return status in {"ambiguous", "expired"} or (
+            source_set_mode == "none"
+            and reason in {"ambiguous_retrieval_scope", "expired_or_conflicting"}
+        )
 
     def _diagnostics_suppress_references(self, diagnostics: object) -> bool:
         if not isinstance(diagnostics, list):
@@ -3324,6 +3562,9 @@ class ChatTable:
         tool_outputs: object = None,
     ) -> dict:
         metadata = metadata if isinstance(metadata, dict) else {}
+        active_source_scope = self.normalize_active_source_scope(
+            metadata.get("active_source_scope")
+        )
         tool_reference_payloads = [
             *self._iter_retrieval_tool_output_payloads(tool_outputs),
             *self._iter_web_tool_output_payloads(tool_outputs),
@@ -3355,10 +3596,7 @@ class ChatTable:
                 explicit_accepted_references,
             )
         )
-        if (
-            not explicit_accepted_references
-            and self._diagnostics_indicate_no_evidence(retrieval_diagnostics)
-        ):
+        if self._diagnostics_indicate_no_evidence(retrieval_diagnostics):
             references = []
         if self._should_suppress_canonical_references(
             metadata=metadata,
@@ -3367,6 +3605,8 @@ class ChatTable:
             references = []
 
         sidecar: dict = {}
+        if active_source_scope:
+            sidecar["active_source_scope"] = active_source_scope
         if references:
             sidecar["canonical_references"] = references
         if retrieval_diagnostics:
@@ -3377,6 +3617,11 @@ class ChatTable:
                 "metadata_present": bool(metadata),
                 "source_group_count": len(source_groups),
                 "retrieval_tool_payload_count": len(tool_reference_payloads),
+                "active_source_focus_state": (
+                    active_source_scope.get("focus_state")
+                    if isinstance(active_source_scope, dict)
+                    else None
+                ),
                 "canonical_reference_count": len(references),
                 "diagnostic_count": len(retrieval_diagnostics),
                 "result_status": (
@@ -3446,6 +3691,10 @@ class ChatTable:
                 merged_metadata["canonical_references"] = sidecar["canonical_references"]
             else:
                 merged_metadata.pop("canonical_references", None)
+            if sidecar.get("active_source_scope"):
+                merged_metadata["active_source_scope"] = sidecar["active_source_scope"]
+            else:
+                merged_metadata.pop("active_source_scope", None)
             if sidecar.get("retrieval_diagnostics"):
                 merged_metadata["retrieval_diagnostics"] = sidecar["retrieval_diagnostics"]
             else:
