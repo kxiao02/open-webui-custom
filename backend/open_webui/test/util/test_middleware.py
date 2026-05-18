@@ -13,6 +13,7 @@ from open_webui.utils.middleware import (
     _gate_retrieval_sources,
     _filter_inline_sources_for_selected_files,
     _completion_sources_for_persistence,
+    _constrain_retrieval_queries,
     _build_assistant_reference_seed_metadata,
     _build_assistant_reference_persistence_metadata,
     _build_chat_completion_payload,
@@ -2051,6 +2052,99 @@ def test_fresh_multi_selected_explicit_multi_prompt_keeps_active_source_scope(
         "alpha-file",
         "beta-file",
     ]
+
+
+def test_source_aware_query_constraints_keep_original_query_only_by_default():
+    files = [{"id": "alpha-file", "name": "alpha-policy.txt", "context": "partial"}]
+
+    queries = _constrain_retrieval_queries(
+        original_query="alpha-policy.txt 的审批要求是什么？",
+        generated_queries=[
+            "approval requirements",
+            "alpha-policy.txt approval requirements",
+        ],
+        retrieval_candidates=files,
+        active_source_scope={
+            "status": "resolved",
+            "source_set_mode": "single",
+            "source_ids": ["alpha-file"],
+            "sources": [{"id": "alpha-file", "name": "alpha-policy.txt"}],
+            "reason": "explicit_anchor",
+        },
+    )
+
+    assert queries == ["alpha-policy.txt 的审批要求是什么？"]
+
+
+def test_source_aware_query_constraints_preserve_explicit_anchors_for_variants():
+    files = [{"id": "alpha-file", "name": "alpha-policy.txt", "context": "partial"}]
+
+    queries = _constrain_retrieval_queries(
+        original_query="alpha-policy.txt 的审批要求是什么？另外列出负责人。",
+        generated_queries=[
+            "approval requirements owner",
+            "alpha-policy.txt approval requirements owner",
+        ],
+        retrieval_candidates=files,
+        active_source_scope={
+            "status": "resolved",
+            "source_set_mode": "single",
+            "source_ids": ["alpha-file"],
+            "sources": [{"id": "alpha-file", "name": "alpha-policy.txt"}],
+            "reason": "explicit_anchor",
+        },
+    )
+
+    assert queries == [
+        "alpha-policy.txt 的审批要求是什么？另外列出负责人。",
+        "alpha-policy.txt approval requirements owner",
+    ]
+
+
+def test_source_aware_query_constraints_skip_ambiguous_scope_fallbacks():
+    files = [
+        {"id": "alpha-file", "name": "alpha-policy.txt", "context": "partial"},
+        {"id": "beta-file", "name": "beta-policy.txt", "context": "partial"},
+    ]
+
+    queries = _constrain_retrieval_queries(
+        original_query="这个文件说了什么？",
+        generated_queries=["policy summary"],
+        retrieval_candidates=files,
+        active_source_scope={
+            "status": "ambiguous",
+            "source_set_mode": "none",
+            "reason": "ambiguous_retrieval_scope",
+            "confidence": "low",
+        },
+    )
+
+    assert queries == []
+    sidecar = Chats.build_reference_metadata_sidecar(
+        metadata={
+            "active_source_scope": {
+                "status": "ambiguous",
+                "source_set_mode": "none",
+                "reason": "ambiguous_retrieval_scope",
+            }
+        },
+        diagnostics=[
+            {
+                "kind": "retrieval_quality",
+                "classification": "diagnostics",
+                "reason": "ambiguous_retrieval_scope",
+                "candidate_index": -1,
+            }
+        ],
+        sources=[
+            {
+                "source": {"id": "alpha-file", "name": "alpha-policy.txt"},
+                "document": ["stale evidence"],
+                "metadata": [{"source": "alpha-policy.txt", "file_id": "alpha-file"}],
+            }
+        ],
+    )
+    assert "canonical_references" not in sidecar
 
 
 def test_zero_source_retrieval_status_history_is_hidden_on_reload_normalization():

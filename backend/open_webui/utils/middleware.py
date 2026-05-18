@@ -7068,6 +7068,26 @@ def _is_explicit_research_retrieval(body: dict) -> bool:
     return False
 
 
+def _prompt_has_explicit_multi_part_retrieval_request(prompt: str) -> bool:
+    normalized_prompt = _normalize_retrieval_query_text(
+        _strip_attached_file_context(prompt)
+    )
+    if not normalized_prompt:
+        return False
+
+    if len(re.findall(r"[?？]", normalized_prompt)) >= 2:
+        return True
+
+    return bool(
+        re.search(
+            r"\b(?:also|separately|respectively|compare|contrast)\b|"
+            r"(?:分别|同时|并且|另外|此外|对比|比较|一方面|另一方面)",
+            normalized_prompt,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _retrieval_scope_is_ambiguous(prompt: str, retrieval_candidates: list[dict]) -> bool:
     normalized_prompt = _normalize_retrieval_query_text(
         _strip_attached_file_context(prompt)
@@ -7100,17 +7120,37 @@ def _normalize_generated_retrieval_queries(value: Any) -> list[str]:
     return [str(query) for query in value if str(query or "").strip()]
 
 
+def _active_source_scope_blocks_query_generation(scope: object) -> bool:
+    if not isinstance(scope, dict):
+        return False
+    status = str(scope.get("status") or "").strip().lower()
+    source_set_mode = str(scope.get("source_set_mode") or "").strip().lower()
+    reason = str(
+        scope.get("reason")
+        or scope.get("ambiguity_reason")
+        or scope.get("expiration_reason")
+        or ""
+    ).strip()
+    return status in {"ambiguous", "expired"} or (
+        source_set_mode == "none"
+        and reason in {"ambiguous_retrieval_scope", "expired_or_conflicting"}
+    )
+
+
 def _constrain_retrieval_queries(
     *,
     original_query: str,
     generated_queries: Any,
     retrieval_candidates: list[dict],
     explicit_research: bool = False,
+    active_source_scope: Optional[dict] = None,
 ) -> list[str]:
     original_query = _normalize_retrieval_query_text(
         _strip_attached_file_context(original_query)
     )
-    if _retrieval_scope_is_ambiguous(original_query, retrieval_candidates):
+    if _active_source_scope_blocks_query_generation(
+        active_source_scope
+    ) or _retrieval_scope_is_ambiguous(original_query, retrieval_candidates):
         return []
 
     scope_labels = _candidate_scope_labels(retrieval_candidates)
@@ -7138,7 +7178,13 @@ def _constrain_retrieval_queries(
 
     add_query(original_query)
 
-    max_total = None if explicit_research else 2
+    allow_query_variants = explicit_research or _prompt_has_explicit_multi_part_retrieval_request(
+        original_query
+    )
+    max_total = None if explicit_research else 3 if allow_query_variants else 1
+    if max_total is not None and len(queries) >= max_total:
+        return queries
+
     for query in _normalize_generated_retrieval_queries(generated_queries):
         normalized_query = _normalize_retrieval_query_text(query)
         if not normalized_query:
@@ -7663,6 +7709,10 @@ async def chat_completion_files_handler(
             queries_cache = []
             original_query = get_last_user_message(body["messages"])
             explicit_research = _is_explicit_research_retrieval(body)
+            allow_query_variants = (
+                explicit_research
+                or _prompt_has_explicit_multi_part_retrieval_request(original_query)
+            )
             all_full_context = bool(retrieval_candidates) and all(
                 item.get("context") == "full" for item in retrieval_candidates
             )
@@ -7679,7 +7729,7 @@ async def chat_completion_files_handler(
                         chunk_total=len(retrieval_candidates),
                     )
                 )
-            elif retrieval_candidates and not all_full_context:
+            elif retrieval_candidates and not all_full_context and allow_query_variants:
                 try:
                     queries_response = await generate_queries(
                         request,
@@ -7712,6 +7762,7 @@ async def chat_completion_files_handler(
                         generated_queries=queries_response.get("queries", []),
                         retrieval_candidates=retrieval_candidates,
                         explicit_research=explicit_research,
+                        active_source_scope=metadata.get("active_source_scope"),
                     )
                 except Exception:
                     queries_cache = []
@@ -7726,6 +7777,7 @@ async def chat_completion_files_handler(
                     generated_queries=[],
                     retrieval_candidates=retrieval_candidates,
                     explicit_research=explicit_research,
+                    active_source_scope=metadata.get("active_source_scope"),
                 )
 
             if not query_status_emitted and retrieval_candidates:
