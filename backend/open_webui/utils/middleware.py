@@ -6052,6 +6052,399 @@ def _gate_retrieval_sources(
     return injectable_sources, diagnostics
 
 
+_NEUTRAL_RETRIEVAL_CAPABILITIES = {
+    "literal_anchor",
+    "metadata_first",
+    "keyword_bm25",
+    "dense_semantic",
+    "hybrid",
+    "query_expansion",
+    "rerank",
+    "diversity_mmr",
+    "parent_child",
+    "freshness",
+    "graph/wiki",
+}
+
+
+def _list_from_optional_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def _retrieval_output_candidates(output: Any) -> list:
+    if isinstance(output, list):
+        return output
+    if not isinstance(output, dict):
+        return []
+    for key in ("candidates", "sources", "results", "documents", "data"):
+        value = output.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _neutral_strategy_values(output: Any, candidates: list) -> tuple[list[str], list[str]]:
+    raw_values: list[Any] = []
+    if isinstance(output, dict):
+        raw_values.extend(
+            [
+                output.get("strategy_used"),
+                output.get("strategy"),
+                output.get("strategies"),
+                output.get("capabilities"),
+                output.get("capabilities_used"),
+            ]
+        )
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        raw_values.extend(
+            [
+                candidate.get("strategy_used"),
+                candidate.get("strategy"),
+                candidate.get("capabilities"),
+                candidate.get("capabilities_used"),
+            ]
+        )
+        metadatas = candidate.get("metadata")
+        for metadata in metadatas if isinstance(metadatas, list) else []:
+            if isinstance(metadata, dict):
+                raw_values.extend(
+                    [
+                        metadata.get("strategy_used"),
+                        metadata.get("strategy"),
+                        metadata.get("capabilities"),
+                        metadata.get("capabilities_used"),
+                    ]
+                )
+
+    strategy_values: list[str] = []
+    for raw_value in raw_values:
+        for value in _list_from_optional_strings(raw_value):
+            normalized = value.strip()
+            if normalized and normalized not in strategy_values:
+                strategy_values.append(normalized)
+
+    capabilities = [
+        value for value in strategy_values if value in _NEUTRAL_RETRIEVAL_CAPABILITIES
+    ]
+    strategies = [
+        value for value in strategy_values if value not in _NEUTRAL_RETRIEVAL_CAPABILITIES
+    ]
+    return strategies, capabilities
+
+
+def _provider_local_scores(candidates: list) -> list[dict[str, Any]]:
+    score_keys = (
+        "score",
+        "distance",
+        "similarity",
+        "relevance",
+        "rank",
+        "vector_score",
+        "keyword_score",
+        "bm25_score",
+        "hybrid_score",
+        "rerank_score",
+        "mmr_score",
+    )
+    collected: list[dict[str, Any]] = []
+    for candidate_index, candidate in enumerate(candidates or []):
+        if not isinstance(candidate, dict):
+            continue
+        metadatas = candidate.get("metadata")
+        metadata_items = metadatas if isinstance(metadatas, list) else [{}]
+        distances = candidate.get("distances") if isinstance(candidate.get("distances"), list) else []
+        for chunk_index, metadata in enumerate(metadata_items):
+            metadata = metadata if isinstance(metadata, dict) else {}
+            scores: dict[str, Any] = {}
+            for key in score_keys:
+                value = metadata.get(key, candidate.get(key))
+                if value not in (None, "", [], {}):
+                    scores[key] = value
+            if chunk_index < len(distances) and "distance" not in scores:
+                scores["distance"] = distances[chunk_index]
+            if scores:
+                collected.append(
+                    {
+                        "candidate_index": candidate_index,
+                        "chunk_index": chunk_index,
+                        "source_id": _source_id_for_diagnostic(candidate, metadata) or None,
+                        "scores": scores,
+                        "semantics": "provider_local_advisory",
+                    }
+                )
+    return collected
+
+
+def _freshness_index_state(candidates: list) -> list[dict[str, Any]]:
+    freshness_keys = (
+        "freshness",
+        "index_state",
+        "indexed_at",
+        "updated_at",
+        "created_at",
+        "version",
+        "version_current",
+        "connector_freshness",
+        "stale",
+        "expired",
+    )
+    states: list[dict[str, Any]] = []
+    for candidate_index, candidate in enumerate(candidates or []):
+        if not isinstance(candidate, dict):
+            continue
+        source_info = candidate.get("source") if isinstance(candidate.get("source"), dict) else {}
+        metadatas = candidate.get("metadata")
+        metadata_items = metadatas if isinstance(metadatas, list) else [{}]
+        for chunk_index, metadata in enumerate(metadata_items):
+            metadata = metadata if isinstance(metadata, dict) else {}
+            state = {
+                key: metadata.get(key, candidate.get(key, source_info.get(key)))
+                for key in freshness_keys
+                if metadata.get(key, candidate.get(key, source_info.get(key))) not in (None, "", [], {})
+            }
+            if state:
+                states.append(
+                    {
+                        "candidate_index": candidate_index,
+                        "chunk_index": chunk_index,
+                        "source_id": _source_id_for_diagnostic(candidate, metadata) or None,
+                        "state": state,
+                    }
+                )
+    return states
+
+
+def _authorization_outcomes(candidates: list) -> list[dict[str, Any]]:
+    outcomes: list[dict[str, Any]] = []
+    for candidate_index, candidate in enumerate(candidates or []):
+        if not isinstance(candidate, dict):
+            continue
+        metadatas = candidate.get("metadata")
+        metadata_items = metadatas if isinstance(metadatas, list) else [{}]
+        for chunk_index, metadata in enumerate(metadata_items):
+            metadata = metadata if isinstance(metadata, dict) else {}
+            denied = any(
+                _metadata_falsey(value)
+                for value in (
+                    metadata.get("authorized"),
+                    metadata.get("has_access"),
+                    metadata.get("permission_allowed"),
+                    candidate.get("authorized"),
+                    candidate.get("has_access"),
+                    candidate.get("permission_allowed"),
+                )
+            ) or any(
+                _metadata_truthy(value)
+                for value in (
+                    metadata.get("unauthorized"),
+                    metadata.get("permission_denied"),
+                    candidate.get("unauthorized"),
+                    candidate.get("permission_denied"),
+                )
+            )
+            explicit_allowed = any(
+                _metadata_truthy(value)
+                for value in (
+                    metadata.get("authorized"),
+                    metadata.get("has_access"),
+                    metadata.get("permission_allowed"),
+                    candidate.get("authorized"),
+                    candidate.get("has_access"),
+                    candidate.get("permission_allowed"),
+                )
+            )
+            if denied or explicit_allowed:
+                outcomes.append(
+                    {
+                        "candidate_index": candidate_index,
+                        "chunk_index": chunk_index,
+                        "source_id": _source_id_for_diagnostic(candidate, metadata) or None,
+                        "outcome": "permission_denied" if denied else "authorized",
+                    }
+                )
+    return outcomes
+
+
+def _retrieval_output_has_provider_answer_prose(output: Any) -> bool:
+    if not isinstance(output, dict):
+        return False
+    for key in ("answer", "answer_text", "response", "summary", "provider_answer"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _compare_knowflow_retrieval_against_neutral_contract(
+    retrieval_output: Any,
+    *,
+    query: str,
+    active_source_scope: Optional[dict] = None,
+    evidence_need: str = "internal_selected_source",
+    exact_anchors: Optional[list[str]] = None,
+    filters: Optional[dict] = None,
+    strategy_preferences: Optional[list[str]] = None,
+    count: Optional[int] = None,
+    retrieval_round: Any = "first_pass",
+    relevance_threshold: Optional[float] = None,
+) -> dict[str, Any]:
+    """Compare current Knowflow-shaped retrieval output through the neutral contract.
+
+    The result is diagnostic/evaluation metadata only. It never makes WeKnora a
+    dependency and never treats provider answer prose as citation evidence.
+    """
+
+    output_dict = retrieval_output if isinstance(retrieval_output, dict) else {}
+    candidates = _retrieval_output_candidates(retrieval_output)
+    provider = str(
+        output_dict.get("provider")
+        or output_dict.get("retriever")
+        or output_dict.get("backend")
+        or "knowflow"
+    ).strip() or "knowflow"
+
+    injectable_sources, diagnostics = _gate_retrieval_sources(
+        candidates,
+        active_source_scope=active_source_scope,
+        relevance_threshold=relevance_threshold,
+    )
+    if _retrieval_output_has_provider_answer_prose(retrieval_output):
+        diagnostics = [
+            *diagnostics,
+            _safe_retrieval_diagnostic(
+                classification="diagnostics",
+                reason="provider_answer_prose_ignored",
+                candidate_index=-1,
+                outcome="malformed",
+            ),
+        ]
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        sources=injectable_sources,
+        diagnostics=diagnostics,
+    )
+    strategies, capabilities = _neutral_strategy_values(retrieval_output, candidates)
+    requested_capabilities = [
+        value
+        for value in _list_from_optional_strings(strategy_preferences)
+        if value in _NEUTRAL_RETRIEVAL_CAPABILITIES
+    ]
+    if exact_anchors:
+        requested_capabilities.append("literal_anchor")
+    if filters:
+        requested_capabilities.append("metadata_first")
+    requested_capabilities = list(dict.fromkeys(requested_capabilities))
+
+    response_status = "success" if injectable_sources else "diagnostic"
+    if injectable_sources and diagnostics:
+        response_status = "mixed"
+
+    comparison = {
+        "kind": "retrieval_contract_comparison",
+        "subject_provider": provider,
+        "reference_mechanics": "weknora_style",
+        "reference_dependency": "none",
+        "runtime_authority": "diagnostic_only",
+        "neutral_request": {
+            "query": str(query or "").strip(),
+            "source_scope": active_source_scope or {},
+            "evidence_need": str(evidence_need or "").strip(),
+            "exact_anchors": _list_from_optional_strings(exact_anchors),
+            "filters": copy.deepcopy(filters or {}),
+            "strategy_preferences": _list_from_optional_strings(strategy_preferences),
+            "count": count,
+            "retrieval_round": retrieval_round,
+        },
+        "neutral_response": {
+            "status": response_status,
+            "provider": provider,
+            "strategy_used": strategies,
+            "capabilities_requested": requested_capabilities,
+            "capabilities_observed": capabilities,
+            "candidate_count": len(candidates),
+            "accepted_count": len(injectable_sources),
+            "canonical_references": sidecar.get("canonical_references", []),
+            "diagnostics": sidecar.get("retrieval_diagnostics", []),
+            "freshness_index_state": _freshness_index_state(candidates),
+            "provider_local_scores": _provider_local_scores(candidates),
+            "authorization_outcomes": _authorization_outcomes(candidates),
+        },
+        "quality_gate": {
+            "accepted_count": len(injectable_sources),
+            "diagnostic_count": len(diagnostics),
+            "reason_codes": diagnostic_reason_codes(diagnostics),
+            "classification_counts": diagnostic_classification_counts(diagnostics),
+        },
+        "retrieval_stage_trace": [
+            {
+                "stage": "neutral_request",
+                "status": "captured",
+                "fields": [
+                    "query",
+                    "source_scope",
+                    "evidence_need",
+                    "exact_anchors",
+                    "filters",
+                    "strategy_preferences",
+                    "count",
+                    "retrieval_round",
+                ],
+            },
+            {
+                "stage": "provider_recall",
+                "status": "observed",
+                "provider": provider,
+                "candidate_count": len(candidates),
+                "capabilities_observed": capabilities,
+            },
+            {
+                "stage": "quality_gate",
+                "status": response_status,
+                "accepted_count": len(injectable_sources),
+                "diagnostic_count": len(diagnostics),
+            },
+            {
+                "stage": "canonicalization",
+                "status": "diagnostic_only"
+                if not sidecar.get("canonical_references")
+                else "canonical_references_ready",
+                "canonical_reference_count": len(
+                    sidecar.get("canonical_references", [])
+                ),
+                "diagnostic_count": len(sidecar.get("retrieval_diagnostics", [])),
+            },
+        ],
+        "notes": [
+            "comparison_only_not_runtime_authority",
+            "weknora_not_runtime_dependency",
+            "provider_answer_prose_not_citation",
+        ],
+    }
+    observe_llm_event(
+        "retrieval.neutral_contract_comparison",
+        {
+            "provider": provider,
+            "candidate_count": len(candidates),
+            "accepted_count": len(injectable_sources),
+            "diagnostic_count": len(diagnostics),
+            "status": response_status,
+            "capabilities_observed": capabilities,
+        },
+    )
+    return comparison
+
+
 def _append_no_evidence_guard(messages: list) -> list:
     guard = (
         "File and knowledge retrieval found no usable source evidence for this turn. "

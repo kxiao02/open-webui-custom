@@ -14,6 +14,7 @@ from open_webui.utils.middleware import (
     _filter_inline_sources_for_selected_files,
     _completion_sources_for_persistence,
     _constrain_retrieval_queries,
+    _compare_knowflow_retrieval_against_neutral_contract,
     _build_assistant_reference_seed_metadata,
     _build_assistant_reference_persistence_metadata,
     _build_chat_completion_payload,
@@ -1671,6 +1672,147 @@ def test_retrieval_quality_gate_keeps_stale_unauthorized_conflict_as_diagnostics
         "unauthorized",
         "conflict",
     }
+
+
+def test_knowflow_neutral_contract_comparison_preserves_scope_and_quality_gate():
+    comparison = _compare_knowflow_retrieval_against_neutral_contract(
+        {
+            "provider": "knowflow",
+            "strategy_used": ["hybrid", "rerank"],
+            "candidates": [
+                {
+                    "source": {
+                        "id": "alpha-file",
+                        "name": "alpha-policy.txt",
+                        "type": "file",
+                    },
+                    "document": ["Alpha selected-file evidence."],
+                    "metadata": [
+                        {
+                            "file_id": "alpha-file",
+                            "name": "alpha-policy.txt",
+                            "strategy_used": ["metadata_first", "hybrid"],
+                            "vector_score": 0.82,
+                            "bm25_score": 12.4,
+                            "rerank_score": 0.91,
+                            "index_state": "fresh",
+                            "indexed_at": "2026-05-18T09:00:00Z",
+                            "authorized": True,
+                        }
+                    ],
+                }
+            ],
+        },
+        query="alpha policy",
+        active_source_scope={
+            "status": "resolved",
+            "source_set_mode": "single",
+            "source_ids": ["alpha-file"],
+            "sources": [{"id": "alpha-file", "name": "alpha-policy.txt"}],
+        },
+        evidence_need="internal_selected_source",
+        exact_anchors=["alpha-policy.txt"],
+        filters={"file_id": "alpha-file"},
+        strategy_preferences=["literal_anchor", "metadata_first", "hybrid", "rerank"],
+        count=5,
+        retrieval_round=1,
+    )
+
+    assert comparison["reference_mechanics"] == "weknora_style"
+    assert comparison["reference_dependency"] == "none"
+    assert comparison["runtime_authority"] == "diagnostic_only"
+    assert comparison["neutral_request"]["source_scope"]["source_ids"] == [
+        "alpha-file"
+    ]
+    assert comparison["neutral_request"]["evidence_need"] == "internal_selected_source"
+    assert comparison["neutral_response"]["status"] == "success"
+    assert comparison["neutral_response"]["provider"] == "knowflow"
+    assert comparison["neutral_response"]["accepted_count"] == 1
+    assert comparison["neutral_response"]["canonical_references"][0]["source"]["id"] == (
+        "alpha-file"
+    )
+    assert comparison["neutral_response"]["diagnostics"] == []
+    assert {"metadata_first", "hybrid"}.issubset(
+        set(comparison["neutral_response"]["capabilities_observed"])
+    )
+    assert comparison["neutral_response"]["provider_local_scores"][0]["semantics"] == (
+        "provider_local_advisory"
+    )
+    assert comparison["neutral_response"]["freshness_index_state"][0]["state"][
+        "index_state"
+    ] == "fresh"
+    assert comparison["neutral_response"]["authorization_outcomes"][0]["outcome"] == (
+        "authorized"
+    )
+    assert [stage["stage"] for stage in comparison["retrieval_stage_trace"]] == [
+        "neutral_request",
+        "provider_recall",
+        "quality_gate",
+        "canonicalization",
+    ]
+
+
+def test_knowflow_neutral_contract_comparison_keeps_provider_prose_out_of_citations():
+    comparison = _compare_knowflow_retrieval_against_neutral_contract(
+        {
+            "provider": "knowflow",
+            "answer": "Provider-specific answer prose that must not become a citation.",
+            "candidates": [],
+        },
+        query="what does selected source say",
+        active_source_scope=_resolved_active_source_scope(),
+        evidence_need="internal_selected_source",
+    )
+
+    assert comparison["neutral_response"]["status"] == "diagnostic"
+    assert comparison["neutral_response"]["canonical_references"] == []
+    assert {
+        item["reason"] for item in comparison["neutral_response"]["diagnostics"]
+    } == {"provider_answer_prose_ignored"}
+    assert "provider_answer_prose_not_citation" in comparison["notes"]
+
+
+def test_knowflow_neutral_contract_comparison_keeps_rejections_diagnostic_only():
+    comparison = _compare_knowflow_retrieval_against_neutral_contract(
+        {
+            "provider": "knowflow",
+            "capabilities": ["dense_semantic"],
+            "candidates": [
+                {
+                    "source": {"id": "beta-file", "name": "beta.txt", "type": "file"},
+                    "document": ["Beta content outside alpha scope."],
+                    "metadata": [{"file_id": "beta-file", "distance": 0.1}],
+                },
+                {
+                    "source": {
+                        "id": "alpha-file",
+                        "name": "alpha.txt",
+                        "type": "file",
+                    },
+                    "document": ["Weak alpha content."],
+                    "metadata": [{"file_id": "alpha-file", "answerable": False}],
+                },
+            ],
+        },
+        query="alpha policy",
+        active_source_scope={
+            "status": "resolved",
+            "source_set_mode": "single",
+            "source_ids": ["alpha-file"],
+            "sources": [{"id": "alpha-file", "name": "alpha.txt"}],
+        },
+        evidence_need="internal_selected_source",
+    )
+
+    assert comparison["neutral_response"]["canonical_references"] == []
+    reasons = {item["reason"] for item in comparison["neutral_response"]["diagnostics"]}
+    assert reasons >= {
+        "source_scope_mismatch",
+        "weak_or_indirect_evidence",
+        "no_injectable_evidence",
+    }
+    assert comparison["quality_gate"]["accepted_count"] == 0
+    assert "dense_semantic" in comparison["neutral_response"]["capabilities_observed"]
 
 
 def test_completion_wrapper_filter_does_not_persist_ambiguous_sources():
