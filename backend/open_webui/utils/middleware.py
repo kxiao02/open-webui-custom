@@ -12340,9 +12340,9 @@ async def streaming_chat_response_handler(response, ctx):
                         else None
                     )
 
-                while (
-                    len(tool_calls) > 0
-                    and tool_call_retries < CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES
+                while len(tool_calls) > 0 and (
+                    CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES <= 0
+                    or tool_call_retries < CHAT_RESPONSE_MAX_TOOL_CALL_RETRIES
                 ):
 
                     tool_call_retries += 1

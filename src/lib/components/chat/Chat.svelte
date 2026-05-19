@@ -184,7 +184,7 @@
 		selectedModelIds = selectedModels;
 	}
 
-	const DEFAULT_THINKING_MODE_ENABLED = false;
+	const DEFAULT_THINKING_MODE_ENABLED = true;
 	const normalizeThinkingModeEnabled = (value: unknown): boolean => {
 		if (typeof value === 'boolean') {
 			return value;
@@ -266,6 +266,7 @@
 		selectedFilterIds: string[];
 		sessionSkillIds: string[];
 		selectedTerminalId: string | number | null;
+		finalAnswerOnly: boolean;
 		featureToggles: {
 			imageGenerationEnabled: boolean;
 			webSearchEnabled: boolean;
@@ -941,6 +942,9 @@
 				requestContext.selectedTerminalId.trim() !== '')
 				? requestContext.selectedTerminalId
 				: (fallbackRequestContext?.selectedTerminalId ?? null),
+		finalAnswerOnly: Boolean(
+			requestContext?.finalAnswerOnly ?? fallbackRequestContext?.finalAnswerOnly
+		),
 		featureToggles: {
 			imageGenerationEnabled: Boolean(
 				requestContext?.featureToggles?.imageGenerationEnabled ??
@@ -1379,7 +1383,7 @@
 	};
 
 	const finalizeAssistantMessage = async (chatId: string, message: any) => {
-		message.done = true;
+		message = { ...(message ?? {}), done: true };
 
 		if ($settings.responseAutoCopy) {
 			copyToClipboard(
@@ -1417,7 +1421,7 @@
 			})
 		);
 
-		history.messages[message.id] = message;
+		replaceHistoryMessage(message);
 
 		await tick();
 		if (autoScroll) {
@@ -1456,6 +1460,42 @@
 		return true;
 	};
 
+	const extractOutputTextParts = (value: unknown): string => {
+		if (typeof value === 'string') return value;
+		if (!Array.isArray(value)) return '';
+
+		return value
+			.map((part) => {
+				if (typeof part === 'string') return part;
+				if (!part || typeof part !== 'object') return '';
+				const record = part as Record<string, unknown>;
+				const text = record.text ?? record.output ?? record.content;
+				return typeof text === 'string' ? text : '';
+			})
+			.filter(Boolean)
+			.join('')
+			.trim();
+	};
+
+	const extractAssistantMessageTextFromOutput = (value: unknown): string => {
+		if (!Array.isArray(value)) return '';
+
+		for (let index = value.length - 1; index >= 0; index -= 1) {
+			const item = value[index];
+			if (!item || typeof item !== 'object') continue;
+			const record = item as Record<string, unknown>;
+			if (record.type !== 'message' || record.role !== 'assistant') continue;
+
+			const contentText = extractOutputTextParts(record.content);
+			if (contentText) return contentText;
+
+			const summaryText = extractOutputTextParts(record.summary);
+			if (summaryText) return summaryText;
+		}
+
+		return '';
+	};
+
 	const hasRenderableAssistantPayload = (message: any): boolean => {
 		if (!message || message.role !== 'assistant') {
 			return false;
@@ -1465,11 +1505,11 @@
 			return true;
 		}
 
-		if (Array.isArray(message.content) && message.content.length > 0) {
+		if (Array.isArray(message.content) && extractOutputTextParts(message.content)) {
 			return true;
 		}
 
-		if (Array.isArray(message.output) && message.output.length > 0) {
+		if (extractAssistantMessageTextFromOutput(message.output)) {
 			return true;
 		}
 
@@ -1510,6 +1550,29 @@
 		}
 
 		return merged;
+	};
+
+	const replaceHistoryMessage = (message: any) => {
+		if (!message?.id) return;
+		history = {
+			...history,
+			messages: {
+				...(history?.messages ?? {}),
+				[message.id]: message
+			}
+		};
+	};
+
+	const replaceHistoryMessages = (updates: Record<string, any>) => {
+		const entries = Object.entries(updates ?? {}).filter(([id, message]) => id && message);
+		if (entries.length === 0) return;
+		history = {
+			...history,
+			messages: {
+				...(history?.messages ?? {}),
+				...Object.fromEntries(entries)
+			}
+		};
 	};
 
 	const hasBlockingAssistantResponse = (historyData: any): boolean => {
@@ -1615,8 +1678,10 @@
 		// Preserve explicit completion. Active backend tasks may continue for follow-ups,
 		// title generation, or tags after the assistant answer has already finished.
 		if (lastAssistantMessage && lastAssistantMessage.done !== true) {
-			lastAssistantMessage.done = false;
-			historyData.messages[lastAssistantMessage.id] = lastAssistantMessage;
+			historyData.messages[lastAssistantMessage.id] = {
+				...lastAssistantMessage,
+				done: false
+			};
 		}
 	};
 
@@ -1822,11 +1887,18 @@
 			) {
 				await finalizeIdleChatAfterReload($chatId);
 			} else {
-				for (const message of Object.values(history.messages ?? {}) as any[]) {
-					if (message && message.role === 'assistant') {
-						message.done = true;
-					}
-				}
+				const updates = Object.fromEntries(
+					Object.entries(history.messages ?? {}).map(([id, message]) => [
+						id,
+						message && (message as any).role === 'assistant'
+							? { ...(message as any), done: true }
+							: message
+					])
+				);
+				history = {
+					...history,
+					messages: updates
+				};
 			}
 		}
 	};
@@ -1843,15 +1915,23 @@
 
 		if ((nextTaskIds?.length ?? 0) > 0) {
 			markHistoryForRecoveredActiveTasks(history);
+			history = {
+				...history,
+				messages: { ...(history?.messages ?? {}) }
+			};
 		} else if (history?.currentId) {
-			for (const message of Object.values(history.messages)) {
-				if (message && message.role === 'assistant') {
-					message.done = true;
-				}
-			}
+			const updates = Object.fromEntries(
+				Object.entries(history.messages ?? {}).map(([id, message]) => [
+					id,
+					message && message.role === 'assistant' ? { ...message, done: true } : message
+				])
+			);
+			history = {
+				...history,
+				messages: updates
+			};
+			return;
 		}
-
-		history = history;
 	};
 
 	const finalizeIdleChatAfterReload = async (requestedChatId: string) => {
@@ -2248,7 +2328,9 @@
 	const chatEventHandler = async (event, cb) => {
 		if (event.chat_id === $chatId) {
 			await tick();
-			let message = history.messages[event.message_id];
+			let message = history.messages[event.message_id]
+				? { ...history.messages[event.message_id] }
+				: null;
 
 			if (message) {
 				const type = event?.data?.type ?? null;
@@ -2256,12 +2338,13 @@
 
 				if (type === 'status') {
 					if (message?.statusHistory) {
-						message.statusHistory.push(data);
+						message.statusHistory = [...message.statusHistory, data];
 					} else {
 						message.statusHistory = [data];
 					}
 				} else if (type === 'chat:completion') {
-					chatCompletionEventHandler(data, message, event.chat_id);
+					await chatCompletionEventHandler(data, message, event.chat_id);
+					return;
 				} else if (type === 'chat:tasks:cancel') {
 					taskIds = null;
 					setActiveChatIndicator(event.chat_id, false);
@@ -2273,12 +2356,21 @@
 					const responseMessage = targetMessageId ? history.messages[targetMessageId] : null;
 					// Mark the canceled response branch as done using the message that emitted the event.
 					if (responseMessage?.parentId && history.messages[responseMessage.parentId]) {
+						const updates: Record<string, any> = {};
 						for (const messageId of history.messages[responseMessage.parentId].childrenIds) {
-							history.messages[messageId].done = true;
+							updates[messageId] = {
+								...(history.messages[messageId] ?? {}),
+								done: true
+							};
 						}
+						replaceHistoryMessages(updates);
 					} else if (targetMessageId && history.messages[targetMessageId]) {
-						history.messages[targetMessageId].done = true;
+						replaceHistoryMessage({
+							...history.messages[targetMessageId],
+							done: true
+						});
 					}
+					return;
 				} else if (type === 'chat:active') {
 					if (data?.active === false) {
 						let activeTaskIds: string[] = [];
@@ -2343,12 +2435,15 @@
 					message.error = data.error;
 				} else if (type === 'chat:message:follow_ups') {
 					message.followUps = data.follow_ups;
-					history.messages[message.id] = message;
-					history = history;
+					if (hasRenderableAssistantPayload(message)) {
+						message.done = true;
+					}
+					replaceHistoryMessage(message);
 
 					if (autoScroll) {
 						scrollToBottom('smooth');
 					}
+					return;
 				} else if (type === 'chat:message:favorite') {
 					// Update message favorite status
 					message.favorite = data.favorite;
@@ -2371,12 +2466,12 @@
 						);
 
 						if (existingCodeExecutionIndex !== -1) {
-							message.code_executions[existingCodeExecutionIndex] = data;
+							message.code_executions = message.code_executions.map((execution, index) =>
+								index === existingCodeExecutionIndex ? data : execution
+							);
 						} else {
-							message.code_executions.push(data);
+							message.code_executions = [...message.code_executions, data];
 						}
-
-						message.code_executions = message.code_executions;
 					} else {
 						// Regular source.
 						const sourceLikeItems = getSourceLikeItems(data);
@@ -2440,7 +2535,7 @@
 					console.log('Unknown message type', data);
 				}
 
-				history.messages[event.message_id] = message;
+				replaceHistoryMessage(message);
 			}
 		}
 	};
@@ -3816,6 +3911,7 @@
 	};
 
 	const chatCompletionEventHandler = async (data: any, message: any, chatId: string) => {
+		message = { ...(message ?? {}) };
 		const { id, done, choices, content, output, selected_model_id, error, usage, metadata } =
 			data;
 		const hasContent = Object.prototype.hasOwnProperty.call(data ?? {}, 'content');
@@ -3950,7 +4046,7 @@
 			message.usage = usage;
 		}
 
-		history.messages[message.id] = message;
+		replaceHistoryMessage(message);
 
 		if (didUpdateEmbeds) {
 			await tick();
@@ -3964,9 +4060,15 @@
 
 		if (done) {
 			const activeTaskIds = await resolveActiveTaskIds(chatId);
-			if (activeTaskIds.length > 0) {
+			if (hasRenderableAssistantPayload(message)) {
+				pendingChatCompletion = null;
+				await finalizeAssistantMessage(chatId, message);
+				if (activeTaskIds.length > 0) {
+					applyTaskIdsToHistory(activeTaskIds);
+				}
+			} else if (activeTaskIds.length > 0) {
 				message.done = false;
-				history.messages[message.id] = message;
+				replaceHistoryMessage(message);
 				applyTaskIdsToHistory(activeTaskIds);
 				pendingChatCompletion = { chatId, messageId: message.id };
 			} else {
@@ -4321,6 +4423,7 @@
 			selectedFilterIds: [...selectedFilterIds],
 			sessionSkillIds: [...sessionSkillIds],
 			selectedTerminalId: $selectedTerminalId ?? null,
+			finalAnswerOnly: false,
 			featureToggles: {
 				imageGenerationEnabled,
 				webSearchEnabled,
@@ -4353,6 +4456,10 @@
 	};
 
 	const getFeatures = (requestContext: ChatRequestContext | null = null) => {
+		if (requestContext?.finalAnswerOnly) {
+			return {};
+		}
+
 		const featureToggles = requestContext?.featureToggles ?? {
 			imageGenerationEnabled,
 			webSearchEnabled,
@@ -4529,19 +4636,22 @@
 				return Array.isArray(message?.output) && message.output.length > 0;
 			});
 
+		const finalAnswerOnly = Boolean(requestContext.finalAnswerOnly);
 		const toolIds = [];
 		const toolServerIds = [];
 
-		for (const toolId of dedupeIds(requestContext.selectedToolIds)) {
-			if (toolId.startsWith('direct_server:')) {
-				let serverId = toolId.replace('direct_server:', '');
-				if (!isNaN(parseInt(serverId))) {
-					toolServerIds.push(parseInt(serverId));
+		if (!finalAnswerOnly) {
+			for (const toolId of dedupeIds(requestContext.selectedToolIds)) {
+				if (toolId.startsWith('direct_server:')) {
+					let serverId = toolId.replace('direct_server:', '');
+					if (!isNaN(parseInt(serverId))) {
+						toolServerIds.push(parseInt(serverId));
+					} else {
+						toolServerIds.push(serverId);
+					}
 				} else {
-					toolServerIds.push(serverId);
+					toolIds.push(toolId);
 				}
-			} else {
-				toolIds.push(toolId);
 			}
 		}
 
@@ -4550,12 +4660,14 @@
 		// Parse skill mentions (<$skillId|label>) from user messages
 		const skillMentionRegex = /<\$([^|>]+)\|?[^>]*>/g;
 		const skillIds = [];
-		for (const message of messages) {
-			const content =
-				typeof message.content === 'string' ? message.content : (message.content?.[0]?.text ?? '');
-			for (const match of content.matchAll(skillMentionRegex)) {
-				if (!skillIds.includes(match[1])) {
-					skillIds.push(match[1]);
+		if (!finalAnswerOnly) {
+			for (const message of messages) {
+				const content =
+					typeof message.content === 'string' ? message.content : (message.content?.[0]?.text ?? '');
+				for (const match of content.matchAll(skillMentionRegex)) {
+					if (!skillIds.includes(match[1])) {
+						skillIds.push(match[1]);
+					}
 				}
 			}
 		}
@@ -4583,8 +4695,10 @@
 		}
 
 		// Use the user-selected terminal from the dropdown
-		const activeTerminalId = requestContext.selectedTerminalId ?? null;
-		const effectiveSkillIds = dedupeIds([...requestContext.sessionSkillIds, ...skillIds]);
+		const activeTerminalId = finalAnswerOnly ? null : (requestContext.selectedTerminalId ?? null);
+		const effectiveSkillIds = finalAnswerOnly
+			? []
+			: dedupeIds([...requestContext.sessionSkillIds, ...skillIds]);
 		const clientCapabilities = getClientCapabilities({
 			chatId: _chatId,
 			temporaryChatEnabled: $temporaryChatEnabled,
@@ -4616,22 +4730,24 @@
 							: undefined
 				},
 
-				files: (files?.length ?? 0) > 0 ? files : undefined,
+				files: !finalAnswerOnly && (files?.length ?? 0) > 0 ? files : undefined,
 
 				filter_ids:
-					requestContext.selectedFilterIds.length > 0
+					!finalAnswerOnly && requestContext.selectedFilterIds.length > 0
 						? requestContext.selectedFilterIds
 						: undefined,
 				tool_ids: toolIds.length > 0 ? toolIds : undefined,
 				skill_ids: effectiveSkillIds.length > 0 ? effectiveSkillIds : undefined,
 				terminal_id: activeTerminalId ?? undefined,
-				tool_servers: [
-					...($toolServers ?? []).filter(
-						(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
-					),
-					// Direct terminal servers — always included when enabled (not routed through selectedToolIds)
-					...($terminalServers ?? []).filter((t) => !t.id)
-				],
+				tool_servers: finalAnswerOnly
+					? []
+					: [
+							...($toolServers ?? []).filter(
+								(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
+							),
+							// Direct terminal servers — always included when enabled (not routed through selectedToolIds)
+							...($terminalServers ?? []).filter((t) => !t.id)
+						],
 				features: getFeatures(requestContext),
 				variables: {
 					...getPromptVariables(
@@ -4813,6 +4929,51 @@
 			generationController?.abort();
 			generationController = null;
 		}
+	};
+
+	const answerNowResponse = async () => {
+		const responseMessage = history.messages?.[history.currentId];
+		if (!responseMessage || responseMessage.role !== 'assistant' || !responseMessage.parentId) {
+			await stopResponse();
+			return;
+		}
+
+		const parentId = responseMessage.parentId;
+		const responseId = responseMessage.id;
+		const modelId = responseMessage.selectedModelId ?? responseMessage.model ?? null;
+		const requestContext = normalizeRequestContext(
+			{
+				thinkingModeEnabled,
+				selectedToolIds: [],
+				selectedFilterIds: [],
+				sessionSkillIds: [],
+				selectedTerminalId: null,
+				finalAnswerOnly: true,
+				featureToggles: {
+					imageGenerationEnabled: false,
+					webSearchEnabled: false,
+					codeInterpreterEnabled: false
+				}
+			},
+			captureRequestContext()
+		);
+		const immediateAnswerInstruction =
+			'请立即基于目前已经完成的检索、附件读取、工具结果和上下文给出最终回答。不要再调用工具；如果信息不足，请明确说明已有信息和限制。';
+
+		await stopResponse();
+		await tick();
+
+		await sendMessage(history, parentId, {
+			modelId,
+			requestContext,
+			messages: [
+				...createMessagesList(history, responseId),
+				{
+					role: 'user',
+					content: immediateAnswerInstruction
+				}
+			]
+		});
 	};
 
 	const submitMessage = async (parentId, prompt) => {
@@ -5368,6 +5529,7 @@
 									toolServers={$toolServers}
 									{generating}
 									{stopResponse}
+									{answerNowResponse}
 									{createMessagePair}
 									{onUpload}
 									{messageQueue}
@@ -5449,6 +5611,7 @@
 									bind:dragged
 									toolServers={$toolServers}
 									{stopResponse}
+									{answerNowResponse}
 									{createMessagePair}
 									{onSelect}
 									{onUpload}

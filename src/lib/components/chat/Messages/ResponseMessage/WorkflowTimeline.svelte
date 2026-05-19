@@ -1,11 +1,14 @@
 <script lang="ts">
+	import { slide } from 'svelte/transition';
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
+	import Check from '$lib/components/icons/Check.svelte';
 	import CheckCircle from '$lib/components/icons/CheckCircle.svelte';
 	import Computer from '$lib/components/icons/Computer.svelte';
 	import LightBulb from '$lib/components/icons/LightBulb.svelte';
 	import QueueList from '$lib/components/icons/QueueList.svelte';
 	import Search from '$lib/components/icons/Search.svelte';
 	import WrenchSolid from '$lib/components/icons/WrenchSolid.svelte';
+	import XMark from '$lib/components/icons/XMark.svelte';
 	import { resolveToolCallStatus } from '$lib/utils/generated-files';
 	import { resolveToolDisplay } from '$lib/utils/tool-display';
 
@@ -70,6 +73,7 @@
 	let userWorkflowToggled = false;
 	let previousFinalState = false;
 	let expandedStepKey = '';
+	let previousActiveStepKey = '';
 
 	const RETRIEVAL_STATUS_ACTIONS = new Set([
 		'knowledge_search',
@@ -289,7 +293,9 @@
 		Boolean(status) && status?.hidden !== true;
 
 	const getDisplayStatusHistory = (items: MessageStatus[]): MessageStatus[] => {
-		const visible = (items ?? []).filter((status) => isVisibleMessageStatus(status));
+		const visible = (items ?? []).filter(
+			(status) => isVisibleMessageStatus(status) && status?.action !== 'chat'
+		);
 		const hasSpecificStatus = visible.some((status) => status?.action !== 'chat');
 		return visible.filter((status) => !hasSpecificStatus || status?.action !== 'chat');
 	};
@@ -297,18 +303,20 @@
 	const getMessageStatusDone = (
 		status: MessageStatus,
 		index: number,
-		items: MessageStatus[]
-	): boolean => index < items.length - 1 || Boolean(status?.done) || done;
+		items: MessageStatus[],
+		currentDone = done
+	): boolean => index < items.length - 1 || Boolean(status?.done) || currentDone;
 
 	const getMessageStatusState = (
 		status: MessageStatus,
 		index: number,
-		items: MessageStatus[]
+		items: MessageStatus[],
+		currentDone = done
 	): WorkflowStatus => {
 		const normalized = String(status?.status ?? '').toLowerCase();
 		if (['error', 'failed', 'failure'].includes(normalized)) return 'error';
 		if (['timeout', 'timed_out', 'timed-out'].includes(normalized)) return 'timeout';
-		return getMessageStatusDone(status, index, items) ? 'success' : 'running';
+		return getMessageStatusDone(status, index, items, currentDone) ? 'success' : 'running';
 	};
 
 	const getRetrievalTitle = (status: MessageStatus): string => {
@@ -321,7 +329,7 @@
 		if (status?.action === 'sources_retrieved') {
 			return '来源整理';
 		}
-		return '检索尝试';
+		return '处理步骤';
 	};
 
 	const getStatusSummary = (status: MessageStatus | null | undefined): string => {
@@ -389,17 +397,23 @@
 		return '任务清单已更新';
 	};
 
-	const getTerminalAwareStatus = (status: WorkflowStatus): WorkflowStatus =>
-		done && finalResponseVisible && status === 'running' ? 'success' : status;
+	const getTerminalAwareStatus = (status: WorkflowStatus): WorkflowStatus => status;
 
 	const isRetrievalStatus = (status: MessageStatus): boolean =>
 		RETRIEVAL_STATUS_ACTIONS.has(status?.action ?? '');
 
-	const getSteps = (): WorkflowStep[] => {
+	const getSteps = (
+		currentStatusHistory: MessageStatus[] = statusHistory,
+		currentTaskItems: ProcessToolCallItem[] = taskItems,
+		currentToolItems: ProcessToolCallItem[] = toolItems,
+		currentReasoningItems: ProcessReasoningItem[] = reasoningItems,
+		currentDone = done,
+		currentFinalResponseVisible = finalResponseVisible
+	): WorkflowStep[] => {
 		const steps: WorkflowStep[] = [];
 
-		for (const [index, item] of reasoningItems.entries()) {
-			const itemDone = item.done || (done && finalResponseVisible);
+		for (const [index, item] of currentReasoningItems.entries()) {
+			const itemDone = item.done || (currentDone && currentFinalResponseVisible);
 			steps.push({
 				key: `thinking:${item.key || index}`,
 				kind: 'thinking',
@@ -414,19 +428,19 @@
 			});
 		}
 
-		const displayStatuses = getDisplayStatusHistory(statusHistory);
+		const displayStatuses = getDisplayStatusHistory(currentStatusHistory);
 		for (const [index, status] of displayStatuses.entries()) {
 			steps.push({
 				key: `retrieval:${status.action ?? 'status'}:${index}:${getStatusSummary(status)}`,
 				kind: isRetrievalStatus(status) ? 'retrieval' : 'tool',
 				title: getRetrievalTitle(status),
 				summary: getStatusSummary(status),
-				status: getMessageStatusState(status, index, displayStatuses),
+				status: getMessageStatusState(status, index, displayStatuses, currentDone),
 				messageStatus: status
 			});
 		}
 
-		for (const item of taskItems) {
+		for (const item of currentTaskItems) {
 			const status = getTerminalAwareStatus(getToolStatus(item));
 			const todoSummary = getTodoSummary(buildTodoPayload(item), status);
 			steps.push({
@@ -439,7 +453,7 @@
 			});
 		}
 
-		for (const item of toolItems) {
+		for (const item of currentToolItems) {
 			const status = getTerminalAwareStatus(getToolStatus(item));
 			steps.push({
 				key: `tool:${item.key}`,
@@ -479,6 +493,11 @@
 			return 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-300';
 		}
 		return 'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900/70 dark:bg-blue-950/30 dark:text-blue-300';
+	};
+
+	const getHeaderStatusLabel = (status: WorkflowStatus): string => {
+		if (status === 'success') return `${steps.length} 个步骤`;
+		return getStatusLabel(status);
 	};
 
 	const getStepIcon = (kind: WorkflowStep['kind']) => {
@@ -529,7 +548,14 @@
 		expandedStepKey = expandedStepKey === key ? '' : key;
 	};
 
-	$: steps = getSteps();
+	$: steps = getSteps(
+		statusHistory,
+		taskItems,
+		toolItems,
+		reasoningItems,
+		done,
+		finalResponseVisible
+	);
 	$: anyRunning = steps.some((step) => step.status === 'running');
 	$: activeStepIndex = Math.max(
 		0,
@@ -538,6 +564,10 @@
 			: steps.length - 1
 	);
 	$: activeStep = steps[activeStepIndex] ?? null;
+	$: if (workflowOpen && activeStep?.key && activeStep.key !== previousActiveStepKey) {
+		expandedStepKey = activeStep.key;
+		previousActiveStepKey = activeStep.key;
+	}
 	$: finalState = done && finalResponseVisible;
 	$: if (finalState !== previousFinalState) {
 		if (finalState) {
@@ -551,10 +581,13 @@
 	$: if (expandedStepKey && !steps.some((step) => step.key === expandedStepKey)) {
 		expandedStepKey = '';
 	}
+	$: if (steps.length === 0) {
+		previousActiveStepKey = '';
+	}
 </script>
 
 {#if steps.length > 0}
-	<div class="mb-3 w-full overflow-hidden rounded-xl border border-gray-200/80 bg-white/75 text-gray-800 shadow-xs dark:border-gray-800/80 dark:bg-gray-950/45 dark:text-gray-100">
+	<div class="workflow-timeline mb-3 w-full overflow-hidden rounded-xl border border-gray-200/80 bg-white/75 text-gray-800 shadow-xs dark:border-gray-800/80 dark:bg-gray-950/45 dark:text-gray-100">
 		<button
 			type="button"
 			class="flex w-full items-center justify-between gap-3 px-3 py-2 text-left transition hover:bg-gray-50/80 dark:hover:bg-gray-900/60"
@@ -585,11 +618,14 @@
 
 			<div class="flex shrink-0 items-center gap-2">
 				<span
-					class={`rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${getBadgeClass(
+					class={`inline-flex min-h-5 items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${getBadgeClass(
 						anyRunning ? 'running' : activeStep?.status ?? 'success'
 					)}`}
 				>
-					{anyRunning ? '运行中' : '已收起'}
+					{#if !anyRunning && activeStep?.status === 'success'}
+						<Check className="size-3" strokeWidth="3" />
+					{/if}
+					{getHeaderStatusLabel(anyRunning ? 'running' : activeStep?.status ?? 'success')}
 				</span>
 				<ChevronDown
 					className={`size-3.5 text-gray-500 transition-transform ${workflowOpen ? 'rotate-180' : ''}`}
@@ -599,7 +635,10 @@
 		</button>
 
 		{#if workflowOpen}
-			<div class="border-t border-gray-200/70 px-3 py-2 dark:border-gray-800/80">
+			<div
+				class="border-t border-gray-200/70 px-3 py-2 dark:border-gray-800/80"
+				transition:slide={{ duration: 180 }}
+			>
 				<div class="relative">
 					<div
 						class="pointer-events-none absolute bottom-4 left-[13px] top-4 w-px bg-gray-200 dark:bg-gray-800"
@@ -612,18 +651,18 @@
 							{@const isExpandedStep = expandedStepKey === step.key}
 							<div class="relative flex gap-2.5 pl-8">
 								<div
-									class={`absolute left-[8.5px] top-3.5 size-2.5 rounded-full ring-4 ring-white dark:ring-gray-950 ${getStatusClass(
+									class={`workflow-dot absolute left-[8.5px] top-3.5 size-2.5 rounded-full ring-4 ring-white dark:ring-gray-950 ${getStatusClass(
 										step.status
-									)} ${step.status === 'running' ? 'animate-pulse' : ''}`}
+									)} ${step.status === 'running' ? 'workflow-dot-running' : ''}`}
 								></div>
 
 								<div class="min-w-0 flex-1">
 									<button
 										type="button"
 										aria-expanded={isExpandedStep}
-										class={`flex min-h-8 w-full items-center justify-between gap-3 rounded-lg px-2 py-1.5 text-left transition hover:bg-gray-50 dark:hover:bg-gray-900/70 ${
+										class={`workflow-step-button flex min-h-8 w-full items-center justify-between gap-3 rounded-lg px-2 py-1.5 text-left transition hover:bg-gray-50 dark:hover:bg-gray-900/70 ${
 											isActiveStep
-												? 'bg-gray-50 text-gray-900 dark:bg-gray-900/70 dark:text-gray-100'
+												? `bg-gray-50 text-gray-900 dark:bg-gray-900/70 dark:text-gray-100 ${step.status === 'running' ? 'workflow-step-running' : ''}`
 												: 'text-gray-600 dark:text-gray-400'
 										}`}
 										on:click={() => toggleStepExpansion(step.key)}
@@ -644,11 +683,17 @@
 
 										<div class="flex shrink-0 items-center gap-1.5">
 											<span
-												class={`rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${getBadgeClass(
+												class={`inline-flex min-h-5 items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${getBadgeClass(
 													step.status
 												)}`}
 											>
-												{getStatusLabel(step.status)}
+												{#if step.status === 'success'}
+													<Check className="size-3" strokeWidth="3" />
+												{:else if step.status === 'error'}
+													<XMark className="size-3" strokeWidth="3" />
+												{:else}
+													{getStatusLabel(step.status)}
+												{/if}
 											</span>
 											<ChevronDown
 												className={`size-3 text-gray-400 transition-transform ${isExpandedStep ? 'rotate-180' : ''}`}
@@ -662,6 +707,7 @@
 										{@const todoPayload = step.kind === 'task' ? buildTodoPayload(step.toolItem) : null}
 										<div
 											class="mx-2 mb-1 mt-1 rounded-lg border border-gray-200/80 bg-white/80 px-3 py-2 text-xs text-gray-600 dark:border-gray-800 dark:bg-gray-950/60 dark:text-gray-300"
+											transition:slide={{ duration: 170 }}
 										>
 											{#if todoPayload}
 												<div class="mb-2 flex flex-wrap items-center justify-between gap-2">
@@ -752,3 +798,83 @@
 		{/if}
 	</div>
 {/if}
+
+<style>
+	.workflow-timeline {
+		overflow-anchor: none;
+	}
+
+	.workflow-step-button {
+		position: relative;
+		overflow: hidden;
+	}
+
+	.workflow-step-running::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		pointer-events: none;
+		background: linear-gradient(
+			100deg,
+			transparent 0%,
+			rgba(59, 130, 246, 0.08) 34%,
+			rgba(16, 185, 129, 0.1) 50%,
+			rgba(59, 130, 246, 0.08) 66%,
+			transparent 100%
+		);
+		background-size: 220% 100%;
+		animation: workflow-wave 1.5s ease-in-out infinite;
+	}
+
+	.workflow-dot-running {
+		animation: workflow-dot-roll 1.2s ease-in-out infinite;
+	}
+
+	.workflow-dot-running::after {
+		content: '';
+		position: absolute;
+		inset: -6px;
+		border-radius: 9999px;
+		border: 1px solid currentColor;
+		opacity: 0.28;
+		animation: workflow-ripple 1.2s ease-out infinite;
+	}
+
+	@keyframes workflow-wave {
+		0% {
+			background-position: 140% 0;
+		}
+		100% {
+			background-position: -80% 0;
+		}
+	}
+
+	@keyframes workflow-dot-roll {
+		0%,
+		100% {
+			transform: translateY(0) scale(0.92);
+		}
+		50% {
+			transform: translateY(-1px) scale(1.08);
+		}
+	}
+
+	@keyframes workflow-ripple {
+		0% {
+			transform: scale(0.65);
+			opacity: 0.36;
+		}
+		100% {
+			transform: scale(1.35);
+			opacity: 0;
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.workflow-step-running::after,
+		.workflow-dot-running,
+		.workflow-dot-running::after {
+			animation: none;
+		}
+	}
+</style>

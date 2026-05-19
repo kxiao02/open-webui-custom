@@ -368,6 +368,10 @@
 		status: MessageStatus | null | undefined
 	): status is MessageStatus => Boolean(status) && status?.hidden !== true;
 
+	const isWorkflowMessageStatus = (
+		status: MessageStatus | null | undefined
+	): status is MessageStatus => isVisibleMessageStatus(status) && status.action !== 'chat';
+
 	const getNormalizedStatusHistory = (
 		source: MessageType | null | undefined
 	): MessageStatus[] => {
@@ -385,14 +389,8 @@
 	};
 
 	const shouldRenderStatusHistory = (history: MessageStatus[]): boolean => {
-		const visibleStatuses = history.filter(isVisibleMessageStatus);
-		if (visibleStatuses.length === 0) return false;
-
-		const latestStatus = history.at(-1);
-		if (latestStatus?.hidden === true && visibleStatuses.every((status) => status.action === 'chat')) {
-			return false;
-		}
-
+		const workflowStatuses = history.filter(isWorkflowMessageStatus);
+		if (workflowStatuses.length === 0) return false;
 		return true;
 	};
 
@@ -1481,12 +1479,32 @@
 		return normalizeToolId(toolName) === 'write_todos';
 	};
 
+	const collapseTaskProcessToolCalls = (
+		items: ProcessToolCallItem[]
+	): ProcessToolCallItem[] => {
+		const taskItems = items.filter((item) => isTaskProcessToolCallAttrs(item.attrs ?? {}));
+		if (taskItems.length === 0) return [];
+
+		const mergedAttrs = taskItems.reduce(
+			(attrs, item) => mergeToolCallAttrs(attrs, item.attrs ?? {}),
+			{} as Record<string, string>
+		);
+
+		return [
+			{
+				key: 'task_tracker:write_todos',
+				attrs: mergedAttrs
+			}
+		];
+	};
+
 	const splitTaskAndToolCallItems = (
 		items: ProcessToolCallItem[]
-	): { taskItems: ProcessToolCallItem[]; toolItems: ProcessToolCallItem[] } => ({
-		taskItems: items.filter((item) => isTaskProcessToolCallAttrs(item.attrs ?? {})),
-		toolItems: items.filter((item) => !isTaskProcessToolCallAttrs(item.attrs ?? {}))
-	});
+	): { taskItems: ProcessToolCallItem[]; toolItems: ProcessToolCallItem[] } => {
+		const taskItems = collapseTaskProcessToolCalls(items);
+		const toolItems = items.filter((item) => !isTaskProcessToolCallAttrs(item.attrs ?? {}));
+		return { taskItems, toolItems };
+	};
 
 	const mergeProcessToolCalls = (
 		contentItems: ProcessToolCallItem[],

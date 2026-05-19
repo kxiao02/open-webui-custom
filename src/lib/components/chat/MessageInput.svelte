@@ -81,13 +81,12 @@
 	import Wrench from '../icons/Wrench.svelte';
 	import Sparkles from '../icons/Sparkles.svelte';
 	import LightBulb from '../icons/LightBulb.svelte';
+	import Database from '../icons/Database.svelte';
 
 	import InputVariablesModal from './MessageInput/InputVariablesModal.svelte';
 	import Voice from '../icons/Voice.svelte';
 	import Cloud from '../icons/Cloud.svelte';
-	import IntegrationsMenu from './MessageInput/IntegrationsMenu.svelte';
 	import TerminalMenu from './MessageInput/TerminalMenu.svelte';
-	import Component from '../icons/Component.svelte';
 	import PlusAlt from '../icons/PlusAlt.svelte';
 	import Dropdown from '../common/Dropdown.svelte';
 
@@ -110,6 +109,7 @@
 
 	export let createMessagePair: Function;
 	export let stopResponse: Function;
+	export let answerNowResponse: Function = stopResponse;
 
 	export let autoScroll = false;
 	export let generating = false;
@@ -154,11 +154,6 @@
 	let showValvesModal = false;
 	let selectedValvesType = 'tool'; // 'tool' or 'function'
 	let selectedValvesItemId = null;
-	let integrationsMenuCloseOnOutsideClick = true;
-
-	$: if (!showValvesModal) {
-		integrationsMenuCloseOnOutsideClick = true;
-	}
 
 	$: onChange({
 		prompt,
@@ -1087,7 +1082,6 @@
 		await tick();
 	}}
 	on:close={() => {
-		integrationsMenuCloseOnOutsideClick = true;
 	}}
 />
 
@@ -1660,31 +1654,57 @@
 										</div>
 									</InputMenu>
 
-									{#if showWebSearchButton || showImageGenerationButton || showCodeInterpreterButton || showToolsButton || (toggleFilters && toggleFilters.length > 0)}
+									{#if $config?.features?.enable_knowledge ?? true}
 										<div
 											class="flex self-center w-[1px] h-4 mx-1 bg-gray-200/50 dark:bg-gray-800/50"
 										/>
 
-										<IntegrationsMenu
+										<InputMenu
+											bind:files
 											selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
-											{toggleFilters}
-											{showWebSearchButton}
-											{showImageGenerationButton}
-											{showCodeInterpreterButton}
-											bind:selectedToolIds
-											{lockedToolIds}
-											bind:selectedFilterIds
-											bind:webSearchEnabled
-											bind:imageGenerationEnabled
-											bind:codeInterpreterEnabled
-											closeOnOutsideClick={integrationsMenuCloseOnOutsideClick}
-											onShowValves={(e) => {
-												const { type, id } = e;
-												selectedValvesType = type;
-												selectedValvesItemId = id;
-												showValvesModal = true;
-												integrationsMenuCloseOnOutsideClick = false;
+											{fileUploadCapableModels}
+											uploadFilesHandler={() => {
+												filesInputElement.click();
 											}}
+											uploadGoogleDriveHandler={async () => {
+												try {
+													const fileData = await createPicker();
+													if (fileData) {
+														const file = new File([fileData.blob], fileData.name, {
+															type: fileData.blob.type
+														});
+														await uploadFileHandler(file);
+													} else {
+														console.log('No file was selected from Google Drive');
+													}
+												} catch (error) {
+													console.error('Google Drive Error:', error);
+													toast.error(
+														$i18n.t('Error accessing Google Drive: {{error}}', {
+															error: error.message
+														})
+													);
+												}
+											}}
+											uploadOneDriveHandler={async (authorityType) => {
+												try {
+													const fileData = await pickAndDownloadFile(authorityType);
+													if (fileData) {
+														const file = new File([fileData.blob], fileData.name, {
+															type: fileData.blob.type || 'application/octet-stream'
+														});
+														await uploadFileHandler(file);
+													} else {
+														console.log('No file was selected from OneDrive');
+													}
+												} catch (error) {
+													console.error('OneDrive Error:', error);
+												}
+											}}
+											{onUpload}
+											initialTab="knowledge"
+											knowledgeOnly={true}
+											tooltipContent="引用知识库"
 											onClose={async () => {
 												await tick();
 
@@ -1693,12 +1713,12 @@
 											}}
 										>
 											<div
-												id="integration-menu-button"
+												id="knowledge-menu-button"
 												class="bg-transparent hover:bg-gray-100 text-gray-700 dark:text-white dark:hover:bg-gray-800 rounded-full size-8 flex justify-center items-center outline-hidden focus:outline-hidden"
 											>
-												<Component className="size-4.5" strokeWidth="1.5" />
+												<Database className="size-4.5" strokeWidth="1.5" />
 											</div>
-										</IntegrationsMenu>
+										</InputMenu>
 									{/if}
 
 									{#if selectedModelIds.length === 1 && $models.find((m) => m.id === selectedModelIds[0])?.has_user_valves}
@@ -1847,7 +1867,18 @@
 
 								<div class="self-end flex space-x-1 mr-1 shrink-0 gap-[0.5px]">
 									{#if hasBlockingGeneration}
-										<div class=" flex items-center">
+										<div class=" flex items-center gap-1">
+											<Tooltip content="立即回答">
+												<button
+													class="inline-flex h-8 items-center rounded-full border border-gray-200 bg-white px-2.5 text-xs font-medium text-gray-700 shadow-xs transition hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+													type="button"
+													on:click|preventDefault|stopPropagation={() => {
+														answerNowResponse();
+													}}
+												>
+													立即回答
+												</button>
+											</Tooltip>
 											<Tooltip content={$i18n.t('Stop')}>
 												<button
 													class="bg-white hover:bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-1.5"

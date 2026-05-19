@@ -38,6 +38,7 @@
 
 	export let createMessagePair: Function;
 	export let stopResponse: Function;
+	export let answerNowResponse: Function = stopResponse;
 
 	export let autoScroll = false;
 
@@ -349,6 +350,7 @@
 					bind:dragged
 					{toolServers}
 					{stopResponse}
+					{answerNowResponse}
 					{createMessagePair}
 					placeholder={$i18n.t('How can I help you today?')}
 					{onChange}

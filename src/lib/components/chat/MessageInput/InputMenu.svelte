@@ -42,6 +42,9 @@
 
 	export let onUpload: Function;
 	export let onClose: Function;
+	export let initialTab = '';
+	export let knowledgeOnly = false;
+	export let tooltipContent = '';
 
 	let show = false;
 	let tab = '';
@@ -91,12 +94,15 @@
 <Dropdown
 	bind:show
 	on:change={(e) => {
+		if (e.detail === true) {
+			tab = initialTab;
+		}
 		if (e.detail === false) {
 			onClose();
 		}
 	}}
 >
-	<Tooltip content={$i18n.t('More')}>
+	<Tooltip content={tooltipContent || $i18n.t('More')}>
 		<slot />
 	</Tooltip>
 
@@ -109,7 +115,11 @@
 			align="start"
 			transition={flyAndScale}
 		>
-			{#if tab === ''}
+			{#if knowledgeOnly && tab === 'knowledge' && ($config?.features?.enable_knowledge ?? true)}
+				<div in:fly={{ x: 20, duration: 150 }}>
+					<Knowledge {onSelect} />
+				</div>
+			{:else if tab === ''}
 				<div in:fly={{ x: -20, duration: 150 }}>
 					<Tooltip
 						content={fileUploadCapableModels.length !== selectedModels.length
@@ -184,7 +194,7 @@
 						</Tooltip>
 					{/if}
 
-					{#if $config?.features?.enable_knowledge ?? true}
+					{#if ($config?.features?.enable_knowledge ?? true) && !knowledgeOnly}
 						<Tooltip
 							content={fileUploadCapableModels.length !== selectedModels.length
 								? $i18n.t('Model(s) do not support file upload')
