@@ -156,11 +156,16 @@ export const getModels = async (
 	return models;
 };
 
+type ChatMessagePayload = Record<string, unknown>;
+
 type ChatCompletedForm = {
 	model: string;
-	messages: string[];
+	messages: ChatMessagePayload[];
 	chat_id: string;
-	session_id: string;
+	session_id?: string;
+	filter_ids?: string[];
+	model_item?: unknown;
+	id?: string;
 };
 
 export const chatCompleted = async (token: string, body: ChatCompletedForm) => {
@@ -198,8 +203,12 @@ export const chatCompleted = async (token: string, body: ChatCompletedForm) => {
 
 type ChatActionForm = {
 	model: string;
-	messages: string[];
+	messages: ChatMessagePayload[];
 	chat_id: string;
+	session_id?: string;
+	model_item?: unknown;
+	id?: string;
+	event?: unknown;
 };
 
 export const chatAction = async (token: string, action_id: string, body: ChatActionForm) => {

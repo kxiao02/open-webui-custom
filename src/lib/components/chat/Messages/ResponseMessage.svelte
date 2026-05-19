@@ -321,9 +321,10 @@
 		const followUpsLength = Array.isArray((source as any).followUps)
 			? (source as any).followUps.length
 			: 0;
-		const sourcesLength = Array.isArray((source as any).sources)
-			? (source as any).sources.length
-			: 0;
+		const referencesSignature = buildStructuredSignature({
+			sources: (source as any).sources,
+			citations: (source as any).citations
+		});
 		const statusHistorySignature = buildStructuredSignature((source as any).statusHistory);
 		const codeExecutionsLength = Array.isArray((source as any).code_executions)
 			? (source as any).code_executions.length
@@ -339,7 +340,7 @@
 			filesSignature,
 			metadataSignature,
 			followUpsLength,
-			sourcesLength,
+			referencesSignature,
 			codeExecutionsLength,
 			embedsSignature,
 			`${annotation?.type ?? ''}:${annotation?.rating ?? ''}`,
@@ -418,13 +419,17 @@
 		return metadata && typeof metadata === 'object' ? metadata : null;
 	};
 
+	const toReferenceList = (value: unknown): any[] => {
+		if (Array.isArray(value)) return value;
+		return value && typeof value === 'object' ? [value] : [];
+	};
+
 	const getRenderableSources = (source: MessageType | null | undefined): any[] => {
 		const metadata = getRetrievalMetadata(source);
-		const primarySources = Array.isArray(source?.sources)
-			? source.sources
-			: Array.isArray(source?.citations)
-				? source.citations
-				: [];
+		const primarySources = [
+			...toReferenceList(source?.sources),
+			...toReferenceList(source?.citations)
+		].filter((item: any) => item && typeof item === 'object' && item?.type !== 'code_execution');
 		const canonicalReferences = Array.isArray(metadata?.canonical_references)
 			? metadata.canonical_references
 			: [];

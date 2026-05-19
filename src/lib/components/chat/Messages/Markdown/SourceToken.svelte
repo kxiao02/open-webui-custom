@@ -3,12 +3,12 @@
 	import { decodeString } from '$lib/utils';
 	import Source from './Source.svelte';
 
-	export let id;
-	export let token;
-	export let sourceIds = [];
+	export let id: string;
+	export let token: any;
+	export let sourceIds: string[] = [];
 	export let onClick: Function = () => {};
 
-	let containerElement;
+	let containerElement: HTMLDivElement | undefined;
 	let openPreview = false;
 
 	// Helper function to return only the domain from a URL
@@ -46,7 +46,7 @@
 	};
 </script>
 
-{#if sourceIds}
+{#if sourceIds?.length > 0}
 	{#if (token?.ids ?? []).length == 1}
 		{@const id = token.ids[0]}
 		{@const identifier = token.citationIdentifiers ? token.citationIdentifiers[0] : id}

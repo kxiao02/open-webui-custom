@@ -1230,10 +1230,26 @@
 			return '';
 		}
 
+		if (source?.data && typeof source.data === 'object') {
+			source = source.data;
+		}
+
 		const sourceMeta = source?.source ?? {};
-		const metadata = Array.isArray(source?.metadata) ? source.metadata : [];
-		const document = Array.isArray(source?.document) ? source.document : [];
-		const distances = Array.isArray(source?.distances) ? source.distances : [];
+		const metadata = Array.isArray(source?.metadata)
+			? source.metadata
+			: Array.isArray(source?.metadatas)
+				? source.metadatas
+				: [];
+		const document = Array.isArray(source?.document)
+			? source.document
+			: Array.isArray(source?.documents)
+				? source.documents
+				: [];
+		const distances = Array.isArray(source?.distances)
+			? source.distances
+			: Array.isArray(source?.distance)
+				? source.distance
+				: [];
 
 		return JSON.stringify({
 			id: source?.id ?? null,
@@ -1246,12 +1262,24 @@
 		});
 	};
 
-	const mergeMessageSources = (existingSources: any[] = [], incomingSources: any[] = []) => {
+	const normalizeSourceList = (value: any): any[] => {
+		if (Array.isArray(value)) return value;
+		if (value && typeof value === 'object') return [value];
+		return [];
+	};
+
+	const mergeMessageSources = (existingSources: any = [], incomingSources: any = []) => {
 		const merged: any[] = [];
 		const seen = new Set<string>();
 
-		for (const source of [...existingSources, ...incomingSources]) {
+		for (const source of [
+			...normalizeSourceList(existingSources),
+			...normalizeSourceList(incomingSources)
+		]) {
 			if (!source || typeof source !== 'object') {
+				continue;
+			}
+			if (source?.type === 'code_execution') {
 				continue;
 			}
 
@@ -1265,6 +1293,46 @@
 		}
 
 		return merged;
+	};
+
+	const isSourceLikeItem = (value: any) =>
+		value &&
+		typeof value === 'object' &&
+		('source' in value || 'document' in value || 'documents' in value || 'metadata' in value);
+
+	const getSourceLikeItems = (payload: any): any[] => {
+		if (Array.isArray(payload)) {
+			return payload.flatMap(getSourceLikeItems);
+		}
+
+		if (isSourceLikeItem(payload)) {
+			return [payload];
+		}
+
+		const items: any[] = [];
+		for (const key of ['sources', 'citations', 'references']) {
+			const value = payload?.[key];
+			if (Array.isArray(value)) {
+				const nestedItems = value.flatMap(getSourceLikeItems);
+				items.push(
+					...(nestedItems.length > 0
+						? nestedItems
+						: value.filter((item) => item && typeof item === 'object'))
+				);
+			} else if (value && typeof value === 'object') {
+				const nestedItems = getSourceLikeItems(value);
+				items.push(...(nestedItems.length > 0 ? nestedItems : [value]));
+			}
+		}
+		if (items.length > 0) {
+			return items;
+		}
+
+		if (payload?.data && typeof payload.data === 'object') {
+			return getSourceLikeItems(payload.data);
+		}
+
+		return items;
 	};
 
 	const normalizeTaskIds = (ids: unknown): string[] =>
@@ -1419,13 +1487,29 @@
 	const mergeHistoryMessage = (existingMessage: any, nextMessage: any) => {
 		const previousContent = existingMessage?.content;
 
-		return {
+		const merged = {
 			...(existingMessage ?? {}),
 			...(previousContent !== undefined && previousContent !== nextMessage.content
 				? { originalContent: previousContent }
 				: {}),
 			...nextMessage
 		};
+
+		for (const key of ['sources', 'citations']) {
+			const existingReferences = existingMessage?.[key];
+			const nextReferences = nextMessage?.[key];
+			if (
+				(existingReferences && typeof existingReferences === 'object') ||
+				(nextReferences && typeof nextReferences === 'object')
+			) {
+				const references = mergeMessageSources(existingReferences ?? [], nextReferences ?? []);
+				if (references.length > 0) {
+					merged[key] = references;
+				}
+			}
+		}
+
+		return merged;
 	};
 
 	const hasBlockingAssistantResponse = (historyData: any): boolean => {
@@ -2295,7 +2379,9 @@
 						message.code_executions = message.code_executions;
 					} else {
 						// Regular source.
-						const incomingSources = Array.isArray(data) ? data : [data];
+						const sourceLikeItems = getSourceLikeItems(data);
+						const incomingSources =
+							sourceLikeItems.length > 0 ? sourceLikeItems : Array.isArray(data) ? data : [data];
 						message.sources = mergeMessageSources(message?.sources ?? [], incomingSources);
 					}
 				} else if (type === 'notification') {
@@ -3484,7 +3570,8 @@
 				info: m.info ? m.info : undefined,
 				timestamp: m.timestamp,
 				...(m.usage ? { usage: m.usage } : {}),
-				...(m.sources ? { sources: m.sources } : {})
+				...(m.sources ? { sources: m.sources } : {}),
+				...(m.citations ? { citations: m.citations } : {})
 			})),
 			filter_ids:
 				requestContext.selectedFilterIds.length > 0
@@ -3553,7 +3640,8 @@
 				content: m.content,
 				info: m.info ? m.info : undefined,
 				timestamp: m.timestamp,
-				...(m.sources ? { sources: m.sources } : {})
+				...(m.sources ? { sources: m.sources } : {}),
+				...(m.citations ? { citations: m.citations } : {})
 			})),
 			...(event ? { event: event } : {}),
 			model_item: $models.find((m) => m.id === modelId),
@@ -3728,7 +3816,7 @@
 	};
 
 	const chatCompletionEventHandler = async (data: any, message: any, chatId: string) => {
-		const { id, done, choices, content, output, sources, selected_model_id, error, usage, metadata } =
+		const { id, done, choices, content, output, selected_model_id, error, usage, metadata } =
 			data;
 		const hasContent = Object.prototype.hasOwnProperty.call(data ?? {}, 'content');
 		let hasVisibleResponseUpdate = false;
@@ -3756,8 +3844,8 @@
 			await handleOpenAIError(error, message);
 		}
 
-		if (sources) {
-			const incomingSources = Array.isArray(sources) ? sources : [sources];
+		const incomingSources = getSourceLikeItems(data);
+		if (incomingSources.length > 0) {
 			message.sources = mergeMessageSources(message?.sources ?? [], incomingSources);
 		}
 
