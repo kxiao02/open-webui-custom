@@ -713,7 +713,7 @@
 																		{#if todo.status === 'completed'}
 																			<CheckCircle className="size-4 text-emerald-500" />
 																		{:else if todo.status === 'in_progress'}
-																			<span class="mt-1 inline-flex size-2 rounded-full bg-amber-500 animate-pulse"></span>
+																			<span class="mt-1 inline-flex size-2 rounded-full bg-amber-500 {isExecuting ? 'animate-pulse' : ''}"></span>
 																		{:else}
 																			<span class="mt-1 inline-flex size-2 rounded-full bg-gray-400 dark:bg-gray-500"></span>
 																		{/if}

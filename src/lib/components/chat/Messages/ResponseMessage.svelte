@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
 	import dayjs from 'dayjs';
+	import { decode } from 'html-entities';
 	import { goto } from '$app/navigation';
 	import { createEventDispatcher, onDestroy } from 'svelte';
 	import { onMount, tick, getContext } from 'svelte';
@@ -83,16 +84,13 @@
 	import Image from '$lib/components/common/Image.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import RateComment from './RateComment.svelte';
-	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Switch from '$lib/components/common/Switch.svelte';
 	import WebSearchResults from './ResponseMessage/WebSearchResults.svelte';
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
 	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
-	import ChevronUp from '$lib/components/icons/ChevronUp.svelte';
 	import Document from '$lib/components/icons/Document.svelte';
-	import WrenchSolid from '$lib/components/icons/WrenchSolid.svelte';
 
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
@@ -104,12 +102,11 @@
 	import ContentRenderer from './ContentRenderer.svelte';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
 	import FollowUps from './ResponseMessage/FollowUps.svelte';
-	import StatusHistory from './ResponseMessage/StatusHistory.svelte';
+	import WorkflowTimeline from './ResponseMessage/WorkflowTimeline.svelte';
 	import { fade } from 'svelte/transition';
 	import RegenerateMenu from './ResponseMessage/RegenerateMenu.svelte';
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import AccessControl from '$lib/components/workspace/common/AccessControl.svelte';
-	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
 	import { isHiddenHelperToolCall, normalizeToolId } from '$lib/utils/tool-display';
 
 	type MessageStatus = {
@@ -497,6 +494,7 @@
 	let statusUpdatesEnabled = true;
 	let normalizedStatusHistory: MessageStatus[] = [];
 	let hasVisibleStatusHistory = false;
+	let hasWorkflowTimeline = false;
 	let retrievalMetadata: Record<string, any> | null = null;
 	let renderableSources: any[] = [];
 	let generatedFilesKey = '';
@@ -1140,15 +1138,37 @@
 	const REASONING_OPEN_BLOCK_REGEX = /<details\b[^>]*\btype="reasoning"[^>]*>/gi;
 	const REASONING_SUMMARY_REGEX = /<summary>[\s\S]*?<\/summary>/i;
 	const REASONING_CLOSE_TAG = '</details>';
+	const RAW_TOOL_CALL_SECTION_REGEX =
+		/<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/g;
+	const RAW_TOOL_CALL_TOKEN_REGEX =
+		/<\|(?:tool_calls_section|tool_call|tool_call_argument)_(?:begin|end)\|>/g;
+	const STANDALONE_RAW_TOOL_CALL_LINE_REGEX =
+		/(^|\n)\s*(?:functions\.)?[\w.-]+\s*:\s*\d+\s*(?:\{[\s\S]*?\})?\s*(?=\n|$)/g;
 
 	type ProcessToolCallItem = { key: string; attrs: Record<string, string> };
 	type ProcessToolVisualTiming = { firstSeenAt: number };
+	type ProcessReasoningItem = {
+		key: string;
+		text: string;
+		done: boolean;
+		duration?: number;
+	};
 
 	const MIN_PROCESS_RUNNING_MS = 450;
 	const processToolVisualTimingByKeyByMessageId = new Map<
 		string,
 		Map<string, ProcessToolVisualTiming>
 	>();
+
+	const stripRawToolCallText = (content: string): string => {
+		if (!content) return '';
+		return content
+			.replace(RAW_TOOL_CALL_SECTION_REGEX, '')
+			.replace(RAW_TOOL_CALL_TOKEN_REGEX, '')
+			.replace(STANDALONE_RAW_TOOL_CALL_LINE_REGEX, '$1')
+			.replace(/\n{3,}/g, '\n\n')
+			.trim();
+	};
 
 	const upsertToolCallAttr = (openTag: string, name: string, value: string): string => {
 		const attrRegex = new RegExp(`\\s${name}="[^"]*"`, 'i');
@@ -1432,77 +1452,10 @@
 	const getVisibleAssistantContent = (content: string, output: unknown): string => {
 		const outputMessageText = extractAssistantMessageTextFromOutput(output);
 		if (outputMessageText) return outputMessageText;
-		if (!content) return '';
-		if (!outputHasStructuredAssistantItems(output)) return content;
-		return outputHasAssistantMessageItem(output) ? content : '';
-	};
-
-	const getProcessToolCallStatus = (item: ProcessToolCallItem): string =>
-		resolveToolCallStatus(item.attrs ?? {}, {
-			promoteArtifactRunning: getToolCallArtifactEvidence(item.attrs ?? {})
-		});
-
-	const getProcessToolCallSectionStatus = (items: ProcessToolCallItem[]): string => {
-		if (items.some((item) => getProcessToolCallStatus(item) === 'running')) {
-			return 'running';
-		}
-		if (items.some((item) => getProcessToolCallStatus(item) === 'error')) {
-			return 'error';
-		}
-		if (items.some((item) => getProcessToolCallStatus(item) === 'timeout')) {
-			return 'timeout';
-		}
-		return items.length > 0 ? 'success' : '';
-	};
-
-	const getProcessToolCallSectionSummary = (items: ProcessToolCallItem[]): string => {
-		const count = items.length;
-		if (!count) return '';
-
-		const status = getProcessToolCallSectionStatus(items);
-		if (status === 'running') {
-			return `${count} 个工具执行中`;
-		}
-		if (status === 'error') {
-			return `${count} 个工具，包含失败`;
-		}
-		if (status === 'timeout') {
-			return `${count} 个工具，包含超时`;
-		}
-		return `${count} 个工具已完成`;
-	};
-
-	const getProcessToolCallSectionBadgeClass = (status: string): string => {
-		if (status === 'success') {
-			return 'border-emerald-200 bg-emerald-100 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-300';
-		}
-		if (status === 'error') {
-			return 'border-rose-200 bg-rose-100 text-rose-700 dark:border-rose-900 dark:bg-rose-950/60 dark:text-rose-300';
-		}
-		if (status === 'timeout') {
-			return 'border-amber-200 bg-amber-100 text-amber-700 dark:border-amber-900 dark:bg-amber-950/60 dark:text-amber-300';
-		}
-		return 'border-blue-200 bg-blue-100 text-blue-700 dark:border-blue-900 dark:bg-blue-950/60 dark:text-blue-300';
-	};
-
-	const getProcessToolCallSectionBadgeLabel = (status: string): string => {
-		if (status === 'success') return '已完成';
-		if (status === 'error') return '失败';
-		if (status === 'timeout') return '超时';
-		return '执行中';
-	};
-
-	const getProcessToolCallTimelineDotClass = (status: string): string => {
-		if (status === 'success') {
-			return 'bg-emerald-500 ring-emerald-100 dark:bg-emerald-400 dark:ring-emerald-950/80';
-		}
-		if (status === 'error') {
-			return 'bg-rose-500 ring-rose-100 dark:bg-rose-400 dark:ring-rose-950/80';
-		}
-		if (status === 'timeout') {
-			return 'bg-amber-500 ring-amber-100 dark:bg-amber-400 dark:ring-amber-950/80';
-		}
-		return 'bg-blue-500 ring-blue-100 dark:bg-blue-400 dark:ring-blue-950/80';
+		const cleanedContent = stripRawToolCallText(content);
+		if (!cleanedContent) return '';
+		if (!outputHasStructuredAssistantItems(output)) return cleanedContent;
+		return outputHasAssistantMessageItem(output) ? cleanedContent : '';
 	};
 
 	const mergeToolCallAttrs = (
@@ -1522,6 +1475,18 @@
 		items: ProcessToolCallItem[]
 	): ProcessToolCallItem[] =>
 		items.filter((item) => !isHiddenProcessToolCallAttrs(item.attrs ?? {}));
+
+	const isTaskProcessToolCallAttrs = (attrs: Record<string, string>): boolean => {
+		const toolName = String(attrs.tool_id || attrs.tool_name || attrs.name || '').trim();
+		return normalizeToolId(toolName) === 'write_todos';
+	};
+
+	const splitTaskAndToolCallItems = (
+		items: ProcessToolCallItem[]
+	): { taskItems: ProcessToolCallItem[]; toolItems: ProcessToolCallItem[] } => ({
+		taskItems: items.filter((item) => isTaskProcessToolCallAttrs(item.attrs ?? {})),
+		toolItems: items.filter((item) => !isTaskProcessToolCallAttrs(item.attrs ?? {}))
+	});
 
 	const mergeProcessToolCalls = (
 		contentItems: ProcessToolCallItem[],
@@ -1779,10 +1744,10 @@
 			const record = item as Record<string, unknown>;
 			if (record.type !== 'message' || record.role !== 'assistant') continue;
 
-			const contentText = extractOutputTextParts(record.content);
+			const contentText = stripRawToolCallText(extractOutputTextParts(record.content));
 			if (contentText.trim()) return contentText.trim();
 
-			const summaryText = extractOutputTextParts(record.summary);
+			const summaryText = stripRawToolCallText(extractOutputTextParts(record.summary));
 			if (summaryText.trim()) return summaryText.trim();
 		}
 
@@ -1792,7 +1757,11 @@
 	const serializeReasoningOutputForDisplay = (value: unknown): string => {
 		if (!Array.isArray(value)) return '';
 
-		const blocks: string[] = [];
+		const reasoningTexts: string[] = [];
+		const seenReasoningTexts = new Set<string>();
+		let totalDuration = 0;
+		let hasDuration = false;
+		let hasActiveReasoning = false;
 
 		value.forEach((entry, index) => {
 			if (!entry || typeof entry !== 'object') return;
@@ -1807,16 +1776,26 @@
 			const duration = typeof item.duration === 'number' ? item.duration : undefined;
 			const status = typeof item.status === 'string' ? item.status : '';
 			const isLastItem = index === value.length - 1;
+			const isDone = status === 'completed' || duration !== undefined || !isLastItem;
+			const normalizedReasoningText = reasoningText.replace(/\s+/g, ' ').trim();
 
-			if (status === 'completed' || duration !== undefined || !isLastItem) {
-				blocks.push(serializeReasoningTextBlock(reasoningText, { done: true, duration }));
-				return;
+			if (!seenReasoningTexts.has(normalizedReasoningText)) {
+				seenReasoningTexts.add(normalizedReasoningText);
+				reasoningTexts.push(reasoningText);
 			}
-
-			blocks.push(serializeReasoningTextBlock(reasoningText, { done: false }));
+			if (duration !== undefined) {
+				hasDuration = true;
+				totalDuration += duration;
+			}
+			if (!isDone) hasActiveReasoning = true;
 		});
 
-		return blocks.join('\n\n').trim();
+		if (reasoningTexts.length === 0) return '';
+
+		return serializeReasoningTextBlock(reasoningTexts.join('\n\n'), {
+			done: !hasActiveReasoning,
+			duration: hasDuration ? totalDuration : undefined
+		});
 	};
 
 	const extractCompletedReasoningBlocks = (content: string): string[] => {
@@ -1831,6 +1810,54 @@
 		return Array.from(markup.matchAll(REASONING_BLOCK_REGEX))
 			.map((match) => (match[0] || '').trim())
 			.filter(Boolean);
+	};
+
+	const getStructuredBlockAttr = (block: string, name: string): string => {
+		const openTag = block.match(/^<details\b[^>]*>/i)?.[0] ?? '';
+		const match = openTag.match(new RegExp(`\\s${name}="([^"]*)"`, 'i'));
+		return match?.[1] ?? '';
+	};
+
+	const getReasoningTextFromBlock = (block: string): string =>
+		decode(
+			block
+				.replace(/^<details\b[^>]*>/i, '')
+				.replace(REASONING_SUMMARY_REGEX, '')
+				.replace(/<\/details>\s*$/i, '')
+				.replace(/<\/?[^>]+>/g, ' ')
+		)
+			.replace(/^\s*>\s?/gm, '')
+			.replace(/\n{3,}/g, '\n\n')
+			.trim();
+
+	const extractReasoningItemsFromMarkup = (markup: string): ProcessReasoningItem[] => {
+		const items: ProcessReasoningItem[] = [];
+
+		for (const [index, block] of extractReasoningBlocksFromMarkup(markup).entries()) {
+			const text = getReasoningTextFromBlock(block);
+			if (!text) continue;
+
+			const durationValue = Number(getStructuredBlockAttr(block, 'duration'));
+			const item: ProcessReasoningItem = {
+				key: `${index}:${buildStringSignature(text)}`,
+				text,
+				done: getStructuredBlockAttr(block, 'done').toLowerCase() !== 'false'
+			};
+			if (Number.isFinite(durationValue)) {
+				item.duration = durationValue;
+			}
+			items.push(item);
+		}
+
+		return items;
+	};
+
+	const stripReasoningBlocksFromContent = (content: string): string => {
+		if (!content || !content.includes('type="reasoning"')) return content;
+		return stripActiveReasoningBlock(content)
+			.replace(REASONING_BLOCK_REGEX, '')
+			.replace(/\n{3,}/g, '\n\n')
+			.trim();
 	};
 
 	const dedupeStructuredBlocks = (blocks: string[]): string[] => {
@@ -1853,11 +1880,9 @@
 						done: false
 					})
 				: '';
-		const reasoningBlocks = dedupeStructuredBlocks([
-			...outputBlocks,
-			...completedContentBlocks,
-			activeContentBlock
-		]);
+		const reasoningBlocks = dedupeStructuredBlocks(
+			outputBlocks.length > 0 ? outputBlocks : [...completedContentBlocks, activeContentBlock]
+		);
 		const reasoningMarkup = reasoningBlocks.join('\n\n').trim();
 		if (!reasoningMarkup) return normalizedContent;
 
@@ -1890,7 +1915,9 @@
 		output: unknown,
 		generatedFiles: GeneratedFileItem[]
 	): {
+		processTaskItems: ProcessToolCallItem[];
 		processToolCallItems: ProcessToolCallItem[];
+		processReasoningItems: ProcessReasoningItem[];
 		finalMessageContent: string;
 		finalContentBeforeGeneratedFiles: string;
 		finalContentAfterGeneratedFiles: string;
@@ -1910,12 +1937,16 @@
 		const mergedProcessToolCallItems = filterHiddenProcessToolCalls(
 			mergeProcessToolCalls(legacyProcessToolCallItems, structuredProcessToolCallItems)
 		);
+		const { taskItems, toolItems } = splitTaskAndToolCallItems(mergedProcessToolCallItems);
+		const reasoningItems = extractReasoningItemsFromMarkup(legacyCompatibleContent);
 
 		const cleanedFinal = normalizeLeakedFormatting(
-			stripDownloadSection(final, generatedFiles)
+			stripDownloadSection(stripReasoningBlocksFromContent(final), generatedFiles)
 		);
 		const renderState = {
-			processToolCallItems: mergedProcessToolCallItems,
+			processTaskItems: taskItems,
+			processToolCallItems: toolItems,
+			processReasoningItems: reasoningItems,
 			finalMessageContent: cleanedFinal,
 			finalContentBeforeGeneratedFiles: '',
 			finalContentAfterGeneratedFiles: '',
@@ -1935,16 +1966,21 @@
 		};
 	};
 
+	let processTaskItems: ProcessToolCallItem[] = [];
 	let processToolCallItems: ProcessToolCallItem[] = [];
+	let processReasoningItems: ProcessReasoningItem[] = [];
 	let processStatusTick = 0;
 	let processStatusTimer: ReturnType<typeof setTimeout> | null = null;
 	let finalMessageContent = '';
 	let finalContentBeforeGeneratedFiles = '';
 	let finalContentAfterGeneratedFiles = '';
 	let placeInlineGeneratedFiles = false;
-	let toolCallSectionOpen = false;
-	let toolCallSectionStateKey = '';
-	let toolCallSectionUserToggled = false;
+
+	$: hasWorkflowTimeline =
+		hasVisibleStatusHistory ||
+		processReasoningItems.length > 0 ||
+		processTaskItems.length > 0 ||
+		processToolCallItems.length > 0;
 
 	const getLatestReasoningOpenBlock = (content: string): { start: number; end: number } | null => {
 		if (!content || !content.includes('type="reasoning"')) return null;
@@ -2049,7 +2085,10 @@
 
 	const computeParsedContent = (rawContent: string, output: unknown) => {
 		const renderState = resolveAssistantRenderState(rawContent, output, generatedFiles);
-		const mergedProcessToolCallItems = renderState.processToolCallItems;
+		const mergedProcessToolCallItems = [
+			...renderState.processTaskItems,
+			...renderState.processToolCallItems
+		];
 
 		const timingMap = getProcessTimingMapForMessage(message?.id);
 		const activeProcessKeys = new Set(mergedProcessToolCallItems.map((item) => item.key));
@@ -2059,10 +2098,15 @@
 			}
 		}
 
-		processToolCallItems = mergedProcessToolCallItems.map((item) => ({
+		processTaskItems = renderState.processTaskItems.map((item) => ({
 			...item,
 			attrs: getEffectiveProcessToolCallAttrs(item) ?? item.attrs
 		}));
+		processToolCallItems = renderState.processToolCallItems.map((item) => ({
+			...item,
+			attrs: getEffectiveProcessToolCallAttrs(item) ?? item.attrs
+		}));
+		processReasoningItems = renderState.processReasoningItems;
 
 		finalMessageContent = renderState.finalMessageContent;
 		finalContentBeforeGeneratedFiles = renderState.finalContentBeforeGeneratedFiles;
@@ -2092,27 +2136,6 @@
 			parsedEmbedsKey = embedsKey;
 			parsedProcessStatusTick = processStatusTick;
 			computeParsedContent(rawContent, message?.output);
-		}
-	}
-
-	$: {
-		const nextToolCallStateKey = `${message?.id ?? ''}::${processToolCallItems
-			.map((item) => `${item.key}:${getProcessToolCallStatus(item)}`)
-			.join('|')}`;
-		const messageKeyPrefix = `${message?.id ?? ''}::`;
-		const isNewMessage = !toolCallSectionStateKey.startsWith(messageKeyPrefix);
-		const hasRunningTool = processToolCallItems.some(
-			(item) => getProcessToolCallStatus(item) === 'running'
-		);
-
-		if (nextToolCallStateKey !== toolCallSectionStateKey) {
-			if (isNewMessage) {
-				toolCallSectionOpen = hasRunningTool;
-				toolCallSectionUserToggled = false;
-			} else if (!toolCallSectionUserToggled && hasRunningTool) {
-				toolCallSectionOpen = true;
-			}
-			toolCallSectionStateKey = nextToolCallStateKey;
 		}
 	}
 
@@ -3147,10 +3170,6 @@
 			<div>
 				<div class="chat-{message.role} w-full min-w-full chat-markdown-prose">
 					<div>
-						{#if hasVisibleStatusHistory}
-							<StatusHistory statusHistory={normalizedStatusHistory} />
-						{/if}
-
 						{#if visibleMessageFiles.length > 0}
 							<div
 								class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap"
@@ -3267,90 +3286,22 @@
 							class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
 							id="response-content-container"
 						>
-							{#if processToolCallItems.length > 0}
-								{@const toolCallSectionStatus = getProcessToolCallSectionStatus(
-									processToolCallItems
-								)}
-								<div class="mb-3 w-full overflow-hidden rounded-2xl border border-gray-200/90 bg-gray-50/85 shadow-xs dark:border-gray-800 dark:bg-gray-900/80">
-									<button
-										type="button"
-										class={`flex w-full items-center justify-between px-3 py-2 text-left transition hover:bg-gray-100/80 dark:hover:bg-gray-900 ${
-											toolCallSectionOpen
-												? 'border-b border-gray-200/90 dark:border-gray-800'
-												: ''
-										}`}
-										on:click={() => {
-											toolCallSectionUserToggled = true;
-											toolCallSectionOpen = !toolCallSectionOpen;
-										}}
-									>
-										<div class="min-w-0 flex items-center gap-2.5">
-											<div
-												class="flex size-7 shrink-0 items-center justify-center rounded-full bg-gray-200/70 text-gray-600 dark:bg-gray-800 dark:text-gray-200"
-											>
-												<WrenchSolid className="size-3.5" />
-											</div>
-											<div class="min-w-0">
-												<div class="text-sm font-medium text-gray-800 dark:text-gray-100">
-													工具调用
-												</div>
-												<div class="line-clamp-1 text-xs text-gray-500 dark:text-gray-400">
-													{getProcessToolCallSectionSummary(processToolCallItems)}
-												</div>
-											</div>
-										</div>
-
-										<div class="ml-2 flex shrink-0 items-center gap-2">
-											<div
-												class={`rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${getProcessToolCallSectionBadgeClass(
-													toolCallSectionStatus
-												)}`}
-											>
-												{getProcessToolCallSectionBadgeLabel(toolCallSectionStatus)}
-											</div>
-											{#if toolCallSectionStatus === 'running'}
-												<Spinner className="size-3.5 text-blue-600 dark:text-blue-400" />
-											{/if}
-											<div class="text-gray-500 dark:text-gray-400">
-												{#if toolCallSectionOpen}
-													<ChevronUp className="size-3.5" strokeWidth="3" />
-												{:else}
-													<ChevronDown className="size-3.5" strokeWidth="3" />
-												{/if}
-											</div>
-										</div>
-									</button>
-
-									{#if toolCallSectionOpen}
-										<div class="relative px-3 py-3">
-											<div
-												class="pointer-events-none absolute bottom-4 left-[1.05rem] top-4 w-px bg-gray-200 dark:bg-gray-800"
-											></div>
-											<div class="space-y-2.5">
-												{#each processToolCallItems as item (item.key)}
-													{@const itemStatus = getProcessToolCallStatus(item)}
-													<div class="relative pl-6">
-														<div
-															class={`absolute left-0 top-4 size-2.5 rounded-full ring-4 ${getProcessToolCallTimelineDotClass(
-																itemStatus
-															)}`}
-														></div>
-														<ToolCallDisplay
-															id={`${chatId}-${message.id}-${item.key}`}
-															attributes={item.attrs}
-															disableVisualStatusDelay={true}
-															embedded={true}
-															className="w-full"
-														/>
-													</div>
-												{/each}
-											</div>
-										</div>
-									{/if}
-								</div>
+							{#if hasWorkflowTimeline}
+								<WorkflowTimeline
+									statusHistory={normalizedStatusHistory}
+									taskItems={processTaskItems}
+									toolItems={processToolCallItems}
+									reasoningItems={processReasoningItems}
+									done={message?.done ?? false}
+									finalResponseVisible={Boolean(
+										finalMessageContent ||
+											finalContentBeforeGeneratedFiles ||
+											finalContentAfterGeneratedFiles
+									)}
+								/>
 							{/if}
 
-							{#if finalMessageContent === '' && processToolCallItems.length === 0 && visibleMessageFiles.length === 0 && visibleMessageEmbeds.length === 0 && !message.error && !hasVisibleStatusHistory && message.done !== true}
+							{#if finalMessageContent === '' && !hasWorkflowTimeline && visibleMessageFiles.length === 0 && visibleMessageEmbeds.length === 0 && !message.error && message.done !== true}
 								<Skeleton />
 							{:else if finalMessageContent && message.error !== true}
 								<!-- always show message contents even if there's an error -->
@@ -3363,7 +3314,7 @@
 											{history}
 											{selectedModels}
 											content={finalContentBeforeGeneratedFiles}
-											sources={message.sources}
+											sources={renderableSources}
 											floatingButtons={false}
 											save={!readOnly}
 											preview={!readOnly}
@@ -3402,7 +3353,7 @@
 										{history}
 										{selectedModels}
 										content={finalMessageContent}
-										sources={message.sources}
+										sources={renderableSources}
 										floatingButtons={message?.done &&
 											!readOnly &&
 											($settings?.showFloatingActionButtons ?? true)}
@@ -3538,7 +3489,7 @@
 										{history}
 										{selectedModels}
 										content={finalContentAfterGeneratedFiles}
-										sources={message.sources}
+										sources={renderableSources}
 										floatingButtons={message?.done &&
 											!readOnly &&
 											($settings?.showFloatingActionButtons ?? true)}

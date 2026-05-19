@@ -25,7 +25,6 @@
 	import ItemMenu from './Knowledge/ItemMenu.svelte';
 	import Badge from '../common/Badge.svelte';
 	import Search from '../icons/Search.svelte';
-	import Plus from '../icons/Plus.svelte';
 	import Spinner from '../common/Spinner.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
 	import XMark from '../icons/XMark.svelte';
@@ -71,7 +70,6 @@
 		title: '知识库',
 		settings: '设置',
 		refreshStatus: '刷新状态',
-		newKnowledge: '新建知识库',
 		knowledgeSettings: '知识库设置',
 		searchKnowledge: '搜索知识库',
 		viewPlaceholder: '查看范围',
@@ -301,6 +299,7 @@
 										: 'text-gray-600 hover:bg-white hover:text-gray-900 dark:text-gray-300 dark:hover:bg-gray-800 dark:hover:text-gray-100'
 								}`}
 								type="button"
+								aria-label={kbText.settings}
 								on:click={() => {
 									showKnowledgeSettings = !showKnowledgeSettings;
 								}}
@@ -315,6 +314,7 @@
 						<button
 							class="inline-flex items-center gap-1.5 rounded-xl border border-gray-100/40 bg-white/55 px-3 py-1.5 text-xs font-medium text-gray-600 shadow-none transition hover:border-gray-100/60 hover:bg-white/80 hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-850/25 dark:bg-transparent dark:text-gray-200 dark:hover:border-gray-800/40 dark:hover:bg-gray-900/35 dark:hover:text-gray-100"
 							type="button"
+							aria-label={kbText.refreshStatus}
 							disabled={knowflowStatusLoading}
 							on:click={() => {
 								refreshKnowflowStatusFromToolbar();
@@ -326,16 +326,6 @@
 							/>
 							<div class="hidden md:block">{kbText.refreshStatus}</div>
 						</button>
-					{/if}
-
-					{#if !knowflowReadOnly}
-						<a
-							class="inline-flex items-center rounded-2xl bg-gray-900 px-3 py-2 text-xs font-semibold text-white shadow-xs transition hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
-							href="/workspace/knowledge/create"
-						>
-							<Plus className="size-3.5" strokeWidth="2.5" />
-							<div class="hidden md:block md:ml-1">{kbText.newKnowledge}</div>
-						</a>
 					{/if}
 				</div>
 			</div>
