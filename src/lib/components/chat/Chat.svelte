@@ -49,7 +49,8 @@
 		selectedGeneratedFilePreviewId,
 		selectedTerminalId,
 		showFileNavPath,
-		showFileNavDir
+		showFileNavDir,
+		activeChatIds
 	} from '$lib/stores';
 
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
@@ -1271,6 +1272,24 @@
 			.map((id) => (typeof id === 'string' ? id.trim() : ''))
 			.filter((id) => id !== '' && id !== 'null' && id !== 'undefined');
 
+	const setActiveChatIndicator = (
+		targetChatId: string | null | undefined,
+		isActive: boolean
+	) => {
+		const normalizedChatId = typeof targetChatId === 'string' ? targetChatId.trim() : '';
+		if (!normalizedChatId || normalizedChatId.startsWith('local:')) return;
+
+		activeChatIds.update((ids) => {
+			const nextIds = new Set(ids);
+			if (isActive) {
+				nextIds.add(normalizedChatId);
+			} else {
+				nextIds.delete(normalizedChatId);
+			}
+			return nextIds;
+		});
+	};
+
 	const resolveActiveTaskIds = async (requestedChatId: string | null | undefined) => {
 		let activeTaskIds = normalizeTaskIds(taskIds);
 		if (activeTaskIds.length > 0) {
@@ -1702,6 +1721,7 @@
 		if (!taskRes) return;
 		const nextTaskIds = normalizeTaskIds(taskRes?.task_ids);
 		taskIds = nextTaskIds;
+		setActiveChatIndicator($chatId, nextTaskIds.length > 0);
 
 		if ((nextTaskIds?.length ?? 0) > 0) {
 			markHistoryForRecoveredActiveTasks(history);
@@ -1735,6 +1755,7 @@
 
 	const applyTaskIdsToHistory = (nextTaskIds: string[]) => {
 		taskIds = nextTaskIds;
+		setActiveChatIndicator($chatId, (nextTaskIds?.length ?? 0) > 0);
 
 		if ((nextTaskIds?.length ?? 0) > 0) {
 			markHistoryForRecoveredActiveTasks(history);
@@ -2159,6 +2180,7 @@
 					chatCompletionEventHandler(data, message, event.chat_id);
 				} else if (type === 'chat:tasks:cancel') {
 					taskIds = null;
+					setActiveChatIndicator(event.chat_id, false);
 					pendingChatCompletion = null;
 					const targetMessageId =
 						event?.message_id && history.messages[event.message_id]
@@ -2192,6 +2214,7 @@
 						}
 
 						taskIds = null;
+						setActiveChatIndicator(event.chat_id, false);
 						if (await flushPendingChatCompletion(event.chat_id, activeTaskIds)) {
 							return;
 						}
@@ -3510,6 +3533,7 @@
 		}
 
 		taskIds = null;
+		setActiveChatIndicator(_chatId, false);
 		responseRequestContexts.delete(responseMessageId);
 
 		// Drain the next compatible queue batch so per-message request toggles stay intact.
@@ -4606,6 +4630,7 @@
 					} else {
 						taskIds = [newTaskId];
 					}
+					setActiveChatIndicator(_chatId, true);
 				}
 			}
 		}
@@ -4678,6 +4703,7 @@
 				)
 			);
 			taskIds = null;
+			setActiveChatIndicator($chatId, false);
 		}
 		pendingChatCompletion = null;
 
