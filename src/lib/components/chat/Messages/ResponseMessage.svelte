@@ -3664,10 +3664,7 @@
 								</div>
 							{/if}
 
-							<SourceContextNotice
-								metadata={retrievalMetadata}
-								hasRenderableSources={renderableSources.length > 0}
-							/>
+							<SourceContextNotice metadata={retrievalMetadata} />
 
 							{#if renderableSources.length > 0 && (model?.info?.meta?.capabilities?.citations ?? true)}
 								<Citations

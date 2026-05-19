@@ -29,7 +29,6 @@
 	};
 
 	export let metadata: RetrievalMetadata | null | undefined = null;
-	export let hasRenderableSources = false;
 
 	const MAX_SOURCE_NAMES = 2;
 	const MAX_DIAGNOSTICS = 3;
@@ -75,14 +74,14 @@
 		if (state === 'ambiguous') return '来源不明确';
 		if (state === 'single') return names[0] ? `当前来源：${names[0]}` : '当前来源：1 个来源';
 		if (state === 'multi') return `当前来源：${names.length || '多个'} 个来源`;
-		return '未限定来源';
+		return '';
 	};
 
 	const getScopeHint = (state: 'none' | 'single' | 'multi' | 'ambiguous', names: string[]) => {
 		if (state === 'ambiguous') return '需要明确要使用的文件或来源';
 		if (state === 'multi') return names.slice(0, MAX_SOURCE_NAMES).join('、');
 		if (state === 'single') return names[0] ?? '';
-		return hasRenderableSources ? '有可展示的引用来源' : '没有可展示的引用来源';
+		return '';
 	};
 
 	const getScopeClass = (state: 'none' | 'single' | 'multi' | 'ambiguous') => {
@@ -151,29 +150,27 @@
 	$: scopeLabel = getScopeLabel(sourceState, sourceNames);
 	$: scopeHint = getScopeHint(sourceState, sourceNames);
 	$: scopeClass = getScopeClass(sourceState);
-	$: hasCanonicalReferences =
-		Array.isArray(metadata?.canonical_references) && metadata.canonical_references.length > 0;
-	$: showScope =
-		Boolean(metadata?.active_source_scope) ||
-		uniqueDiagnostics.length > 0 ||
-		hasCanonicalReferences;
 	$: visibleDiagnostics = uniqueDiagnostics.slice(0, MAX_DIAGNOSTICS);
+	$: showSourceScope = Boolean(metadata?.active_source_scope) && sourceState !== 'none';
+	$: showScope = showSourceScope || visibleDiagnostics.length > 0;
 </script>
 
 {#if showScope}
 	<div class="mb-2 flex w-full flex-col gap-1.5 text-xs">
-		<div class="flex flex-wrap items-center gap-1.5">
-			<div
-				class={`inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 ${scopeClass}`}
-				title={sourceNames.join('、')}
-			>
-				<span class="size-1.5 shrink-0 rounded-full bg-current opacity-70"></span>
-				<span class="truncate font-medium">{scopeLabel}</span>
+		{#if showSourceScope}
+			<div class="flex flex-wrap items-center gap-1.5">
+				<div
+					class={`inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 ${scopeClass}`}
+					title={sourceNames.join('、')}
+				>
+					<span class="size-1.5 shrink-0 rounded-full bg-current opacity-70"></span>
+					<span class="truncate font-medium">{scopeLabel}</span>
+				</div>
+				{#if scopeHint}
+					<div class="min-w-0 flex-1 truncate text-gray-500 dark:text-gray-400">{scopeHint}</div>
+				{/if}
 			</div>
-			{#if scopeHint}
-				<div class="min-w-0 flex-1 truncate text-gray-500 dark:text-gray-400">{scopeHint}</div>
-			{/if}
-		</div>
+		{/if}
 
 		{#if visibleDiagnostics.length > 0}
 			<div
