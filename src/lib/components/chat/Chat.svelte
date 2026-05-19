@@ -3703,8 +3703,9 @@
 		}
 	};
 
-	const chatCompletionEventHandler = async (data, message, chatId) => {
-		const { id, done, choices, content, output, sources, selected_model_id, error, usage } = data;
+	const chatCompletionEventHandler = async (data: any, message: any, chatId: string) => {
+		const { id, done, choices, content, output, sources, selected_model_id, error, usage, metadata } =
+			data;
 		const hasContent = Object.prototype.hasOwnProperty.call(data ?? {}, 'content');
 		let hasVisibleResponseUpdate = false;
 		const completionFiles = collectGeneratedFilesFromCompletionData(data);
@@ -3734,6 +3735,15 @@
 		if (sources) {
 			const incomingSources = Array.isArray(sources) ? sources : [sources];
 			message.sources = mergeMessageSources(message?.sources ?? [], incomingSources);
+		}
+
+		const completionMetadata = metadata ?? choices?.[0]?.message?.metadata;
+		if (completionMetadata && typeof completionMetadata === 'object') {
+			message.metadata = {
+				...(message.metadata ?? {}),
+				...completionMetadata
+			};
+			hasVisibleResponseUpdate = true;
 		}
 
 		if (choices) {

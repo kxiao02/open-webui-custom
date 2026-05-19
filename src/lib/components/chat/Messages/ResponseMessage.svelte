@@ -99,6 +99,7 @@
 
 	import Error from './Error.svelte';
 	import Citations from './Citations.svelte';
+	import SourceContextNotice from './SourceContextNotice.svelte';
 	import CodeExecutions from './CodeExecutions.svelte';
 	import ContentRenderer from './ContentRenderer.svelte';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
@@ -115,6 +116,7 @@
 		done?: boolean;
 		action?: string;
 		description?: string;
+		status?: string;
 		hidden?: boolean;
 		urls?: string[];
 		items?: unknown[];
@@ -134,7 +136,9 @@
 		status?: MessageStatus;
 		done: boolean;
 		error?: boolean | { content: string };
-		sources?: string[];
+		sources?: any[];
+		citations?: any[];
+		metadata?: Record<string, any>;
 		code_executions?: {
 			uuid: string;
 			name: string;
@@ -313,6 +317,7 @@
 		const annotation = source.annotation ?? {};
 		const outputSignature = buildOutputSignature((source as any).output);
 		const filesSignature = buildMessageFileSignature((source as any).files);
+		const metadataSignature = buildStructuredSignature((source as any).metadata);
 		const followUpsLength = Array.isArray((source as any).followUps)
 			? (source as any).followUps.length
 			: 0;
@@ -332,6 +337,7 @@
 			statusHistorySignature,
 			outputSignature,
 			filesSignature,
+			metadataSignature,
 			followUpsLength,
 			sourcesLength,
 			codeExecutionsLength,
@@ -392,6 +398,40 @@
 		return true;
 	};
 
+	const hasUsableDocument = (source: any): boolean =>
+		Array.isArray(source?.document) &&
+		source.document.some((item: unknown) => {
+			if (typeof item === 'string') return item.trim().length > 0;
+			return item !== null && item !== undefined;
+		});
+
+	const isDiagnosticOnlyReference = (source: any): boolean => {
+		if (!source || typeof source !== 'object') return true;
+		const hasDiagnostics =
+			Array.isArray(source?.retrieval_diagnostics) ||
+			Array.isArray(source?.metadata?.retrieval_diagnostics);
+		return !hasUsableDocument(source) && hasDiagnostics;
+	};
+
+	const getRetrievalMetadata = (source: MessageType | null | undefined): Record<string, any> | null => {
+		const metadata = source?.metadata;
+		return metadata && typeof metadata === 'object' ? metadata : null;
+	};
+
+	const getRenderableSources = (source: MessageType | null | undefined): any[] => {
+		const metadata = getRetrievalMetadata(source);
+		const primarySources = Array.isArray(source?.sources)
+			? source.sources
+			: Array.isArray(source?.citations)
+				? source.citations
+				: [];
+		const canonicalReferences = Array.isArray(metadata?.canonical_references)
+			? metadata.canonical_references
+			: [];
+		const candidates = primarySources.length > 0 ? primarySources : canonicalReferences;
+		return candidates.filter((item) => !isDiagnosticOnlyReference(item));
+	};
+
 	export let siblings;
 
 	export let setInputText: Function = () => {};
@@ -417,13 +457,13 @@
 	export let editCodeBlock = true;
 	export let topPadding = false;
 
-	let citationsElement: HTMLDivElement;
+	let citationsElement: any;
 
 	let contentContainerElement: HTMLDivElement;
 	let buttonsContainerElement: HTMLDivElement;
 	let showDeleteConfirm = false;
 
-	let model = null;
+	let model: any = null;
 	$: {
 		const modelId = message?.model;
 		model = $models.find((m) => m.id === modelId);
@@ -452,6 +492,8 @@
 	let statusUpdatesEnabled = true;
 	let normalizedStatusHistory: MessageStatus[] = [];
 	let hasVisibleStatusHistory = false;
+	let retrievalMetadata: Record<string, any> | null = null;
+	let renderableSources: any[] = [];
 	let generatedFilesKey = '';
 	let generatedFilesListKey = '';
 	let parsedContentKey = '';
@@ -491,6 +533,8 @@
 	$: statusUpdatesEnabled = model?.info?.meta?.capabilities?.status_updates ?? true;
 	$: normalizedStatusHistory = statusUpdatesEnabled ? getNormalizedStatusHistory(message) : [];
 	$: hasVisibleStatusHistory = shouldRenderStatusHistory(normalizedStatusHistory);
+	$: retrievalMetadata = getRetrievalMetadata(message);
+	$: renderableSources = getRenderableSources(message);
 
 	const cloneSkillDraftForEditing = (draft: ParsedSkillDraft) => ({
 		id: draft.id,
@@ -3615,12 +3659,17 @@
 								</div>
 							{/if}
 
-							{#if (message?.sources || message?.citations) && (model?.info?.meta?.capabilities?.citations ?? true)}
+							<SourceContextNotice
+								metadata={retrievalMetadata}
+								hasRenderableSources={renderableSources.length > 0}
+							/>
+
+							{#if renderableSources.length > 0 && (model?.info?.meta?.capabilities?.citations ?? true)}
 								<Citations
 									bind:this={citationsElement}
 									id={message?.id}
 									{chatId}
-									sources={message?.sources ?? message?.citations}
+									sources={renderableSources}
 									{readOnly}
 								/>
 							{/if}

@@ -50,7 +50,7 @@ const TOOL_RESULT_STRING_ERROR_REGEX =
 const TOOL_RESULT_STRING_SUCCESS_REGEX =
 	/(?:["']?status["']?\s*:\s*["'](?:ok|success|succeeded|completed|complete)["']|["']?(?:success|ok)["']?\s*:\s*(?:true|True)|["']?exit_code["']?\s*:\s*0\b)/i;
 const TOOL_RESULT_SUCCESS_STATUSES = new Set(['ok', 'success', 'succeeded', 'completed', 'complete']);
-const TOOL_RESULT_ERROR_STATUSES = new Set(['error', 'failed', 'failure']);
+const TOOL_RESULT_ERROR_STATUSES = new Set(['error', 'failed', 'failure', 'blocked', 'denied']);
 const TOOL_RESULT_TIMEOUT_STATUSES = new Set(['timeout', 'timed_out', 'timed-out']);
 
 const FILE_GENERATING_TOOL_IDS = new Set([
@@ -935,9 +935,17 @@ export const resolveToolCallStatus = (
 		normalizedStatus === 'success' ||
 		normalizedStatus === 'error' ||
 		normalizedStatus === 'timeout';
+	const hasExplicitFailureStatus = TOOL_RESULT_ERROR_STATUSES.has(normalizedStatus);
+	const hasExplicitTimeoutStatus = TOOL_RESULT_TIMEOUT_STATUSES.has(normalizedStatus);
 
 	if (resultStatus && typeof parsedResult !== 'string') {
 		return resultStatus;
+	}
+	if (hasExplicitFailureStatus) {
+		return 'error';
+	}
+	if (hasExplicitTimeoutStatus) {
+		return 'timeout';
 	}
 	if (hasExplicitStatus) {
 		return normalizedStatus as 'running' | 'success' | 'error' | 'timeout';
