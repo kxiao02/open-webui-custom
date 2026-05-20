@@ -94,8 +94,129 @@ log = logging.getLogger(__name__)
 
 DEEPAGENT_RUNTIME_TOOL_SCHEMA_VERSION = 1
 DEEPAGENT_RUNTIME_TOOL_PREFIX = "owu__"
+DEEPAGENT_BUILTIN_RETRIEVAL_TOOL_ID = "builtin:retrieval"
 DEEPAGENT_BUILTIN_SKILLS_TOOL_ID = "builtin:skills"
 DEEPAGENT_RUNTIME_SKILL_IDS_METADATA_KEY = "deepagent_runtime_skill_ids"
+DEEPAGENT_RETRIEVAL_MAX_SOURCES = 6
+DEEPAGENT_RETRIEVAL_MAX_CHUNKS = 10
+DEEPAGENT_RETRIEVAL_MAX_CHARS_PER_CHUNK = 900
+DEEPAGENT_RETRIEVAL_MAX_TOTAL_CHARS = 6000
+DEEPAGENT_READ_MAX_CHARS_PER_CHUNK = 1200
+DEEPAGENT_READ_MAX_TOTAL_CHARS = 8000
+
+
+def _selected_retrieval_normalized_text(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
+def _selected_retrieval_ascii_terms(query: str) -> list[str]:
+    terms: list[str] = []
+    for term in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", query or ""):
+        normalized = term.strip().lower()
+        if normalized and normalized not in terms:
+            terms.append(normalized)
+    return terms
+
+
+def _selected_retrieval_cjk_phrases(query: str) -> list[str]:
+    phrases: list[str] = []
+    for phrase in re.findall(r"[\u4e00-\u9fff]{4,}", query or ""):
+        normalized = phrase.strip()
+        if normalized and normalized not in phrases:
+            phrases.append(normalized)
+    return phrases
+
+
+def _selected_retrieval_phrase_matches(phrase: str, text: str) -> bool:
+    if not phrase:
+        return False
+    if phrase in text:
+        return True
+    bigrams = {phrase[index : index + 2] for index in range(len(phrase) - 1)}
+    if not bigrams:
+        return False
+    matched = sum(1 for bigram in bigrams if bigram in text)
+    if len(phrase) >= 5:
+        edge_bigrams = {phrase[:2], phrase[-2:]}
+        if not any(bigram in text for bigram in edge_bigrams):
+            return False
+    return matched >= min(2, len(bigrams))
+
+
+def _selected_retrieval_chunk_matches_query(query: str, document: Any) -> bool:
+    """Reject obvious low-evidence semantic drift for selected-source tool calls."""
+
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return True
+
+    text = _selected_retrieval_normalized_text(document)
+    if not text:
+        return False
+
+    ascii_terms = _selected_retrieval_ascii_terms(normalized_query)
+    cjk_phrases = _selected_retrieval_cjk_phrases(normalized_query)
+    if not ascii_terms and not cjk_phrases:
+        return True
+
+    if any(term in text for term in ascii_terms):
+        return True
+
+    normalized_cjk_text = re.sub(r"[^\u4e00-\u9fff]", "", text)
+    if any(
+        _selected_retrieval_phrase_matches(phrase, normalized_cjk_text)
+        for phrase in cjk_phrases
+    ):
+        return True
+
+    return False
+
+
+def _filter_selected_retrieval_sources_by_query(
+    sources: list[dict], query: str
+) -> tuple[list[dict], list[dict[str, Any]]]:
+    filtered_sources: list[dict] = []
+    diagnostics: list[dict[str, Any]] = []
+
+    for source_index, source in enumerate(sources or []):
+        if not isinstance(source, dict):
+            diagnostics.append(
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "diagnostics",
+                    "reason": "malformed_candidate",
+                    "outcome": "malformed",
+                    "candidate_index": source_index,
+                }
+            )
+            continue
+
+        documents = source.get("document") if isinstance(source.get("document"), list) else []
+        accepted_indexes = [
+            index
+            for index, document in enumerate(documents)
+            if _selected_retrieval_chunk_matches_query(query, document)
+        ]
+        if not accepted_indexes:
+            diagnostics.append(
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "no_evidence",
+                    "reason": "weak_or_indirect_evidence",
+                    "outcome": "weak_evidence",
+                    "candidate_index": source_index,
+                    "chunk_total": len(documents),
+                }
+            )
+            continue
+
+        filtered = copy.deepcopy(source)
+        for key, value in source.items():
+            if isinstance(value, list) and len(value) == len(documents):
+                filtered[key] = [value[index] for index in accepted_indexes]
+        filtered_sources.append(filtered)
+
+    return filtered_sources, diagnostics
 
 
 BUILTIN_TOOL_CATALOG: tuple[dict[str, Any], ...] = (
@@ -950,6 +1071,459 @@ def compute_deepagent_builtin_skills_revision(skill_ids: list[str] | None) -> st
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _deepagent_source_identity_values(item: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+
+    def add(value: Any) -> None:
+        normalized = str(value or "").strip()
+        if normalized:
+            values.add(normalized)
+
+    for key in (
+        "id",
+        "file_id",
+        "fileId",
+        "document_id",
+        "documentId",
+        "collection_name",
+        "knowledge_id",
+        "name",
+        "filename",
+        "title",
+    ):
+        add(item.get(key))
+
+    source = item.get("source")
+    if isinstance(source, dict):
+        for key in ("id", "name", "title", "url"):
+            add(source.get(key))
+
+    file_info = item.get("file")
+    if isinstance(file_info, dict):
+        add(file_info.get("id"))
+        add(file_info.get("filename"))
+        add(file_info.get("name"))
+
+    return values
+
+
+def _normalize_deepagent_knowledge_items(items: list[dict] | None) -> list[dict]:
+    normalized_items: list[dict] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("collection_name"):
+            normalized_items.append(
+                {
+                    "id": item.get("collection_name"),
+                    "name": item.get("name") or item.get("collection_name"),
+                    "type": "collection",
+                    "legacy": True,
+                }
+            )
+        elif item.get("collection_names"):
+            normalized_items.append(
+                {
+                    "name": item.get("name"),
+                    "type": "collection",
+                    "collection_names": item.get("collection_names"),
+                    "legacy": True,
+                }
+            )
+        else:
+            normalized_items.append(copy.deepcopy(item))
+    return normalized_items
+
+
+def _deepagent_selected_source_candidates(
+    *,
+    files: list[dict] | None,
+    knowledge: list[dict] | None,
+    metadata: dict | None,
+) -> list[dict]:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    candidates: list[dict] = []
+    for item in files or []:
+        if isinstance(item, dict):
+            candidates.append(copy.deepcopy(item))
+    for item in _normalize_deepagent_knowledge_items(knowledge):
+        candidates.append(item)
+    for item in metadata.get("folder_knowledge") or []:
+        if isinstance(item, dict):
+            candidates.append(copy.deepcopy(item))
+    return candidates
+
+
+def _filter_deepagent_sources_by_ids(
+    candidates: list[dict], source_ids: list[str] | None
+) -> list[dict]:
+    requested = {
+        str(source_id or "").strip()
+        for source_id in (source_ids or [])
+        if str(source_id or "").strip()
+    }
+    if not requested:
+        return candidates
+    return [
+        candidate
+        for candidate in candidates
+        if _deepagent_source_identity_values(candidate).intersection(requested)
+    ]
+
+
+def _truncate_deepagent_tool_text(value: Any, max_chars: int) -> tuple[str, bool]:
+    text = str(value or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text, False
+    suffix = "\n[excerpt truncated]"
+    if max_chars <= len(suffix):
+        return text[:max_chars].rstrip(), True
+    excerpt_limit = max_chars - len(suffix)
+    return f"{text[:excerpt_limit].rstrip()}{suffix}", True
+
+
+def _compact_deepagent_reference_sources(
+    sources: list[dict],
+    *,
+    max_sources: int = DEEPAGENT_RETRIEVAL_MAX_SOURCES,
+    max_chunks: int = DEEPAGENT_RETRIEVAL_MAX_CHUNKS,
+    max_chars_per_chunk: int = DEEPAGENT_RETRIEVAL_MAX_CHARS_PER_CHUNK,
+    max_total_chars: int = DEEPAGENT_RETRIEVAL_MAX_TOTAL_CHARS,
+) -> tuple[list[dict], dict[str, Any]]:
+    compact_sources: list[dict] = []
+    total_chars = 0
+    input_source_count = len([source for source in sources or [] if isinstance(source, dict)])
+    input_chunk_count = 0
+    output_chunk_count = 0
+    truncated = False
+
+    for source in sources or []:
+        if not isinstance(source, dict):
+            continue
+        if len(compact_sources) >= max_sources or output_chunk_count >= max_chunks:
+            truncated = True
+            break
+
+        documents = source.get("document") if isinstance(source.get("document"), list) else []
+        metadatas = source.get("metadata") if isinstance(source.get("metadata"), list) else []
+        distances = source.get("distances") if isinstance(source.get("distances"), list) else []
+        input_chunk_count += len(documents)
+
+        compact_documents: list[str] = []
+        compact_metadatas: list[dict] = []
+        compact_distances: list[Any] = []
+
+        for index, document in enumerate(documents):
+            if output_chunk_count >= max_chunks or total_chars >= max_total_chars:
+                truncated = True
+                break
+
+            remaining_chars = max_total_chars - total_chars
+            chunk_limit = min(max_chars_per_chunk, max(remaining_chars, 0))
+            excerpt, chunk_truncated = _truncate_deepagent_tool_text(
+                document,
+                chunk_limit,
+            )
+            if not excerpt:
+                continue
+            truncated = truncated or chunk_truncated
+            total_chars += len(excerpt)
+            output_chunk_count += 1
+
+            metadata = (
+                copy.deepcopy(metadatas[index])
+                if index < len(metadatas) and isinstance(metadatas[index], dict)
+                else {}
+            )
+            if chunk_truncated:
+                metadata["excerpt_truncated"] = True
+            compact_documents.append(excerpt)
+            compact_metadatas.append(metadata)
+            if index < len(distances):
+                compact_distances.append(distances[index])
+
+        if compact_documents:
+            compact_source = {
+                **copy.deepcopy(source),
+                "document": compact_documents,
+                "metadata": compact_metadatas,
+            }
+            if compact_distances:
+                compact_source["distances"] = compact_distances
+            compact_sources.append(compact_source)
+
+    if input_source_count > len(compact_sources) or input_chunk_count > output_chunk_count:
+        truncated = True
+
+    return compact_sources, {
+        "input_source_count": input_source_count,
+        "input_chunk_count": input_chunk_count,
+        "returned_source_count": len(compact_sources),
+        "returned_chunk_count": output_chunk_count,
+        "returned_char_count": total_chars,
+        "truncated": truncated,
+        "budget": {
+            "max_sources": max_sources,
+            "max_chunks": max_chunks,
+            "max_chars_per_chunk": max_chars_per_chunk,
+            "max_total_chars": max_total_chars,
+        },
+    }
+
+
+def compute_deepagent_builtin_retrieval_revision(
+    files: list[dict] | None = None,
+    knowledge: list[dict] | None = None,
+) -> str:
+    source_signatures = []
+    for item in [*(files or []), *_normalize_deepagent_knowledge_items(knowledge)]:
+        if not isinstance(item, dict):
+            continue
+        source_signatures.append(
+            sorted(_deepagent_source_identity_values(item))
+            or [str(item.get("type") or "source")]
+        )
+    payload = {
+        "tool_id": DEEPAGENT_BUILTIN_RETRIEVAL_TOOL_ID,
+        "functions": ["query_selected_knowledge_files", "read_selected_file"],
+        "sources": source_signatures,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+async def query_selected_knowledge_files(
+    query: str,
+    source_ids: Optional[list[str]] = None,
+    k: int = 5,
+    retrieval_round: int = 1,
+    __request__: Any = None,
+    __files__: Any = None,
+    __knowledge__: Any = None,
+    __metadata__: Any = None,
+    __user_model__: Any = None,
+) -> dict[str, Any]:
+    """Search only the currently selected and authorized files or Knowflow knowledge sources.
+
+    :param query: Focused retrieval query for the unresolved evidence gap.
+    :param source_ids: Optional selected file, document, or KB ids/names to narrow the search.
+    :param k: Maximum chunks per selected source and query.
+    :param retrieval_round: Retrieval round number for provenance.
+    """
+
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return {
+            "status": "malformed",
+            "tool_name": "query_selected_knowledge_files",
+            "code": "missing_query",
+            "message": "A focused query is required.",
+            "retrieval_round": retrieval_round,
+        }
+    if __request__ is None:
+        return {
+            "status": "error",
+            "tool_name": "query_selected_knowledge_files",
+            "code": "runtime_context_unavailable",
+            "message": "Selected-source retrieval runtime context is unavailable.",
+            "query": normalized_query,
+            "retrieval_round": retrieval_round,
+        }
+
+    candidates = _deepagent_selected_source_candidates(
+        files=__files__,
+        knowledge=__knowledge__,
+        metadata=__metadata__,
+    )
+    candidates = _filter_deepagent_sources_by_ids(candidates, source_ids)
+    if not candidates:
+        return {
+            "status": "permission_denied" if source_ids else "no_evidence",
+            "tool_name": "query_selected_knowledge_files",
+            "code": "requested_source_out_of_scope" if source_ids else "no_selected_sources",
+            "query": normalized_query,
+            "retrieval_round": retrieval_round,
+        }
+
+    from open_webui.retrieval.utils import get_sources_from_items
+
+    sources = await get_sources_from_items(
+        request=__request__,
+        items=candidates,
+        queries=[normalized_query],
+        embedding_function=lambda text, prefix: __request__.app.state.EMBEDDING_FUNCTION(
+            text, prefix=prefix, user=__user_model__
+        ),
+        k=max(1, min(int(k or 5), 8)),
+        reranking_function=(
+            (
+                lambda query_text, documents: __request__.app.state.RERANKING_FUNCTION(
+                    query_text, documents, user=__user_model__
+                )
+            )
+            if __request__.app.state.RERANKING_FUNCTION
+            else None
+        ),
+        k_reranker=__request__.app.state.config.TOP_K_RERANKER,
+        r=__request__.app.state.config.RELEVANCE_THRESHOLD,
+        hybrid_bm25_weight=__request__.app.state.config.HYBRID_BM25_WEIGHT,
+        hybrid_search=__request__.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
+        full_context=False,
+        user=__user_model__,
+    )
+    if not sources:
+        return {
+            "status": "no_evidence",
+            "tool_name": "query_selected_knowledge_files",
+            "code": "empty_retrieval_result",
+            "query": normalized_query,
+            "retrieval_round": retrieval_round,
+        }
+
+    sources, diagnostics = _filter_selected_retrieval_sources_by_query(
+        sources, normalized_query
+    )
+    if not sources:
+        return {
+            "status": "no_evidence",
+            "tool_name": "query_selected_knowledge_files",
+            "code": "weak_or_empty_retrieval_result",
+            "query": normalized_query,
+            "retrieval_round": retrieval_round,
+            "retrieval_diagnostics": diagnostics,
+        }
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for metadata in source.get("metadata") or []:
+            if isinstance(metadata, dict):
+                metadata.setdefault(
+                    "retrieval_tool_name", "query_selected_knowledge_files"
+                )
+                metadata.setdefault("retrieval_round", retrieval_round)
+                metadata.setdefault("query", normalized_query)
+
+    compact_sources, context_budget = _compact_deepagent_reference_sources(sources)
+    return {
+        "status": "success",
+        "tool_name": "query_selected_knowledge_files",
+        "query": normalized_query,
+        "retrieval_round": retrieval_round,
+        "canonical_references": compact_sources,
+        "result_count": len(sources),
+        "context_budget": context_budget,
+    }
+
+
+async def read_selected_file(
+    source_id: str,
+    query: str = "",
+    retrieval_round: int = 1,
+    __request__: Any = None,
+    __files__: Any = None,
+    __knowledge__: Any = None,
+    __metadata__: Any = None,
+    __user_model__: Any = None,
+) -> dict[str, Any]:
+    """Read an already selected source when its identity is known and authorized.
+
+    :param source_id: Selected file, document, or KB id/name to read.
+    :param query: Optional focus query used only for provenance.
+    :param retrieval_round: Retrieval round number for provenance.
+    """
+
+    normalized_source_id = str(source_id or "").strip()
+    if not normalized_source_id:
+        return {
+            "status": "malformed",
+            "tool_name": "read_selected_file",
+            "code": "missing_source_id",
+            "message": "A selected source id is required.",
+            "retrieval_round": retrieval_round,
+        }
+    if __request__ is None:
+        return {
+            "status": "error",
+            "tool_name": "read_selected_file",
+            "code": "runtime_context_unavailable",
+            "source_id": normalized_source_id,
+            "retrieval_round": retrieval_round,
+        }
+
+    candidates = _deepagent_selected_source_candidates(
+        files=__files__,
+        knowledge=__knowledge__,
+        metadata=__metadata__,
+    )
+    candidates = _filter_deepagent_sources_by_ids(candidates, [normalized_source_id])
+    if len(candidates) != 1:
+        return {
+            "status": "permission_denied" if not candidates else "malformed",
+            "tool_name": "read_selected_file",
+            "code": "requested_file_out_of_scope"
+            if not candidates
+            else "ambiguous_selected_source",
+            "source_id": normalized_source_id,
+            "retrieval_round": retrieval_round,
+        }
+
+    from open_webui.retrieval.utils import get_sources_from_items
+
+    source_item = {**candidates[0], "context": "full"}
+    sources = await get_sources_from_items(
+        request=__request__,
+        items=[source_item],
+        queries=[str(query or normalized_source_id).strip()],
+        embedding_function=lambda text, prefix: __request__.app.state.EMBEDDING_FUNCTION(
+            text, prefix=prefix, user=__user_model__
+        ),
+        k=1,
+        reranking_function=None,
+        k_reranker=__request__.app.state.config.TOP_K_RERANKER,
+        r=__request__.app.state.config.RELEVANCE_THRESHOLD,
+        hybrid_bm25_weight=__request__.app.state.config.HYBRID_BM25_WEIGHT,
+        hybrid_search=False,
+        full_context=True,
+        user=__user_model__,
+    )
+    if not sources:
+        return {
+            "status": "no_evidence",
+            "tool_name": "read_selected_file",
+            "code": "empty_retrieval_result",
+            "source_id": normalized_source_id,
+            "retrieval_round": retrieval_round,
+        }
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for metadata in source.get("metadata") or []:
+            if isinstance(metadata, dict):
+                metadata.setdefault("retrieval_tool_name", "read_selected_file")
+                metadata.setdefault("retrieval_round", retrieval_round)
+                metadata.setdefault("query", str(query or "").strip())
+
+    compact_sources, context_budget = _compact_deepagent_reference_sources(
+        sources,
+        max_sources=1,
+        max_chunks=8,
+        max_chars_per_chunk=DEEPAGENT_READ_MAX_CHARS_PER_CHUNK,
+        max_total_chars=DEEPAGENT_READ_MAX_TOTAL_CHARS,
+    )
+    return {
+        "status": "success",
+        "tool_name": "read_selected_file",
+        "source_id": normalized_source_id,
+        "query": str(query or "").strip(),
+        "retrieval_round": retrieval_round,
+        "canonical_references": compact_sources,
+        "result_count": len(sources),
+        "context_budget": context_budget,
+    }
+
+
 def _sanitize_deepagent_runtime_parameters(parameters: dict | None) -> dict:
     if not isinstance(parameters, dict):
         return {
@@ -1121,8 +1695,34 @@ def build_deepagent_runtime_tool_snapshot(
             }
         )
 
+    retrieval_candidates = _deepagent_selected_source_candidates(
+        files=files,
+        knowledge=model_knowledge,
+        metadata=metadata,
+    )
+    if retrieval_candidates:
+        revision = compute_deepagent_builtin_retrieval_revision(
+            files=files,
+            knowledge=model_knowledge,
+        )
+        runtime_tools.append(
+            {
+                "tool_id": DEEPAGENT_BUILTIN_RETRIEVAL_TOOL_ID,
+                "tool_name": "Selected Source Retrieval",
+                "revision": revision,
+                "updated_at": 0,
+                "functions": [
+                    _build_deepagent_builtin_function_entry(
+                        query_selected_knowledge_files
+                    ),
+                    _build_deepagent_builtin_function_entry(read_selected_file),
+                ],
+            }
+        )
+
     sanitized_metadata = copy.deepcopy(metadata or {})
     sanitized_metadata.pop("deepagent_runtime_tools", None)
+    sanitized_metadata.pop("model", None)
 
     return {
         "version": DEEPAGENT_RUNTIME_TOOL_SCHEMA_VERSION,

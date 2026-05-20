@@ -87,6 +87,44 @@ DEEPSEEK_REASONING_TAGS = (
 )
 
 
+def _is_deepagent_bridge_url(url: str) -> bool:
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").strip().lower()
+    path = (parsed.path or "").rstrip("/")
+    return host in {"agent-bridge", "deepagent-project-agent-bridge-1"} or (
+        path.endswith("/v1") and "agent-bridge" in host
+    )
+
+
+def _metadata_for_deepagent_bridge(metadata: Optional[dict]) -> Optional[dict]:
+    if not isinstance(metadata, dict):
+        return None
+
+    allowed_keys = {
+        "active_source_scope",
+        "bridge_execution_profile",
+        "client_capabilities",
+        "deepagent_execution_profile",
+        "deepagent_runtime_tools",
+        "executionProfile",
+        "execution_profile",
+        "files",
+        "provider_thinking",
+        "resolved_execution_profile",
+        "task",
+        "thinking",
+        "thinkingMode",
+        "thinking_mode",
+        "tool_ids",
+    }
+    bridge_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if key in allowed_keys and value is not None
+    }
+    return bridge_metadata or None
+
+
 ##########################################
 #
 # Utility functions
@@ -1548,6 +1586,16 @@ async def generate_chat_completion(
             request_url = f"{url}/responses"
         else:
             request_url = f"{url}/chat/completions"
+
+    bridge_metadata = (
+        _metadata_for_deepagent_bridge(metadata)
+        if _is_deepagent_bridge_url(url)
+        else None
+    )
+    if bridge_metadata:
+        payload["metadata"] = json.loads(
+            json.dumps(bridge_metadata, ensure_ascii=False, default=str)
+        )
 
     payload = json.dumps(payload)
 

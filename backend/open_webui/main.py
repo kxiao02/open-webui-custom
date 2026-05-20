@@ -1977,6 +1977,9 @@ async def chat_completion(
         if model_info_params.get("reasoning_tags") is not None:
             reasoning_tags = model_info_params.get("reasoning_tags")
 
+        client_metadata = (
+            form_data.get("metadata") if isinstance(form_data.get("metadata"), dict) else {}
+        )
         metadata = {
             "user_id": user.id,
             "chat_id": form_data.pop("chat_id", None),
@@ -2006,6 +2009,22 @@ async def chat_completion(
                 ),
             },
         }
+        for key in (
+            "active_source_scope",
+            "bridge_execution_profile",
+            "deepagent_execution_profile",
+            "executionProfile",
+            "execution_profile",
+            "provider_thinking",
+            "resolved_execution_profile",
+            "task",
+            "thinking",
+            "thinkingMode",
+            "thinking_mode",
+        ):
+            value = client_metadata.get(key)
+            if value is not None:
+                metadata[key] = value
 
         if metadata.get("chat_id") and user:
             if not metadata["chat_id"].startswith(
@@ -2156,7 +2175,7 @@ async def chat_completion(
             finally:
                 raise  # re-raise to ensure proper task cancellation handling
         except Exception as e:
-            log.debug(f"Error processing chat payload: {e}")
+            log.exception("Error processing chat payload")
             if metadata.get("chat_id") and metadata.get("message_id"):
                 # Update the chat message with the error
                 try:

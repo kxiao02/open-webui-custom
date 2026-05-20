@@ -1535,6 +1535,21 @@
 			...nextMessage
 		};
 
+		if (
+			existingMessage?.parentId &&
+			(nextMessage?.parentId === null || nextMessage?.parentId === undefined)
+		) {
+			merged.parentId = existingMessage.parentId;
+		}
+
+		if (
+			Array.isArray(existingMessage?.childrenIds) &&
+			existingMessage.childrenIds.length > 0 &&
+			(!Array.isArray(nextMessage?.childrenIds) || nextMessage.childrenIds.length === 0)
+		) {
+			merged.childrenIds = existingMessage.childrenIds;
+		}
+
 		for (const key of ['sources', 'citations']) {
 			const existingReferences = existingMessage?.[key];
 			const nextReferences = nextMessage?.[key];
@@ -1624,12 +1639,6 @@
 			return null;
 		}
 
-		const existingCurrentId =
-			typeof historyData?.currentId === 'string' ? historyData.currentId.trim() : '';
-		if (existingCurrentId && messages[existingCurrentId]) {
-			return existingCurrentId;
-		}
-
 		const entries = Object.entries(messages).filter(
 			([id, message]) => typeof id === 'string' && message && typeof message === 'object'
 		) as Array<[string, Record<string, any>]>;
@@ -1638,12 +1647,59 @@
 			return null;
 		}
 
+		const getValidChildIds = (message: Record<string, any>) =>
+			(Array.isArray(message.childrenIds) ? message.childrenIds : []).filter(
+				(childId) => typeof childId === 'string' && messages[childId]
+			);
+
+		const getBranchMessages = (messageId: string) => {
+			const branch: Array<Record<string, any>> = [];
+			const visited = new Set<string>();
+			let currentId: string | null | undefined = messageId;
+
+			while (currentId !== null && currentId !== undefined) {
+				if (visited.has(currentId)) {
+					break;
+				}
+				visited.add(currentId);
+				const message = messages[currentId];
+				if (!message || typeof message !== 'object') {
+					break;
+				}
+				branch.push(message);
+				currentId = typeof message.parentId === 'string' ? message.parentId : null;
+			}
+
+			return branch;
+		};
+
+		const isValidCurrentLeaf = (messageId: string) => {
+			const message = messages[messageId];
+			if (!message || typeof message !== 'object') return false;
+			if (getValidChildIds(message).length > 0) return false;
+
+			const branch = getBranchMessages(messageId);
+			if (branch.length > 1) return true;
+			if (typeof message.parentId === 'string' && message.parentId.trim()) return true;
+
+			// A single root user/system message can be a valid empty or imported branch.
+			// A root assistant is only valid when it is the whole history; otherwise it is
+			// usually a sparse completion update that lost its parent linkage.
+			return message.role !== 'assistant' || entries.length === 1;
+		};
+
+		const existingCurrentId =
+			typeof historyData?.currentId === 'string' ? historyData.currentId.trim() : '';
+		if (existingCurrentId && messages[existingCurrentId] && isValidCurrentLeaf(existingCurrentId)) {
+			return existingCurrentId;
+		}
+
 		const leaves = entries.filter(([, message]) => {
-			const childIds = Array.isArray(message.childrenIds) ? message.childrenIds : [];
-			return childIds.filter((childId) => typeof childId === 'string' && messages[childId]).length === 0;
+			return getValidChildIds(message).length === 0;
 		});
 
-		const candidates = leaves.length > 0 ? leaves : entries;
+		const validLeaves = leaves.filter(([id]) => isValidCurrentLeaf(id));
+		const candidates = validLeaves.length > 0 ? validLeaves : leaves.length > 0 ? leaves : entries;
 		candidates.sort((a, b) => {
 			const tsA = typeof a[1]?.timestamp === 'number' ? a[1].timestamp : 0;
 			const tsB = typeof b[1]?.timestamp === 'number' ? b[1].timestamp : 0;

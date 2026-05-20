@@ -32,13 +32,17 @@ from open_webui.utils.plugin import (
     resolve_valves_schema_options,
 )
 from open_webui.utils.tools import (
+    DEEPAGENT_BUILTIN_RETRIEVAL_TOOL_ID,
     DEEPAGENT_BUILTIN_SKILLS_TOOL_ID,
     _compute_deepagent_tool_revision,
+    compute_deepagent_builtin_retrieval_revision,
     compute_deepagent_builtin_skills_revision,
     get_deepagent_runtime_skill_ids,
     get_async_tool_function_and_apply_extra_params,
     get_builtin_tool_catalog,
     get_tool_specs,
+    query_selected_knowledge_files,
+    read_selected_file,
 )
 from open_webui.tools.builtin import list_skills, view_skill
 from open_webui.utils.auth import get_admin_user, get_verified_user
@@ -646,6 +650,7 @@ class DeepAgentToolExecuteContext(BaseModel):
     session_id: Optional[str] = None
     message_id: Optional[str] = None
     files: list[dict] = Field(default_factory=list)
+    knowledge: list[dict] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
 
 
@@ -698,6 +703,38 @@ async def execute_deepagent_tool(
             )
 
         tool_name = "Workspace Skills"
+        allowed_params = {
+            name
+            for name in inspect.signature(tool_function).parameters.keys()
+            if not str(name).startswith("__")
+        }
+    elif form_data.tool_id == DEEPAGENT_BUILTIN_RETRIEVAL_TOOL_ID:
+        builtin_functions = {
+            query_selected_knowledge_files.__name__: query_selected_knowledge_files,
+            read_selected_file.__name__: read_selected_file,
+        }
+        current_revision = compute_deepagent_builtin_retrieval_revision(
+            context.files,
+            context.knowledge,
+        )
+        if current_revision != form_data.revision:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "tool_revision_mismatch",
+                    "message": "The selected-source tool changed after this run started. Retry the request to use the latest source scope.",
+                    "tool_id": form_data.tool_id,
+                },
+            )
+
+        tool_function = builtin_functions.get(form_data.function_name)
+        if tool_function is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.NOT_FOUND,
+            )
+
+        tool_name = "Selected Source Retrieval"
         allowed_params = {
             name
             for name in inspect.signature(tool_function).parameters.keys()
@@ -793,7 +830,9 @@ async def execute_deepagent_tool(
         "__session_id__": context.session_id,
         "__message_id__": context.message_id,
         "__files__": list(context.files or []),
+        "__knowledge__": list(context.knowledge or []),
         "__user__": tool_user,
+        "__user_model__": user,
         "__metadata__": metadata,
         "__request__": request,
     }
@@ -807,6 +846,10 @@ async def execute_deepagent_tool(
             extra_params,
         )
         raw_result = await tool_callable(**tool_params)
+        if isinstance(raw_result, dict):
+            raw_status = str(raw_result.get("status") or "").strip().lower()
+            if raw_status and raw_status not in {"ok", "success", "evidence"}:
+                execution_status = raw_status
     except Exception as exc:
         execution_status = "error"
         log.exception("DeepAgent tool execution failed for %s/%s", form_data.tool_id, form_data.function_name)

@@ -1116,6 +1116,54 @@ def _first_non_empty_query(queries: list[str]) -> str:
     return ""
 
 
+def _knowflow_chunk_dedupe_key(chunk: dict) -> str:
+    document_id = str(chunk.get("document_id") or "").strip()
+    content = str(chunk.get("content") or chunk.get("text") or "").strip()
+    return (
+        str(chunk.get("id") or "").strip()
+        or str(chunk.get("chunk_id") or "").strip()
+        or (f"{document_id}:{content[:200]}" if document_id and content else "")
+    )
+
+
+async def _retrieve_knowflow_chunks_for_queries(
+    request,
+    user: Optional[UserModel],
+    queries: list[str],
+    *,
+    dataset_ids: Optional[list[str]] = None,
+    document_ids: Optional[list[str]] = None,
+    page_size: int = 5,
+) -> list[dict]:
+    chunks: list[dict] = []
+    seen: set[str] = set()
+
+    for query in queries or []:
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            continue
+
+        query_chunks = await retrieve_from_knowledge(
+            request.app.state.config,
+            user,
+            normalized_query,
+            dataset_ids=dataset_ids,
+            document_ids=document_ids,
+            page_size=page_size,
+        )
+        for chunk in query_chunks or []:
+            if not isinstance(chunk, dict):
+                continue
+            key = _knowflow_chunk_dedupe_key(chunk)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            chunks.append(chunk)
+
+    return chunks
+
+
 def _format_knowflow_document_content(content: str, metadata: dict[str, Any]) -> str:
     normalized_content = str(content or "").strip()
     has_inline_visuals = knowflow_content_has_inline_visuals(normalized_content)
@@ -1344,10 +1392,10 @@ async def get_sources_from_items(
             else:
                 if knowflow_enabled and not full_context and primary_query and item.get("id"):
                     try:
-                        chunks = await retrieve_from_knowledge(
-                            request.app.state.config,
+                        chunks = await _retrieve_knowflow_chunks_for_queries(
+                            request,
                             user,
-                            primary_query,
+                            queries,
                             document_ids=[item["id"]],
                             page_size=max(1, int(k)),
                         )
@@ -1379,10 +1427,10 @@ async def get_sources_from_items(
                 and item.get("id")
             ):
                 try:
-                    chunks = await retrieve_from_knowledge(
-                        request.app.state.config,
+                    chunks = await _retrieve_knowflow_chunks_for_queries(
+                        request,
                         user,
-                        primary_query,
+                        queries,
                         dataset_ids=[item["id"]],
                         page_size=max(1, int(k)),
                     )

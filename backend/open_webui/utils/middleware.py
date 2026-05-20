@@ -1257,6 +1257,42 @@ def _build_chat_completion_payload(
     }
 
 
+def _fallback_answer_for_completed_tool_only_output(output: object) -> str:
+    if not isinstance(output, list):
+        return ""
+
+    saw_web_search = False
+    saw_time = False
+    current_date = ""
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "function_call":
+            name = str(item.get("name") or "").strip()
+            saw_web_search = saw_web_search or name in {"internet_search", "search_web"}
+            saw_time = saw_time or name == "current_server_time"
+            continue
+        if item.get("type") != "function_call_output":
+            continue
+        parsed = _extract_function_call_output_payload(item)
+        if not isinstance(parsed, dict):
+            continue
+        if not current_date and isinstance(parsed.get("date"), str):
+            current_date = parsed["date"]
+        if isinstance(parsed.get("results"), list):
+            saw_web_search = True
+
+    if saw_web_search:
+        prefix = f"今天是 {current_date}。" if current_date else ""
+        return (
+            f"{prefix}已完成当前网络检索，但本轮未能形成进一步的可靠综合结论；"
+            "请参考引用来源，或指定要核验的具体来源继续深入。"
+        )
+    if saw_time and current_date:
+        return f"今天是 {current_date}。"
+    return ""
+
+
 def _merge_reference_sidecar_into_metadata(
     metadata: dict,
     *,
@@ -1271,8 +1307,8 @@ def _merge_reference_sidecar_into_metadata(
     tool_sidecar = Chats.build_reference_metadata_sidecar(tool_outputs=tool_outputs)
     if legacy_tool_sources and tool_sidecar.get("canonical_references"):
         metadata["sources"] = Chats._merge_message_sources(
-            metadata.get("sources"),
             tool_sidecar["canonical_references"],
+            metadata.get("sources"),
         )
 
     sidecar = Chats.build_reference_metadata_sidecar(
@@ -1311,6 +1347,186 @@ def _completion_sources_for_persistence(metadata: dict) -> list[dict]:
         return []
 
     return [item for item in references if isinstance(item, dict)]
+
+
+_SELECTED_SOURCE_RETRIEVAL_TOOL_NAMES = {
+    "query_selected_knowledge_files",
+    "read_selected_file",
+}
+
+
+def _iter_output_items(output: Any):
+    if isinstance(output, list):
+        for item in output:
+            if isinstance(item, dict):
+                yield item
+                content = item.get("content")
+                if isinstance(content, list):
+                    for child in content:
+                        if isinstance(child, dict):
+                            yield child
+    elif isinstance(output, dict):
+        yield output
+        for key in ("output", "content"):
+            value = output.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        yield item
+
+
+def _parse_tool_output_payload(item: dict) -> dict:
+    if not isinstance(item, dict):
+        return {}
+    result = item.get("result")
+    if isinstance(result, dict):
+        return result
+    output = item.get("output")
+    if isinstance(output, dict):
+        return output
+    if isinstance(output, list):
+        for block in output:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            try:
+                decoded = json.loads(text)
+            except Exception:
+                continue
+            if isinstance(decoded, dict):
+                return decoded
+    return {}
+
+
+def _normalize_retrieval_tool_status(status: str, code: str) -> str:
+    normalized = str(status or "").strip().lower()
+    normalized_code = str(code or "").strip().lower()
+    if normalized in {"success", "completed"}:
+        return "success"
+    if "timeout" in normalized or "timeout" in normalized_code:
+        return "timeout"
+    if normalized in {"blocked", "denied", "permission_denied"} or "denied" in normalized_code:
+        return "error"
+    if normalized in {"no_evidence", "malformed", "error", "failed", "failure"}:
+        return "error"
+    return "error" if normalized_code else normalized or "error"
+
+
+def _retrieval_tool_status_for_persistence(tool_outputs: Any) -> list[dict]:
+    statuses: list[dict] = []
+    seen: set[str] = set()
+    calls_by_id: dict[str, str] = {}
+
+    for item in _iter_output_items(tool_outputs):
+        item_type = str(item.get("type") or "").strip()
+        if item_type == "function_call":
+            call_id = str(item.get("call_id") or item.get("id") or "").strip()
+            tool_name = str(item.get("name") or "").strip()
+            if call_id and tool_name:
+                calls_by_id[call_id] = tool_name
+            continue
+
+        if item_type != "function_call_output":
+            continue
+
+        call_id = str(item.get("call_id") or "").strip()
+        payload = _parse_tool_output_payload(item)
+        tool_name = str(
+            payload.get("tool_name") or payload.get("function_name") or calls_by_id.get(call_id) or ""
+        ).strip()
+        if tool_name not in _SELECTED_SOURCE_RETRIEVAL_TOOL_NAMES:
+            continue
+
+        raw_status = str(payload.get("status") or item.get("status") or "").strip()
+        code = str(payload.get("code") or "").strip()
+        normalized_status = _normalize_retrieval_tool_status(raw_status, code)
+        status_item = {
+            "tool_name": tool_name,
+            "status": normalized_status,
+            "code": code or raw_status or normalized_status,
+        }
+        query = str(payload.get("query") or "").strip()
+        source_id = str(payload.get("source_id") or "").strip()
+        if query:
+            status_item["query"] = query
+        if source_id:
+            status_item["source_id"] = source_id
+        if payload.get("retrieval_round") not in (None, ""):
+            status_item["retrieval_round"] = payload.get("retrieval_round")
+
+        signature = json.dumps(status_item, ensure_ascii=False, sort_keys=True, default=str)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        statuses.append(status_item)
+
+    return statuses
+
+
+_NO_SELECTED_SOURCE_EVIDENCE_PATTERN = re.compile(
+    r"(未在[^。；\n]{0,80}(?:找到|检索到)|"
+    r"(?:未|没有)[^。；\n]{0,40}(?:找到|检索到)[^。；\n]{0,80}(?:证据|依据|相关)|"
+    r"无[^。；\n]{0,40}(?:证据|依据)|"
+    r"no\s+(?:usable\s+)?(?:evidence|results?)|"
+    r"not\s+found)",
+    re.IGNORECASE,
+)
+
+
+_SOURCE_SCOPE_CLARIFICATION_PATTERN = re.compile(
+    r"(?:指代不清|请(?:先)?(?:明确|确认|告诉我).{0,40}(?:哪(?:一)?(?:份|个)|哪个).{0,30}(?:文件|知识库|来源)|"
+    r"(?:which|what)\s+(?:file|document|knowledge\s*base|source).{0,80}(?:mean|refer|use|search))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _content_is_source_scope_clarification(content: str) -> bool:
+    return bool(_SOURCE_SCOPE_CLARIFICATION_PATTERN.search(str(content or "")))
+
+
+def _source_reference_is_web(source: dict) -> bool:
+    if not isinstance(source, dict):
+        return False
+    source_info = source.get("source")
+    source_info = source_info if isinstance(source_info, dict) else {}
+    source_type = str(source_info.get("type") or source.get("source_class") or "").lower()
+    source_url = str(source_info.get("url") or source_info.get("id") or "").strip()
+    source_id = str(source_info.get("id") or "").strip()
+    if "/minio/" in source_url and source_id and not source_id.startswith(("http://", "https://")):
+        return False
+    return source_type == "web" or source_url.startswith(("http://", "https://"))
+
+
+def _filter_uncited_no_evidence_source_cards(
+    sources: object,
+    *,
+    content: str,
+) -> list[dict]:
+    """Avoid rendering weak selected-KB diagnostics as accepted source cards."""
+
+    if not isinstance(sources, list):
+        return []
+
+    clean_sources = [source for source in sources if isinstance(source, dict)]
+    if not clean_sources:
+        return []
+
+    content = str(content or "")
+    if _content_is_source_scope_clarification(content):
+        return []
+
+    if not _NO_SELECTED_SOURCE_EVIDENCE_PATTERN.search(content):
+        return clean_sources
+
+    # If the model cited a source explicitly, keep the source list; otherwise
+    # remove local/KB-only cards from a no-evidence answer while preserving web
+    # evidence in mixed local+web turns.
+    if re.search(r"\[\s*\d+(?:\s*[-,，]\s*\d+)*\s*\]", content):
+        return clean_sources
+
+    return [source for source in clean_sources if _source_reference_is_web(source)]
 
 
 def _build_assistant_reference_persistence_metadata(
@@ -1355,6 +1571,25 @@ def _build_assistant_reference_persistence_metadata(
         persisted["retrieval_diagnostics"] = retrieval_diagnostics
     if sidecar.get("canonical_references"):
         persisted["canonical_references"] = sidecar["canonical_references"]
+
+    existing_tool_status = (
+        base_metadata.get("retrieval_tool_status")
+        if isinstance(base_metadata.get("retrieval_tool_status"), list)
+        else []
+    )
+    retrieval_tool_status = _retrieval_tool_status_for_persistence(tool_outputs)
+    merged_tool_status = []
+    seen_tool_status: set[str] = set()
+    for item in [*existing_tool_status, *retrieval_tool_status]:
+        if not isinstance(item, dict):
+            continue
+        signature = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+        if signature in seen_tool_status:
+            continue
+        seen_tool_status.add(signature)
+        merged_tool_status.append(item)
+    if merged_tool_status:
+        persisted["retrieval_tool_status"] = merged_tool_status
 
     return persisted
 
@@ -7772,6 +8007,26 @@ def _is_explicit_research_retrieval(body: dict) -> bool:
     return False
 
 
+def _has_selected_source_retrieval_runtime_tool(metadata: dict) -> bool:
+    snapshot = metadata.get("deepagent_runtime_tools") if isinstance(metadata, dict) else None
+    if not isinstance(snapshot, dict):
+        return False
+    for tool_entry in snapshot.get("tools") or []:
+        if not isinstance(tool_entry, dict):
+            continue
+        if str(tool_entry.get("tool_id") or "").strip() == "builtin:retrieval":
+            return True
+        for function_entry in tool_entry.get("functions") or []:
+            if not isinstance(function_entry, dict):
+                continue
+            if str(function_entry.get("function_name") or "").strip() in {
+                "query_selected_knowledge_files",
+                "read_selected_file",
+            }:
+                return True
+    return False
+
+
 def _prompt_has_explicit_multi_part_retrieval_request(prompt: str) -> bool:
     normalized_prompt = _normalize_retrieval_query_text(
         _strip_attached_file_context(prompt)
@@ -9525,6 +9780,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     if (
         model_knowledge
         and metadata.get("params", {}).get("function_calling") != "native"
+        and event_emitter
     ):
         await event_emitter(
             {
@@ -10372,6 +10628,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         sources=sources,
         diagnostics=retrieval_diagnostics,
     )
+    if Chats._should_clear_reference_aliases(
+        metadata=metadata,
+        diagnostics=retrieval_diagnostics,
+        accepted_references=metadata.get("canonical_references"),
+    ):
+        sources = []
+        metadata["sources"] = []
+        metadata.pop("references", None)
+        metadata.pop("citations", None)
+        metadata.pop("documents", None)
     metadata["deepagent_runtime_tools"] = build_deepagent_runtime_tool_snapshot(
         tool_ids,
         user,
@@ -10381,8 +10647,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     )
     form_data["metadata"] = metadata
 
-    # If context is not empty, insert it into the messages
-    if sources and prompt:
+    defer_source_context_to_research_tool = (
+        bool(sources)
+        and _is_explicit_research_retrieval(form_data)
+        and _has_selected_source_retrieval_runtime_tool(metadata)
+    )
+
+    # If context is not empty, insert it into the messages. Research-mode
+    # selected-source turns keep first-pass results as metadata/seed state so
+    # the agent can perform scoped second-pass retrieval without prompt crowding.
+    if sources and prompt and not defer_source_context_to_research_tool:
         form_data["messages"] = apply_source_context_to_messages(
             request, form_data["messages"], sources, prompt
         )
@@ -10397,10 +10671,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         or source.get("source", {}).get("id", "")
     ]
 
-    if len(sources) > 0:
+    if len(sources) > 0 and not defer_source_context_to_research_tool:
         events.append({"sources": sources})
 
-    if model_knowledge:
+    if model_knowledge and event_emitter:
         await event_emitter(
             {
                 "type": "status",
@@ -10901,7 +11175,12 @@ async def non_streaming_chat_response_handler(response, ctx):
                         message["metadata"] = message_metadata
                     message_metadata["embeds"] = combined_embeds
 
-                content = response_payload.get("content", content or "") or ""
+                content = (
+                    response_payload.get("content", "")
+                    or _fallback_answer_for_completed_tool_only_output(response_output)
+                    or ""
+                )
+                message["content"] = content
                 retrieval_generated_files, retrieval_embeds = (
                     _select_retrieval_source_visual_payloads(
                         metadata,
@@ -10941,6 +11220,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
                 _merge_reference_sidecar_into_metadata(
                     metadata,
+                    sources=response_data.get("sources"),
                     tool_outputs=response_output,
                     legacy_tool_sources=True,
                 )
@@ -10960,6 +11240,22 @@ async def non_streaming_chat_response_handler(response, ctx):
                 persisted_sources = _completion_sources_for_persistence(
                     completion_metadata
                 )
+                persisted_sources = Chats._merge_message_sources(
+                    persisted_sources,
+                    response_data.get("sources"),
+                )
+                persisted_sources = _filter_uncited_no_evidence_source_cards(
+                    persisted_sources,
+                    content=content or "",
+                )
+                if persisted_sources:
+                    completion_metadata["canonical_references"] = persisted_sources
+                else:
+                    completion_metadata.pop("canonical_references", None)
+                if persisted_sources:
+                    response_data["sources"] = persisted_sources
+                else:
+                    response_data.pop("sources", None)
 
                 await event_emitter(
                     {
@@ -10971,6 +11267,11 @@ async def non_streaming_chat_response_handler(response, ctx):
                             **(
                                 {"files": message_files}
                                 if isinstance(message_files, list) and message_files
+                                else {}
+                            ),
+                            **(
+                                {"sources": persisted_sources}
+                                if persisted_sources
                                 else {}
                             ),
                             **(
@@ -11043,6 +11344,71 @@ async def non_streaming_chat_response_handler(response, ctx):
             log.debug(f"Error occurred while processing request: {e}")
             pass
 
+        return response
+
+    choices = response_data.get("choices", []) if isinstance(response_data, dict) else []
+    if choices and isinstance(choices[0].get("message"), dict):
+        message = choices[0]["message"]
+        content = str(message.get("content") or "")
+        response_output = response_data.get("output")
+        if response_output is None:
+            response_output = message.get("output")
+        if response_output is None and content:
+            response_output = [
+                {
+                    "type": "message",
+                    "id": output_id("msg"),
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": content}],
+                }
+            ]
+        if response_output is None:
+            response_output = []
+        response_output, response_payload = _build_chat_completion_payload(
+            response_output,
+            fallback_content=content,
+        )
+        content = response_payload.get("content") or _fallback_answer_for_completed_tool_only_output(
+            response_output
+        )
+        message["content"] = content
+
+        _merge_reference_sidecar_into_metadata(
+            metadata,
+            sources=response_data.get("sources"),
+            tool_outputs=response_output,
+            legacy_tool_sources=True,
+        )
+        reference_metadata = _build_assistant_reference_persistence_metadata(
+            metadata,
+            message_metadata=message.get("metadata"),
+            tool_outputs=response_output,
+        )
+        completion_metadata = dict(reference_metadata)
+        persisted_sources = _completion_sources_for_persistence(completion_metadata)
+        persisted_sources = Chats._merge_message_sources(
+            persisted_sources,
+            response_data.get("sources"),
+        )
+        persisted_sources = _filter_uncited_no_evidence_source_cards(
+            persisted_sources,
+            content=content,
+        )
+        if persisted_sources:
+            completion_metadata["canonical_references"] = persisted_sources
+            response_data["sources"] = persisted_sources
+        else:
+            completion_metadata.pop("canonical_references", None)
+            response_data.pop("sources", None)
+        if completion_metadata:
+            message_metadata = message.get("metadata")
+            if isinstance(message_metadata, dict):
+                message_metadata.update(completion_metadata)
+            else:
+                message["metadata"] = completion_metadata
+
+        response = build_response_object(response, merge_events_into_response(response_data, events))
         return response
 
     if isinstance(response, dict):
@@ -12930,6 +13296,10 @@ async def streaming_chat_response_handler(response, ctx):
 
                 title = Chats.get_chat_title_by_id(metadata["chat_id"])
                 output, final_payload = _build_chat_completion_payload(output, fallback_content=content)
+                if not final_payload.get("content"):
+                    final_payload["content"] = _fallback_answer_for_completed_tool_only_output(
+                        output
+                    )
                 _merge_reference_sidecar_into_metadata(
                     metadata,
                     tool_outputs=output,
@@ -12949,6 +13319,14 @@ async def streaming_chat_response_handler(response, ctx):
                 persisted_sources = _completion_sources_for_persistence(
                     completion_metadata
                 )
+                persisted_sources = _filter_uncited_no_evidence_source_cards(
+                    persisted_sources,
+                    content=final_payload.get("content", ""),
+                )
+                if persisted_sources:
+                    completion_metadata["canonical_references"] = persisted_sources
+                else:
+                    completion_metadata.pop("canonical_references", None)
 
                 data = {
                     "done": True,
@@ -12957,6 +13335,11 @@ async def streaming_chat_response_handler(response, ctx):
                     **(
                         {"files": message_files}
                         if isinstance(message_files, list) and message_files
+                        else {}
+                    ),
+                    **(
+                        {"sources": persisted_sources}
+                        if persisted_sources
                         else {}
                     ),
                     **(
