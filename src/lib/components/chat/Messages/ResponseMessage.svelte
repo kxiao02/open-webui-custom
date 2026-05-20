@@ -1118,10 +1118,23 @@
 
 	const normalizeSourcesHeading = (content: string): string => {
 		if (!content) return '';
-		return content.replace(
+		const normalized = content.replace(
 			/(^|\n)(#{1,6}\s*)?Sources\s*(?=\n|$)/gim,
 			(_, prefix: string) => `${prefix}参考来源`
 		);
+		const sourceHeading =
+			/(^|\n)\s*(?:#{1,6}\s*)?(?:[*_]{1,2}\s*)?(参考来源|Sources|References)(?:\s*[*_]{1,2})?\s*[:：]?\s*(?:\n|$)/i;
+		const inlineSourceHeading =
+			/(^|\n)\s*(?:#{1,6}\s*)?(?:[*_]{1,2}\s*)?(参考来源|Sources|References)(?:\s*[*_]{1,2})?\s*[:：]\s*(?:\[[^\]]+\]|\d+[.)]|[-*]|\s*https?:\/\/|$)/i;
+		const lineMatch = normalized.match(sourceHeading);
+		if (lineMatch?.index !== undefined) {
+			return normalized.slice(0, lineMatch.index).trimEnd();
+		}
+		const inlineMatch = normalized.match(inlineSourceHeading);
+		if (inlineMatch?.index !== undefined) {
+			return normalized.slice(0, inlineMatch.index).trimEnd();
+		}
+		return normalized;
 	};
 
 	const normalizeStructuredDetailsTags = (content: string): string => {

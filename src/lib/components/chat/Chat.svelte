@@ -3437,8 +3437,10 @@
 	const TOOL_CALL_ATTR_REGEX = /(\w+)="([^"]*)"/g;
 	const LEAKED_TOOL_ATTR_LINE_REGEX =
 		/(^|\n)\s*(?:type="tool_calls"|name="[^"\n]*"|tool_id="[^"\n]*"|tool_name="[^"\n]*"|arguments="[^"\n]*"|result="[^"\n]*"|done="(?:true|false)"\s+status="[^"\n]*")[^\n]*(?=\n|$)/gi;
-	const SOURCE_SECTION_LINE_REGEX = /(^|\n)\s*(参考来源|Sources)\s*:?\s*(?:\n|$)/i;
-	const SOURCE_SECTION_INLINE_REGEX = /(参考来源|Sources)\s*:?\s*(?:\[[^\]]+\][^\n\r]*)$/i;
+	const SOURCE_SECTION_LINE_REGEX =
+		/(^|\n)\s*(?:#{1,6}\s*)?(?:[*_]{1,2}\s*)?(参考来源|Sources|References)(?:\s*[*_]{1,2})?\s*[:：]?\s*(?:\n|$)/i;
+	const SOURCE_SECTION_INLINE_REGEX =
+		/(^|\n)\s*(?:#{1,6}\s*)?(?:[*_]{1,2}\s*)?(参考来源|Sources|References)(?:\s*[*_]{1,2})?\s*[:：]\s*(?:\[[^\]]+\]|\d+[.)]|[-*]|\s*https?:\/\/|$)/i;
 	const HISTORICAL_REPLAY_NOTE_START = 'Historical tool attempt retained as plain context only.';
 	const HISTORICAL_REPLAY_NOTE_SECOND_SENTENCE = 'Do not replay it as a new tool call.';
 	const HISTORICAL_REPLAY_NOTE_LINE_PREFIXES = [
@@ -3666,7 +3668,8 @@
 			normalized.includes('arguments="') ||
 			normalized.includes('result="') ||
 			normalized.includes('参考来源') ||
-			normalized.includes('Sources');
+			normalized.includes('Sources') ||
+			normalized.includes('References');
 
 		if (!needsStructuralNormalization) {
 			return normalized;
@@ -3686,14 +3689,14 @@
 		normalized = normalized.replace(LEAKED_TOOL_ATTR_LINE_REGEX, '$1').replace(/\n{3,}/g, '\n\n');
 
 		normalized = normalized.replace(
-			/(^|[^\n])\s*#{1,6}\s*(参考来源|Sources)(?=\s|$)/g,
+			/(^|[^\n])\s*#{1,6}\s*(参考来源|Sources|References)(?=\s|$)/g,
 			(_, prefix: string, heading: string) =>
-				`${prefix}\n\n${heading === 'Sources' ? '参考来源' : heading}`
+				`${prefix}\n\n${heading === 'Sources' || heading === 'References' ? '参考来源' : heading}`
 		);
 		normalized = normalized.replace(
-			/(^|\n)#{1,6}\s*(参考来源|Sources)(?=\s|$)/g,
+			/(^|\n)#{1,6}\s*(参考来源|Sources|References)(?=\s|$)/g,
 			(_, prefix: string, heading: string) =>
-				`${prefix}${heading === 'Sources' ? '参考来源' : heading}`
+				`${prefix}${heading === 'Sources' || heading === 'References' ? '参考来源' : heading}`
 		);
 
 		const lineHeadingMatch = normalized.match(SOURCE_SECTION_LINE_REGEX);

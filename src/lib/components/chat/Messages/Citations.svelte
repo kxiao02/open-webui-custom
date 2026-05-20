@@ -221,7 +221,15 @@
 				}
 
 				if (id.startsWith('http://') || id.startsWith('https://')) {
-					_source = { ..._source, title: _source?.name ?? metadata?.name ?? id, name: id, url: id };
+					const title =
+						compactString(_source?.title) && !isHttpUrl(_source?.title)
+							? _source.title
+							: compactString(metadata?.name) && !isHttpUrl(metadata?.name)
+								? metadata.name
+								: compactString(_source?.name) && !isHttpUrl(_source?.name)
+									? _source.name
+									: id;
+					_source = { ..._source, title, name: id, url: id };
 				}
 
 				const existingSource = acc.find((item: any) => item.id === id);
@@ -347,8 +355,9 @@
 						label={getCitationKind(citation) === 'web' ? $i18n.t('Web') : $i18n.t('Knowledge Base')}
 						title={getCitationTitle(citation)}
 						subtitle={getCitationSubtitle(citation)}
+						url={citation?.source?.url ?? citation?.source?.name ?? ''}
 						index={idx + 1}
-						titleAttr={decodeString(citation?.source?.title ?? citation?.source?.name ?? '')}
+						titleAttr={getCitationTitle(citation)}
 						onClick={() => {
 							showCitationModal = true;
 							selectedCitation = citation;

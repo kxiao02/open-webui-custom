@@ -5,6 +5,7 @@
 	import DocumentPage from '$lib/components/icons/DocumentPage.svelte';
 	import GlobeAlt from '$lib/components/icons/GlobeAlt.svelte';
 	import Note from '$lib/components/icons/Note.svelte';
+	import WebSourceAvatar from './WebSourceAvatar.svelte';
 
 	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
@@ -12,6 +13,7 @@
 	export let label = '';
 	export let title = '';
 	export let subtitle = '';
+	export let url = '';
 	export let index: number | null = null;
 	export let loading = false;
 	export let titleAttr = '';
@@ -46,6 +48,8 @@
 		>
 			{#if loading}
 				<Spinner className="size-4" />
+			{:else if kind === 'web' && url}
+				<WebSourceAvatar {url} title={resolvedTitle} className="size-9 rounded-xl" />
 			{:else if kind === 'note'}
 				<Note className="size-4" strokeWidth="1.8" />
 			{:else if kind === 'web'}
