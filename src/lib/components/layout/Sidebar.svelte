@@ -573,6 +573,14 @@
 		}, 0);
 	};
 
+	const newChatNavigationHandler = async (event?: MouseEvent) => {
+		event?.stopImmediatePropagation();
+		event?.preventDefault();
+
+		await goto('/');
+		await newChatHandler();
+	};
+
 	const itemClickHandler = async () => {
 		selectedChatId = null;
 		chatId.set('');
@@ -667,11 +675,9 @@
 <button
 	id="sidebar-new-chat-button"
 	class="hidden"
-	on:click={() => {
-		goto('/');
-		newChatHandler();
-	}}
-/>
+	on:click={newChatNavigationHandler}
+	aria-label={$i18n.t('New Chat')}
+></button>
 
 <svelte:window
 	on:mousemove={(e) => {
@@ -730,13 +736,7 @@
 							class=" cursor-pointer flex rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 transition group"
 							href="/"
 							draggable="false"
-							on:click={async (e) => {
-								e.stopImmediatePropagation();
-								e.preventDefault();
-
-								goto('/');
-								newChatHandler();
-							}}
+							on:click={newChatNavigationHandler}
 							aria-label={$i18n.t('New Chat')}
 						>
 							<div class=" self-center flex items-center justify-center size-9">
@@ -903,7 +903,7 @@
 					class="flex items-center rounded-xl size-8.5 h-full justify-center hover:bg-gray-100/50 dark:hover:bg-gray-850/50 transition no-drag-region"
 					href="/"
 					draggable="false"
-					on:click={newChatHandler}
+					on:click={newChatNavigationHandler}
 				>
 					<img
 						crossorigin="anonymous"
@@ -919,7 +919,7 @@
 					/>
 				</a>
 
-				<a href="/" class="flex flex-1 px-1.5" on:click={newChatHandler}>
+				<a href="/" class="flex flex-1 px-1.5" on:click={newChatNavigationHandler}>
 					<div
 						id="sidebar-webui-name"
 						class=" self-center font-medium text-gray-850 dark:text-white font-primary"
@@ -970,7 +970,7 @@
 							class="group grow flex items-center space-x-3 rounded-2xl px-2.5 py-2 hover:bg-gray-100 dark:hover:bg-gray-900 transition outline-none"
 							href="/"
 							draggable="false"
-							on:click={newChatHandler}
+							on:click={newChatNavigationHandler}
 							aria-label={$i18n.t('New Chat')}
 						>
 							<div class="self-center">
