@@ -166,6 +166,85 @@
 	let heartbeatInterval = null;
 
 	const BREAKPOINT = 768;
+	const MASCOT_NOTIFICATION_EVENT = 'cpecc:mascot-notification';
+	const MASCOT_WIDGET_STATE_EVENT = 'cpecc:widget-state';
+	const MASCOT_WIDGET_READY_EVENT = 'cpecc:widget-ready';
+	let mascotWidgetState = {
+		avatarPresent: false,
+		widgetActive: true,
+		lastSeenAt: 0
+	};
+
+	const truncateMascotNotificationText = (value, limit) => {
+		const text = toPlainNotificationText(`${value ?? ''}`)
+			.replace(/\s+/g, ' ')
+			.trim();
+		return text.length > limit ? `${text.slice(0, Math.max(0, limit - 3))}...` : text;
+	};
+
+	const emitMascotNotificationBubble = ({ title, content, path, status, duration, clear }) => {
+		if (typeof window === 'undefined') {
+			return false;
+		}
+
+		const payload = {
+			source: 'cpecc',
+			title: truncateMascotNotificationText(title, 80),
+			content: truncateMascotNotificationText(content, 180),
+			path: typeof path === 'string' ? path : '',
+			status: typeof status === 'string' ? status : '',
+			duration: Number.isFinite(Number(duration)) ? Math.max(0, Number(duration)) : undefined,
+			clear: clear === true
+		};
+
+		if (!payload.title && !payload.content && !payload.clear) {
+			return false;
+		}
+
+		window.dispatchEvent(new CustomEvent(MASCOT_NOTIFICATION_EVENT, { detail: payload }));
+
+		if (window.parent && window.parent !== window) {
+			window.parent.postMessage({ type: MASCOT_NOTIFICATION_EVENT, payload }, '*');
+		}
+
+		return true;
+	};
+
+	const shouldRouteNotificationToMascot = () => {
+		return (
+			typeof window !== 'undefined' &&
+			window.parent &&
+			window.parent !== window &&
+			mascotWidgetState.avatarPresent === true &&
+			mascotWidgetState.widgetActive === false
+		);
+	};
+
+	const announceMascotWidgetReady = () => {
+		if (typeof window === 'undefined' || !window.parent || window.parent === window) {
+			return;
+		}
+
+		window.parent.postMessage({ type: MASCOT_WIDGET_READY_EVENT }, '*');
+	};
+
+	const handleMascotWidgetStateMessage = (event) => {
+		if (!window.parent || window.parent === window || event.source !== window.parent) {
+			return;
+		}
+
+		const data = event.data;
+		if (!data || typeof data !== 'object' || data.type !== MASCOT_WIDGET_STATE_EVENT) {
+			return;
+		}
+
+		const payload = data.payload ?? {};
+		mascotWidgetState = {
+			avatarPresent: payload.avatarPresent === true || payload.launcherVisible === true,
+			widgetActive: payload.widgetActive === true || payload.active === true,
+			lastSeenAt: Date.now()
+		};
+	};
 
 	const setupSocket = async (enableWebsocket) => {
 		const _socket = io(`${WEBUI_BASE_URL}` || undefined, {
@@ -206,9 +285,7 @@
 				mismatchReasons.push(`version:${$WEBUI_VERSION}->${version ?? 'null'}`);
 			}
 			if ($WEBUI_DEPLOYMENT_ID !== null && deploymentId !== $WEBUI_DEPLOYMENT_ID) {
-				mismatchReasons.push(
-					`deployment:${$WEBUI_DEPLOYMENT_ID}->${deploymentId ?? 'null'}`
-				);
+				mismatchReasons.push(`deployment:${$WEBUI_DEPLOYMENT_ID}->${deploymentId ?? 'null'}`);
 			}
 			if (expectsBuildHashMatch && buildHash !== null && buildHash !== WEBUI_BUILD_HASH) {
 				mismatchReasons.push(`build_hash:${WEBUI_BUILD_HASH}->${buildHash}`);
@@ -526,8 +603,12 @@
 		await tick();
 		const type = event?.data?.type ?? null;
 		const data = event?.data?.data ?? null;
+		const routeNotificationToMascot = shouldRouteNotificationToMascot();
 
-		if (type === 'chat:completion' && (!isCurrentChat || !isWindowFocused)) {
+		if (
+			type === 'chat:completion' &&
+			(!isCurrentChat || !isWindowFocused || routeNotificationToMascot)
+		) {
 			const { done, content, title } = data;
 
 			if (done) {
@@ -552,17 +633,25 @@
 					}
 				}
 
-				toast.custom(NotificationToast, {
-					componentProps: {
-						onClick: () => {
-							goto(`/c/${event.chat_id}`);
-						},
-						content: notificationContent,
-						title: title
-					},
-					duration: 15000,
-					unstyled: true
+				emitMascotNotificationBubble({
+					title,
+					content: notificationContent,
+					path: `/c/${event.chat_id}`
 				});
+
+				if (!routeNotificationToMascot) {
+					toast.custom(NotificationToast, {
+						componentProps: {
+							onClick: () => {
+								goto(`/c/${event.chat_id}`);
+							},
+							content: notificationContent,
+							title: title
+						},
+						duration: 15000,
+						unstyled: true
+					});
+				}
 			}
 		}
 
@@ -708,7 +797,9 @@
 			}
 		}
 
-		if ((!channel || isFocused) && event?.user?.id !== $user?.id) {
+		const routeNotificationToMascot = shouldRouteNotificationToMascot();
+
+		if ((!channel || isFocused || routeNotificationToMascot) && event?.user?.id !== $user?.id) {
 			await tick();
 			const type = event?.data?.type ?? null;
 			const data = event?.data?.data ?? null;
@@ -759,17 +850,25 @@
 					}
 				}
 
-				toast.custom(NotificationToast, {
-					componentProps: {
-						onClick: () => {
-							goto(`/channels/${event.channel_id}`);
-						},
-						content: notificationContent,
-						title: `${title}`
-					},
-					duration: 15000,
-					unstyled: true
+				emitMascotNotificationBubble({
+					title,
+					content: notificationContent,
+					path: `/channels/${event.channel_id}`
 				});
+
+				if (!routeNotificationToMascot) {
+					toast.custom(NotificationToast, {
+						componentProps: {
+							onClick: () => {
+								goto(`/channels/${event.channel_id}`);
+							},
+							content: notificationContent,
+							title: `${title}`
+						},
+						duration: 15000,
+						unstyled: true
+					});
+				}
 			}
 		}
 	};
@@ -797,6 +896,9 @@
 
 	onMount(async () => {
 		window.addEventListener('vite:preloadError', preloadErrorHandler);
+		window.addEventListener('message', handleMascotWidgetStateMessage);
+		announceMascotWidgetReady();
+		window.setTimeout(announceMascotWidgetReady, 250);
 
 		let touchstartY = 0;
 
@@ -1038,6 +1140,7 @@
 		return () => {
 			window.removeEventListener('resize', onResize);
 			window.removeEventListener('vite:preloadError', preloadErrorHandler);
+			window.removeEventListener('message', handleMascotWidgetStateMessage);
 			document.removeEventListener('touchstart', touchstartHandler);
 			document.removeEventListener('touchmove', touchmoveHandler);
 			document.removeEventListener('touchend', touchendHandler);

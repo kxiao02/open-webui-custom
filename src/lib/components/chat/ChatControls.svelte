@@ -64,6 +64,11 @@
 	let minSize = 0;
 	let paneReady = false;
 
+	const COMPACT_CONTROLS_PANE_WIDTH_PX = 180;
+	const COMPACT_CONTROLS_PANE_MAX_WIDTH_PX = 220;
+	const PREVIEW_PANE_MIN_WIDTH_PX = 560;
+	const PREVIEW_PANE_MAX_WIDTH_PX = 760;
+
 	// Tab state for Controls+Files panel
 	let activeTab: 'controls' | 'files' | 'overview' | 'preview' = savedTab;
 	let wasFilePreviewOpen = false;
@@ -186,23 +191,50 @@
 		}
 	};
 
+	const getPaneWidthBounds = () => {
+		const container = document.getElementById('chat-container');
+		if (!container) {
+			return {
+				min: COMPACT_CONTROLS_PANE_WIDTH_PX,
+				preferred: COMPACT_CONTROLS_PANE_WIDTH_PX,
+				max: COMPACT_CONTROLS_PANE_MAX_WIDTH_PX
+			};
+		}
+
+		if (activeTab === 'preview' || $showFilePreview) {
+			const preferred = Math.min(
+				Math.max(Math.floor(container.clientWidth * 0.42), PREVIEW_PANE_MIN_WIDTH_PX),
+				PREVIEW_PANE_MAX_WIDTH_PX
+			);
+			return {
+				min: PREVIEW_PANE_MIN_WIDTH_PX,
+				preferred,
+				max: PREVIEW_PANE_MAX_WIDTH_PX
+			};
+		}
+
+		return {
+			min: COMPACT_CONTROLS_PANE_WIDTH_PX,
+			preferred: COMPACT_CONTROLS_PANE_WIDTH_PX,
+			max: COMPACT_CONTROLS_PANE_MAX_WIDTH_PX
+		};
+	};
+
 	const getPreferredPaneSize = () => {
 		const container = document.getElementById('chat-container');
 		if (!container) return minSize;
 
-		const preferredWidthPx = activeTab === 'preview' || $showFilePreview
-			? Math.min(Math.max(Math.floor(container.clientWidth * 0.42), 560), 760)
-			: 350;
-		return Math.max(minSize, Math.floor((preferredWidthPx / container.clientWidth) * 100));
+		const bounds = getPaneWidthBounds();
+		return Math.max(minSize, Math.floor((bounds.preferred / container.clientWidth) * 100));
 	};
 
 	export const openPane = () => {
 		const preferredMinSize = getPreferredPaneSize();
 		if (parseInt(localStorage?.chatControlsSize)) {
 			const container = document.getElementById('chat-container');
-			let size = Math.floor(
-				(parseInt(localStorage?.chatControlsSize) / container.clientWidth) * 100
-			);
+			const bounds = getPaneWidthBounds();
+			const savedWidth = Math.min(parseInt(localStorage?.chatControlsSize), bounds.max);
+			let size = Math.floor((savedWidth / container.clientWidth) * 100);
 			pane.resize(Math.max(size, preferredMinSize));
 		} else {
 			pane.resize(preferredMinSize);
@@ -230,9 +262,7 @@
 
 	const isControlsResizerInteraction = (event: MouseEvent): boolean => {
 		const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
-		return path.some(
-			(node) => node instanceof HTMLElement && node.id === 'controls-resizer'
-		);
+		return path.some((node) => node instanceof HTMLElement && node.id === 'controls-resizer');
 	};
 
 	const onMouseDown = (event: MouseEvent) => {
@@ -268,19 +298,19 @@
 			const container = document.getElementById('chat-container') as HTMLElement;
 			if (!container) return;
 
-			minSize = Math.floor((350 / container.clientWidth) * 100);
+			minSize = Math.floor((COMPACT_CONTROLS_PANE_WIDTH_PX / container.clientWidth) * 100);
 			resizeObserver = new ResizeObserver((entries) => {
 				for (let entry of entries) {
 					const width = entry.contentRect.width;
-					minSize = Math.floor((350 / width) * 100);
+					minSize = Math.floor((COMPACT_CONTROLS_PANE_WIDTH_PX / width) * 100);
 					const preferredMinSize = getPreferredPaneSize();
 					if ($showControls) {
 						if (pane && pane.isExpanded() && pane.getSize() < preferredMinSize) {
 							pane.resize(preferredMinSize);
 						} else {
-							let size = Math.floor(
-								(parseInt(localStorage?.chatControlsSize) / container.clientWidth) * 100
-							);
+							const bounds = getPaneWidthBounds();
+							const savedWidth = Math.min(parseInt(localStorage?.chatControlsSize), bounds.max);
+							let size = Math.floor((savedWidth / container.clientWidth) * 100);
 							if (size < preferredMinSize && pane) pane.resize(preferredMinSize);
 						}
 					}
@@ -488,12 +518,22 @@
 		onResize={(size) => {
 			if ($showControls && pane.isExpanded()) {
 				const preferredMinSize = getPreferredPaneSize();
+				const container = document.getElementById('chat-container');
+				if (!container) return;
+
+				const bounds = getPaneWidthBounds();
+				const maxSize = Math.floor((bounds.max / container.clientWidth) * 100);
+				const clampedSize = Math.min(Math.max(size, preferredMinSize), maxSize);
+
 				if (size < preferredMinSize) pane.resize(preferredMinSize);
+				if (size > maxSize) pane.resize(maxSize);
 				if (size < preferredMinSize) {
 					localStorage.chatControlsSize = 0;
 				} else {
-					const container = document.getElementById('chat-container');
-					localStorage.chatControlsSize = Math.floor((size / 100) * container.clientWidth);
+					localStorage.chatControlsSize = Math.min(
+						Math.floor((clampedSize / 100) * container.clientWidth),
+						bounds.max
+					);
 				}
 			}
 		}}
@@ -509,7 +549,7 @@
 					class="w-full {specialPanel && !$showCallOverlay
 						? ' '
 						: 'bg-white dark:shadow-lg dark:bg-gray-850'} z-40 pointer-events-auto {activeTab ===
-					'files' || $showFilePreview
+						'files' || $showFilePreview
 						? ''
 						: 'overflow-y-auto'} scrollbar-hidden"
 					id="controls-container"
@@ -607,7 +647,11 @@
 											stroke-width="1.5"
 											class="size-4"
 										>
-											<path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
+											<path
+												stroke-linecap="round"
+												stroke-linejoin="round"
+												d="M6 18 18 6M6 6l12 12"
+											/>
 										</svg>
 									</button>
 								</div>
