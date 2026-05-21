@@ -443,6 +443,8 @@ from open_webui.config import (
     PORTAL_SSO_APP_INITIATED_ENABLED,
     PORTAL_SSO_ENABLED,
     PORTAL_SSO_PROVIDER_NAME,
+    WECOM_SSO_ENABLED,
+    WECOM_SSO_PROVIDER_NAME,
     # WebUI (LDAP)
     ENABLE_LDAP,
     LDAP_SERVER_LABEL,
@@ -586,6 +588,7 @@ from open_webui.utils.oauth import (
     OAuthClientInformationFull,
 )
 from open_webui.utils.portal_sso import PortalSSOManager
+from open_webui.utils.wecom_sso import WeComSSOManager
 from open_webui.utils.security_headers import SecurityHeadersMiddleware
 from open_webui.utils.redis import get_redis_connection
 
@@ -847,6 +850,8 @@ oauth_manager = OAuthManager(app)
 app.state.oauth_manager = oauth_manager
 portal_sso_manager = PortalSSOManager(app)
 app.state.portal_sso_manager = portal_sso_manager
+wecom_sso_manager = WeComSSOManager(app)
+app.state.wecom_sso_manager = wecom_sso_manager
 
 # For Integrations
 oauth_client_manager = OAuthClientManager(app)
@@ -2444,6 +2449,10 @@ async def get_app_config(request: Request):
             "app_initiated_enabled": PORTAL_SSO_APP_INITIATED_ENABLED.value,
             "provider_name": PORTAL_SSO_PROVIDER_NAME.value,
         },
+        "wecom_sso": {
+            "enabled": WECOM_SSO_ENABLED.value,
+            "provider_name": WECOM_SSO_PROVIDER_NAME.value,
+        },
         "knowflow": get_knowflow_public_config(app.state.config),
         "features": {
             "auth": WEBUI_AUTH,
@@ -2845,6 +2854,19 @@ async def oauth_login(provider: str, request: Request):
 @app.get("/sso/portal/login")
 async def portal_sso_login(request: Request):
     return await portal_sso_manager.handle_login(request)
+
+
+@app.get("/sso/wecom/login")
+async def wecom_sso_login(request: Request):
+    return await wecom_sso_manager.handle_login(request)
+
+
+@app.get("/sso/wecom/callback")
+async def wecom_sso_callback(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    return await wecom_sso_manager.handle_callback(request, db=db)
 
 
 @app.get("/sso/portal/callback")

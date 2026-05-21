@@ -41,6 +41,7 @@
 	let portalSsoConfigured = false;
 	let providersEnabled = false;
 	let portalSsoEnabled = false;
+	let wecomSsoEnabled = false;
 	let externalSignInEnabled = false;
 	let authRedirectInProgress = false;
 	let trustedHeaderAuth = false;
@@ -321,7 +322,8 @@
 	$: providersEnabled = configReady && Object.keys($config?.oauth?.providers ?? {}).length > 0;
 	$: portalSsoEnabled =
 		portalSsoConfigured && ($config?.portal_sso?.app_initiated_enabled ?? false);
-	$: externalSignInEnabled = providersEnabled || portalSsoEnabled;
+	$: wecomSsoEnabled = configReady && ($config?.wecom_sso?.enabled ?? false);
+	$: externalSignInEnabled = providersEnabled || portalSsoEnabled || wecomSsoEnabled;
 	$: trustedHeaderAuth =
 		configReady &&
 		(($config?.features.auth_trusted_header ?? false) || $config?.features.auth === false);
@@ -598,6 +600,29 @@
 									<hr class="w-32 h-px my-4 border-0 dark:bg-gray-100/10 bg-gray-700/10" />
 								</div>
 								<div class="flex flex-col space-y-2">
+									{#if wecomSsoEnabled}
+										<button
+											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+											on:click={() => {
+												const query = new URLSearchParams();
+												const redirectPath =
+													$page.url.searchParams.get('redirect') ||
+													localStorage.getItem('redirectPath') ||
+													'';
+												if (redirectPath) {
+													query.set('redirect', redirectPath);
+												}
+												const search = query.toString();
+												window.location.href = `${WEBUI_BASE_URL}/sso/wecom/login${search ? `?${search}` : ''}`;
+											}}
+										>
+											<span
+												>{$i18n.t('Continue with {{provider}}', {
+													provider: $config?.wecom_sso?.provider_name ?? '企业微信'
+												})}</span
+											>
+										</button>
+									{/if}
 									{#if portalSsoEnabled}
 										<button
 											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"

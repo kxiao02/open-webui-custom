@@ -940,6 +940,97 @@ PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN = PersistentConfig(
     prefer_env=True,
 )
 
+WECOM_SSO_ENABLED = PersistentConfig(
+    "WECOM_SSO_ENABLED",
+    "wecom_sso.enabled",
+    os.environ.get("WECOM_SSO_ENABLED", "False").lower() == "true",
+    prefer_env=True,
+)
+
+WECOM_SSO_PROVIDER_NAME = PersistentConfig(
+    "WECOM_SSO_PROVIDER_NAME",
+    "wecom_sso.provider_name",
+    os.environ.get("WECOM_SSO_PROVIDER_NAME", "企业微信"),
+    prefer_env=True,
+)
+
+WECOM_SSO_CORP_ID = PersistentConfig(
+    "WECOM_SSO_CORP_ID",
+    "wecom_sso.corp_id",
+    os.environ.get("WECOM_SSO_CORP_ID", ""),
+    prefer_env=True,
+)
+
+WECOM_SSO_AGENT_ID = PersistentConfig(
+    "WECOM_SSO_AGENT_ID",
+    "wecom_sso.agent_id",
+    os.environ.get("WECOM_SSO_AGENT_ID", ""),
+    prefer_env=True,
+)
+
+WECOM_SSO_CORP_SECRET = PersistentConfig(
+    "WECOM_SSO_CORP_SECRET",
+    "wecom_sso.corp_secret",
+    os.environ.get("WECOM_SSO_CORP_SECRET", ""),
+    prefer_env=True,
+)
+
+WECOM_SSO_CALLBACK_URL = PersistentConfig(
+    "WECOM_SSO_CALLBACK_URL",
+    "wecom_sso.callback_url",
+    os.environ.get("WECOM_SSO_CALLBACK_URL", ""),
+    prefer_env=True,
+)
+
+WECOM_SSO_PUBLIC_URL = PersistentConfig(
+    "WECOM_SSO_PUBLIC_URL",
+    "wecom_sso.public_url",
+    os.environ.get("WECOM_SSO_PUBLIC_URL", ""),
+    prefer_env=True,
+)
+
+WECOM_SSO_SCOPE = PersistentConfig(
+    "WECOM_SSO_SCOPE",
+    "wecom_sso.scope",
+    os.environ.get("WECOM_SSO_SCOPE", "snsapi_base"),
+    prefer_env=True,
+)
+
+WECOM_SSO_TIMEOUT_SECONDS = PersistentConfig(
+    "WECOM_SSO_TIMEOUT_SECONDS",
+    "wecom_sso.timeout_seconds",
+    int(os.environ.get("WECOM_SSO_TIMEOUT_SECONDS", "10")),
+    prefer_env=True,
+)
+
+WECOM_SSO_AUTO_SIGNUP = PersistentConfig(
+    "WECOM_SSO_AUTO_SIGNUP",
+    "wecom_sso.auto_signup",
+    os.environ.get("WECOM_SSO_AUTO_SIGNUP", "True").lower() == "true",
+    prefer_env=True,
+)
+
+WECOM_SSO_FETCH_USER_DETAIL = PersistentConfig(
+    "WECOM_SSO_FETCH_USER_DETAIL",
+    "wecom_sso.fetch_user_detail",
+    os.environ.get("WECOM_SSO_FETCH_USER_DETAIL", "True").lower() == "true",
+    prefer_env=True,
+)
+
+WECOM_SSO_ACCOUNT_NO_FIELD = PersistentConfig(
+    "WECOM_SSO_ACCOUNT_NO_FIELD",
+    "wecom_sso.account_no_field",
+    os.environ.get("WECOM_SSO_ACCOUNT_NO_FIELD", "userid"),
+    prefer_env=True,
+)
+
+WECOM_SSO_SYNTHETIC_EMAIL_DOMAIN = PersistentConfig(
+    "WECOM_SSO_SYNTHETIC_EMAIL_DOMAIN",
+    "wecom_sso.synthetic_email_domain",
+    os.environ.get("WECOM_SSO_SYNTHETIC_EMAIL_DOMAIN", "wecom.local"),
+    prefer_env=True,
+)
+
 KNOWFLOW_SITE_URL = PersistentConfig(
     "KNOWFLOW_SITE_URL",
     "knowflow.site_url",

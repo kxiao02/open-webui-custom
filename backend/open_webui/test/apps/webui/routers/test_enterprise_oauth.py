@@ -1,6 +1,7 @@
 import copy
 import os
 import time
+from urllib.parse import parse_qs, urlparse
 
 os.environ.setdefault("ENABLE_DB_MIGRATIONS", "False")
 
@@ -14,6 +15,7 @@ from open_webui.routers import auths, configs
 from open_webui.test_support import AbstractPostgresTest
 from open_webui.utils.oauth import OAuthManager
 from open_webui.utils.portal_sso import PortalSSOManager
+from open_webui.utils.wecom_sso import WeComSSOManager
 
 
 class TestEnterpriseOAuth(AbstractPostgresTest):
@@ -40,6 +42,40 @@ class TestEnterpriseOAuth(AbstractPostgresTest):
         config.PORTAL_SSO_TIMEOUT_SECONDS.value = snapshot["timeout_seconds"]
         config.PORTAL_SSO_AUTO_SIGNUP.value = snapshot["auto_signup"]
         config.PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN.value = snapshot[
+            "synthetic_email_domain"
+        ]
+
+    def _snapshot_wecom_sso_config(self):
+        return {
+            "enabled": config.WECOM_SSO_ENABLED.value,
+            "provider_name": config.WECOM_SSO_PROVIDER_NAME.value,
+            "corp_id": config.WECOM_SSO_CORP_ID.value,
+            "agent_id": config.WECOM_SSO_AGENT_ID.value,
+            "corp_secret": config.WECOM_SSO_CORP_SECRET.value,
+            "callback_url": config.WECOM_SSO_CALLBACK_URL.value,
+            "public_url": config.WECOM_SSO_PUBLIC_URL.value,
+            "scope": config.WECOM_SSO_SCOPE.value,
+            "timeout_seconds": config.WECOM_SSO_TIMEOUT_SECONDS.value,
+            "auto_signup": config.WECOM_SSO_AUTO_SIGNUP.value,
+            "fetch_user_detail": config.WECOM_SSO_FETCH_USER_DETAIL.value,
+            "account_no_field": config.WECOM_SSO_ACCOUNT_NO_FIELD.value,
+            "synthetic_email_domain": config.WECOM_SSO_SYNTHETIC_EMAIL_DOMAIN.value,
+        }
+
+    def _restore_wecom_sso_config(self, snapshot):
+        config.WECOM_SSO_ENABLED.value = snapshot["enabled"]
+        config.WECOM_SSO_PROVIDER_NAME.value = snapshot["provider_name"]
+        config.WECOM_SSO_CORP_ID.value = snapshot["corp_id"]
+        config.WECOM_SSO_AGENT_ID.value = snapshot["agent_id"]
+        config.WECOM_SSO_CORP_SECRET.value = snapshot["corp_secret"]
+        config.WECOM_SSO_CALLBACK_URL.value = snapshot["callback_url"]
+        config.WECOM_SSO_PUBLIC_URL.value = snapshot["public_url"]
+        config.WECOM_SSO_SCOPE.value = snapshot["scope"]
+        config.WECOM_SSO_TIMEOUT_SECONDS.value = snapshot["timeout_seconds"]
+        config.WECOM_SSO_AUTO_SIGNUP.value = snapshot["auto_signup"]
+        config.WECOM_SSO_FETCH_USER_DETAIL.value = snapshot["fetch_user_detail"]
+        config.WECOM_SSO_ACCOUNT_NO_FIELD.value = snapshot["account_no_field"]
+        config.WECOM_SSO_SYNTHETIC_EMAIL_DOMAIN.value = snapshot[
             "synthetic_email_domain"
         ]
 
@@ -647,3 +683,103 @@ class TestEnterpriseOAuth(AbstractPostgresTest):
         finally:
             config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value = prev_merge
             self._restore_portal_sso_config(snapshot)
+
+    def test_wecom_sso_login_builds_authorize_redirect_and_state_cookie(self):
+        snapshot = self._snapshot_wecom_sso_config()
+        try:
+            config.WECOM_SSO_ENABLED.value = True
+            config.WECOM_SSO_CORP_ID.value = "ww-test-corp"
+            config.WECOM_SSO_AGENT_ID.value = "1000001"
+            config.WECOM_SSO_CORP_SECRET.value = "secret"
+            config.WECOM_SSO_CALLBACK_URL.value = (
+                "https://chat.cpecc.net:29999/sso/wecom/callback"
+            )
+
+            request = self.make_request(
+                "/sso/wecom/login",
+                query_string=b"redirect=%2Fworkspace",
+            )
+            manager = WeComSSOManager(request.app)
+
+            redirect = self.run_async(manager.handle_login(request))
+            location = redirect.headers["location"]
+            parsed = urlparse(location)
+            params = parse_qs(parsed.query)
+            callback = params["redirect_uri"][0]
+
+            assert parsed.scheme == "https"
+            assert parsed.netloc == "open.weixin.qq.com"
+            assert parsed.path == "/connect/oauth2/authorize"
+            assert params["appid"] == ["ww-test-corp"]
+            assert params["agentid"] == ["1000001"]
+            assert params["scope"] == ["snsapi_base"]
+            assert callback == (
+                "https://chat.cpecc.net:29999/sso/wecom/callback?redirect=%2Fworkspace"
+            )
+            assert "wecom_sso_state=" in redirect.headers.get("set-cookie", "")
+        finally:
+            self._restore_wecom_sso_config(snapshot)
+
+    def test_wecom_sso_callback_creates_user_and_session(self, monkeypatch):
+        snapshot = self._snapshot_wecom_sso_config()
+        try:
+            config.WECOM_SSO_ENABLED.value = True
+            config.WECOM_SSO_CORP_ID.value = "ww-test-corp"
+            config.WECOM_SSO_AGENT_ID.value = "1000001"
+            config.WECOM_SSO_CORP_SECRET.value = "secret"
+            config.WECOM_SSO_PUBLIC_URL.value = "https://chat.cpecc.net:29999"
+            config.WECOM_SSO_AUTO_SIGNUP.value = True
+
+            request = self.make_request(
+                "/sso/wecom/callback",
+                query_string=b"code=code-1&state=state-1&redirect=%2Fworkspace",
+                headers={"cookie": "wecom_sso_state=state-1"},
+            )
+            manager = WeComSSOManager(request.app)
+
+            async def _fake_resolve_profile(_code):
+                return {
+                    "userid": "sysmintest",
+                    "account_no": "sysmintest",
+                    "name": "System Mint",
+                    "email": "sysmintest@example.com",
+                    "mobile": "",
+                    "alias": "",
+                    "avatar": "",
+                    "department": [],
+                }
+
+            monkeypatch.setattr(manager, "_resolve_profile", _fake_resolve_profile)
+
+            redirect = self.run_async(manager.handle_callback(request, db=self.db))
+
+            user = Users.get_user_by_oauth_sub("wecom", "sysmintest", db=self.db)
+            assert user is not None
+            assert user.name == "System Mint"
+            assert user.oauth["wecom"]["userid"] == "sysmintest"
+            assert redirect.headers["location"] == "https://chat.cpecc.net:29999/workspace"
+            assert "token=" in redirect.headers.get("set-cookie", "")
+        finally:
+            self._restore_wecom_sso_config(snapshot)
+
+    def test_wecom_sso_callback_rejects_invalid_state(self):
+        snapshot = self._snapshot_wecom_sso_config()
+        try:
+            config.WECOM_SSO_ENABLED.value = True
+            config.WECOM_SSO_PUBLIC_URL.value = "https://chat.cpecc.net:29999"
+
+            request = self.make_request(
+                "/sso/wecom/callback",
+                query_string=b"code=code-1&state=bad-state",
+                headers={"cookie": "wecom_sso_state=state-1"},
+            )
+            manager = WeComSSOManager(request.app)
+
+            redirect = self.run_async(manager.handle_callback(request, db=self.db))
+            location = redirect.headers["location"]
+            params = parse_qs(urlparse(location).query)
+
+            assert location.startswith("https://chat.cpecc.net:29999/auth?")
+            assert params["error"] == ["WeCom SSO state is invalid"]
+        finally:
+            self._restore_wecom_sso_config(snapshot)
