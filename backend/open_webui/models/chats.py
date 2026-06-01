@@ -87,6 +87,30 @@ SECOND_PASS_RETRIEVAL_FAILURE_CLASSIFICATIONS = {
     "malformed": "diagnostics",
     "error": "diagnostics",
 }
+SECOND_PASS_RETRIEVAL_REFERENCE_SUPPRESSION_OUTCOMES = {
+    "blocked",
+    "error",
+    "low_relevance",
+    "malformed",
+    "no_evidence",
+    "permission_denied",
+    "timeout",
+    "weak_evidence",
+}
+SECOND_PASS_RETRIEVAL_REFERENCE_SUPPRESSION_REASON_TOKENS = (
+    "blocked",
+    "denied",
+    "low_relevance",
+    "malformed",
+    "no_evidence",
+    "not_found",
+    "permission_denied",
+    "rejected",
+    "requested_source_out_of_scope",
+    "source_not_authorized",
+    "timeout",
+    "weak",
+)
 SECOND_PASS_RETRIEVAL_PERMISSION_REASONS = {
     "permission_denied",
     "unauthorized",
@@ -119,6 +143,55 @@ _SUPPRESSED_REFERENCE_CITATION_PATTERN = re.compile(
 )
 _SUPPRESSED_REFERENCE_PUNCTUATION_PATTERN = re.compile(r"[ \t]+([,.;:!?，。！？；：])")
 _SUPPRESSED_REFERENCE_DOUBLE_SPACE_PATTERN = re.compile(r"[ \t]{2,}")
+_NO_EVIDENCE_RESPONSE_CONTENT_PATTERN = re.compile(
+    r"(未在[^。；\n]{0,120}(?:找到|检索到)|"
+    r"(?:未|没有)[^。；\n]{0,40}(?:找到|检索到)[^。；\n]{0,220}(?:证据|依据|相关)|"
+    r"(?:未|没有)(?:找到|检索到)[^。；\n]{0,220}(?:原文|内容|结果|条款|信息)|"
+    r"无[^。；\n]{0,40}(?:证据|依据)|"
+    r"no\s+(?:usable\s+)?(?:evidence|results?)|"
+    r"not\s+found)",
+    re.IGNORECASE,
+)
+_EXPLICIT_CITATION_MARKER_PATTERN = re.compile(
+    r"\[\s*\d+(?:\s*[-,，]\s*\d+)*\s*\]"
+)
+REFERENCE_CARD_REJECTED_STATUS_VALUES = {
+    "blocked",
+    "denied",
+    "error",
+    "failed",
+    "failure",
+    "low_relevance",
+    "malformed",
+    "no_evidence",
+    "not_found",
+    "permission_denied",
+    "rejected",
+    "timeout",
+    "timed_out",
+    "weak",
+    "weak_evidence",
+}
+REFERENCE_CARD_REJECTED_REASON_TOKENS = (
+    "blocked",
+    "denied",
+    "low_relevance",
+    "no_evidence",
+    "not_found",
+    "permission_denied",
+    "rejected",
+    "retry",
+    "timeout",
+    "weak",
+)
+REFERENCE_CARD_STATUS_KEYS = (
+    "classification",
+    "outcome",
+    "reason",
+    "status",
+    "status_code",
+    "code",
+)
 
 
 def _normalize_message_file_ref(value: object) -> str:
@@ -1902,6 +1975,18 @@ class ChatTable:
             )
             for alias in ("sources", "citations", "references", "documents"):
                 payload.pop(alias, None)
+            for sensitive_key in (
+                "provider_payload",
+                "provider_response",
+                "provider_prose",
+                "raw_payload",
+                "raw_response",
+                "raw_results",
+                "inventory_rows",
+                "inventory_documents",
+                "strategy_trace",
+            ):
+                payload.pop(sensitive_key, None)
             status = self._normalize_second_pass_retrieval_status(payload)
             status_counts[status or "unknown"] = (
                 status_counts.get(status or "unknown", 0) + 1
@@ -3085,6 +3170,108 @@ class ChatTable:
 
         return references
 
+    def _reference_card_has_rejected_signal(self, reference: object) -> bool:
+        if not isinstance(reference, dict):
+            return True
+        if self._is_retrieval_diagnostic_item(reference):
+            return True
+
+        signal_values: list[str] = []
+        for key in REFERENCE_CARD_STATUS_KEYS:
+            value = reference.get(key)
+            if value in (None, "", [], {}):
+                continue
+            signal_values.append(str(value).strip().lower())
+
+        provenance = reference.get("provenance")
+        if isinstance(provenance, dict):
+            for key in REFERENCE_CARD_STATUS_KEYS:
+                value = provenance.get(key)
+                if value in (None, "", [], {}):
+                    continue
+                signal_values.append(str(value).strip().lower())
+
+        for metadata_item in reference.get("metadata") or []:
+            if not isinstance(metadata_item, dict):
+                continue
+            if self._is_retrieval_diagnostic_item(metadata_item):
+                return True
+            for key in REFERENCE_CARD_STATUS_KEYS:
+                value = metadata_item.get(key)
+                if value in (None, "", [], {}):
+                    continue
+                signal_values.append(str(value).strip().lower())
+
+        for value in signal_values:
+            if value in REFERENCE_CARD_REJECTED_STATUS_VALUES:
+                return True
+            if any(token in value for token in REFERENCE_CARD_REJECTED_REASON_TOKENS):
+                return True
+
+        if reference.get("provider_prose") not in (None, "", [], {}):
+            return True
+        if reference.get("retry_trace") not in (None, "", [], {}):
+            return True
+        if reference.get("retry_traces") not in (None, "", [], {}):
+            return True
+        if reference.get("retry_history") not in (None, "", [], {}):
+            return True
+
+        source_meta = reference.get("source")
+        has_source_identity = isinstance(source_meta, dict) and any(
+            source_meta.get(key) not in (None, "", [], {})
+            for key in ("id", "name", "title", "url")
+        )
+        documents = reference.get("document")
+        has_document = isinstance(documents, list) and any(
+            item not in (None, "", [], {}) for item in documents
+        )
+        metadata_items = [
+            item
+            for item in (reference.get("metadata") or [])
+            if isinstance(item, dict)
+        ]
+        if metadata_items and not has_source_identity and not has_document:
+            score_only_keys = {
+                "distance",
+                "score",
+                "scores",
+                "raw_score",
+                "raw_scores",
+                "provider_score",
+                "provider_scores",
+                "relevance",
+                "relevance_score",
+                "rank",
+            }
+            metadata_looks_like_score_only = True
+            for metadata_item in metadata_items:
+                if not metadata_item:
+                    continue
+                item_keys = set(str(key) for key in metadata_item.keys())
+                if not item_keys:
+                    continue
+                if not item_keys.issubset(score_only_keys):
+                    metadata_looks_like_score_only = False
+                    break
+            if metadata_looks_like_score_only:
+                return True
+
+        return False
+
+    def build_reference_cards(self, *reference_groups: object) -> list[dict]:
+        normalized_references = self.build_canonical_references(*reference_groups)
+        if not normalized_references:
+            return []
+
+        cards: list[dict] = []
+        for reference in normalized_references:
+            if self._reference_card_has_rejected_signal(reference):
+                continue
+            cards.append(reference)
+
+        return cards
+
     def _merge_reference_provenance(
         self, existing_reference: dict, incoming_reference: dict
     ) -> None:
@@ -3414,10 +3601,44 @@ class ChatTable:
 
         return any(
             isinstance(item, dict)
-            and str(item.get("reason") or "").strip().lower()
-            == "ambiguous_retrieval_scope"
+            and (
+                str(item.get("classification") or "").strip().lower() == "no_evidence"
+                or str(item.get("outcome") or "").strip().lower() == "no_evidence"
+                or
+                str(item.get("reason") or "").strip().lower()
+                == "ambiguous_retrieval_scope"
+                or self._diagnostic_suppresses_selected_source_references(item)
+            )
             for item in diagnostics
         )
+
+    def _diagnostic_suppresses_selected_source_references(self, diagnostic: object) -> bool:
+        if not isinstance(diagnostic, dict):
+            return False
+        if not self._is_retrieval_diagnostic_item(diagnostic):
+            return False
+
+        tool_name = str(diagnostic.get("tool_name") or "").strip()
+        if not self._is_second_pass_retrieval_tool_name(tool_name):
+            return False
+
+        classification = str(diagnostic.get("classification") or "").strip().lower()
+        outcome = str(
+            diagnostic.get("outcome") or diagnostic.get("status") or ""
+        ).strip().lower()
+        reason = str(diagnostic.get("reason") or "").strip().lower()
+
+        if classification == "no_evidence":
+            return True
+        if outcome in SECOND_PASS_RETRIEVAL_REFERENCE_SUPPRESSION_OUTCOMES:
+            return True
+        if any(
+            token and token in reason
+            for token in SECOND_PASS_RETRIEVAL_REFERENCE_SUPPRESSION_REASON_TOKENS
+        ):
+            return True
+
+        return False
 
     def _diagnostics_indicate_no_evidence(self, diagnostics: object) -> bool:
         if not isinstance(diagnostics, list):
@@ -3431,16 +3652,27 @@ class ChatTable:
         )
 
     def _should_suppress_canonical_references(
-        self, *, metadata: object = None, diagnostics: object = None
+        self,
+        *,
+        metadata: object = None,
+        diagnostics: object = None,
+        accepted_references: object = None,
     ) -> bool:
         metadata = metadata if isinstance(metadata, dict) else {}
+        accepted_references = (
+            accepted_references if isinstance(accepted_references, list) else []
+        )
         merged_diagnostics = self._merge_retrieval_diagnostics(
             metadata.get("retrieval_diagnostics"),
             diagnostics,
         )
-        return self._active_source_scope_suppresses_references(
+        if self._active_source_scope_suppresses_references(
             metadata.get("active_source_scope")
-        ) or self._diagnostics_suppress_references(merged_diagnostics)
+        ):
+            return True
+        return (not accepted_references) and self._diagnostics_suppress_references(
+            merged_diagnostics
+        )
 
     def _should_clear_reference_aliases(
         self,
@@ -3457,12 +3689,14 @@ class ChatTable:
 
         if self._active_source_scope_suppresses_references(
             metadata.get("active_source_scope")
-        ) or self._diagnostics_suppress_references(merged_diagnostics):
+        ):
             return True
 
-        accepted_references = (
-            accepted_references if isinstance(accepted_references, list) else []
-        )
+        if (not accepted_references) and self._diagnostics_suppress_references(
+            merged_diagnostics
+        ):
+            return True
+
         return (
             not accepted_references
             and self._diagnostics_indicate_no_evidence(merged_diagnostics)
@@ -3616,6 +3850,19 @@ class ChatTable:
 
         return cleaned_output if changed else output
 
+    def _content_indicates_no_evidence_response(self, content: object) -> bool:
+        if not isinstance(content, str):
+            return False
+        normalized = content.strip()
+        if not normalized:
+            return False
+        return bool(_NO_EVIDENCE_RESPONSE_CONTENT_PATTERN.search(normalized))
+
+    def _content_has_explicit_citation_markers(self, content: object) -> bool:
+        if not isinstance(content, str):
+            return False
+        return bool(_EXPLICIT_CITATION_MARKER_PATTERN.search(content))
+
     def _hide_retrieval_status_history(self, message: dict) -> tuple[dict, bool]:
         if not isinstance(message, dict):
             return message, False
@@ -3693,11 +3940,21 @@ class ChatTable:
             tool_reference_payloads,
         ]
         explicit_accepted_references = self.build_canonical_references(
-            metadata.get("canonical_references"),
+            sources,
             tool_reference_payloads,
         )
         references = self.build_canonical_references(
             *source_groups,
+        )
+        reference_cards = self.build_reference_cards(
+            metadata.get("reference_cards"),
+            metadata.get("canonical_references"),
+            metadata.get("sources"),
+            metadata.get("citations"),
+            metadata.get("references"),
+            metadata.get("documents"),
+            sources,
+            tool_reference_payloads,
         )
         retrieval_diagnostics = self._merge_retrieval_diagnostics(
             metadata.get("retrieval_diagnostics"),
@@ -3710,19 +3967,92 @@ class ChatTable:
                 explicit_accepted_references,
             )
         )
-        if self._diagnostics_indicate_no_evidence(retrieval_diagnostics):
-            references = []
+        status_value = str(metadata.get("status") or "").strip().lower()
+        terminal_reason = str(metadata.get("terminal_reason") or "").strip().lower()
+        strategy = (
+            metadata.get("first_pass_retrieval_strategy")
+            if isinstance(metadata.get("first_pass_retrieval_strategy"), dict)
+            else {}
+        )
+        routing_diagnostics = (
+            metadata.get("execution_profile_routing_diagnostics")
+            if isinstance(metadata.get("execution_profile_routing_diagnostics"), dict)
+            else {}
+        )
+        metadata_first_intent = bool(strategy.get("metadata_first_intent")) or (
+            str(strategy.get("retrieval_strategy") or "").strip().lower()
+            == "metadata_first_then_targeted_chunks"
+        ) or str(
+            routing_diagnostics.get("classified_evidence_need") or ""
+        ).strip().lower().startswith("metadata_first")
+        selected_source_authority = bool(
+            isinstance(active_source_scope, dict)
+            and str(active_source_scope.get("authority") or "").strip().lower()
+            in {
+                "selected_source",
+                "current_upload",
+                "user_clarification",
+                "canonical_reference",
+            }
+        )
+        selected_source_metadata_first_turn = bool(
+            metadata_first_intent and selected_source_authority
+        )
+        if (
+            status_value == "success"
+            and not explicit_accepted_references
+            and selected_source_metadata_first_turn
+        ):
+            # Preserve current-turn accepted references when later sidecar rebuilds
+            # run without raw `sources` but metadata already carries vetted refs.
+            explicit_accepted_references = self.build_canonical_references(
+                metadata.get("references"),
+                metadata.get("canonical_references"),
+            )
+        diagnostics_only_blocked = (
+            status_value in {"blocked", "no_evidence"}
+            and self._diagnostics_suppress_references(retrieval_diagnostics)
+        )
+        diagnostics_only_missing_status = (
+            not status_value
+            and self._diagnostics_suppress_references(retrieval_diagnostics)
+            and isinstance(active_source_scope, dict)
+            and str(active_source_scope.get("authority") or "").strip().lower()
+            in {"selected_source", "current_upload", "user_clarification", "canonical_reference"}
+        )
+        diagnostics_only_unsupported_selected_source = bool(
+            selected_source_metadata_first_turn
+            and (
+                status_value in {"blocked", "no_evidence"}
+                or terminal_reason.startswith("unsupported_")
+            )
+        )
+        if (
+            diagnostics_only_blocked
+            or diagnostics_only_missing_status
+            or diagnostics_only_unsupported_selected_source
+        ):
+            # Do not allow stale pre-existing references/cards to survive a
+            # current-turn blocked or no-evidence retrieval outcome.
+            explicit_accepted_references = []
         if self._should_suppress_canonical_references(
             metadata=metadata,
             diagnostics=retrieval_diagnostics,
+            accepted_references=explicit_accepted_references,
         ):
             references = []
+            reference_cards = []
+        if diagnostics_only_unsupported_selected_source:
+            references = []
+            reference_cards = []
 
         sidecar: dict = {}
         if active_source_scope:
             sidecar["active_source_scope"] = active_source_scope
         if references:
             sidecar["canonical_references"] = references
+        if reference_cards:
+            sidecar["reference_cards"] = reference_cards
         if retrieval_diagnostics:
             sidecar["retrieval_diagnostics"] = retrieval_diagnostics
         observe_llm_event(
@@ -3737,6 +4067,7 @@ class ChatTable:
                     else None
                 ),
                 "canonical_reference_count": len(references),
+                "reference_card_count": len(reference_cards),
                 "diagnostic_count": len(retrieval_diagnostics),
                 "result_status": (
                     "mixed"
@@ -3805,6 +4136,10 @@ class ChatTable:
                 merged_metadata["canonical_references"] = sidecar["canonical_references"]
             else:
                 merged_metadata.pop("canonical_references", None)
+            if sidecar.get("reference_cards"):
+                merged_metadata["reference_cards"] = sidecar["reference_cards"]
+            else:
+                merged_metadata.pop("reference_cards", None)
             if sidecar.get("active_source_scope"):
                 merged_metadata["active_source_scope"] = sidecar["active_source_scope"]
             else:
@@ -3820,22 +4155,53 @@ class ChatTable:
         accepted_references = self.build_canonical_references(
             metadata.get("canonical_references"),
             normalized_message.get("canonical_references"),
+            sidecar.get("canonical_references"),
         )
+        selected_source_accepted_references = [
+            reference
+            for reference in accepted_references
+            if isinstance(reference, dict)
+            and self._is_second_pass_retrieval_tool_name(
+                str(
+                    (
+                        reference.get("provenance")
+                        if isinstance(reference.get("provenance"), dict)
+                        else {}
+                    ).get("tool_name")
+                    or ""
+                ).strip()
+            )
+        ]
 
-        if self._should_clear_reference_aliases(
+        should_clear_aliases = self._should_clear_reference_aliases(
             metadata=normalized_message.get("metadata"),
             diagnostics=sidecar.get("retrieval_diagnostics"),
-            accepted_references=accepted_references,
+            accepted_references=selected_source_accepted_references,
+        )
+        if (
+            not should_clear_aliases
+            and self._content_indicates_no_evidence_response(
+                normalized_message.get("content")
+            )
+            and not self._content_has_explicit_citation_markers(
+                normalized_message.get("content")
+            )
         ):
+            should_clear_aliases = True
+
+        if should_clear_aliases:
             message_metadata = normalized_message.get("metadata")
             if (
                 isinstance(message_metadata, dict)
-                and "canonical_references" in message_metadata
+                and (
+                    "canonical_references" in message_metadata
+                    or "reference_cards" in message_metadata
+                )
             ):
                 normalized_message["metadata"] = {
                     key: value
                     for key, value in message_metadata.items()
-                    if key != "canonical_references"
+                    if key not in {"canonical_references", "reference_cards"}
                 }
                 changed = True
             for key in (

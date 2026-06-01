@@ -103,6 +103,152 @@ DEEPAGENT_RETRIEVAL_MAX_CHARS_PER_CHUNK = 900
 DEEPAGENT_RETRIEVAL_MAX_TOTAL_CHARS = 6000
 DEEPAGENT_READ_MAX_CHARS_PER_CHUNK = 1200
 DEEPAGENT_READ_MAX_TOTAL_CHARS = 8000
+SELECTED_SOURCE_RETRIEVAL_DEFAULT_TIMEOUT_SECONDS = 25.0
+SELECTED_SOURCE_RETRIEVAL_MAX_TIMEOUT_SECONDS = 90.0
+SELECTED_SOURCE_RETRIEVAL_DESCRIPTOR_BY_TOOL: dict[str, dict[str, Any]] = {
+    "query_selected_knowledge_files": {
+        "tool_name": "query_selected_knowledge_files",
+        "full_context": False,
+        "default_k": 5,
+        "max_k": 8,
+        "max_sources": DEEPAGENT_RETRIEVAL_MAX_SOURCES,
+        "max_chunks": DEEPAGENT_RETRIEVAL_MAX_CHUNKS,
+        "max_chars_per_chunk": DEEPAGENT_RETRIEVAL_MAX_CHARS_PER_CHUNK,
+        "max_total_chars": DEEPAGENT_RETRIEVAL_MAX_TOTAL_CHARS,
+        "default_evidence_need": "balanced",
+    },
+    "read_selected_file": {
+        "tool_name": "read_selected_file",
+        "full_context": True,
+        "default_k": 1,
+        "max_k": 1,
+        "max_sources": 1,
+        "max_chunks": 8,
+        "max_chars_per_chunk": DEEPAGENT_READ_MAX_CHARS_PER_CHUNK,
+        "max_total_chars": DEEPAGENT_READ_MAX_TOTAL_CHARS,
+        "default_evidence_need": "focused_read",
+    },
+}
+_METADATA_FIRST_SELECTED_SOURCE_EVIDENCE_NEEDS = frozenset(
+    {
+        "metadata_first_inventory",
+        "metadata_first_targeted_chunks",
+        "document_inventory",
+        "document_listing",
+        "temporal_listing",
+        "topic_scoped_listing",
+        "document_type_listing",
+        "count_or_statistics",
+        "table_of_contents",
+        "corpus_overview",
+    }
+)
+_SEMANTIC_DETAIL_SELECTED_SOURCE_EVIDENCE_NEEDS = frozenset(
+    {
+        "narrow_fact",
+        "selected_source_retrieval",
+        "focused_read",
+        "semantic_detail",
+        "semantic_chunks",
+    }
+)
+_SELECTED_SOURCE_METADATA_FIRST_QUERY_FACET_PATTERN = re.compile(
+    r"\b(?:document|doc_id|evidence_facets|topic_terms|requested_types|user_anchors)\s*=",
+    flags=re.IGNORECASE,
+)
+_SELECTED_SOURCE_WEAK_METADATA_FIRST_QUERY_HINT_PATTERN = re.compile(
+    r"\b(?:list|listing|inventory|catalog|metadata|table\s+of\s+contents|toc|"
+    r"count|statistics|latest|recent)\b|"
+    r"(?:列出|清单|目录|元数据|目录结构|统计|最近|最新|前两年|近两年|近三年|公文|论文|讲话|政策|相关)",
+    flags=re.IGNORECASE,
+)
+_SELECTED_SOURCE_WEAK_NARROW_QUERY_HINT_PATTERN = re.compile(
+    r"\b(?:what\s+is|define|definition|explain|how|why)\b|"
+    r"(?:什么是|解释|定义|如何|为什么|怎么|详情)",
+    flags=re.IGNORECASE,
+)
+_SELECTED_SOURCE_RECENCY_CLAIM_PATTERN = re.compile(
+    r"\b(?:latest|recent|newest|most\s+recent)\b|"
+    r"(?:最新|最近|近(?:两|2|三|3)年|前(?:两|2|三|3)年)",
+    flags=re.IGNORECASE,
+)
+_SELECTED_SOURCE_YEAR_RANGE_CLAIM_PATTERN = re.compile(
+    r"\b(?:19|20)\d{2}\b|"
+    r"(?:前(?:两|2|三|3)年|近(?:两|2|三|3)年|最近(?:两|2|三|3)年|近年)",
+    flags=re.IGNORECASE,
+)
+_SELECTED_SOURCE_TYPE_CLAIM_PATTERN = re.compile(
+    r"\b(?:policy|policies|paper|papers|speech|speeches|report|reports|notice|notices)\b|"
+    r"(?:公文|论文|讲话|政策|报告|通知|纪要)",
+    flags=re.IGNORECASE,
+)
+_SELECTED_SOURCE_TOPIC_CLAIM_PATTERN = re.compile(
+    r"\b(?:related\s+to|about|topic|entity|with)\b|"
+    r"(?:相关|关于|围绕|主题|话题|有关)",
+    flags=re.IGNORECASE,
+)
+
+
+def _split_structured_retrieval_terms(value: Any) -> list[str]:
+    if isinstance(value, list):
+        values = value
+    else:
+        values = [value]
+    terms: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        for part in re.split(r"[;,，、|/]", text):
+            normalized = part.strip()
+            if normalized and normalized not in terms:
+                terms.append(normalized)
+    return terms
+
+
+def _selected_retrieval_structured_terms(query: str) -> dict[str, list[str]]:
+    terms = {
+        "document": [],
+        "doc_id": [],
+        "evidence_facets": [],
+        "topic_terms": [],
+        "requested_types": [],
+        "user_anchors": [],
+        "date_basis": [],
+        "type_basis": [],
+        "topic_basis": [],
+    }
+    for key, raw_value in re.findall(
+        r"\b(document|doc_id|evidence_facets|topic_terms|requested_types|"
+        r"user_anchors|date_basis|type_basis|topic_basis)\s*=\s*([^;\n]+)",
+        str(query or ""),
+        flags=re.IGNORECASE,
+    ):
+        normalized_key = str(key or "").strip().lower()
+        if normalized_key not in terms:
+            continue
+        for term in _split_structured_retrieval_terms(raw_value):
+            if term not in terms[normalized_key]:
+                terms[normalized_key].append(term)
+    return terms
+
+
+def _selected_retrieval_claim_flags(query: str) -> dict[str, bool]:
+    normalized_query = str(query or "")
+    return {
+        "latest_or_recent": bool(
+            _SELECTED_SOURCE_RECENCY_CLAIM_PATTERN.search(normalized_query)
+        ),
+        "year_or_range": bool(
+            _SELECTED_SOURCE_YEAR_RANGE_CLAIM_PATTERN.search(normalized_query)
+        ),
+        "document_type": bool(
+            _SELECTED_SOURCE_TYPE_CLAIM_PATTERN.search(normalized_query)
+        ),
+        "topic_scope": bool(
+            _SELECTED_SOURCE_TOPIC_CLAIM_PATTERN.search(normalized_query)
+        ),
+    }
 
 
 def _selected_retrieval_normalized_text(value: Any) -> str:
@@ -172,8 +318,696 @@ def _selected_retrieval_chunk_matches_query(query: str, document: Any) -> bool:
     return False
 
 
+def _selected_retrieval_normalize_identifier(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _selected_retrieval_compact_diagnostic(
+    *,
+    classification: str,
+    reason: str,
+    outcome: str,
+    tool_name: str,
+    candidate_index: int = -1,
+    chunk_total: int = 0,
+    source_id: str = "",
+    query: str = "",
+    retrieval_round: Any = None,
+    detail: Any = None,
+) -> dict[str, Any]:
+    diagnostic: dict[str, Any] = {
+        "kind": "retrieval_quality",
+        "classification": str(classification or "diagnostics"),
+        "reason": str(reason or "unknown"),
+        "outcome": str(outcome or "diagnostics"),
+        "tool_name": str(tool_name or ""),
+        "candidate_index": int(candidate_index),
+    }
+    if chunk_total:
+        diagnostic["chunk_total"] = int(chunk_total)
+    if source_id:
+        diagnostic["source_id"] = source_id
+    if query:
+        diagnostic["query"] = query
+    if retrieval_round not in (None, "", [], {}):
+        diagnostic["retrieval_round"] = retrieval_round
+    if detail not in (None, "", [], {}):
+        diagnostic["detail"] = detail
+    return diagnostic
+
+
+def _selected_retrieval_dedupe_diagnostics(
+    diagnostics: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in diagnostics or []:
+        if not isinstance(item, dict):
+            continue
+        signature = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(item)
+    return deduped
+
+
+def _selected_retrieval_metadata_first_diagnostics(
+    *,
+    query: str,
+    tool_name: str,
+    retrieval_round: Any,
+    routing_strategy: dict[str, Any] | None,
+    selected_inventory_count: int,
+    scoped_inventory_count: int,
+    structured_terms: dict[str, list[str]] | None = None,
+) -> list[dict[str, Any]]:
+    strategy = routing_strategy if isinstance(routing_strategy, dict) else {}
+    if not strategy.get("metadata_first_intent"):
+        return []
+
+    diagnostics: list[dict[str, Any]] = []
+    claims = _selected_retrieval_claim_flags(query)
+    terms = (
+        structured_terms
+        if isinstance(structured_terms, dict)
+        else _selected_retrieval_structured_terms(query)
+    )
+    has_date_basis_for_recency = bool(terms.get("date_basis"))
+    has_date_basis_for_range = bool(
+        terms.get("date_basis")
+        or _SELECTED_SOURCE_YEAR_RANGE_CLAIM_PATTERN.search(str(query or ""))
+    )
+    has_type_basis = bool(
+        terms.get("requested_types") or terms.get("type_basis") or terms.get("document")
+    )
+    has_topic_basis = bool(
+        terms.get("topic_terms") or terms.get("topic_basis") or terms.get("document")
+    )
+
+    if selected_inventory_count <= 0 or scoped_inventory_count <= 0:
+        diagnostics.append(
+            _selected_retrieval_compact_diagnostic(
+                classification="no_evidence",
+                reason="inventory_unavailable",
+                outcome="blocked",
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+            )
+        )
+
+    if claims.get("latest_or_recent") and not has_date_basis_for_recency:
+        diagnostics.append(
+            _selected_retrieval_compact_diagnostic(
+                classification="diagnostics",
+                reason="missing_date_metadata",
+                outcome="unsupported",
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+            )
+        )
+        diagnostics.append(
+            _selected_retrieval_compact_diagnostic(
+                classification="no_evidence",
+                reason="unsupported_latest_or_recent_claim",
+                outcome="unsupported",
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+            )
+        )
+    if claims.get("year_or_range") and not has_date_basis_for_range:
+        diagnostics.append(
+            _selected_retrieval_compact_diagnostic(
+                classification="diagnostics",
+                reason="missing_date_metadata",
+                outcome="unsupported",
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+            )
+        )
+        diagnostics.append(
+            _selected_retrieval_compact_diagnostic(
+                classification="no_evidence",
+                reason="unsupported_year_range_claim",
+                outcome="unsupported",
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+            )
+        )
+    if claims.get("document_type") and not has_type_basis:
+        diagnostics.append(
+            _selected_retrieval_compact_diagnostic(
+                classification="diagnostics",
+                reason="missing_type_metadata",
+                outcome="unsupported",
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+            )
+        )
+        diagnostics.append(
+            _selected_retrieval_compact_diagnostic(
+                classification="no_evidence",
+                reason="unsupported_document_type_claim",
+                outcome="unsupported",
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+            )
+        )
+    if claims.get("topic_scope") and not has_topic_basis:
+        diagnostics.append(
+            _selected_retrieval_compact_diagnostic(
+                classification="diagnostics",
+                reason="missing_topic_metadata",
+                outcome="unsupported",
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+            )
+        )
+        diagnostics.append(
+            _selected_retrieval_compact_diagnostic(
+                classification="no_evidence",
+                reason="unsupported_topic_scope_claim",
+                outcome="unsupported",
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+            )
+        )
+    return _selected_retrieval_dedupe_diagnostics(diagnostics)
+
+
+def _selected_retrieval_scope_identity_values(scope_source: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for key in (
+        "id",
+        "file_id",
+        "fileId",
+        "document_id",
+        "documentId",
+        "collection_name",
+        "knowledge_id",
+        "name",
+        "title",
+        "filename",
+    ):
+        normalized = _selected_retrieval_normalize_identifier(scope_source.get(key))
+        if normalized:
+            values.add(normalized)
+    return values
+
+
+def _selected_retrieval_source_identity_values(source: dict[str, Any]) -> set[str]:
+    values = {
+        _selected_retrieval_normalize_identifier(value)
+        for value in _deepagent_source_identity_values(source)
+        if _selected_retrieval_normalize_identifier(value)
+    }
+    source_info = source.get("source")
+    if isinstance(source_info, dict):
+        for key in (
+            "id",
+            "file_id",
+            "fileId",
+            "document_id",
+            "documentId",
+            "collection_name",
+            "knowledge_id",
+            "name",
+            "title",
+            "filename",
+            "source",
+            "url",
+        ):
+            normalized = _selected_retrieval_normalize_identifier(source_info.get(key))
+            if normalized:
+                values.add(normalized)
+
+    metadatas = source.get("metadata")
+    for metadata in metadatas if isinstance(metadatas, list) else []:
+        if not isinstance(metadata, dict):
+            continue
+        for key in (
+            "file_id",
+            "fileId",
+            "document_id",
+            "documentId",
+            "knowledge_id",
+            "collection_name",
+            "name",
+            "title",
+            "filename",
+            "source",
+            "url",
+        ):
+            normalized = _selected_retrieval_normalize_identifier(metadata.get(key))
+            if normalized:
+                values.add(normalized)
+    return values
+
+
+def _selected_retrieval_scope_candidate_filter(
+    candidates: list[dict],
+    metadata: dict | None,
+    *,
+    query: str,
+    retrieval_round: Any,
+    tool_name: str,
+) -> tuple[list[dict], list[dict[str, Any]]]:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    scope = metadata.get("active_source_scope")
+    scope = scope if isinstance(scope, dict) else {}
+    if not scope:
+        return candidates, []
+
+    status = str(scope.get("status") or "").strip().lower()
+    source_set_mode = str(scope.get("source_set_mode") or "").strip().lower()
+    reason = str(
+        scope.get("reason")
+        or scope.get("ambiguity_reason")
+        or scope.get("expiration_reason")
+        or "source_scope_mismatch"
+    ).strip()
+    blocked = status in {"ambiguous", "expired"} or (
+        source_set_mode == "none"
+        and reason in {"ambiguous_retrieval_scope", "expired_or_conflicting"}
+    )
+    if blocked:
+        return [], [
+            _selected_retrieval_compact_diagnostic(
+                classification="diagnostics",
+                reason=reason or "source_scope_blocked",
+                outcome="blocked",
+                tool_name=tool_name,
+                query=query,
+                retrieval_round=retrieval_round,
+            )
+        ]
+
+    scope_sources = [item for item in scope.get("sources") or [] if isinstance(item, dict)]
+    if not scope_sources:
+        return candidates, []
+
+    allowed_values: set[str] = set()
+    for source in scope_sources:
+        allowed_values.update(_selected_retrieval_scope_identity_values(source))
+
+    if not allowed_values:
+        return candidates, []
+
+    filtered = [
+        candidate
+        for candidate in candidates
+        if _selected_retrieval_source_identity_values(candidate).intersection(
+            allowed_values
+        )
+    ]
+    if filtered:
+        return filtered, []
+
+    return [], [
+        _selected_retrieval_compact_diagnostic(
+            classification="diagnostics",
+            reason="source_scope_mismatch",
+            outcome="unauthorized",
+            tool_name=tool_name,
+            query=query,
+            retrieval_round=retrieval_round,
+        )
+    ]
+
+
+def _selected_retrieval_original_query(metadata: dict | None) -> str:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for key in (
+        "original_query",
+        "initial_user_query",
+        "user_prompt",
+        "user_query",
+    ):
+        candidate = str(metadata.get(key) or "").strip()
+        if candidate:
+            return candidate
+    return ""
+
+
+def _selected_retrieval_normalize_strategy(
+    *,
+    evidence_need: str,
+    query: str,
+    required_anchors: list[str],
+    source_ids: list[str],
+    active_source_scope: dict[str, Any] | None,
+) -> dict[str, Any]:
+    normalized_evidence_need = str(evidence_need or "").strip().lower()
+    reason_codes: list[str] = []
+    query_text = str(query or "").strip()
+    scoped_source_ids = [
+        str(value or "").strip()
+        for value in source_ids or []
+        if str(value or "").strip()
+    ]
+    normalized_required_anchors = [
+        str(value or "").strip()
+        for value in required_anchors or []
+        if str(value or "").strip()
+    ]
+
+    metadata_first_intent = False
+    if normalized_evidence_need:
+        reason_codes.append(f"evidence_need:{normalized_evidence_need}")
+    if normalized_evidence_need in _METADATA_FIRST_SELECTED_SOURCE_EVIDENCE_NEEDS:
+        metadata_first_intent = True
+    elif normalized_evidence_need.startswith("metadata_first"):
+        metadata_first_intent = True
+
+    weak_metadata_hint = bool(
+        query_text and _SELECTED_SOURCE_WEAK_METADATA_FIRST_QUERY_HINT_PATTERN.search(query_text)
+    )
+    if weak_metadata_hint:
+        reason_codes.append("weak_query_metadata_first_hint")
+    weak_narrow_hint = bool(
+        query_text and _SELECTED_SOURCE_WEAK_NARROW_QUERY_HINT_PATTERN.search(query_text)
+    )
+    if weak_narrow_hint:
+        reason_codes.append("weak_query_narrow_detail_hint")
+    if weak_metadata_hint and not weak_narrow_hint:
+        metadata_first_intent = True
+
+    has_structured_query_facets = bool(
+        query_text and _SELECTED_SOURCE_METADATA_FIRST_QUERY_FACET_PATTERN.search(query_text)
+    )
+    if has_structured_query_facets:
+        reason_codes.append("structured_query_facets")
+
+    has_bounded_source_ids = bool(scoped_source_ids)
+    has_bounded_anchors = bool(normalized_required_anchors)
+    targeted_context_present = has_bounded_source_ids and has_bounded_anchors
+    if targeted_context_present:
+        reason_codes.append("bounded_targeted_context_present")
+
+    targeted_context_bounded = targeted_context_present and has_structured_query_facets
+    if targeted_context_bounded:
+        reason_codes.append("bounded_targeted_context_proven")
+
+    retrieval_strategy = "semantic_chunks"
+    semantic_chunk_lookup_ok = True
+    if metadata_first_intent:
+        retrieval_strategy = "metadata_first_then_targeted_chunks"
+        semantic_chunk_lookup_ok = targeted_context_bounded
+        if not semantic_chunk_lookup_ok:
+            reason_codes.append("metadata_first_requires_bounded_targeted_context")
+    elif normalized_evidence_need in _SEMANTIC_DETAIL_SELECTED_SOURCE_EVIDENCE_NEEDS:
+        reason_codes.append("semantic_detail_evidence_need")
+    elif not normalized_evidence_need:
+        reason_codes.append("default_semantic_strategy")
+
+    scope_status = (
+        str(active_source_scope.get("status") or "").strip().lower()
+        if isinstance(active_source_scope, dict)
+        else ""
+    )
+    if scope_status:
+        reason_codes.append(f"active_scope_status:{scope_status}")
+
+    return {
+        "normalized_evidence_need": normalized_evidence_need,
+        "retrieval_strategy": retrieval_strategy,
+        "semantic_chunk_lookup_ok": bool(semantic_chunk_lookup_ok),
+        "metadata_first_intent": bool(metadata_first_intent),
+        "targeted_context_present": bool(targeted_context_present),
+        "targeted_context_bounded": bool(targeted_context_bounded),
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+    }
+
+
+def _selected_retrieval_with_strategy_metadata(
+    strategy_used: dict[str, Any],
+    routing_strategy: dict[str, Any],
+) -> dict[str, Any]:
+    strategy = (
+        copy.deepcopy(strategy_used)
+        if isinstance(strategy_used, dict)
+        else {}
+    )
+    if not isinstance(routing_strategy, dict):
+        return strategy
+    strategy["retrieval_strategy"] = str(
+        routing_strategy.get("retrieval_strategy") or "semantic_chunks"
+    )
+    strategy["semantic_chunk_lookup_ok"] = bool(
+        routing_strategy.get("semantic_chunk_lookup_ok")
+    )
+    strategy["reason_codes"] = [
+        str(value)
+        for value in routing_strategy.get("reason_codes") or []
+        if str(value).strip()
+    ]
+    return strategy
+
+
+def _selected_retrieval_descriptor(tool_name: str) -> dict[str, Any]:
+    descriptor = SELECTED_SOURCE_RETRIEVAL_DESCRIPTOR_BY_TOOL.get(str(tool_name or "").strip())
+    if not isinstance(descriptor, dict):
+        return {}
+    return copy.deepcopy(descriptor)
+
+
+def _selected_retrieval_timeout_seconds(
+    timeout_seconds: Any,
+    *,
+    request: Any = None,
+) -> float:
+    configured_timeout = None
+    if request is not None:
+        try:
+            configured_timeout = getattr(
+                request.app.state.config,
+                "SELECTED_SOURCE_RETRIEVAL_TIMEOUT_SECONDS",
+                None,
+            )
+        except Exception:
+            configured_timeout = None
+    candidate = timeout_seconds
+    if candidate in (None, "", [], {}):
+        candidate = configured_timeout
+    try:
+        normalized = float(candidate)
+    except Exception:
+        normalized = SELECTED_SOURCE_RETRIEVAL_DEFAULT_TIMEOUT_SECONDS
+    if normalized <= 0:
+        normalized = SELECTED_SOURCE_RETRIEVAL_DEFAULT_TIMEOUT_SECONDS
+    return min(normalized, SELECTED_SOURCE_RETRIEVAL_MAX_TIMEOUT_SECONDS)
+
+
+def _selected_retrieval_effective_query(
+    query: str,
+    *,
+    retrieval_round: Any,
+    metadata: dict | None,
+    explicit_original_query: str = "",
+) -> tuple[str, str, bool]:
+    normalized_query = str(query or "").strip()
+    original_query = str(explicit_original_query or "").strip() or _selected_retrieval_original_query(metadata)
+    try:
+        normalized_round = int(retrieval_round)
+    except Exception:
+        normalized_round = 1
+    enforce_original_query = bool(original_query) and normalized_round <= 1
+    effective_query = original_query if enforce_original_query else normalized_query
+    return effective_query, original_query, enforce_original_query
+
+
+def _selected_retrieval_extract_confident_required_anchors(
+    query: str,
+    *,
+    metadata: dict | None,
+    explicit_required_anchors: list[str] | None = None,
+    candidates: list[dict] | None = None,
+) -> list[str]:
+    anchors: list[str] = []
+    normalized_query = str(query or "").strip()
+
+    def add_anchor(value: Any) -> None:
+        candidate = str(value or "").strip()
+        if not candidate:
+            return
+        if candidate not in anchors:
+            anchors.append(candidate)
+
+    for item in explicit_required_anchors or []:
+        add_anchor(item)
+
+    if not normalized_query:
+        return anchors
+
+    for match in re.findall(
+        r"[\"“”'‘’《》「」『』]([^\"“”'‘’《》「」『』]{2,80})[\"“”'‘’《》「」『』]",
+        normalized_query,
+    ):
+        add_anchor(match)
+
+    for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9._:/-]{3,}", normalized_query):
+        if any(char.isdigit() for char in term) or any(
+            char in term for char in ("_", "-", "/", ".")
+        ):
+            add_anchor(term)
+
+    for pattern in (
+        r"第[\dA-Za-z一二三四五六七八九十百千零〇.．-]{1,24}[章节条款项]",
+        r"\d{4}[-/年.]\d{1,2}(?:[-/月.]\d{1,2})?",
+    ):
+        for term in re.findall(pattern, normalized_query):
+            add_anchor(term)
+
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for key in ("normalized_required_anchors", "required_anchors", "explicit_user_terms"):
+        value = metadata.get(key)
+        if isinstance(value, str):
+            add_anchor(value)
+            continue
+        if isinstance(value, list):
+            for item in value:
+                add_anchor(item)
+
+    normalized_query_text = _selected_retrieval_normalized_text(normalized_query)
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("name", "title", "filename"):
+            label = str(candidate.get(key) or "").strip()
+            if not label or len(label) < 4:
+                continue
+            normalized_label = _selected_retrieval_normalized_text(label)
+            if normalized_label and normalized_label in normalized_query_text:
+                add_anchor(label)
+
+    return anchors
+
+
+def _selected_retrieval_anchor_policy(required_anchors: list[str]) -> str:
+    if required_anchors:
+        return "strict_confident_required_anchors_only"
+    return "query_correlation_only"
+
+
+def _selected_retrieval_provenance_ok(
+    source: dict[str, Any],
+    metadata: dict[str, Any],
+) -> bool:
+    source_info = source.get("source") if isinstance(source.get("source"), dict) else {}
+    for container in (metadata, source_info, source):
+        if not isinstance(container, dict):
+            continue
+        for key in (
+            "file_id",
+            "fileId",
+            "document_id",
+            "documentId",
+            "knowledge_id",
+            "collection_name",
+            "name",
+            "title",
+            "source",
+            "url",
+            "id",
+        ):
+            if str(container.get(key) or "").strip():
+                return True
+    return False
+
+
+def _selected_retrieval_metadata_denied(
+    source: dict[str, Any],
+    metadata: dict[str, Any],
+) -> bool:
+    def is_falsey(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value is False
+        if isinstance(value, (int, float)):
+            return value == 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized in {"false", "0", "denied", "forbidden", "unauthorized"}
+        return False
+
+    def is_truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value is True
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized in {"true", "1", "yes", "denied", "forbidden", "unauthorized"}
+        return False
+
+    denied_markers = (
+        metadata.get("unauthorized"),
+        metadata.get("permission_denied"),
+        source.get("unauthorized"),
+        source.get("permission_denied"),
+    )
+    allowed_markers = (
+        metadata.get("authorized"),
+        metadata.get("has_access"),
+        metadata.get("permission_allowed"),
+        source.get("authorized"),
+        source.get("has_access"),
+        source.get("permission_allowed"),
+    )
+    return any(is_truthy(value) for value in denied_markers) or any(
+        is_falsey(value) for value in allowed_markers
+    )
+
+
+def _selected_retrieval_anchor_match(
+    anchor: str,
+    *,
+    source: dict[str, Any],
+    document: Any,
+    metadata: dict[str, Any],
+) -> bool:
+    normalized_anchor = _selected_retrieval_normalized_text(anchor)
+    if not normalized_anchor:
+        return True
+    metadata_text = " ".join(
+        [
+            str(metadata.get("name") or ""),
+            str(metadata.get("title") or ""),
+            str(metadata.get("source") or ""),
+            str(metadata.get("filename") or ""),
+        ]
+    )
+    source_info = source.get("source") if isinstance(source.get("source"), dict) else {}
+    source_text = " ".join(
+        [
+            str(source_info.get("name") or ""),
+            str(source_info.get("title") or ""),
+            str(source_info.get("id") or ""),
+            str(source_info.get("source") or ""),
+        ]
+    )
+    combined = f"{document or ''}\n{metadata_text}\n{source_text}"
+    return normalized_anchor in _selected_retrieval_normalized_text(combined)
+
+
 def _filter_selected_retrieval_sources_by_query(
-    sources: list[dict], query: str
+    sources: list[dict],
+    *,
+    query: str,
+    required_anchors: list[str],
+    required_facets: list[str],
+    metadata_first_intent: bool,
+    allowed_identity_values: set[str],
+    tool_name: str,
+    retrieval_round: Any,
 ) -> tuple[list[dict], list[dict[str, Any]]]:
     filtered_sources: list[dict] = []
     diagnostics: list[dict[str, Any]] = []
@@ -181,32 +1015,175 @@ def _filter_selected_retrieval_sources_by_query(
     for source_index, source in enumerate(sources or []):
         if not isinstance(source, dict):
             diagnostics.append(
-                {
-                    "kind": "retrieval_quality",
-                    "classification": "diagnostics",
-                    "reason": "malformed_candidate",
-                    "outcome": "malformed",
-                    "candidate_index": source_index,
-                }
+                _selected_retrieval_compact_diagnostic(
+                    classification="diagnostics",
+                    reason="malformed_candidate",
+                    outcome="malformed",
+                    tool_name=tool_name,
+                    candidate_index=source_index,
+                    query=query,
+                    retrieval_round=retrieval_round,
+                )
+            )
+            continue
+
+        source_values = _selected_retrieval_source_identity_values(source)
+        source_id = next(iter(source_values), "")
+        if allowed_identity_values and not source_values.intersection(
+            allowed_identity_values
+        ):
+            diagnostics.append(
+                _selected_retrieval_compact_diagnostic(
+                    classification="diagnostics",
+                    reason="source_scope_mismatch",
+                    outcome="unauthorized",
+                    tool_name=tool_name,
+                    candidate_index=source_index,
+                    source_id=source_id,
+                    query=query,
+                    retrieval_round=retrieval_round,
+                )
             )
             continue
 
         documents = source.get("document") if isinstance(source.get("document"), list) else []
-        accepted_indexes = [
-            index
-            for index, document in enumerate(documents)
-            if _selected_retrieval_chunk_matches_query(query, document)
-        ]
+        metadatas = source.get("metadata") if isinstance(source.get("metadata"), list) else []
+        if not documents:
+            diagnostics.append(
+                _selected_retrieval_compact_diagnostic(
+                    classification="no_evidence",
+                    reason="missing_document_body",
+                    outcome="empty",
+                    tool_name=tool_name,
+                    candidate_index=source_index,
+                    source_id=source_id,
+                    query=query,
+                    retrieval_round=retrieval_round,
+                )
+            )
+            continue
+
+        accepted_indexes: list[int] = []
+        for index, document in enumerate(documents):
+            if not str(document or "").strip():
+                continue
+            metadata = metadatas[index] if index < len(metadatas) else {}
+            metadata = metadata if isinstance(metadata, dict) else {}
+            if _selected_retrieval_metadata_denied(source, metadata):
+                diagnostics.append(
+                    _selected_retrieval_compact_diagnostic(
+                        classification="no_evidence",
+                        reason="permission_denied",
+                        outcome="denied",
+                        tool_name=tool_name,
+                        candidate_index=source_index,
+                        chunk_total=len(documents),
+                        source_id=source_id,
+                        query=query,
+                        retrieval_round=retrieval_round,
+                    )
+                )
+                continue
+            if not _selected_retrieval_provenance_ok(source, metadata):
+                diagnostics.append(
+                    _selected_retrieval_compact_diagnostic(
+                        classification="diagnostics",
+                        reason="missing_provenance",
+                        outcome="malformed",
+                        tool_name=tool_name,
+                        candidate_index=source_index,
+                        chunk_total=len(documents),
+                        source_id=source_id,
+                        query=query,
+                        retrieval_round=retrieval_round,
+                    )
+                )
+                continue
+            query_correlation_match = _selected_retrieval_chunk_matches_query(
+                query, document
+            )
+            if (required_anchors or metadata_first_intent) and not query_correlation_match:
+                diagnostics.append(
+                    _selected_retrieval_compact_diagnostic(
+                        classification="no_evidence",
+                        reason=(
+                            "weak_targeted_chunk_evidence"
+                            if metadata_first_intent
+                            else "weak_or_indirect_evidence"
+                        ),
+                        outcome="weak_evidence",
+                        tool_name=tool_name,
+                        candidate_index=source_index,
+                        chunk_total=len(documents),
+                        source_id=source_id,
+                        query=query,
+                        retrieval_round=retrieval_round,
+                    )
+                )
+                continue
+            if required_anchors and not all(
+                _selected_retrieval_anchor_match(
+                    anchor,
+                    source=source,
+                    document=document,
+                    metadata=metadata,
+                )
+                for anchor in required_anchors
+            ):
+                diagnostics.append(
+                    _selected_retrieval_compact_diagnostic(
+                        classification="no_evidence",
+                        reason="off_anchor_evidence",
+                        outcome="low_relevance",
+                        tool_name=tool_name,
+                        candidate_index=source_index,
+                        chunk_total=len(documents),
+                        source_id=source_id,
+                        query=query,
+                        retrieval_round=retrieval_round,
+                        detail={"required_anchor_count": len(required_anchors)},
+                    )
+                )
+                continue
+            if required_facets and not any(
+                _selected_retrieval_anchor_match(
+                    facet,
+                    source=source,
+                    document=document,
+                    metadata=metadata,
+                )
+                for facet in required_facets
+            ):
+                diagnostics.append(
+                    _selected_retrieval_compact_diagnostic(
+                        classification="no_evidence",
+                        reason="off_facet_evidence",
+                        outcome="low_relevance",
+                        tool_name=tool_name,
+                        candidate_index=source_index,
+                        chunk_total=len(documents),
+                        source_id=source_id,
+                        query=query,
+                        retrieval_round=retrieval_round,
+                        detail={"required_facet_count": len(required_facets)},
+                    )
+                )
+                continue
+            accepted_indexes.append(index)
+
         if not accepted_indexes:
             diagnostics.append(
-                {
-                    "kind": "retrieval_quality",
-                    "classification": "no_evidence",
-                    "reason": "weak_or_indirect_evidence",
-                    "outcome": "weak_evidence",
-                    "candidate_index": source_index,
-                    "chunk_total": len(documents),
-                }
+                _selected_retrieval_compact_diagnostic(
+                    classification="no_evidence",
+                    reason="no_injectable_evidence",
+                    outcome="empty",
+                    tool_name=tool_name,
+                    candidate_index=source_index,
+                    chunk_total=len(documents),
+                    source_id=source_id,
+                    query=query,
+                    retrieval_round=retrieval_round,
+                )
             )
             continue
 
@@ -216,7 +1193,7 @@ def _filter_selected_retrieval_sources_by_query(
                 filtered[key] = [value[index] for index in accepted_indexes]
         filtered_sources.append(filtered)
 
-    return filtered_sources, diagnostics
+    return filtered_sources, _selected_retrieval_dedupe_diagnostics(diagnostics)
 
 
 BUILTIN_TOOL_CATALOG: tuple[dict[str, Any], ...] = (
@@ -1171,6 +2148,491 @@ def _filter_deepagent_sources_by_ids(
     ]
 
 
+def _selected_retrieval_candidate_denied(candidate: dict[str, Any]) -> bool:
+    denied_values = (
+        candidate.get("unauthorized"),
+        candidate.get("permission_denied"),
+        candidate.get("denied"),
+    )
+    for value in denied_values:
+        if isinstance(value, bool) and value:
+            return True
+        if isinstance(value, str) and value.strip().lower() in {
+            "true",
+            "1",
+            "yes",
+            "denied",
+            "unauthorized",
+            "forbidden",
+        }:
+            return True
+    return False
+
+
+def _selected_retrieval_filter_authorized_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    query: str,
+    retrieval_round: Any,
+    tool_name: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    allowed: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    for index, candidate in enumerate(candidates or []):
+        if not isinstance(candidate, dict):
+            continue
+        if _selected_retrieval_candidate_denied(candidate):
+            source_values = _deepagent_source_identity_values(candidate)
+            diagnostics.append(
+                _selected_retrieval_compact_diagnostic(
+                    classification="no_evidence",
+                    reason="source_not_authorized",
+                    outcome="denied",
+                    tool_name=tool_name,
+                    candidate_index=index,
+                    source_id=next(iter(source_values), ""),
+                    query=query,
+                    retrieval_round=retrieval_round,
+                )
+            )
+            continue
+        allowed.append(candidate)
+    return allowed, diagnostics
+
+
+def _selected_retrieval_strategy_used(
+    *,
+    descriptor: dict[str, Any],
+    normalized_required_anchors: list[str],
+    anchor_policy: str,
+    evidence_need: str,
+    original_query: str,
+    executed_query: str,
+    retrieval_round: Any,
+    query_enforced_from_original: bool,
+) -> dict[str, Any]:
+    return {
+        "source_lane": "selected_source",
+        "tool_name": descriptor.get("tool_name") or "",
+        "full_context": bool(descriptor.get("full_context")),
+        "evidence_need": str(
+            evidence_need or descriptor.get("default_evidence_need") or "balanced"
+        ),
+        "anchor_policy": str(anchor_policy or "query_correlation_only"),
+        "normalized_required_anchors": list(normalized_required_anchors or []),
+        "original_query": str(original_query or ""),
+        "executed_query": str(executed_query or ""),
+        "retrieval_round": retrieval_round,
+        "query_enforced_from_original": bool(query_enforced_from_original),
+    }
+
+
+def _selected_retrieval_authorization_context(
+    *,
+    selected_inventory_count: int,
+    scoped_inventory_count: int,
+    requested_source_ids: list[str],
+    active_source_scope: Any,
+) -> dict[str, Any]:
+    scope = active_source_scope if isinstance(active_source_scope, dict) else {}
+    return {
+        "selected_inventory_count": int(max(selected_inventory_count, 0)),
+        "scoped_inventory_count": int(max(scoped_inventory_count, 0)),
+        "requested_source_ids": [str(value) for value in requested_source_ids if str(value).strip()],
+        "active_source_scope_state": str(scope.get("status") or "none"),
+    }
+
+
+def _selected_retrieval_retry_policy(timeout_seconds: float) -> dict[str, Any]:
+    return {
+        "max_retries": 0,
+        "retries_attempted": 0,
+        "retry_allowed": False,
+        "timeout_seconds": float(timeout_seconds),
+    }
+
+
+def _selected_retrieval_worker_contract_lanes(
+    response: dict[str, Any] | None,
+    *,
+    tool_name: str,
+    normalized_timeout_seconds: float,
+) -> dict[str, Any]:
+    payload = copy.deepcopy(response) if isinstance(response, dict) else {}
+    for key in (
+        "provider_payload",
+        "provider_response",
+        "raw_payload",
+        "raw_response",
+        "raw_results",
+        "inventory_rows",
+        "inventory_documents",
+    ):
+        payload.pop(key, None)
+
+    normalized_tool_name = str(payload.get("tool_name") or tool_name or "").strip()
+    if normalized_tool_name:
+        payload["tool_name"] = normalized_tool_name
+
+    status = str(payload.get("status") or "").strip() or "error"
+    payload["status"] = status
+
+    canonical_references = payload.get("canonical_references")
+    if not isinstance(canonical_references, list):
+        canonical_references = []
+    canonical_references = [item for item in canonical_references if isinstance(item, dict)]
+    payload["canonical_references"] = canonical_references
+    payload["references"] = copy.deepcopy(canonical_references)
+
+    accepted_outputs = payload.get("accepted_outputs")
+    if not isinstance(accepted_outputs, list):
+        accepted_outputs = []
+    payload["accepted_outputs"] = [
+        item for item in accepted_outputs if isinstance(item, dict)
+    ]
+
+    retrieval_diagnostics = payload.get("retrieval_diagnostics")
+    if not isinstance(retrieval_diagnostics, list):
+        retrieval_diagnostics = []
+    retrieval_diagnostics = [
+        item for item in retrieval_diagnostics if isinstance(item, dict)
+    ]
+    payload["retrieval_diagnostics"] = retrieval_diagnostics
+    payload["diagnostics"] = copy.deepcopy(retrieval_diagnostics)
+
+    authorization_context = payload.get("authorization_context")
+    if not isinstance(authorization_context, dict):
+        authorization_context = {}
+    payload["authorization_context"] = authorization_context
+
+    default_retry_policy = _selected_retrieval_retry_policy(normalized_timeout_seconds)
+    retry_policy = payload.get("retry_policy")
+    if not isinstance(retry_policy, dict):
+        retry_policy = copy.deepcopy(default_retry_policy)
+    else:
+        retry_policy = copy.deepcopy(retry_policy)
+        for key, value in default_retry_policy.items():
+            retry_policy.setdefault(key, value)
+    payload["retry_policy"] = retry_policy
+
+    terminal_reason = (
+        str(payload.get("terminal_reason") or "").strip()
+        or str(payload.get("code") or "").strip()
+        or status
+    )
+    payload["terminal_reason"] = terminal_reason
+
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+    provenance = copy.deepcopy(provenance)
+    strategy_used = payload.get("strategy_used")
+    if isinstance(strategy_used, dict) and strategy_used:
+        provenance.setdefault("strategy_used", copy.deepcopy(strategy_used))
+    context_budget = payload.get("context_budget")
+    if isinstance(context_budget, dict) and context_budget:
+        provenance.setdefault("context_budget", copy.deepcopy(context_budget))
+    for key in (
+        "query",
+        "original_query",
+        "retrieval_round",
+        "query_enforced_from_original",
+        "source_id",
+    ):
+        value = payload.get(key)
+        if value not in (None, "", [], {}):
+            provenance.setdefault(key, value)
+    provenance.setdefault("worker_kind", "selected_source_retrieval")
+    if normalized_tool_name:
+        provenance.setdefault("tool_name", normalized_tool_name)
+    provenance.setdefault("status", status)
+    provenance.setdefault("terminal_reason", terminal_reason)
+    strategy_used = (
+        payload.get("strategy_used")
+        if isinstance(payload.get("strategy_used"), dict)
+        else {}
+    )
+    authorization_context = (
+        payload.get("authorization_context")
+        if isinstance(payload.get("authorization_context"), dict)
+        else {}
+    )
+    limitations = [
+        str(item.get("reason") or "").strip()
+        for item in retrieval_diagnostics
+        if isinstance(item, dict) and str(item.get("reason") or "").strip()
+    ]
+    structured_terms = _selected_retrieval_structured_terms(
+        str(payload.get("query") or "")
+    )
+    date_basis_values = structured_terms.get("date_basis") or []
+    type_basis_values = structured_terms.get("type_basis") or []
+    topic_basis_values = structured_terms.get("topic_basis") or []
+    provenance["compact_retrieval_provenance"] = {
+        "strategy": {
+            "evidence_need": str(strategy_used.get("evidence_need") or ""),
+            "retrieval_strategy": str(
+                strategy_used.get("retrieval_strategy")
+                or "semantic_chunks"
+            ),
+            "semantic_chunk_lookup_ok": bool(
+                strategy_used.get("semantic_chunk_lookup_ok", True)
+            ),
+        },
+        "inventory_counts": {
+            "selected_inventory_count": int(
+                authorization_context.get("selected_inventory_count") or 0
+            ),
+            "scoped_inventory_count": int(
+                authorization_context.get("scoped_inventory_count") or 0
+            ),
+            "shortlist_count": len(
+                authorization_context.get("requested_source_ids") or []
+            ),
+        },
+        "accepted_counts": {
+            "reference_count": len(canonical_references),
+            "accepted_output_count": len(payload.get("accepted_outputs") or []),
+        },
+        "fallback_used": bool(
+            strategy_used.get("metadata_first_intent")
+            and str(strategy_used.get("retrieval_strategy") or "").strip().lower()
+            == "semantic_chunks"
+        ),
+        "basis": {
+            "date_basis": (
+                (date_basis_values[0] if date_basis_values else "")
+                or ("structured_document_anchor" if structured_terms.get("document") else "")
+            ),
+            "type_basis": (
+                (type_basis_values[0] if type_basis_values else "")
+                or (
+                    "structured_requested_types"
+                    if structured_terms.get("requested_types")
+                    else ""
+                )
+            ),
+            "topic_basis": (
+                (topic_basis_values[0] if topic_basis_values else "")
+                or (
+                    "structured_topic_terms"
+                    if structured_terms.get("topic_terms")
+                    else ""
+                )
+            ),
+        },
+        "material_limitations": list(dict.fromkeys([item for item in limitations if item])),
+    }
+    payload["provenance"] = provenance
+
+    return payload
+
+
+def _selected_retrieval_blocked_terminal_reason(
+    diagnostics: list[dict[str, Any]] | None,
+    *,
+    fallback: str = "source_scope_blocked",
+) -> str:
+    for item in diagnostics or []:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("reason") or "").strip().lower()
+        outcome = str(item.get("outcome") or item.get("status") or "").strip().lower()
+        if reason == "missing_active_source_scope":
+            return "missing_active_source_scope"
+        if reason == "ambiguous_active_source_scope":
+            return "ambiguous_active_source_scope"
+        if "ambiguous" in reason:
+            return "ambiguous_active_source_scope"
+        if "expired" in reason:
+            return "expired_active_source_scope"
+        if reason == "invalid_authorization_context":
+            return "invalid_authorization_context"
+        if reason == "source_not_authorized":
+            return "invalid_authorization_context"
+        if outcome in {"denied", "permission_denied", "unauthorized"}:
+            return "invalid_authorization_context"
+    return str(fallback or "source_scope_blocked")
+
+
+def _selected_retrieval_blocked_response(
+    *,
+    descriptor: dict[str, Any],
+    tool_name: str,
+    query: str,
+    original_query: str,
+    retrieval_round: Any,
+    normalized_timeout_seconds: float,
+    diagnostics: list[dict[str, Any]] | None,
+    selected_inventory_count: int,
+    scoped_inventory_count: int,
+    requested_source_ids: list[str],
+    active_source_scope: Any,
+    evidence_need: str,
+    executed_query: str,
+    query_enforced_from_original: bool,
+    normalized_required_anchors: list[str] | None = None,
+    anchor_policy: str = "query_correlation_only",
+    source_id: str = "",
+) -> dict[str, Any]:
+    blocked_diagnostics = _selected_retrieval_dedupe_diagnostics(
+        [item for item in (diagnostics or []) if isinstance(item, dict)]
+    )
+    terminal_reason = _selected_retrieval_blocked_terminal_reason(blocked_diagnostics)
+    response: dict[str, Any] = {
+        "status": "blocked",
+        "tool_name": tool_name,
+        "code": terminal_reason,
+        "query": query,
+        "original_query": original_query,
+        "retrieval_round": retrieval_round,
+        "canonical_references": [],
+        "accepted_outputs": [],
+        "retrieval_diagnostics": blocked_diagnostics,
+        "terminal_reason": terminal_reason,
+        "strategy_used": _selected_retrieval_strategy_used(
+            descriptor=descriptor,
+            normalized_required_anchors=list(normalized_required_anchors or []),
+            anchor_policy=anchor_policy,
+            evidence_need=evidence_need,
+            original_query=original_query,
+            executed_query=executed_query,
+            retrieval_round=retrieval_round,
+            query_enforced_from_original=bool(query_enforced_from_original),
+        ),
+        "authorization_context": _selected_retrieval_authorization_context(
+            selected_inventory_count=selected_inventory_count,
+            scoped_inventory_count=scoped_inventory_count,
+            requested_source_ids=requested_source_ids,
+            active_source_scope=active_source_scope,
+        ),
+        "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+    }
+    if source_id:
+        response["source_id"] = source_id
+    return _selected_retrieval_worker_contract_lanes(
+        response,
+        tool_name=tool_name,
+        normalized_timeout_seconds=normalized_timeout_seconds,
+    )
+
+
+def _selected_retrieval_cancelled_response(
+    *,
+    tool_name: str,
+    query: str,
+    original_query: str,
+    retrieval_round: Any,
+    normalized_timeout_seconds: float,
+    descriptor: dict[str, Any],
+    normalized_required_anchors: list[str],
+    anchor_policy: str,
+    evidence_need: str,
+    executed_query: str,
+    query_enforced_from_original: bool,
+    selected_inventory_count: int,
+    scoped_inventory_count: int,
+    requested_source_ids: list[str],
+    active_source_scope: Any,
+    source_id: str = "",
+) -> dict[str, Any]:
+    diagnostic = _selected_retrieval_compact_diagnostic(
+        classification="diagnostics",
+        reason="retrieval_cancelled",
+        outcome="cancelled",
+        tool_name=tool_name,
+        query=executed_query or query,
+        retrieval_round=retrieval_round,
+        source_id=source_id,
+    )
+    response: dict[str, Any] = {
+        "status": "error",
+        "tool_name": tool_name,
+        "code": "retrieval_cancelled",
+        "query": query,
+        "original_query": original_query,
+        "retrieval_round": retrieval_round,
+        "canonical_references": [],
+        "accepted_outputs": [],
+        "retrieval_diagnostics": [diagnostic],
+        "terminal_reason": "retrieval_cancelled",
+        "strategy_used": _selected_retrieval_strategy_used(
+            descriptor=descriptor,
+            normalized_required_anchors=list(normalized_required_anchors or []),
+            anchor_policy=anchor_policy,
+            evidence_need=evidence_need,
+            original_query=original_query,
+            executed_query=executed_query or query,
+            retrieval_round=retrieval_round,
+            query_enforced_from_original=bool(query_enforced_from_original),
+        ),
+        "authorization_context": _selected_retrieval_authorization_context(
+            selected_inventory_count=selected_inventory_count,
+            scoped_inventory_count=scoped_inventory_count,
+            requested_source_ids=requested_source_ids,
+            active_source_scope=active_source_scope,
+        ),
+        "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+    }
+    if source_id:
+        response["source_id"] = source_id
+    return _selected_retrieval_worker_contract_lanes(
+        response,
+        tool_name=tool_name,
+        normalized_timeout_seconds=normalized_timeout_seconds,
+    )
+
+
+def _selected_retrieval_accepted_outputs(
+    canonical_references: list[dict[str, Any]],
+    *,
+    tool_name: str,
+    query: str,
+    original_query: str,
+    retrieval_round: Any,
+) -> list[dict[str, Any]]:
+    accepted_outputs: list[dict[str, Any]] = []
+    for reference in canonical_references or []:
+        if not isinstance(reference, dict):
+            continue
+        source = reference.get("source") if isinstance(reference.get("source"), dict) else {}
+        documents = reference.get("document") if isinstance(reference.get("document"), list) else []
+        metadatas = reference.get("metadata") if isinstance(reference.get("metadata"), list) else []
+        snippet = str(documents[0] or "").strip() if documents else ""
+        metadata = metadatas[0] if metadatas and isinstance(metadatas[0], dict) else {}
+        if not snippet:
+            continue
+        accepted_outputs.append(
+            {
+                "type": "selected_source_evidence",
+                "tool_name": tool_name,
+                "query": query,
+                "original_query": original_query,
+                "retrieval_round": retrieval_round,
+                "source": {
+                    "id": str(source.get("id") or metadata.get("file_id") or ""),
+                    "name": str(source.get("name") or metadata.get("name") or metadata.get("title") or ""),
+                    "type": str(source.get("type") or metadata.get("source_type") or ""),
+                },
+                "snippet": snippet,
+                "provenance": {
+                    "file_id": str(
+                        metadata.get("file_id")
+                        or metadata.get("fileId")
+                        or source.get("id")
+                        or ""
+                    ),
+                    "knowledge_id": str(metadata.get("knowledge_id") or ""),
+                    "document_id": str(metadata.get("document_id") or ""),
+                    "retrieval_tool_name": str(
+                        metadata.get("retrieval_tool_name") or tool_name
+                    ),
+                },
+            }
+        )
+    return accepted_outputs
+
+
 def _truncate_deepagent_tool_text(value: Any, max_chars: int) -> tuple[str, bool]:
     text = str(value or "").strip()
     if max_chars <= 0 or len(text) <= max_chars:
@@ -1297,6 +2759,10 @@ async def query_selected_knowledge_files(
     source_ids: Optional[list[str]] = None,
     k: int = 5,
     retrieval_round: int = 1,
+    original_query: str = "",
+    required_anchors: Optional[list[str]] = None,
+    evidence_need: str = "",
+    timeout_seconds: Optional[float] = None,
     __request__: Any = None,
     __files__: Any = None,
     __knowledge__: Any = None,
@@ -1309,89 +2775,549 @@ async def query_selected_knowledge_files(
     :param source_ids: Optional selected file, document, or KB ids/names to narrow the search.
     :param k: Maximum chunks per selected source and query.
     :param retrieval_round: Retrieval round number for provenance.
+    :param original_query: Optional original user query for deterministic round-1 execution.
+    :param required_anchors: Optional strict anchors (used only when confidently required).
+    :param evidence_need: Optional retrieval intent hint (for strategy/provenance only).
+    :param timeout_seconds: Optional hard timeout for the provider call.
     """
 
-    normalized_query = str(query or "").strip()
+    descriptor = _selected_retrieval_descriptor("query_selected_knowledge_files")
+    metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+    active_source_scope = (
+        metadata.get("active_source_scope")
+        if isinstance(metadata.get("active_source_scope"), dict)
+        else {}
+    )
+    normalized_query, original_query, enforced_original_query = (
+        _selected_retrieval_effective_query(
+            query,
+            retrieval_round=retrieval_round,
+            metadata=metadata,
+            explicit_original_query=original_query,
+        )
+    )
+    normalized_timeout_seconds = _selected_retrieval_timeout_seconds(
+        timeout_seconds,
+        request=__request__,
+    )
+
+    def finalize(response: dict[str, Any]) -> dict[str, Any]:
+        return _selected_retrieval_worker_contract_lanes(
+            response,
+            tool_name="query_selected_knowledge_files",
+            normalized_timeout_seconds=normalized_timeout_seconds,
+        )
+
     if not normalized_query:
-        return {
+        return finalize({
             "status": "malformed",
             "tool_name": "query_selected_knowledge_files",
             "code": "missing_query",
             "message": "A focused query is required.",
             "retrieval_round": retrieval_round,
-        }
+            "terminal_reason": "missing_query",
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
     if __request__ is None:
-        return {
+        return finalize({
             "status": "error",
             "tool_name": "query_selected_knowledge_files",
             "code": "runtime_context_unavailable",
             "message": "Selected-source retrieval runtime context is unavailable.",
             "query": normalized_query,
             "retrieval_round": retrieval_round,
-        }
+            "terminal_reason": "runtime_context_unavailable",
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
 
-    candidates = _deepagent_selected_source_candidates(
+    selected_candidates = _deepagent_selected_source_candidates(
         files=__files__,
         knowledge=__knowledge__,
         metadata=__metadata__,
     )
-    candidates = _filter_deepagent_sources_by_ids(candidates, source_ids)
+    requested_source_ids = []
+    for source_id in source_ids or []:
+        normalized_source_id = str(source_id or "").strip()
+        if normalized_source_id and normalized_source_id not in requested_source_ids:
+            requested_source_ids.append(normalized_source_id)
+
+    if not active_source_scope:
+        if not selected_candidates:
+            return _selected_retrieval_blocked_response(
+                descriptor=descriptor,
+                tool_name="query_selected_knowledge_files",
+                query=normalized_query,
+                original_query=original_query,
+                retrieval_round=retrieval_round,
+                normalized_timeout_seconds=normalized_timeout_seconds,
+                diagnostics=[
+                    _selected_retrieval_compact_diagnostic(
+                        classification="diagnostics",
+                        reason="missing_active_source_scope",
+                        outcome="blocked",
+                        tool_name="query_selected_knowledge_files",
+                        query=normalized_query,
+                        retrieval_round=retrieval_round,
+                    )
+                ],
+                selected_inventory_count=len(selected_candidates),
+                scoped_inventory_count=0,
+                requested_source_ids=requested_source_ids,
+                active_source_scope=active_source_scope,
+                evidence_need=evidence_need,
+                executed_query=normalized_query,
+                query_enforced_from_original=bool(enforced_original_query),
+            )
+        if len(selected_candidates) > 1 and not requested_source_ids:
+            return _selected_retrieval_blocked_response(
+                descriptor=descriptor,
+                tool_name="query_selected_knowledge_files",
+                query=normalized_query,
+                original_query=original_query,
+                retrieval_round=retrieval_round,
+                normalized_timeout_seconds=normalized_timeout_seconds,
+                diagnostics=[
+                    _selected_retrieval_compact_diagnostic(
+                        classification="diagnostics",
+                        reason="ambiguous_active_source_scope",
+                        outcome="blocked",
+                        tool_name="query_selected_knowledge_files",
+                        query=normalized_query,
+                        retrieval_round=retrieval_round,
+                    )
+                ],
+                selected_inventory_count=len(selected_candidates),
+                scoped_inventory_count=0,
+                requested_source_ids=requested_source_ids,
+                active_source_scope=active_source_scope,
+                evidence_need=evidence_need,
+                executed_query=normalized_query,
+                query_enforced_from_original=bool(enforced_original_query),
+            )
+
+    candidates, scope_diagnostics = _selected_retrieval_scope_candidate_filter(
+        selected_candidates,
+        metadata,
+        query=normalized_query,
+        retrieval_round=retrieval_round,
+        tool_name="query_selected_knowledge_files",
+    )
+    candidates, authorization_diagnostics = _selected_retrieval_filter_authorized_candidates(
+        candidates,
+        query=normalized_query,
+        retrieval_round=retrieval_round,
+        tool_name="query_selected_knowledge_files",
+    )
+    combined_scope_diagnostics = _selected_retrieval_dedupe_diagnostics(
+        [*scope_diagnostics, *authorization_diagnostics]
+    )
+    if combined_scope_diagnostics and not candidates:
+        return _selected_retrieval_blocked_response(
+            descriptor=descriptor,
+            tool_name="query_selected_knowledge_files",
+            query=normalized_query,
+            original_query=original_query,
+            retrieval_round=retrieval_round,
+            normalized_timeout_seconds=normalized_timeout_seconds,
+            diagnostics=combined_scope_diagnostics,
+            selected_inventory_count=len(selected_candidates),
+            scoped_inventory_count=len(candidates),
+            requested_source_ids=requested_source_ids,
+            active_source_scope=active_source_scope,
+            evidence_need=evidence_need,
+            executed_query=normalized_query,
+            query_enforced_from_original=bool(enforced_original_query),
+        )
+
+    if requested_source_ids:
+        selected_identity_values: set[str] = set()
+        for candidate in selected_candidates:
+            selected_identity_values.update(
+                _selected_retrieval_source_identity_values(candidate)
+            )
+        scoped_identity_values: set[str] = set()
+        for candidate in candidates:
+            scoped_identity_values.update(
+                _selected_retrieval_source_identity_values(candidate)
+            )
+        unknown_ids = [
+            source_id
+            for source_id in requested_source_ids
+            if _selected_retrieval_normalize_identifier(source_id)
+            not in selected_identity_values
+        ]
+        out_of_scope_ids = [
+            source_id
+            for source_id in requested_source_ids
+            if _selected_retrieval_normalize_identifier(source_id)
+            in selected_identity_values
+            and _selected_retrieval_normalize_identifier(source_id)
+            not in scoped_identity_values
+        ]
+        if unknown_ids or out_of_scope_ids:
+            diagnostics = [
+                _selected_retrieval_compact_diagnostic(
+                    classification="no_evidence",
+                    reason="requested_source_out_of_scope",
+                    outcome="denied",
+                    tool_name="query_selected_knowledge_files",
+                    query=normalized_query,
+                    retrieval_round=retrieval_round,
+                    detail={
+                        "unknown_source_ids": unknown_ids,
+                        "out_of_scope_source_ids": out_of_scope_ids,
+                    },
+                )
+            ]
+            return finalize({
+                "status": "permission_denied",
+                "tool_name": "query_selected_knowledge_files",
+                "code": "requested_source_out_of_scope",
+                "query": normalized_query,
+                "original_query": original_query,
+                "retrieval_round": retrieval_round,
+                "retrieval_diagnostics": diagnostics,
+                "terminal_reason": "requested_source_out_of_scope",
+                "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+            })
+        candidates = _filter_deepagent_sources_by_ids(candidates, requested_source_ids)
+
     if not candidates:
-        return {
-            "status": "permission_denied" if source_ids else "no_evidence",
+        return finalize({
+            "status": "permission_denied" if requested_source_ids else "no_evidence",
             "tool_name": "query_selected_knowledge_files",
-            "code": "requested_source_out_of_scope" if source_ids else "no_selected_sources",
+            "code": "requested_source_out_of_scope"
+            if requested_source_ids
+            else "no_selected_sources",
             "query": normalized_query,
+            "original_query": original_query,
             "retrieval_round": retrieval_round,
-        }
+            "retrieval_diagnostics": combined_scope_diagnostics or [],
+            "terminal_reason": "requested_source_out_of_scope"
+            if requested_source_ids
+            else "no_selected_sources",
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
+
+    allowed_identity_values: set[str] = set()
+    for candidate in candidates:
+        allowed_identity_values.update(_selected_retrieval_source_identity_values(candidate))
+    normalized_required_anchors = _selected_retrieval_extract_confident_required_anchors(
+        original_query or normalized_query,
+        metadata=metadata,
+        explicit_required_anchors=required_anchors,
+        candidates=candidates,
+    )
+    structured_terms = _selected_retrieval_structured_terms(normalized_query)
+    required_facets = list(
+        dict.fromkeys(
+            [
+                *structured_terms.get("evidence_facets", []),
+                *structured_terms.get("topic_terms", []),
+                *structured_terms.get("requested_types", []),
+            ]
+        )
+    )
+    routing_strategy = _selected_retrieval_normalize_strategy(
+        evidence_need=evidence_need,
+        query=normalized_query,
+        required_anchors=normalized_required_anchors,
+        source_ids=requested_source_ids,
+        active_source_scope=active_source_scope,
+    )
+    effective_evidence_need = (
+        str(routing_strategy.get("normalized_evidence_need") or "").strip()
+        or evidence_need
+    )
+    anchor_policy = _selected_retrieval_anchor_policy(normalized_required_anchors)
+
+    if (
+        routing_strategy.get("metadata_first_intent")
+        and not routing_strategy.get("semantic_chunk_lookup_ok")
+    ):
+        diagnostics = _selected_retrieval_dedupe_diagnostics(
+            [
+                _selected_retrieval_compact_diagnostic(
+                    classification="no_evidence",
+                    reason="metadata_first_targeted_evidence_required",
+                    outcome="blocked",
+                    tool_name="query_selected_knowledge_files",
+                    query=normalized_query,
+                    retrieval_round=retrieval_round,
+                    detail={
+                        "targeted_context_present": bool(
+                            routing_strategy.get("targeted_context_present")
+                        ),
+                        "targeted_context_bounded": bool(
+                            routing_strategy.get("targeted_context_bounded")
+                        ),
+                    },
+                ),
+                *_selected_retrieval_metadata_first_diagnostics(
+                    query=normalized_query,
+                    tool_name="query_selected_knowledge_files",
+                    retrieval_round=retrieval_round,
+                    routing_strategy=routing_strategy,
+                    selected_inventory_count=len(selected_candidates),
+                    scoped_inventory_count=len(candidates),
+                    structured_terms=structured_terms,
+                ),
+            ]
+        )
+        strategy_used = _selected_retrieval_with_strategy_metadata(
+            _selected_retrieval_strategy_used(
+                descriptor=descriptor,
+                normalized_required_anchors=normalized_required_anchors,
+                anchor_policy=anchor_policy,
+                evidence_need=effective_evidence_need,
+                original_query=original_query,
+                executed_query=normalized_query,
+                retrieval_round=retrieval_round,
+                query_enforced_from_original=bool(enforced_original_query),
+            ),
+            routing_strategy,
+        )
+        return finalize({
+            "status": "no_evidence",
+            "tool_name": "query_selected_knowledge_files",
+            "code": "metadata_first_targeted_evidence_required",
+            "query": normalized_query,
+            "original_query": original_query,
+            "retrieval_round": retrieval_round,
+            "canonical_references": [],
+            "accepted_outputs": [],
+            "retrieval_diagnostics": diagnostics,
+            "terminal_reason": "metadata_first_targeted_evidence_required",
+            "strategy_used": strategy_used,
+            "authorization_context": _selected_retrieval_authorization_context(
+                selected_inventory_count=len(selected_candidates),
+                scoped_inventory_count=len(candidates),
+                requested_source_ids=requested_source_ids,
+                active_source_scope=active_source_scope,
+            ),
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
 
     from open_webui.retrieval.utils import get_sources_from_items
 
-    sources = await get_sources_from_items(
-        request=__request__,
-        items=candidates,
-        queries=[normalized_query],
-        embedding_function=lambda text, prefix: __request__.app.state.EMBEDDING_FUNCTION(
-            text, prefix=prefix, user=__user_model__
-        ),
-        k=max(1, min(int(k or 5), 8)),
-        reranking_function=(
-            (
-                lambda query_text, documents: __request__.app.state.RERANKING_FUNCTION(
-                    query_text, documents, user=__user_model__
+    try:
+        provider_call = get_sources_from_items(
+            request=__request__,
+            items=candidates,
+            queries=[normalized_query],
+            embedding_function=lambda text, prefix: __request__.app.state.EMBEDDING_FUNCTION(
+                text, prefix=prefix, user=__user_model__
+            ),
+            k=max(
+                1,
+                min(
+                    int(k or descriptor.get("default_k") or 5),
+                    int(descriptor.get("max_k") or 8),
+                ),
+            ),
+            reranking_function=(
+                (
+                    lambda query_text, documents: __request__.app.state.RERANKING_FUNCTION(
+                        query_text, documents, user=__user_model__
+                    )
                 )
-            )
-            if __request__.app.state.RERANKING_FUNCTION
-            else None
-        ),
-        k_reranker=__request__.app.state.config.TOP_K_RERANKER,
-        r=__request__.app.state.config.RELEVANCE_THRESHOLD,
-        hybrid_bm25_weight=__request__.app.state.config.HYBRID_BM25_WEIGHT,
-        hybrid_search=__request__.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
-        full_context=False,
-        user=__user_model__,
-    )
+                if __request__.app.state.RERANKING_FUNCTION
+                else None
+            ),
+            k_reranker=__request__.app.state.config.TOP_K_RERANKER,
+            r=__request__.app.state.config.RELEVANCE_THRESHOLD,
+            hybrid_bm25_weight=__request__.app.state.config.HYBRID_BM25_WEIGHT,
+            hybrid_search=__request__.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
+            full_context=False,
+            user=__user_model__,
+        )
+        sources = await asyncio.wait_for(
+            provider_call,
+            timeout=normalized_timeout_seconds,
+        )
+    except asyncio.CancelledError:
+        return _selected_retrieval_cancelled_response(
+            tool_name="query_selected_knowledge_files",
+            query=normalized_query,
+            original_query=original_query,
+            retrieval_round=retrieval_round,
+            normalized_timeout_seconds=normalized_timeout_seconds,
+            descriptor=descriptor,
+            normalized_required_anchors=normalized_required_anchors,
+            anchor_policy=anchor_policy,
+            evidence_need=effective_evidence_need,
+            executed_query=normalized_query,
+            query_enforced_from_original=bool(enforced_original_query),
+            selected_inventory_count=len(selected_candidates),
+            scoped_inventory_count=len(candidates),
+            requested_source_ids=requested_source_ids,
+            active_source_scope=active_source_scope,
+        )
+    except Exception as exc:
+        timeout_types = (TimeoutError, asyncio.TimeoutError)
+        timeout = isinstance(exc, timeout_types)
+        diagnostic = _selected_retrieval_compact_diagnostic(
+            classification="diagnostics",
+            reason="retrieval_timeout" if timeout else "retrieval_provider_error",
+            outcome="timeout" if timeout else "malformed",
+            tool_name="query_selected_knowledge_files",
+            query=normalized_query,
+            retrieval_round=retrieval_round,
+        )
+        return finalize({
+            "status": "timeout" if timeout else "error",
+            "tool_name": "query_selected_knowledge_files",
+            "code": "retrieval_timeout" if timeout else "retrieval_provider_error",
+            "query": normalized_query,
+            "original_query": original_query,
+            "retrieval_round": retrieval_round,
+            "retrieval_diagnostics": [diagnostic],
+            "terminal_reason": "retrieval_timeout"
+            if timeout
+            else "retrieval_provider_error",
+            "strategy_used": _selected_retrieval_strategy_used(
+                descriptor=descriptor,
+                normalized_required_anchors=normalized_required_anchors,
+                anchor_policy=anchor_policy,
+                evidence_need=effective_evidence_need,
+                original_query=original_query,
+                executed_query=normalized_query,
+                retrieval_round=retrieval_round,
+                query_enforced_from_original=bool(enforced_original_query),
+            ),
+            "authorization_context": _selected_retrieval_authorization_context(
+                selected_inventory_count=len(selected_candidates),
+                scoped_inventory_count=len(candidates),
+                requested_source_ids=requested_source_ids,
+                active_source_scope=active_source_scope,
+            ),
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
     if not sources:
-        return {
+        return finalize({
             "status": "no_evidence",
             "tool_name": "query_selected_knowledge_files",
             "code": "empty_retrieval_result",
             "query": normalized_query,
+            "original_query": original_query,
             "retrieval_round": retrieval_round,
-        }
+            "terminal_reason": "empty_retrieval_result",
+            "strategy_used": _selected_retrieval_strategy_used(
+                descriptor=descriptor,
+                normalized_required_anchors=normalized_required_anchors,
+                anchor_policy=anchor_policy,
+                evidence_need=effective_evidence_need,
+                original_query=original_query,
+                executed_query=normalized_query,
+                retrieval_round=retrieval_round,
+                query_enforced_from_original=bool(enforced_original_query),
+            ),
+            "authorization_context": _selected_retrieval_authorization_context(
+                selected_inventory_count=len(selected_candidates),
+                scoped_inventory_count=len(candidates),
+                requested_source_ids=requested_source_ids,
+                active_source_scope=active_source_scope,
+            ),
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
 
     sources, diagnostics = _filter_selected_retrieval_sources_by_query(
-        sources, normalized_query
+        sources,
+        query=normalized_query,
+        required_anchors=normalized_required_anchors,
+        required_facets=required_facets,
+        metadata_first_intent=bool(routing_strategy.get("metadata_first_intent")),
+        allowed_identity_values=allowed_identity_values,
+        tool_name="query_selected_knowledge_files",
+        retrieval_round=retrieval_round,
     )
+    if routing_strategy.get("metadata_first_intent"):
+        diagnostics = _selected_retrieval_dedupe_diagnostics(
+            [
+                *diagnostics,
+                *_selected_retrieval_metadata_first_diagnostics(
+                    query=normalized_query,
+                    tool_name="query_selected_knowledge_files",
+                    retrieval_round=retrieval_round,
+                    routing_strategy=routing_strategy,
+                    selected_inventory_count=len(selected_candidates),
+                    scoped_inventory_count=len(candidates),
+                    structured_terms=structured_terms,
+                ),
+            ]
+        )
+    unsupported_claim_reason = next(
+        (
+            str(item.get("reason") or "").strip()
+            for item in diagnostics
+            if isinstance(item, dict)
+            and str(item.get("reason") or "").strip().startswith("unsupported_")
+        ),
+        "",
+    )
+    if routing_strategy.get("metadata_first_intent") and unsupported_claim_reason:
+        return finalize(
+            {
+                "status": "no_evidence",
+                "tool_name": "query_selected_knowledge_files",
+                "code": unsupported_claim_reason,
+                "query": normalized_query,
+                "original_query": original_query,
+                "retrieval_round": retrieval_round,
+                "retrieval_diagnostics": diagnostics,
+                "terminal_reason": unsupported_claim_reason,
+                "strategy_used": _selected_retrieval_with_strategy_metadata(
+                    _selected_retrieval_strategy_used(
+                        descriptor=descriptor,
+                        normalized_required_anchors=normalized_required_anchors,
+                        anchor_policy=anchor_policy,
+                        evidence_need=effective_evidence_need,
+                        original_query=original_query,
+                        executed_query=normalized_query,
+                        retrieval_round=retrieval_round,
+                        query_enforced_from_original=bool(enforced_original_query),
+                    ),
+                    routing_strategy,
+                ),
+                "authorization_context": _selected_retrieval_authorization_context(
+                    selected_inventory_count=len(selected_candidates),
+                    scoped_inventory_count=len(candidates),
+                    requested_source_ids=requested_source_ids,
+                    active_source_scope=active_source_scope,
+                ),
+                "retry_policy": _selected_retrieval_retry_policy(
+                    normalized_timeout_seconds
+                ),
+            }
+        )
     if not sources:
-        return {
+        return finalize({
             "status": "no_evidence",
             "tool_name": "query_selected_knowledge_files",
             "code": "weak_or_empty_retrieval_result",
             "query": normalized_query,
+            "original_query": original_query,
             "retrieval_round": retrieval_round,
             "retrieval_diagnostics": diagnostics,
-        }
+            "terminal_reason": "weak_or_empty_retrieval_result",
+            "strategy_used": _selected_retrieval_strategy_used(
+                descriptor=descriptor,
+                normalized_required_anchors=normalized_required_anchors,
+                anchor_policy=anchor_policy,
+                evidence_need=effective_evidence_need,
+                original_query=original_query,
+                executed_query=normalized_query,
+                retrieval_round=retrieval_round,
+                query_enforced_from_original=bool(enforced_original_query),
+            ),
+            "authorization_context": _selected_retrieval_authorization_context(
+                selected_inventory_count=len(selected_candidates),
+                scoped_inventory_count=len(candidates),
+                requested_source_ids=requested_source_ids,
+                active_source_scope=active_source_scope,
+            ),
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
 
     for source in sources:
         if not isinstance(source, dict):
@@ -1403,23 +3329,67 @@ async def query_selected_knowledge_files(
                 )
                 metadata.setdefault("retrieval_round", retrieval_round)
                 metadata.setdefault("query", normalized_query)
+                if original_query:
+                    metadata.setdefault("original_query", original_query)
+                metadata.setdefault(
+                    "query_enforced_from_original",
+                    bool(enforced_original_query),
+                )
 
     compact_sources, context_budget = _compact_deepagent_reference_sources(sources)
-    return {
+    strategy_used = _selected_retrieval_with_strategy_metadata(
+        _selected_retrieval_strategy_used(
+            descriptor=descriptor,
+            normalized_required_anchors=normalized_required_anchors,
+            anchor_policy=anchor_policy,
+            evidence_need=effective_evidence_need,
+            original_query=original_query,
+            executed_query=normalized_query,
+            retrieval_round=retrieval_round,
+            query_enforced_from_original=bool(enforced_original_query),
+        ),
+        routing_strategy,
+    )
+    result = {
         "status": "success",
         "tool_name": "query_selected_knowledge_files",
         "query": normalized_query,
+        "original_query": original_query,
+        "query_enforced_from_original": bool(enforced_original_query),
         "retrieval_round": retrieval_round,
         "canonical_references": compact_sources,
+        "accepted_outputs": _selected_retrieval_accepted_outputs(
+            compact_sources,
+            tool_name="query_selected_knowledge_files",
+            query=normalized_query,
+            original_query=original_query,
+            retrieval_round=retrieval_round,
+        ),
         "result_count": len(sources),
         "context_budget": context_budget,
+        "strategy_used": strategy_used,
+        "authorization_context": _selected_retrieval_authorization_context(
+            selected_inventory_count=len(selected_candidates),
+            scoped_inventory_count=len(candidates),
+            requested_source_ids=requested_source_ids,
+            active_source_scope=active_source_scope,
+        ),
+        "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        "terminal_reason": "success",
     }
+    if diagnostics:
+        result["retrieval_diagnostics"] = diagnostics
+    return finalize(result)
 
 
 async def read_selected_file(
     source_id: str,
     query: str = "",
     retrieval_round: int = 1,
+    original_query: str = "",
+    required_anchors: Optional[list[str]] = None,
+    evidence_need: str = "",
+    timeout_seconds: Optional[float] = None,
     __request__: Any = None,
     __files__: Any = None,
     __knowledge__: Any = None,
@@ -1431,70 +3401,465 @@ async def read_selected_file(
     :param source_id: Selected file, document, or KB id/name to read.
     :param query: Optional focus query used only for provenance.
     :param retrieval_round: Retrieval round number for provenance.
+    :param original_query: Optional original user query for deterministic round-1 execution.
+    :param required_anchors: Optional strict anchors (used only when confidently required).
+    :param evidence_need: Optional retrieval intent hint (for strategy/provenance only).
+    :param timeout_seconds: Optional hard timeout for the provider call.
     """
 
+    descriptor = _selected_retrieval_descriptor("read_selected_file")
     normalized_source_id = str(source_id or "").strip()
+    normalized_timeout_seconds = _selected_retrieval_timeout_seconds(
+        timeout_seconds,
+        request=__request__,
+    )
+
+    def finalize(response: dict[str, Any]) -> dict[str, Any]:
+        return _selected_retrieval_worker_contract_lanes(
+            response,
+            tool_name="read_selected_file",
+            normalized_timeout_seconds=normalized_timeout_seconds,
+        )
+
     if not normalized_source_id:
-        return {
+        return finalize({
             "status": "malformed",
             "tool_name": "read_selected_file",
             "code": "missing_source_id",
             "message": "A selected source id is required.",
             "retrieval_round": retrieval_round,
-        }
+            "terminal_reason": "missing_source_id",
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
     if __request__ is None:
-        return {
+        return finalize({
             "status": "error",
             "tool_name": "read_selected_file",
             "code": "runtime_context_unavailable",
             "source_id": normalized_source_id,
             "retrieval_round": retrieval_round,
-        }
+            "terminal_reason": "runtime_context_unavailable",
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
 
-    candidates = _deepagent_selected_source_candidates(
+    metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+    active_source_scope = (
+        metadata.get("active_source_scope")
+        if isinstance(metadata.get("active_source_scope"), dict)
+        else {}
+    )
+    normalized_query, original_query, enforced_original_query = (
+        _selected_retrieval_effective_query(
+            query,
+            retrieval_round=retrieval_round,
+            metadata=metadata,
+            explicit_original_query=original_query,
+        )
+    )
+    selected_candidates = _deepagent_selected_source_candidates(
         files=__files__,
         knowledge=__knowledge__,
         metadata=__metadata__,
     )
-    candidates = _filter_deepagent_sources_by_ids(candidates, [normalized_source_id])
+    scoped_candidates, scope_diagnostics = _selected_retrieval_scope_candidate_filter(
+        selected_candidates,
+        metadata,
+        query=normalized_query or normalized_source_id,
+        retrieval_round=retrieval_round,
+        tool_name="read_selected_file",
+    )
+    scoped_candidates, authorization_diagnostics = (
+        _selected_retrieval_filter_authorized_candidates(
+            scoped_candidates,
+            query=normalized_query or normalized_source_id,
+            retrieval_round=retrieval_round,
+            tool_name="read_selected_file",
+        )
+    )
+    combined_scope_diagnostics = _selected_retrieval_dedupe_diagnostics(
+        [*scope_diagnostics, *authorization_diagnostics]
+    )
+    if combined_scope_diagnostics and not scoped_candidates:
+        return _selected_retrieval_blocked_response(
+            descriptor=descriptor,
+            tool_name="read_selected_file",
+            query=normalized_query,
+            original_query=original_query,
+            retrieval_round=retrieval_round,
+            normalized_timeout_seconds=normalized_timeout_seconds,
+            diagnostics=combined_scope_diagnostics,
+            selected_inventory_count=len(selected_candidates),
+            scoped_inventory_count=len(scoped_candidates),
+            requested_source_ids=[normalized_source_id],
+            active_source_scope=active_source_scope,
+            evidence_need=evidence_need,
+            executed_query=normalized_query or normalized_source_id,
+            query_enforced_from_original=bool(enforced_original_query),
+            source_id=normalized_source_id,
+        )
+
+    selected_identity_values: set[str] = set()
+    for candidate in selected_candidates:
+        selected_identity_values.update(_selected_retrieval_source_identity_values(candidate))
+    scoped_identity_values: set[str] = set()
+    for candidate in scoped_candidates:
+        scoped_identity_values.update(_selected_retrieval_source_identity_values(candidate))
+
+    normalized_requested_id = _selected_retrieval_normalize_identifier(
+        normalized_source_id
+    )
+    unknown_id = normalized_requested_id not in selected_identity_values
+    out_of_scope_id = (
+        normalized_requested_id in selected_identity_values
+        and normalized_requested_id not in scoped_identity_values
+    )
+    if unknown_id or out_of_scope_id:
+        diagnostics = [
+            _selected_retrieval_compact_diagnostic(
+                classification="no_evidence",
+                reason="requested_source_out_of_scope",
+                outcome="denied",
+                tool_name="read_selected_file",
+                query=normalized_query,
+                retrieval_round=retrieval_round,
+                detail={
+                    "unknown_source_ids": [normalized_source_id] if unknown_id else [],
+                    "out_of_scope_source_ids": (
+                        [normalized_source_id] if out_of_scope_id else []
+                    ),
+                },
+            )
+        ]
+        return finalize({
+            "status": "permission_denied",
+            "tool_name": "read_selected_file",
+            "code": "requested_file_out_of_scope",
+            "source_id": normalized_source_id,
+            "query": normalized_query,
+            "original_query": original_query,
+            "retrieval_round": retrieval_round,
+            "retrieval_diagnostics": diagnostics,
+            "terminal_reason": "requested_file_out_of_scope",
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
+
+    candidates = _filter_deepagent_sources_by_ids(scoped_candidates, [normalized_source_id])
     if len(candidates) != 1:
-        return {
+        return finalize({
             "status": "permission_denied" if not candidates else "malformed",
             "tool_name": "read_selected_file",
             "code": "requested_file_out_of_scope"
             if not candidates
             else "ambiguous_selected_source",
             "source_id": normalized_source_id,
+            "query": normalized_query,
+            "original_query": original_query,
             "retrieval_round": retrieval_round,
-        }
+            "retrieval_diagnostics": combined_scope_diagnostics or [],
+            "terminal_reason": "requested_file_out_of_scope"
+            if not candidates
+            else "ambiguous_selected_source",
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
 
     from open_webui.retrieval.utils import get_sources_from_items
 
     source_item = {**candidates[0], "context": "full"}
-    sources = await get_sources_from_items(
-        request=__request__,
-        items=[source_item],
-        queries=[str(query or normalized_source_id).strip()],
-        embedding_function=lambda text, prefix: __request__.app.state.EMBEDDING_FUNCTION(
-            text, prefix=prefix, user=__user_model__
-        ),
-        k=1,
-        reranking_function=None,
-        k_reranker=__request__.app.state.config.TOP_K_RERANKER,
-        r=__request__.app.state.config.RELEVANCE_THRESHOLD,
-        hybrid_bm25_weight=__request__.app.state.config.HYBRID_BM25_WEIGHT,
-        hybrid_search=False,
-        full_context=True,
-        user=__user_model__,
+    provider_query = str(normalized_query or normalized_source_id).strip()
+    normalized_required_anchors = _selected_retrieval_extract_confident_required_anchors(
+        original_query or provider_query,
+        metadata=metadata,
+        explicit_required_anchors=required_anchors,
+        candidates=candidates,
     )
+    structured_terms = _selected_retrieval_structured_terms(provider_query)
+    required_facets = list(
+        dict.fromkeys(
+            [
+                *structured_terms.get("evidence_facets", []),
+                *structured_terms.get("topic_terms", []),
+                *structured_terms.get("requested_types", []),
+            ]
+        )
+    )
+    routing_strategy = _selected_retrieval_normalize_strategy(
+        evidence_need=evidence_need,
+        query=provider_query,
+        required_anchors=normalized_required_anchors,
+        source_ids=[normalized_source_id],
+        active_source_scope=active_source_scope,
+    )
+    anchor_policy = _selected_retrieval_anchor_policy(normalized_required_anchors)
+    if (
+        routing_strategy.get("metadata_first_intent")
+        and not routing_strategy.get("semantic_chunk_lookup_ok")
+    ):
+        return finalize(
+            {
+                "status": "no_evidence",
+                "tool_name": "read_selected_file",
+                "code": "metadata_first_targeted_evidence_required",
+                "source_id": normalized_source_id,
+                "query": provider_query,
+                "original_query": original_query,
+                "retrieval_round": retrieval_round,
+                "retrieval_diagnostics": _selected_retrieval_dedupe_diagnostics(
+                    [
+                        _selected_retrieval_compact_diagnostic(
+                            classification="no_evidence",
+                            reason="metadata_first_targeted_evidence_required",
+                            outcome="blocked",
+                            tool_name="read_selected_file",
+                            query=provider_query,
+                            retrieval_round=retrieval_round,
+                        ),
+                        *_selected_retrieval_metadata_first_diagnostics(
+                            query=provider_query,
+                            tool_name="read_selected_file",
+                            retrieval_round=retrieval_round,
+                            routing_strategy=routing_strategy,
+                            selected_inventory_count=len(selected_candidates),
+                            scoped_inventory_count=len(candidates),
+                            structured_terms=structured_terms,
+                        ),
+                    ]
+                ),
+                "terminal_reason": "metadata_first_targeted_evidence_required",
+                "strategy_used": _selected_retrieval_with_strategy_metadata(
+                    _selected_retrieval_strategy_used(
+                        descriptor=descriptor,
+                        normalized_required_anchors=normalized_required_anchors,
+                        anchor_policy=anchor_policy,
+                        evidence_need=evidence_need,
+                        original_query=original_query,
+                        executed_query=provider_query,
+                        retrieval_round=retrieval_round,
+                        query_enforced_from_original=bool(enforced_original_query),
+                    ),
+                    routing_strategy,
+                ),
+                "authorization_context": _selected_retrieval_authorization_context(
+                    selected_inventory_count=len(selected_candidates),
+                    scoped_inventory_count=len(candidates),
+                    requested_source_ids=[normalized_source_id],
+                    active_source_scope=active_source_scope,
+                ),
+                "retry_policy": _selected_retrieval_retry_policy(
+                    normalized_timeout_seconds
+                ),
+            }
+        )
+    try:
+        provider_call = get_sources_from_items(
+            request=__request__,
+            items=[source_item],
+            queries=[provider_query],
+            embedding_function=lambda text, prefix: __request__.app.state.EMBEDDING_FUNCTION(
+                text, prefix=prefix, user=__user_model__
+            ),
+            k=1,
+            reranking_function=None,
+            k_reranker=__request__.app.state.config.TOP_K_RERANKER,
+            r=__request__.app.state.config.RELEVANCE_THRESHOLD,
+            hybrid_bm25_weight=__request__.app.state.config.HYBRID_BM25_WEIGHT,
+            hybrid_search=False,
+            full_context=True,
+            user=__user_model__,
+        )
+        sources = await asyncio.wait_for(
+            provider_call,
+            timeout=normalized_timeout_seconds,
+        )
+    except asyncio.CancelledError:
+        return _selected_retrieval_cancelled_response(
+            tool_name="read_selected_file",
+            query=provider_query,
+            original_query=original_query,
+            retrieval_round=retrieval_round,
+            normalized_timeout_seconds=normalized_timeout_seconds,
+            descriptor=descriptor,
+            normalized_required_anchors=normalized_required_anchors,
+            anchor_policy=anchor_policy,
+            evidence_need=evidence_need,
+            executed_query=provider_query,
+            query_enforced_from_original=bool(enforced_original_query),
+            selected_inventory_count=len(selected_candidates),
+            scoped_inventory_count=len(candidates),
+            requested_source_ids=[normalized_source_id],
+            active_source_scope=active_source_scope,
+            source_id=normalized_source_id,
+        )
+    except Exception as exc:
+        timeout_types = (TimeoutError, asyncio.TimeoutError)
+        timeout = isinstance(exc, timeout_types)
+        diagnostic = _selected_retrieval_compact_diagnostic(
+            classification="diagnostics",
+            reason="retrieval_timeout" if timeout else "retrieval_provider_error",
+            outcome="timeout" if timeout else "malformed",
+            tool_name="read_selected_file",
+            query=provider_query,
+            retrieval_round=retrieval_round,
+            source_id=normalized_source_id,
+        )
+        return finalize({
+            "status": "timeout" if timeout else "error",
+            "tool_name": "read_selected_file",
+            "code": "retrieval_timeout" if timeout else "retrieval_provider_error",
+            "source_id": normalized_source_id,
+            "query": provider_query,
+            "original_query": original_query,
+            "retrieval_round": retrieval_round,
+            "retrieval_diagnostics": [diagnostic],
+            "terminal_reason": "retrieval_timeout"
+            if timeout
+            else "retrieval_provider_error",
+            "strategy_used": _selected_retrieval_strategy_used(
+                descriptor=descriptor,
+                normalized_required_anchors=normalized_required_anchors,
+                anchor_policy=anchor_policy,
+                evidence_need=evidence_need,
+                original_query=original_query,
+                executed_query=provider_query,
+                retrieval_round=retrieval_round,
+                query_enforced_from_original=bool(enforced_original_query),
+            ),
+            "authorization_context": _selected_retrieval_authorization_context(
+                selected_inventory_count=len(selected_candidates),
+                scoped_inventory_count=len(candidates),
+                requested_source_ids=[normalized_source_id],
+                active_source_scope=active_source_scope,
+            ),
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
     if not sources:
-        return {
+        return finalize({
             "status": "no_evidence",
             "tool_name": "read_selected_file",
             "code": "empty_retrieval_result",
             "source_id": normalized_source_id,
+            "query": provider_query,
+            "original_query": original_query,
             "retrieval_round": retrieval_round,
-        }
+            "terminal_reason": "empty_retrieval_result",
+            "strategy_used": _selected_retrieval_strategy_used(
+                descriptor=descriptor,
+                normalized_required_anchors=normalized_required_anchors,
+                anchor_policy=anchor_policy,
+                evidence_need=evidence_need,
+                original_query=original_query,
+                executed_query=provider_query,
+                retrieval_round=retrieval_round,
+                query_enforced_from_original=bool(enforced_original_query),
+            ),
+            "authorization_context": _selected_retrieval_authorization_context(
+                selected_inventory_count=len(selected_candidates),
+                scoped_inventory_count=len(candidates),
+                requested_source_ids=[normalized_source_id],
+                active_source_scope=active_source_scope,
+            ),
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
+
+    allowed_identity_values = _selected_retrieval_source_identity_values(candidates[0])
+    sources, diagnostics = _filter_selected_retrieval_sources_by_query(
+        sources,
+        query=provider_query,
+        required_anchors=normalized_required_anchors,
+        required_facets=required_facets,
+        metadata_first_intent=bool(routing_strategy.get("metadata_first_intent")),
+        allowed_identity_values=allowed_identity_values,
+        tool_name="read_selected_file",
+        retrieval_round=retrieval_round,
+    )
+    if routing_strategy.get("metadata_first_intent"):
+        diagnostics = _selected_retrieval_dedupe_diagnostics(
+            [
+                *diagnostics,
+                *_selected_retrieval_metadata_first_diagnostics(
+                    query=provider_query,
+                    tool_name="read_selected_file",
+                    retrieval_round=retrieval_round,
+                    routing_strategy=routing_strategy,
+                    selected_inventory_count=len(selected_candidates),
+                    scoped_inventory_count=len(candidates),
+                    structured_terms=structured_terms,
+                ),
+            ]
+        )
+    unsupported_claim_reason = next(
+        (
+            str(item.get("reason") or "").strip()
+            for item in diagnostics
+            if isinstance(item, dict)
+            and str(item.get("reason") or "").strip().startswith("unsupported_")
+        ),
+        "",
+    )
+    if routing_strategy.get("metadata_first_intent") and unsupported_claim_reason:
+        return finalize(
+            {
+                "status": "no_evidence",
+                "tool_name": "read_selected_file",
+                "code": unsupported_claim_reason,
+                "source_id": normalized_source_id,
+                "query": provider_query,
+                "original_query": original_query,
+                "retrieval_round": retrieval_round,
+                "retrieval_diagnostics": diagnostics,
+                "terminal_reason": unsupported_claim_reason,
+                "strategy_used": _selected_retrieval_with_strategy_metadata(
+                    _selected_retrieval_strategy_used(
+                        descriptor=descriptor,
+                        normalized_required_anchors=normalized_required_anchors,
+                        anchor_policy=anchor_policy,
+                        evidence_need=evidence_need,
+                        original_query=original_query,
+                        executed_query=provider_query,
+                        retrieval_round=retrieval_round,
+                        query_enforced_from_original=bool(enforced_original_query),
+                    ),
+                    routing_strategy,
+                ),
+                "authorization_context": _selected_retrieval_authorization_context(
+                    selected_inventory_count=len(selected_candidates),
+                    scoped_inventory_count=len(candidates),
+                    requested_source_ids=[normalized_source_id],
+                    active_source_scope=active_source_scope,
+                ),
+                "retry_policy": _selected_retrieval_retry_policy(
+                    normalized_timeout_seconds
+                ),
+            }
+        )
+    if not sources:
+        return finalize({
+            "status": "no_evidence",
+            "tool_name": "read_selected_file",
+            "code": "weak_or_empty_retrieval_result",
+            "source_id": normalized_source_id,
+            "query": provider_query,
+            "original_query": original_query,
+            "retrieval_round": retrieval_round,
+            "retrieval_diagnostics": diagnostics,
+            "terminal_reason": "weak_or_empty_retrieval_result",
+            "strategy_used": _selected_retrieval_strategy_used(
+                descriptor=descriptor,
+                normalized_required_anchors=normalized_required_anchors,
+                anchor_policy=anchor_policy,
+                evidence_need=evidence_need,
+                original_query=original_query,
+                executed_query=provider_query,
+                retrieval_round=retrieval_round,
+                query_enforced_from_original=bool(enforced_original_query),
+            ),
+            "authorization_context": _selected_retrieval_authorization_context(
+                selected_inventory_count=len(selected_candidates),
+                scoped_inventory_count=len(candidates),
+                requested_source_ids=[normalized_source_id],
+                active_source_scope=active_source_scope,
+            ),
+            "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        })
 
     for source in sources:
         if not isinstance(source, dict):
@@ -1503,25 +3868,62 @@ async def read_selected_file(
             if isinstance(metadata, dict):
                 metadata.setdefault("retrieval_tool_name", "read_selected_file")
                 metadata.setdefault("retrieval_round", retrieval_round)
-                metadata.setdefault("query", str(query or "").strip())
+                metadata.setdefault("query", provider_query)
+                if original_query:
+                    metadata.setdefault("original_query", original_query)
+                metadata.setdefault(
+                    "query_enforced_from_original",
+                    bool(enforced_original_query),
+                )
 
     compact_sources, context_budget = _compact_deepagent_reference_sources(
         sources,
-        max_sources=1,
-        max_chunks=8,
-        max_chars_per_chunk=DEEPAGENT_READ_MAX_CHARS_PER_CHUNK,
-        max_total_chars=DEEPAGENT_READ_MAX_TOTAL_CHARS,
+        max_sources=int(descriptor.get("max_sources") or 1),
+        max_chunks=int(descriptor.get("max_chunks") or 8),
+        max_chars_per_chunk=int(descriptor.get("max_chars_per_chunk") or DEEPAGENT_READ_MAX_CHARS_PER_CHUNK),
+        max_total_chars=int(descriptor.get("max_total_chars") or DEEPAGENT_READ_MAX_TOTAL_CHARS),
     )
-    return {
+    strategy_used = _selected_retrieval_strategy_used(
+        descriptor=descriptor,
+        normalized_required_anchors=normalized_required_anchors,
+        anchor_policy=anchor_policy,
+        evidence_need=evidence_need,
+        original_query=original_query,
+        executed_query=provider_query,
+        retrieval_round=retrieval_round,
+        query_enforced_from_original=bool(enforced_original_query),
+    )
+    result = {
         "status": "success",
         "tool_name": "read_selected_file",
         "source_id": normalized_source_id,
-        "query": str(query or "").strip(),
+        "query": provider_query,
+        "original_query": original_query,
+        "query_enforced_from_original": bool(enforced_original_query),
         "retrieval_round": retrieval_round,
         "canonical_references": compact_sources,
+        "accepted_outputs": _selected_retrieval_accepted_outputs(
+            compact_sources,
+            tool_name="read_selected_file",
+            query=provider_query,
+            original_query=original_query,
+            retrieval_round=retrieval_round,
+        ),
         "result_count": len(sources),
         "context_budget": context_budget,
+        "strategy_used": strategy_used,
+        "authorization_context": _selected_retrieval_authorization_context(
+            selected_inventory_count=len(selected_candidates),
+            scoped_inventory_count=len(candidates),
+            requested_source_ids=[normalized_source_id],
+            active_source_scope=active_source_scope,
+        ),
+        "retry_policy": _selected_retrieval_retry_policy(normalized_timeout_seconds),
+        "terminal_reason": "success",
     }
+    if diagnostics:
+        result["retrieval_diagnostics"] = diagnostics
+    return finalize(result)
 
 
 def _sanitize_deepagent_runtime_parameters(parameters: dict | None) -> dict:

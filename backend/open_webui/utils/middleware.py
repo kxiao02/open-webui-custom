@@ -33,6 +33,7 @@ from open_webui.utils.misc import is_string_allowed
 from open_webui.models.oauth_sessions import OAuthSessions
 from open_webui.models.chats import Chats
 from open_webui.models.folders import Folders
+from open_webui.models.knowledge import Knowledges
 from open_webui.models.users import Users
 from open_webui.socket.main import (
     get_event_call,
@@ -131,6 +132,7 @@ from open_webui.utils.access_control import get_permissions, has_connection_acce
 from open_webui.utils.knowflow import (
     get_knowflow_asset_ref_key,
     is_knowflow_image_ref,
+    list_knowledge_documents,
     resolve_knowflow_asset_url,
     resolve_knowflow_html_content,
 )
@@ -1321,6 +1323,10 @@ def _merge_reference_sidecar_into_metadata(
         metadata["canonical_references"] = sidecar["canonical_references"]
     else:
         metadata.pop("canonical_references", None)
+    if sidecar.get("reference_cards"):
+        metadata["reference_cards"] = sidecar["reference_cards"]
+    else:
+        metadata.pop("reference_cards", None)
     if sidecar.get("active_source_scope"):
         metadata["active_source_scope"] = sidecar["active_source_scope"]
     elif metadata.get("active_source_scope"):
@@ -1347,6 +1353,51 @@ def _completion_sources_for_persistence(metadata: dict) -> list[dict]:
         return []
 
     return [item for item in references if isinstance(item, dict)]
+
+
+def _is_persistable_chat_target(metadata: object) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+
+    chat_id = metadata.get("chat_id")
+    message_id = metadata.get("message_id")
+    if not isinstance(chat_id, str) or not chat_id or chat_id.startswith("local:"):
+        return False
+    if not isinstance(message_id, str) or not message_id:
+        return False
+    return True
+
+
+def _persist_assistant_completion_message(
+    *,
+    metadata: dict,
+    content: str,
+    output: object,
+    sources: object = None,
+    usage: object = None,
+    completion_metadata: object = None,
+) -> bool:
+    if not _is_persistable_chat_target(metadata):
+        return False
+
+    message_payload: dict[str, Any] = {
+        "role": "assistant",
+        "content": str(content or ""),
+        "output": output if isinstance(output, list) else [],
+    }
+    if isinstance(sources, list) and sources:
+        message_payload["sources"] = sources
+    if isinstance(usage, dict) and usage:
+        message_payload["usage"] = usage
+    if isinstance(completion_metadata, dict) and completion_metadata:
+        message_payload["metadata"] = completion_metadata
+
+    Chats.upsert_message_to_chat_by_id_and_message_id(
+        metadata["chat_id"],
+        metadata["message_id"],
+        message_payload,
+    )
+    return True
 
 
 _SELECTED_SOURCE_RETRIEVAL_TOOL_NAMES = {
@@ -1466,13 +1517,158 @@ def _retrieval_tool_status_for_persistence(tool_outputs: Any) -> list[dict]:
 
 
 _NO_SELECTED_SOURCE_EVIDENCE_PATTERN = re.compile(
-    r"(未在[^。；\n]{0,80}(?:找到|检索到)|"
-    r"(?:未|没有)[^。；\n]{0,40}(?:找到|检索到)[^。；\n]{0,80}(?:证据|依据|相关)|"
+    r"(未在[^。；\n]{0,120}(?:找到|检索到)|"
+    r"(?:未|没有)[^。；\n]{0,40}(?:找到|检索到)[^。；\n]{0,220}(?:证据|依据|相关)|"
+    r"(?:未|没有)(?:找到|检索到)[^。；\n]{0,220}(?:原文|内容|结果|条款|信息)|"
     r"无[^。；\n]{0,40}(?:证据|依据)|"
     r"no\s+(?:usable\s+)?(?:evidence|results?)|"
     r"not\s+found)",
     re.IGNORECASE,
 )
+_NO_EVIDENCE_DIAGNOSTIC_CLASSIFICATIONS = {
+    "no_evidence",
+}
+_NO_EVIDENCE_DIAGNOSTIC_OUTCOMES = {
+    "blocked",
+    "denied",
+    "error",
+    "low_relevance",
+    "malformed",
+    "no_evidence",
+    "permission_denied",
+    "timeout",
+    "unauthorized",
+    "weak_evidence",
+}
+_NO_EVIDENCE_TOOL_STATUS_VALUES = {
+    "blocked",
+    "denied",
+    "error",
+    "failed",
+    "failure",
+    "malformed",
+    "no_evidence",
+    "permission_denied",
+    "timeout",
+}
+
+_EXPLICIT_INCOMPATIBLE_PROFILE_LOCK_REASONS = {
+    "explicit_incompatible_profile",
+    "chat_profile_zero_tool_lane",
+}
+
+
+def _normalized_match_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def _trim_reference_by_accepted_snippets(
+    reference: dict[str, Any],
+    accepted_snippets: list[str],
+) -> dict[str, Any]:
+    if not isinstance(reference, dict):
+        return {}
+    if not accepted_snippets:
+        return copy.deepcopy(reference)
+
+    documents = reference.get("document") if isinstance(reference.get("document"), list) else []
+    if not documents:
+        return copy.deepcopy(reference)
+
+    normalized_snippets = [
+        _normalized_match_text(snippet)
+        for snippet in accepted_snippets
+        if _normalized_match_text(snippet)
+    ]
+    if not normalized_snippets:
+        return copy.deepcopy(reference)
+
+    accepted_indexes: list[int] = []
+    for index, document in enumerate(documents):
+        normalized_document = _normalized_match_text(document)
+        if not normalized_document:
+            continue
+        if any(
+            snippet in normalized_document or normalized_document in snippet
+            for snippet in normalized_snippets
+        ):
+            accepted_indexes.append(index)
+
+    if not accepted_indexes:
+        # Keep the first document as a conservative fallback when snippets are present
+        # but normalisation cannot map them exactly (e.g., formatting artifacts).
+        accepted_indexes = [0]
+
+    trimmed = copy.deepcopy(reference)
+    for key, value in reference.items():
+        if isinstance(value, list) and len(value) == len(documents):
+            trimmed[key] = [value[index] for index in accepted_indexes]
+    return trimmed
+
+
+def _selected_source_references_for_persistence(
+    references: object,
+    *,
+    accepted_outputs: object,
+    strategy: object,
+    active_source_scope: object,
+) -> list[dict]:
+    if not isinstance(references, list):
+        return []
+
+    clean_references = [item for item in references if isinstance(item, dict)]
+    if not clean_references:
+        return []
+
+    strategy = strategy if isinstance(strategy, dict) else {}
+    accepted_outputs = accepted_outputs if isinstance(accepted_outputs, list) else []
+    metadata_first_intent = bool(strategy.get("metadata_first_intent"))
+    targeted_context_bounded = bool(strategy.get("targeted_context_bounded"))
+    if (
+        metadata_first_intent
+        and not targeted_context_bounded
+        and not any(isinstance(item, dict) for item in accepted_outputs)
+    ):
+        return []
+    snippet_map: dict[str, list[str]] = {}
+    for item in accepted_outputs:
+        if not isinstance(item, dict):
+            continue
+        source = item.get("source") if isinstance(item.get("source"), dict) else {}
+        source_id = str(source.get("id") or "").strip()
+        snippet = str(item.get("snippet") or "").strip()
+        if not source_id or not snippet:
+            continue
+        snippet_map.setdefault(source_id, [])
+        if snippet not in snippet_map[source_id]:
+            snippet_map[source_id].append(snippet)
+
+    if not snippet_map:
+        return copy.deepcopy(clean_references)
+
+    allowed_scope_ids = set()
+    if isinstance(active_source_scope, dict):
+        for value in active_source_scope.get("source_ids") or []:
+            normalized = str(value or "").strip()
+            if normalized:
+                allowed_scope_ids.add(normalized)
+
+    trimmed_references: list[dict] = []
+    for reference in clean_references:
+        source = reference.get("source") if isinstance(reference.get("source"), dict) else {}
+        source_id = str(source.get("id") or "").strip()
+        if allowed_scope_ids and source_id and source_id not in allowed_scope_ids:
+            continue
+
+        snippets = snippet_map.get(source_id, [])
+        if metadata_first_intent and not snippets:
+            continue
+
+        trimmed_reference = _trim_reference_by_accepted_snippets(reference, snippets)
+        if trimmed_reference:
+            trimmed_references.append(trimmed_reference)
+
+    return trimmed_references
 
 
 _SOURCE_SCOPE_CLARIFICATION_PATTERN = re.compile(
@@ -1499,10 +1695,108 @@ def _source_reference_is_web(source: dict) -> bool:
     return source_type == "web" or source_url.startswith(("http://", "https://"))
 
 
+def _metadata_indicates_no_evidence_state(metadata: object) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+
+    diagnostics = metadata.get("retrieval_diagnostics")
+    if isinstance(diagnostics, list):
+        for item in diagnostics:
+            if not isinstance(item, dict):
+                continue
+            classification = str(item.get("classification") or "").strip().lower()
+            outcome = str(item.get("outcome") or item.get("status") or "").strip().lower()
+            if classification in _NO_EVIDENCE_DIAGNOSTIC_CLASSIFICATIONS:
+                return True
+            if outcome in _NO_EVIDENCE_DIAGNOSTIC_OUTCOMES:
+                return True
+
+    tool_status = metadata.get("retrieval_tool_status")
+    if isinstance(tool_status, list):
+        for item in tool_status:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "").strip().lower()
+            if status in _NO_EVIDENCE_TOOL_STATUS_VALUES:
+                return True
+
+    return False
+
+
+def _compact_execution_profile_routing_diagnostics(metadata: object) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+
+    routing = (
+        metadata.get("execution_profile_routing_diagnostics")
+        if isinstance(metadata.get("execution_profile_routing_diagnostics"), dict)
+        else {}
+    )
+    profile_lock = (
+        metadata.get("first_pass_profile_lock")
+        if isinstance(metadata.get("first_pass_profile_lock"), dict)
+        else {}
+    )
+    resolved_execution_profile = str(
+        routing.get("resolved_execution_profile")
+        or metadata.get("resolved_execution_profile")
+        or metadata.get("execution_profile")
+        or profile_lock.get("resolved_execution_profile")
+        or ""
+    ).strip()
+    classified_evidence_need = str(
+        routing.get("classified_evidence_need")
+        or profile_lock.get("classified_evidence_need")
+        or ""
+    ).strip()
+    promotion_reason = str(routing.get("promotion_reason") or "").strip()
+    non_promotion_reason = str(
+        routing.get("non_promotion_reason") or profile_lock.get("non_promotion_reason") or ""
+    ).strip()
+    explicit_profile_lock = bool(
+        profile_lock.get("incompatible")
+        or non_promotion_reason.strip().lower()
+        in _EXPLICIT_INCOMPATIBLE_PROFILE_LOCK_REASONS
+    )
+    strategy = (
+        metadata.get("first_pass_retrieval_strategy")
+        if isinstance(metadata.get("first_pass_retrieval_strategy"), dict)
+        else {}
+    )
+    if not classified_evidence_need or classified_evidence_need.lower() == "none":
+        strategy_evidence_need = str(strategy.get("evidence_need") or "").strip().lower()
+        strategy_retrieval = str(strategy.get("retrieval_strategy") or "").strip().lower()
+        if strategy_evidence_need and strategy_evidence_need != "none":
+            classified_evidence_need = strategy_evidence_need
+        elif bool(strategy.get("metadata_first_intent")) or (
+            strategy_retrieval == "metadata_first_then_targeted_chunks"
+        ):
+            classified_evidence_need = "metadata_first_inventory"
+
+    if not (
+        resolved_execution_profile
+        or classified_evidence_need
+        or promotion_reason
+        or non_promotion_reason
+        or explicit_profile_lock
+    ):
+        return {}
+
+    compact: dict[str, Any] = {
+        "resolved_execution_profile": resolved_execution_profile or "general",
+        "classified_evidence_need": classified_evidence_need or "none",
+        "promotion_reason": promotion_reason,
+        "non_promotion_reason": non_promotion_reason,
+        "explicit_profile_lock": explicit_profile_lock,
+    }
+    return compact
+
+
 def _filter_uncited_no_evidence_source_cards(
     sources: object,
     *,
     content: str,
+    metadata: object = None,
 ) -> list[dict]:
     """Avoid rendering weak selected-KB diagnostics as accepted source cards."""
 
@@ -1513,11 +1807,18 @@ def _filter_uncited_no_evidence_source_cards(
     if not clean_sources:
         return []
 
+    if _selected_source_metadata_first_diagnostics_lane(metadata):
+        # Selected-source metadata-first blocked/no-evidence/unsupported turns
+        # are diagnostics-only and must not persist any source cards.
+        return []
+
     content = str(content or "")
     if _content_is_source_scope_clarification(content):
         return []
 
-    if not _NO_SELECTED_SOURCE_EVIDENCE_PATTERN.search(content):
+    no_evidence_text = bool(_NO_SELECTED_SOURCE_EVIDENCE_PATTERN.search(content))
+    no_evidence_metadata = _metadata_indicates_no_evidence_state(metadata)
+    if not no_evidence_text and not no_evidence_metadata:
         return clean_sources
 
     # If the model cited a source explicitly, keep the source list; otherwise
@@ -1527,6 +1828,109 @@ def _filter_uncited_no_evidence_source_cards(
         return clean_sources
 
     return [source for source in clean_sources if _source_reference_is_web(source)]
+
+
+def _metadata_is_selected_source_turn(metadata: object) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+
+    active_scope = (
+        metadata.get("active_source_scope")
+        if isinstance(metadata.get("active_source_scope"), dict)
+        else {}
+    )
+    focus_state = str(active_scope.get("focus_state") or "").strip().lower()
+    authority = str(active_scope.get("authority") or "").strip().lower()
+    if focus_state in {"single", "multi"} and authority in {
+        "selected_source",
+        "current_upload",
+        "user_clarification",
+        "canonical_reference",
+    }:
+        return True
+
+    for item in metadata.get("retrieval_tool_status") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("tool_name") or "").strip() in _SELECTED_SOURCE_RETRIEVAL_TOOL_NAMES:
+            return True
+    for item in metadata.get("retrieval_diagnostics") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("tool_name") or "").strip() in _SELECTED_SOURCE_RETRIEVAL_TOOL_NAMES:
+            return True
+
+    strategy = (
+        metadata.get("first_pass_retrieval_strategy")
+        if isinstance(metadata.get("first_pass_retrieval_strategy"), dict)
+        else {}
+    )
+    if strategy:
+        return True
+
+    return False
+
+
+def _selected_source_metadata_first_diagnostics_lane(metadata: object) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    if not _metadata_is_selected_source_turn(metadata):
+        return False
+    if not _selected_source_metadata_first_intent(metadata):
+        return False
+
+    status = str(metadata.get("status") or "").strip().lower()
+    terminal_reason = str(metadata.get("terminal_reason") or "").strip().lower()
+    if status in {"blocked", "no_evidence"}:
+        return True
+    if terminal_reason.startswith("unsupported_"):
+        return True
+
+    reason_codes = {
+        str(item.get("reason") or "").strip().lower()
+        for item in (metadata.get("retrieval_diagnostics") or [])
+        if isinstance(item, dict)
+    }
+    return any(
+        reason.startswith("unsupported_")
+        or reason
+        in {
+            "missing_date_metadata",
+            "missing_type_metadata",
+            "missing_topic_metadata",
+            "no_accepted_references",
+        }
+        for reason in reason_codes
+    )
+
+
+def _merge_persisted_and_response_sources(
+    persisted_sources: list[dict],
+    response_sources: object,
+    *,
+    completion_metadata: object,
+) -> list[dict]:
+    if not isinstance(persisted_sources, list):
+        persisted_sources = []
+    persisted_sources = [item for item in persisted_sources if isinstance(item, dict)]
+    if _metadata_is_selected_source_turn(completion_metadata):
+        active_source_scope = (
+            completion_metadata.get("active_source_scope")
+            if isinstance(completion_metadata, dict)
+            else None
+        )
+        scoped_sources = [
+            source
+            for source in persisted_sources
+            if _source_fits_active_scope(source, active_source_scope)
+        ]
+        # Keep selected-source persistence scoped to the active selection when
+        # at least one accepted scoped reference exists; otherwise preserve the
+        # original list to avoid dropping legitimate narrow-fact citations.
+        if scoped_sources:
+            return scoped_sources
+        return persisted_sources
+    return Chats._merge_message_sources(persisted_sources, response_sources)
 
 
 def _build_assistant_reference_persistence_metadata(
@@ -1542,6 +1946,13 @@ def _build_assistant_reference_persistence_metadata(
     if isinstance(message_metadata, dict):
         base_metadata.update(message_metadata)
 
+    status_value = str(metadata.get("status") or "").strip().lower()
+    if status_value:
+        base_metadata["status"] = status_value
+    terminal_reason = str(metadata.get("terminal_reason") or "").strip().lower()
+    if terminal_reason:
+        base_metadata["terminal_reason"] = terminal_reason
+
     active_source_scope = Chats.normalize_active_source_scope(
         metadata.get("active_source_scope")
     )
@@ -1555,9 +1966,83 @@ def _build_assistant_reference_persistence_metadata(
     if retrieval_diagnostics:
         base_metadata["retrieval_diagnostics"] = retrieval_diagnostics
 
+    explicit_references = (
+        metadata.get("references") if isinstance(metadata.get("references"), list) else None
+    )
+    accepted_outputs = (
+        metadata.get("accepted_outputs")
+        if isinstance(metadata.get("accepted_outputs"), list)
+        else []
+    )
+    first_pass_strategy = (
+        metadata.get("first_pass_retrieval_strategy")
+        if isinstance(metadata.get("first_pass_retrieval_strategy"), dict)
+        else {}
+    )
+    if explicit_references is not None:
+        explicit_references = _selected_source_references_for_persistence(
+            explicit_references,
+            accepted_outputs=accepted_outputs,
+            strategy=first_pass_strategy,
+            active_source_scope=active_source_scope,
+        )
+    if (
+        not status_value
+        and bool(first_pass_strategy.get("metadata_first_intent"))
+        and not bool(first_pass_strategy.get("targeted_context_bounded"))
+    ):
+        status_value = "blocked"
+        terminal_reason = "metadata_first_targeted_evidence_required"
+        base_metadata["status"] = status_value
+        base_metadata["terminal_reason"] = terminal_reason
+    if explicit_references is not None:
+        # Current-turn accepted references take precedence over stale message metadata.
+        for key in (
+            "canonical_references",
+            "reference_cards",
+            "sources",
+            "citations",
+            "references",
+            "documents",
+        ):
+            base_metadata.pop(key, None)
+        base_metadata["references"] = explicit_references
+    sources_for_sidecar: Any = (
+        explicit_references
+        if explicit_references is not None
+        else metadata.get("sources")
+    )
+    if (
+        explicit_references is not None
+        and len(explicit_references) == 0
+        and str(metadata.get("status") or "").strip().lower() in {"blocked", "no_evidence"}
+    ):
+        sources_for_sidecar = []
+    if (
+        str(metadata.get("status") or "").strip().lower() in {"blocked", "no_evidence"}
+        and _metadata_indicates_no_evidence_state(metadata)
+    ):
+        sources_for_sidecar = []
+    if status_value in {"blocked", "no_evidence"} and not explicit_references:
+        sources_for_sidecar = []
+    if (
+        status_value in {"blocked", "no_evidence"}
+        and not retrieval_diagnostics
+        and terminal_reason
+    ):
+        retrieval_diagnostics = [
+            _safe_retrieval_diagnostic(
+                classification="no_evidence",
+                reason=terminal_reason,
+                candidate_index=-1,
+                outcome=status_value,
+            )
+        ]
+        base_metadata["retrieval_diagnostics"] = retrieval_diagnostics
+
     sidecar = Chats.build_reference_metadata_sidecar(
         metadata=base_metadata,
-        sources=metadata.get("sources"),
+        sources=sources_for_sidecar,
         diagnostics=retrieval_diagnostics,
         tool_outputs=tool_outputs,
     )
@@ -1571,6 +2056,16 @@ def _build_assistant_reference_persistence_metadata(
         persisted["retrieval_diagnostics"] = retrieval_diagnostics
     if sidecar.get("canonical_references"):
         persisted["canonical_references"] = sidecar["canonical_references"]
+    if sidecar.get("reference_cards"):
+        persisted["reference_cards"] = sidecar["reference_cards"]
+    if status_value:
+        persisted["status"] = status_value
+    if terminal_reason:
+        persisted["terminal_reason"] = terminal_reason
+
+    compact_profile_routing = _compact_execution_profile_routing_diagnostics(metadata)
+    if compact_profile_routing:
+        persisted["execution_profile_routing_diagnostics"] = compact_profile_routing
 
     existing_tool_status = (
         base_metadata.get("retrieval_tool_status")
@@ -1591,6 +2086,56 @@ def _build_assistant_reference_persistence_metadata(
     if merged_tool_status:
         persisted["retrieval_tool_status"] = merged_tool_status
 
+    provenance = metadata.get("provenance") if isinstance(metadata, dict) else {}
+    if isinstance(provenance, dict):
+        compact = provenance.get("compact_retrieval_provenance")
+        if isinstance(compact, dict) and compact:
+            persisted["retrieval_provenance"] = copy.deepcopy(compact)
+        elif provenance:
+            persisted["retrieval_provenance"] = {
+                "strategy": {
+                    "evidence_need": str(
+                        (metadata.get("first_pass_retrieval_strategy") or {}).get(
+                            "evidence_need"
+                        )
+                        or ""
+                    ),
+                    "retrieval_strategy": str(
+                        (metadata.get("first_pass_retrieval_strategy") or {}).get(
+                            "retrieval_strategy"
+                        )
+                        or ""
+                    ),
+                    "semantic_chunk_lookup_ok": bool(
+                        (metadata.get("first_pass_retrieval_strategy") or {}).get(
+                            "semantic_chunk_lookup_ok", True
+                        )
+                    ),
+                },
+                "accepted_counts": {
+                    "reference_count": len(
+                        [
+                            item
+                            for item in metadata.get("references") or []
+                            if isinstance(item, dict)
+                        ]
+                    ),
+                    "accepted_output_count": len(
+                        [
+                            item
+                            for item in metadata.get("accepted_outputs") or []
+                            if isinstance(item, dict)
+                        ]
+                    ),
+                },
+                "material_limitations": [
+                    str(item.get("reason") or "").strip()
+                    for item in metadata.get("retrieval_diagnostics") or []
+                    if isinstance(item, dict)
+                    and str(item.get("reason") or "").strip()
+                ],
+            }
+
     return persisted
 
 
@@ -1600,6 +2145,7 @@ def _build_assistant_reference_seed_metadata(metadata: dict) -> dict:
         return {}
 
     seed_metadata.pop("canonical_references", None)
+    seed_metadata.pop("reference_cards", None)
     if not seed_metadata:
         return {}
 
@@ -6691,6 +7237,312 @@ def _append_no_evidence_guard(messages: list) -> list:
     return add_or_update_system_message(guard, messages, append=True)
 
 
+def _is_selected_source_metadata_first_diagnostics_only(metadata: object) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+
+    strategy = (
+        metadata.get("first_pass_retrieval_strategy")
+        if isinstance(metadata.get("first_pass_retrieval_strategy"), dict)
+        else {}
+    )
+    if not bool(strategy.get("metadata_first_intent")):
+        return False
+
+    status = str(metadata.get("status") or "").strip().lower()
+    if status not in {"blocked", "no_evidence"}:
+        return False
+
+    references = metadata.get("references")
+    if isinstance(references, list) and any(isinstance(item, dict) for item in references):
+        return False
+
+    accepted_outputs = metadata.get("accepted_outputs")
+    if isinstance(accepted_outputs, list) and any(
+        isinstance(item, dict) for item in accepted_outputs
+    ):
+        return False
+
+    return True
+
+
+def _selected_source_metadata_first_intent(metadata: object) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+
+    strategy = (
+        metadata.get("first_pass_retrieval_strategy")
+        if isinstance(metadata.get("first_pass_retrieval_strategy"), dict)
+        else {}
+    )
+    if bool(strategy.get("metadata_first_intent")):
+        return True
+    if (
+        str(strategy.get("retrieval_strategy") or "").strip().lower()
+        == "metadata_first_then_targeted_chunks"
+    ):
+        return True
+
+    routing = (
+        metadata.get("execution_profile_routing_diagnostics")
+        if isinstance(metadata.get("execution_profile_routing_diagnostics"), dict)
+        else {}
+    )
+    classified_evidence_need = str(
+        routing.get("classified_evidence_need") or ""
+    ).strip().lower()
+    if classified_evidence_need.startswith("metadata_first"):
+        return True
+
+    provenance = (
+        metadata.get("retrieval_provenance")
+        if isinstance(metadata.get("retrieval_provenance"), dict)
+        else {}
+    )
+    provenance_strategy = (
+        provenance.get("strategy") if isinstance(provenance.get("strategy"), dict) else {}
+    )
+    evidence_need = str(provenance_strategy.get("evidence_need") or "").strip().lower()
+    retrieval_strategy = str(
+        provenance_strategy.get("retrieval_strategy") or ""
+    ).strip().lower()
+    return evidence_need.startswith("metadata_first") or (
+        retrieval_strategy == "metadata_first_then_targeted_chunks"
+    )
+
+
+def _selected_source_limitation_content(metadata: object) -> str:
+    active_scope = (
+        metadata.get("active_source_scope")
+        if isinstance(metadata, dict) and isinstance(metadata.get("active_source_scope"), dict)
+        else {}
+    )
+    source_names: list[str] = []
+    for source_item in active_scope.get("sources") or []:
+        if not isinstance(source_item, dict):
+            continue
+        name = str(source_item.get("name") or "").strip()
+        if name and name not in source_names:
+            source_names.append(name)
+    source_label = (
+        f"当前所选来源（{source_names[0]}）"
+        if source_names
+        else "当前所选来源"
+    )
+
+    terminal_reason = str(
+        metadata.get("terminal_reason") if isinstance(metadata, dict) else ""
+    ).strip().lower()
+    reason_codes = {
+        str(item.get("reason") or "").strip().lower()
+        for item in (
+            metadata.get("retrieval_diagnostics")
+            if isinstance(metadata, dict) and isinstance(metadata.get("retrieval_diagnostics"), list)
+            else []
+        )
+        if isinstance(item, dict)
+    }
+
+    limitation_detail = ""
+    if (
+        "unsupported_latest_or_recent_claim" in reason_codes
+        or "unsupported_year_range_claim" in reason_codes
+    ):
+        limitation_detail = "缺少可验证的时间依据，无法判断“最近”或年份范围。"
+    elif "unsupported_document_type_claim" in reason_codes:
+        limitation_detail = "缺少可验证的文档类型标注，无法确认“公文/论文/讲话/政策”等类型。"
+    elif "unsupported_topic_scope_claim" in reason_codes:
+        limitation_detail = "缺少可验证的主题关联标注，无法确认“与XX相关”。"
+    elif terminal_reason == "metadata_first_targeted_evidence_required":
+        limitation_detail = "当前问题需要面向候选文档的定向证据，但本轮未命中可用证据。"
+    else:
+        limitation_detail = "本轮检索未获得可用于支撑该请求的证据。"
+
+    return (
+        f"{source_label}{limitation_detail}"
+        "因此无法给出具体文档列表或结论。"
+        "请提供更具体的文档标题、时间范围、类型或主题后重试。"
+    )
+
+
+def _replace_output_text_with_limitation(output: Any, limitation_text: str) -> list[dict]:
+    normalized_output = copy.deepcopy(output) if isinstance(output, list) else []
+    limitation_payload = [{"type": "output_text", "text": limitation_text}]
+    for item in reversed(normalized_output):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "").strip().lower() != "message":
+            continue
+        if str(item.get("role") or "assistant").strip().lower() != "assistant":
+            continue
+        item["content"] = limitation_payload
+        item["status"] = "completed"
+        return normalized_output
+
+    normalized_output.append(
+        {
+            "type": "message",
+            "id": output_id("msg"),
+            "status": "completed",
+            "role": "assistant",
+            "content": limitation_payload,
+        }
+    )
+    return normalized_output
+
+
+def _apply_selected_source_diagnostics_only_content_guard(
+    *,
+    content: str,
+    output: Any,
+    metadata: object,
+    completion_metadata: object,
+) -> tuple[str, list[dict]]:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    completion_metadata = completion_metadata if isinstance(completion_metadata, dict) else {}
+    merged_metadata: dict[str, Any] = {**metadata, **completion_metadata}
+
+    if not _metadata_is_selected_source_turn(merged_metadata):
+        return str(content or ""), copy.deepcopy(output) if isinstance(output, list) else []
+    if not _selected_source_metadata_first_intent(merged_metadata):
+        return str(content or ""), copy.deepcopy(output) if isinstance(output, list) else []
+    if not _selected_source_metadata_first_diagnostics_lane(merged_metadata):
+        return str(content or ""), copy.deepcopy(output) if isinstance(output, list) else []
+
+    limitation_text = _selected_source_limitation_content(merged_metadata)
+    return limitation_text, _replace_output_text_with_limitation(output, limitation_text)
+
+
+def _enforce_selected_source_metadata_first_final_consistency(
+    *,
+    completion_metadata: object,
+    metadata: object,
+) -> dict[str, Any]:
+    completion_metadata = (
+        copy.deepcopy(completion_metadata) if isinstance(completion_metadata, dict) else {}
+    )
+    metadata = metadata if isinstance(metadata, dict) else {}
+    merged_metadata: dict[str, Any] = {**metadata, **completion_metadata}
+
+    if not _metadata_is_selected_source_turn(merged_metadata):
+        return completion_metadata
+    if not _selected_source_metadata_first_intent(merged_metadata):
+        return completion_metadata
+
+    refs = (
+        completion_metadata.get("canonical_references")
+        if isinstance(completion_metadata.get("canonical_references"), list)
+        else []
+    )
+    cards = (
+        completion_metadata.get("reference_cards")
+        if isinstance(completion_metadata.get("reference_cards"), list)
+        else []
+    )
+    status_value = str(
+        completion_metadata.get("status") or metadata.get("status") or ""
+    ).strip().lower()
+    terminal_reason = str(
+        completion_metadata.get("terminal_reason")
+        or metadata.get("terminal_reason")
+        or ""
+    ).strip().lower()
+    diagnostics = Chats._merge_retrieval_diagnostics(
+        completion_metadata.get("retrieval_diagnostics"),
+        metadata.get("retrieval_diagnostics"),
+    )
+    reason_codes = {
+        str(item.get("reason") or "").strip().lower()
+        for item in diagnostics
+        if isinstance(item, dict)
+    }
+
+    if status_value == "success" and not refs and not cards:
+        status_value = "no_evidence"
+        terminal_reason = "no_accepted_references"
+        diagnostics = Chats._merge_retrieval_diagnostics(
+            diagnostics,
+            [
+                _safe_retrieval_diagnostic(
+                    classification="no_evidence",
+                    reason="no_accepted_references",
+                    candidate_index=-1,
+                    outcome="no_evidence",
+                )
+            ],
+        )
+
+    unsupported_terminal = bool(terminal_reason.startswith("unsupported_"))
+    unsupported_diagnostics = any(reason.startswith("unsupported_") for reason in reason_codes)
+    diagnostics_only_lane = _selected_source_metadata_first_diagnostics_lane(
+        {
+            **merged_metadata,
+            "status": status_value,
+            "terminal_reason": terminal_reason,
+            "retrieval_diagnostics": diagnostics,
+        }
+    ) or (unsupported_terminal and unsupported_diagnostics)
+
+    if diagnostics_only_lane:
+        completion_metadata.pop("canonical_references", None)
+        completion_metadata.pop("reference_cards", None)
+
+    if status_value:
+        completion_metadata["status"] = status_value
+    if terminal_reason:
+        completion_metadata["terminal_reason"] = terminal_reason
+    if diagnostics:
+        completion_metadata["retrieval_diagnostics"] = diagnostics
+
+    return completion_metadata
+
+
+def _append_selected_source_limitation_guard(
+    messages: list,
+    *,
+    terminal_reason: str = "",
+    active_source_scope: Optional[dict] = None,
+) -> list:
+    reason_text = str(terminal_reason or "").strip().lower()
+    scope_names: list[str] = []
+    if isinstance(active_source_scope, dict):
+        for source_item in active_source_scope.get("sources") or []:
+            if not isinstance(source_item, dict):
+                continue
+            name = str(source_item.get("name") or "").strip()
+            if name and name not in scope_names:
+                scope_names.append(name)
+    if len(scope_names) > 1:
+        source_clause = (
+            " If you mention selected sources, only reference the current selected set: "
+            + ", ".join(scope_names[:4])
+            + "."
+        )
+    elif scope_names:
+        source_clause = (
+            " If you mention the selected source, only reference "
+            f"{scope_names[0]}."
+        )
+    else:
+        source_clause = (
+            " Avoid naming prior sources; use neutral wording like '当前所选来源'."
+        )
+    reason_clause = (
+        f" Current retrieval terminal reason: {reason_text}."
+        if reason_text
+        else ""
+    )
+    guard = (
+        "This selected-source retrieval turn is blocked or has no usable evidence."
+        " Do not provide concrete document lists, article titles, dates, or counts as"
+        " if supported by selected-source retrieval in this turn. Do not reuse"
+        " previous-turn source-derived lists as current-turn evidence. Provide a concise"
+        " limitation or clarification response instead, and ask for a narrowed target if"
+        f" needed.{source_clause}{reason_clause}"
+    )
+    return add_or_update_system_message(guard, messages, append=True)
+
+
 _RETRIEVAL_DEICTIC_ONLY_PATTERN = re.compile(
     r"^(this|that|it|these|those|"
     r"(?:this|that|the)\s+(file|document|attachment)|"
@@ -6819,6 +7671,86 @@ _RETRIEVAL_CLAUSE_PATTERN = re.compile(
 )
 _RETRIEVAL_PROJECT_WORKFLOW_PATTERN = re.compile(
     r"(?:项目|工程|流程|workflow|project)[：:#\s-]*[A-Za-z0-9_\-\u4e00-\u9fff]{3,}",
+    flags=re.IGNORECASE,
+)
+_FIRST_PASS_METADATA_FIRST_EVIDENCE_NEEDS = frozenset(
+    {
+        "metadata_first_inventory",
+        "metadata_first_targeted_chunks",
+        "document_inventory",
+        "document_listing",
+        "temporal_listing",
+        "topic_scoped_listing",
+        "document_type_listing",
+        "count_or_statistics",
+        "table_of_contents",
+        "corpus_overview",
+    }
+)
+_FIRST_PASS_METADATA_FIRST_HINT_ALIASES = frozenset(
+    {
+        # Execution-profile routing diagnostics expose these selected-source
+        # evidence needs; treat them as metadata-first gates in first pass.
+        "metadata_first_retrieval",
+        "recency_inventory_retrieval",
+        "listing_or_inventory_retrieval",
+        "second_pass_selected_source_retrieval",
+    }
+)
+_FIRST_PASS_SEMANTIC_EVIDENCE_NEEDS = frozenset(
+    {
+        "narrow_fact",
+        "selected_source_retrieval",
+        "focused_read",
+        "semantic_detail",
+        "semantic_chunks",
+    }
+)
+_FIRST_PASS_RESEARCH_ONLY_EVIDENCE_NEEDS = frozenset(
+    {
+        "metadata_first_retrieval",
+        "metadata_first_inventory",
+        "recency_inventory_retrieval",
+        "listing_or_inventory_retrieval",
+        "selected_source_research",
+        "deep_selected_source_research",
+        "second_pass_selected_source_retrieval",
+        "insufficient_first_pass_evidence",
+    }
+)
+_FIRST_PASS_METADATA_QUERY_FACET_PATTERN = re.compile(
+    r"\b(?:document|doc_id|evidence_facets|topic_terms|requested_types|user_anchors)\s*=",
+    flags=re.IGNORECASE,
+)
+_FIRST_PASS_WEAK_METADATA_HINT_PATTERN = re.compile(
+    r"\b(?:list|listing|inventory|catalog|metadata|table\s+of\s+contents|toc|"
+    r"count|statistics|latest|recent)\b|"
+    r"(?:列出|清单|目录|元数据|目录结构|统计|最近|最新|前两年|近两年|近三年|公文|论文|讲话|政策|相关)",
+    flags=re.IGNORECASE,
+)
+_FIRST_PASS_WEAK_NARROW_HINT_PATTERN = re.compile(
+    r"\b(?:what\s+is|define|definition|explain|how|why)\b|"
+    r"(?:什么是|解释|定义|如何|为什么|怎么|详情)",
+    flags=re.IGNORECASE,
+)
+_FIRST_PASS_RECENCY_CLAIM_PATTERN = re.compile(
+    r"\b(?:latest|recent|newest|most\s+recent)\b|"
+    r"(?:最新|最近|近(?:两|2|三|3)年|前(?:两|2|三|3)年)",
+    flags=re.IGNORECASE,
+)
+_FIRST_PASS_YEAR_RANGE_CLAIM_PATTERN = re.compile(
+    r"\b(?:19|20)\d{2}\b|"
+    r"(?:前(?:两|2|三|3)年|近(?:两|2|三|3)年|最近(?:两|2|三|3)年|近年)",
+    flags=re.IGNORECASE,
+)
+_FIRST_PASS_TYPE_CLAIM_PATTERN = re.compile(
+    r"\b(?:policy|policies|paper|papers|speech|speeches|report|reports|notice|notices)\b|"
+    r"(?:公文|论文|讲话|政策|报告|通知|纪要)",
+    flags=re.IGNORECASE,
+)
+_FIRST_PASS_TOPIC_CLAIM_PATTERN = re.compile(
+    r"\b(?:related\s+to|about|topic|entity|with)\b|"
+    r"(?:相关|关于|围绕|主题|话题|有关)",
     flags=re.IGNORECASE,
 )
 
@@ -8096,6 +9028,824 @@ def _active_source_scope_blocks_query_generation(scope: object) -> bool:
     )
 
 
+def _first_pass_retrieval_hint_values(body: dict, metadata: dict) -> list[str]:
+    hint_values: list[str] = []
+    for mapping in (body, metadata):
+        if not isinstance(mapping, dict):
+            continue
+        for key in (
+            "evidence_need",
+            "retrieval_evidence_need",
+            "retrieval_intent",
+            "retrieval_strategy",
+        ):
+            for value in _list_from_optional_strings(mapping.get(key)):
+                normalized = value.strip().lower()
+                if normalized and normalized not in hint_values:
+                    hint_values.append(normalized)
+
+    profile_diagnostics = (
+        metadata.get("execution_profile_routing_diagnostics")
+        if isinstance(metadata, dict)
+        else {}
+    )
+    if isinstance(profile_diagnostics, dict):
+        for key in ("classified_evidence_need", "evidence_need", "retrieval_strategy"):
+            for value in _list_from_optional_strings(profile_diagnostics.get(key)):
+                normalized = value.strip().lower()
+                if normalized and normalized not in hint_values:
+                    hint_values.append(normalized)
+
+    targeted_request = (
+        metadata.get("selected_source_next_targeted_chunk_request")
+        if isinstance(metadata, dict)
+        else {}
+    )
+    if isinstance(targeted_request, dict):
+        for value in _list_from_optional_strings(targeted_request.get("evidence_need")):
+            normalized = value.strip().lower()
+            if normalized and normalized not in hint_values:
+                hint_values.append(normalized)
+
+    return hint_values
+
+
+def _first_pass_candidate_identity_values(retrieval_candidates: list[dict]) -> set[str]:
+    values: set[str] = set()
+    for candidate in retrieval_candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        identity = _active_source_identity_from_file_item(candidate)
+        if not isinstance(identity, dict):
+            continue
+        for key in ("id", "name"):
+            normalized = _normalize_anchor_text(identity.get(key))
+            if normalized:
+                values.add(normalized)
+    return values
+
+
+def _first_pass_selected_source_strategy(
+    *,
+    prompt: str,
+    body: dict,
+    metadata: dict,
+    retrieval_candidates: list[dict],
+    active_source_scope: Optional[dict],
+) -> dict[str, Any]:
+    normalized_prompt = _normalize_retrieval_query_text(_strip_attached_file_context(prompt))
+    reason_codes: list[str] = []
+    hint_values = _first_pass_retrieval_hint_values(body, metadata)
+    if hint_values:
+        reason_codes.extend(f"evidence_hint:{value}" for value in hint_values)
+
+    weak_metadata_hint = bool(
+        normalized_prompt
+        and _FIRST_PASS_WEAK_METADATA_HINT_PATTERN.search(normalized_prompt)
+    )
+    if weak_metadata_hint:
+        reason_codes.append("weak_query_metadata_first_hint")
+
+    weak_narrow_hint = bool(
+        normalized_prompt
+        and _FIRST_PASS_WEAK_NARROW_HINT_PATTERN.search(normalized_prompt)
+    )
+    if weak_narrow_hint:
+        reason_codes.append("weak_query_narrow_detail_hint")
+
+    strong_metadata_first_intent = any(
+        value in _FIRST_PASS_METADATA_FIRST_EVIDENCE_NEEDS
+        or value in _FIRST_PASS_METADATA_FIRST_HINT_ALIASES
+        or value.startswith("metadata_first")
+        for value in hint_values
+    ) or any(value == "metadata_first_then_targeted_chunks" for value in hint_values)
+
+    explicit_multi_request = _prompt_explicitly_requests_multiple_sources(prompt) or (
+        _prompt_has_explicit_multi_part_retrieval_request(prompt)
+    )
+    scope_mode = (
+        str(active_source_scope.get("source_set_mode") or "").strip().lower()
+        if isinstance(active_source_scope, dict)
+        else ""
+    )
+    multi_scope_comparison_intent = bool(
+        scope_mode == "multi"
+        and normalized_prompt
+        and re.search(
+            r"\b(?:difference|differences|similarity|similarities|compare|comparison|contrast)\b|"
+            r"(?:差异|区别|异同|比较|对比|比对)",
+            normalized_prompt,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    metadata_first_intent = strong_metadata_first_intent or (
+        weak_metadata_hint
+        and not weak_narrow_hint
+        and not explicit_multi_request
+        and not multi_scope_comparison_intent
+    )
+    if weak_metadata_hint and (
+        explicit_multi_request
+        or (multi_scope_comparison_intent and not strong_metadata_first_intent)
+    ):
+        reason_codes.append("weak_metadata_hint_suppressed_for_explicit_multi_scope")
+
+    normalized_evidence_need = next(
+        (
+            value
+            for value in hint_values
+            if value in _FIRST_PASS_METADATA_FIRST_EVIDENCE_NEEDS
+            or value in _FIRST_PASS_METADATA_FIRST_HINT_ALIASES
+            or value in _FIRST_PASS_SEMANTIC_EVIDENCE_NEEDS
+            or value.startswith("metadata_first")
+        ),
+        "",
+    )
+
+    targeted_request = (
+        metadata.get("selected_source_next_targeted_chunk_request")
+        if isinstance(metadata, dict)
+        else {}
+    )
+    targeted_request = targeted_request if isinstance(targeted_request, dict) else {}
+    targeted_source_ids = _list_from_optional_strings(targeted_request.get("source_ids"))
+    if not targeted_source_ids:
+        single_source_id = str(targeted_request.get("source_id") or "").strip()
+        if single_source_id:
+            targeted_source_ids = [single_source_id]
+    required_anchors = _list_from_optional_strings(targeted_request.get("required_anchors"))
+    targeted_query = _normalize_retrieval_query_text(targeted_request.get("query") or "")
+
+    targeted_context_present = bool(targeted_source_ids and required_anchors)
+    if targeted_context_present:
+        reason_codes.append("targeted_context_present")
+
+    scope_values = _active_source_scope_values(active_source_scope)
+    candidate_values = _first_pass_candidate_identity_values(retrieval_candidates)
+    allowed_values = set(scope_values)
+    allowed_values.update(candidate_values)
+    targeted_ids_in_scope = (
+        targeted_context_present
+        and bool(allowed_values)
+        and all(
+            _normalize_anchor_text(source_id) in allowed_values
+            for source_id in targeted_source_ids
+        )
+    )
+    if targeted_context_present and not targeted_ids_in_scope:
+        reason_codes.append("targeted_context_out_of_scope")
+
+    structured_query_facets = bool(
+        _FIRST_PASS_METADATA_QUERY_FACET_PATTERN.search(targeted_query or normalized_prompt)
+    )
+    if structured_query_facets:
+        reason_codes.append("structured_query_facets")
+
+    targeted_context_bounded = bool(
+        targeted_context_present and targeted_ids_in_scope and structured_query_facets
+    )
+    if targeted_context_bounded:
+        reason_codes.append("targeted_context_bounded")
+
+    retrieval_strategy = "semantic_chunks"
+    semantic_chunk_lookup_ok = True
+    if metadata_first_intent:
+        retrieval_strategy = "metadata_first_then_targeted_chunks"
+        semantic_chunk_lookup_ok = targeted_context_bounded
+        if not semantic_chunk_lookup_ok:
+            reason_codes.append("metadata_first_requires_bounded_targeted_context")
+    elif normalized_evidence_need in _FIRST_PASS_SEMANTIC_EVIDENCE_NEEDS:
+        reason_codes.append("semantic_detail_evidence_need")
+    elif not normalized_evidence_need:
+        reason_codes.append("default_semantic_strategy")
+
+    return {
+        "evidence_need": normalized_evidence_need or "none",
+        "retrieval_strategy": retrieval_strategy,
+        "metadata_first_intent": bool(metadata_first_intent),
+        "semantic_chunk_lookup_ok": bool(semantic_chunk_lookup_ok),
+        "targeted_context_present": bool(targeted_context_present),
+        "targeted_context_bounded": bool(targeted_context_bounded),
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+    }
+
+
+def _first_pass_profile_lock_incompatibility(
+    *,
+    metadata: dict,
+    strategy: dict[str, Any],
+) -> dict[str, Any]:
+    diagnostics = (
+        metadata.get("execution_profile_routing_diagnostics")
+        if isinstance(metadata, dict)
+        else {}
+    )
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    non_promotion_reason = str(diagnostics.get("non_promotion_reason") or "").strip().lower()
+    classified_evidence_need = str(
+        diagnostics.get("classified_evidence_need") or ""
+    ).strip().lower()
+    resolved_execution_profile = str(
+        diagnostics.get("resolved_execution_profile")
+        or metadata.get("resolved_execution_profile")
+        or metadata.get("execution_profile")
+        or "general"
+    ).strip().lower()
+
+    explicit_lock = non_promotion_reason in {
+        "explicit_incompatible_profile",
+        "chat_profile_zero_tool_lane",
+    }
+    research_only_need = (
+        classified_evidence_need in _FIRST_PASS_RESEARCH_ONLY_EVIDENCE_NEEDS
+    ) or bool(
+        strategy.get("metadata_first_intent")
+        and str(strategy.get("retrieval_strategy") or "").strip().lower()
+        == "metadata_first_then_targeted_chunks"
+    )
+    incompatible = explicit_lock and research_only_need
+    reason_codes: list[str] = []
+    if explicit_lock:
+        reason_codes.append(f"profile_lock:{non_promotion_reason}")
+    if classified_evidence_need:
+        reason_codes.append(f"classified_evidence_need:{classified_evidence_need}")
+    if research_only_need:
+        reason_codes.append("research_only_selected_source_need")
+
+    return {
+        "incompatible": bool(incompatible),
+        "non_promotion_reason": non_promotion_reason or "none",
+        "classified_evidence_need": classified_evidence_need or "none",
+        "resolved_execution_profile": resolved_execution_profile or "general",
+        "reason_codes": reason_codes,
+    }
+
+
+def _first_pass_structured_terms(query: str) -> dict[str, list[str]]:
+    terms = {
+        "document": [],
+        "evidence_facets": [],
+        "topic_terms": [],
+        "requested_types": [],
+        "date_basis": [],
+        "type_basis": [],
+        "topic_basis": [],
+    }
+    for key, raw_value in re.findall(
+        r"\b(document|evidence_facets|topic_terms|requested_types|date_basis|type_basis|topic_basis)\s*=\s*([^;\n]+)",
+        str(query or ""),
+        flags=re.IGNORECASE,
+    ):
+        normalized_key = str(key or "").strip().lower()
+        if normalized_key not in terms:
+            continue
+        for part in re.split(r"[;,，、|/]", str(raw_value or "")):
+            candidate = part.strip()
+            if candidate and candidate not in terms[normalized_key]:
+                terms[normalized_key].append(candidate)
+    return terms
+
+
+async def _selected_collection_inventory_entries(
+    active_scope_files: list[dict],
+    *,
+    request: Optional[Request] = None,
+    user: Optional[UserModel] = None,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen_file_ids: set[str] = set()
+    for file_item in active_scope_files or []:
+        if not isinstance(file_item, dict):
+            continue
+        file_type = str(file_item.get("type") or "").strip().lower()
+        if file_type not in {"collection", "knowledge"}:
+            continue
+        collection_id = str(file_item.get("id") or "").strip()
+        if not collection_id:
+            continue
+        source_name = str(file_item.get("name") or "").strip()
+        local_file_models = Knowledges.get_files_by_id(collection_id) or []
+        for file_model in local_file_models:
+            file_payload = (
+                file_model.model_dump()
+                if hasattr(file_model, "model_dump")
+                else file_model
+            )
+            if not isinstance(file_payload, dict):
+                continue
+            file_id = str(file_payload.get("id") or "").strip()
+            if not file_id or file_id in seen_file_ids:
+                continue
+            seen_file_ids.add(file_id)
+
+            file_meta = (
+                file_payload.get("meta")
+                if isinstance(file_payload.get("meta"), dict)
+                else {}
+            )
+            file_data = (
+                file_payload.get("data")
+                if isinstance(file_payload.get("data"), dict)
+                else {}
+            )
+            title = str(
+                file_payload.get("filename")
+                or file_meta.get("name")
+                or file_payload.get("name")
+                or file_id
+            ).strip()
+            snippet = str(file_data.get("content") or "").strip()
+            if snippet:
+                snippet = re.sub(r"\s+", " ", snippet)[:600]
+            else:
+                snippet = title
+
+            entries.append(
+                {
+                    "source_id": collection_id,
+                    "source_name": source_name or title,
+                    "file_id": file_id,
+                    "title": title,
+                    "snippet": snippet,
+                    "updated_at": int(file_payload.get("updated_at") or 0),
+                }
+            )
+
+        if local_file_models:
+            continue
+
+        if request is None or user is None:
+            continue
+
+        # Runtime shared/public selected collections can be Knowflow-managed and
+        # absent from local Knowledges rows. Reuse managed lookup inventory here.
+        try:
+            inventory_result = await list_knowledge_documents(
+                request.app.state.config,
+                user,
+                collection_id,
+                page=1,
+                page_size=64,
+            )
+        except Exception:
+            inventory_result = {}
+
+        for file_payload in inventory_result.get("items") or []:
+            if not isinstance(file_payload, dict):
+                continue
+            file_id = str(file_payload.get("id") or "").strip()
+            if not file_id or file_id in seen_file_ids:
+                continue
+            seen_file_ids.add(file_id)
+
+            file_meta = (
+                file_payload.get("meta")
+                if isinstance(file_payload.get("meta"), dict)
+                else {}
+            )
+            file_data = (
+                file_payload.get("data")
+                if isinstance(file_payload.get("data"), dict)
+                else {}
+            )
+            title = str(
+                file_payload.get("filename")
+                or file_meta.get("name")
+                or file_payload.get("name")
+                or file_id
+            ).strip()
+            snippet = str(file_data.get("content") or "").strip()
+            if snippet:
+                snippet = re.sub(r"\s+", " ", snippet)[:600]
+            else:
+                snippet = title
+
+            entries.append(
+                {
+                    "source_id": collection_id,
+                    "source_name": source_name or title,
+                    "file_id": file_id,
+                    "title": title,
+                    "snippet": snippet,
+                    "updated_at": int(file_payload.get("updated_at") or 0),
+                }
+            )
+
+    return entries
+
+
+async def _build_first_pass_inventory_targeted_request(
+    *,
+    query: str,
+    active_scope_files: list[dict],
+    strategy: dict[str, Any],
+    request: Optional[Request] = None,
+    user: Optional[UserModel] = None,
+) -> dict[str, Any]:
+    if not isinstance(strategy, dict) or not strategy.get("metadata_first_intent"):
+        return {}
+
+    entries = await _selected_collection_inventory_entries(
+        active_scope_files,
+        request=request,
+        user=user,
+    )
+    if not entries:
+        return {}
+
+    normalized_query = _normalize_anchor_text(query)
+    shortlisted = [
+        entry
+        for entry in entries
+        if _normalize_anchor_text(entry.get("title")) in normalized_query
+    ]
+    if not shortlisted:
+        shortlisted = list(entries)
+    shortlisted = sorted(
+        shortlisted,
+        key=lambda item: (-int(item.get("updated_at") or 0), str(item.get("title") or "")),
+    )[:8]
+    if not shortlisted:
+        return {}
+
+    source_ids = list(
+        dict.fromkeys(
+            str(item.get("source_id") or "").strip() for item in shortlisted if item.get("source_id")
+        )
+    )
+    if not source_ids:
+        return {}
+
+    anchor_source_name = str(shortlisted[0].get("source_name") or "").strip()
+    if not anchor_source_name:
+        anchor_source_name = str(shortlisted[0].get("title") or "").strip()
+    if not anchor_source_name:
+        return {}
+
+    document_term = str(shortlisted[0].get("title") or "").strip()
+    targeted_query = (
+        f"document={document_term}; evidence_facets=title,ordering_basis;"
+        " date_basis=file_updated_at"
+    )
+    return {
+        "query": targeted_query,
+        "source_ids": source_ids,
+        "required_anchors": [anchor_source_name],
+        "required_facets": ["title"],
+        "evidence_need": "metadata_first_inventory",
+        "shortlisted_documents": [
+            {
+                "source_id": str(item.get("source_id") or ""),
+                "file_id": str(item.get("file_id") or ""),
+                "title": str(item.get("title") or ""),
+                "updated_at": int(item.get("updated_at") or 0),
+            }
+            for item in shortlisted
+        ],
+        "inventory_count": len(entries),
+        "shortlist_count": len(shortlisted),
+        "ordering_basis": "file_updated_at_desc",
+        "inventory_sources": [
+            {
+                "source": {
+                    "id": str(item.get("source_id") or ""),
+                    "name": str(item.get("source_name") or ""),
+                    "type": "collection",
+                    "source": "knowledge",
+                },
+                "document": [str(item.get("snippet") or item.get("title") or "")],
+                "metadata": [
+                    {
+                        "file_id": str(item.get("file_id") or ""),
+                        "name": str(item.get("title") or ""),
+                        "title": str(item.get("title") or ""),
+                        "source": str(item.get("source_name") or ""),
+                        "chunk_type": "inventory_row",
+                        "retrieval_outcome": "success",
+                        "retrieval_classification": "injectable",
+                        "ordering_basis": "file_updated_at_desc",
+                        "date_basis": "file_updated_at",
+                    }
+                ],
+                "retrieval_outcome": "success",
+                "retrieval_classification": "injectable",
+                "source_class": "collection",
+                "type": "retrieval_reference",
+            }
+            for item in shortlisted
+        ],
+    }
+
+
+def _first_pass_metadata_first_diagnostics(
+    *,
+    query: str,
+    retrieval_round: Any,
+    strategy: dict[str, Any],
+    inventory_count: int,
+    shortlist_count: int,
+    structured_terms: dict[str, list[str]],
+) -> list[dict[str, Any]]:
+    if not strategy.get("metadata_first_intent"):
+        return []
+
+    diagnostics: list[dict[str, Any]] = []
+    has_date_basis_for_recency = bool(structured_terms.get("date_basis"))
+    has_date_basis_for_range = bool(
+        structured_terms.get("date_basis")
+        or _FIRST_PASS_YEAR_RANGE_CLAIM_PATTERN.search(str(query or ""))
+    )
+    has_type_basis = bool(
+        structured_terms.get("requested_types") or structured_terms.get("type_basis")
+    )
+    has_topic_basis = bool(
+        structured_terms.get("topic_terms") or structured_terms.get("topic_basis")
+    )
+
+    if inventory_count <= 0 or shortlist_count <= 0:
+        diagnostics.append(
+            _safe_retrieval_diagnostic(
+                classification="no_evidence",
+                reason="inventory_unavailable",
+                candidate_index=-1,
+                outcome="blocked",
+            )
+        )
+    if _FIRST_PASS_RECENCY_CLAIM_PATTERN.search(query or "") and not has_date_basis_for_recency:
+        diagnostics.append(
+            _safe_retrieval_diagnostic(
+                classification="diagnostics",
+                reason="missing_date_metadata",
+                candidate_index=-1,
+                outcome="unsupported",
+            )
+        )
+        diagnostics.append(
+            _safe_retrieval_diagnostic(
+                classification="no_evidence",
+                reason="unsupported_latest_or_recent_claim",
+                candidate_index=-1,
+                outcome="unsupported",
+            )
+        )
+    if _FIRST_PASS_YEAR_RANGE_CLAIM_PATTERN.search(query or "") and not has_date_basis_for_range:
+        diagnostics.append(
+            _safe_retrieval_diagnostic(
+                classification="no_evidence",
+                reason="unsupported_year_range_claim",
+                candidate_index=-1,
+                outcome="unsupported",
+            )
+        )
+    if _FIRST_PASS_TYPE_CLAIM_PATTERN.search(query or "") and not has_type_basis:
+        diagnostics.append(
+            _safe_retrieval_diagnostic(
+                classification="diagnostics",
+                reason="missing_type_metadata",
+                candidate_index=-1,
+                outcome="unsupported",
+            )
+        )
+        diagnostics.append(
+            _safe_retrieval_diagnostic(
+                classification="no_evidence",
+                reason="unsupported_document_type_claim",
+                candidate_index=-1,
+                outcome="unsupported",
+            )
+        )
+    if _FIRST_PASS_TOPIC_CLAIM_PATTERN.search(query or "") and not has_topic_basis:
+        diagnostics.append(
+            _safe_retrieval_diagnostic(
+                classification="diagnostics",
+                reason="missing_topic_metadata",
+                candidate_index=-1,
+                outcome="unsupported",
+            )
+        )
+        diagnostics.append(
+            _safe_retrieval_diagnostic(
+                classification="no_evidence",
+                reason="unsupported_topic_scope_claim",
+                candidate_index=-1,
+                outcome="unsupported",
+            )
+        )
+    return diagnostics
+
+
+def _first_pass_reference_identity_values(reference: dict) -> set[str]:
+    values: set[str] = set()
+    source = reference.get("source") if isinstance(reference.get("source"), dict) else {}
+    for key in ("id", "name", "title", "source"):
+        normalized = _normalize_anchor_text(source.get(key))
+        if normalized:
+            values.add(normalized)
+    for metadata in reference.get("metadata") if isinstance(reference.get("metadata"), list) else []:
+        if not isinstance(metadata, dict):
+            continue
+        for key in ("file_id", "fileId", "name", "title", "source"):
+            normalized = _normalize_anchor_text(metadata.get(key))
+            if normalized:
+                values.add(normalized)
+    return values
+
+
+def _first_pass_chunk_supports_required_facet(
+    facet: str,
+    *,
+    snippet: str,
+    metadata: dict,
+    source: dict,
+    combined: str,
+) -> bool:
+    normalized_facet = _normalize_anchor_text(facet)
+    if not normalized_facet:
+        return False
+    if normalized_facet in combined:
+        return True
+
+    if normalized_facet in {"title", "document_title"}:
+        return bool(
+            str(metadata.get("title") or "").strip()
+            or str(metadata.get("name") or "").strip()
+            or str(source.get("name") or "").strip()
+        )
+    if normalized_facet in {"ordering_basis", "order_basis"}:
+        return bool(
+            str(metadata.get("ordering_basis") or "").strip()
+            or str(metadata.get("date_basis") or "").strip()
+            or str(source.get("ordering_basis") or "").strip()
+            or str(source.get("date_basis") or "").strip()
+        )
+    if normalized_facet in {"date_basis"}:
+        return bool(
+            str(metadata.get("date_basis") or "").strip()
+            or str(source.get("date_basis") or "").strip()
+        )
+    if normalized_facet in {"type_basis"}:
+        return bool(
+            str(metadata.get("type_basis") or "").strip()
+            or str(metadata.get("document_type") or "").strip()
+            or str(metadata.get("doc_type") or "").strip()
+        )
+    if normalized_facet in {"topic_basis"}:
+        return bool(
+            str(metadata.get("topic_basis") or "").strip()
+            or str(metadata.get("topic") or "").strip()
+            or str(metadata.get("keywords") or "").strip()
+        )
+
+    # Fallback: allow direct snippet match for custom facets.
+    return normalized_facet in _normalize_anchor_text(snippet)
+
+
+def _first_pass_selected_source_references(
+    sources: list[dict],
+    *,
+    strategy: dict[str, Any],
+    targeted_source_ids: list[str],
+    required_anchors: list[str],
+    required_facets: list[str],
+    prompt: str,
+    retrieval_round: Any = 1,
+) -> tuple[list[dict], list[dict[str, Any]]]:
+    references = Chats.build_canonical_references(sources)
+    if not strategy.get("metadata_first_intent"):
+        return references, []
+
+    allowed_values = {
+        _normalize_anchor_text(source_id)
+        for source_id in targeted_source_ids
+        if _normalize_anchor_text(source_id)
+    }
+    normalized_anchors = [
+        _normalize_anchor_text(anchor)
+        for anchor in required_anchors
+        if _normalize_anchor_text(anchor)
+    ]
+    normalized_facets = [
+        _normalize_anchor_text(facet)
+        for facet in required_facets
+        if _normalize_anchor_text(facet)
+    ]
+
+    filtered: list[dict] = []
+    diagnostics: list[dict[str, Any]] = []
+    for reference in references:
+        if not isinstance(reference, dict):
+            continue
+        if allowed_values and not _first_pass_reference_identity_values(reference).intersection(
+            allowed_values
+        ):
+            diagnostics.append(
+                _safe_retrieval_diagnostic(
+                    classification="no_evidence",
+                    reason="off_shortlist_chunk",
+                    candidate_index=-1,
+                    outcome="denied",
+                )
+            )
+            continue
+
+        documents = reference.get("document") if isinstance(reference.get("document"), list) else []
+        metadatas = reference.get("metadata") if isinstance(reference.get("metadata"), list) else []
+        accepted_indexes: list[int] = []
+        for index, document in enumerate(documents):
+            snippet = str(document or "").strip()
+            if not snippet:
+                continue
+            metadata = metadatas[index] if index < len(metadatas) else {}
+            metadata = metadata if isinstance(metadata, dict) else {}
+            source = reference.get("source") if isinstance(reference.get("source"), dict) else {}
+            combined = _normalize_anchor_text(
+                f"{snippet}\n{metadata.get('name') or ''}\n{metadata.get('title') or ''}\n"
+                f"{metadata.get('source') or ''}\n{source.get('name') or ''}\n{source.get('id') or ''}"
+            )
+            if normalized_anchors and not all(anchor in combined for anchor in normalized_anchors):
+                diagnostics.append(
+                    _safe_retrieval_diagnostic(
+                        classification="no_evidence",
+                        reason="weak_targeted_chunk_evidence",
+                        candidate_index=-1,
+                        chunk_total=len(documents),
+                        outcome="weak_evidence",
+                    )
+                )
+                continue
+            if normalized_facets and not any(
+                _first_pass_chunk_supports_required_facet(
+                    facet,
+                    snippet=snippet,
+                    metadata=metadata,
+                    source=source,
+                    combined=combined,
+                )
+                for facet in normalized_facets
+            ):
+                diagnostics.append(
+                    _safe_retrieval_diagnostic(
+                        classification="no_evidence",
+                        reason="off_facet_evidence",
+                        candidate_index=-1,
+                        chunk_total=len(documents),
+                        outcome="low_relevance",
+                    )
+                )
+                continue
+            accepted_indexes.append(index)
+
+        if not accepted_indexes:
+            diagnostics.append(
+                _safe_retrieval_diagnostic(
+                    classification="no_evidence",
+                    reason="no_injectable_evidence",
+                    candidate_index=-1,
+                    chunk_total=len(documents),
+                )
+            )
+            continue
+
+        filtered_reference = copy.deepcopy(reference)
+        for key, value in reference.items():
+            if isinstance(value, list) and len(value) == len(documents):
+                filtered_reference[key] = [value[index] for index in accepted_indexes]
+        filtered.append(filtered_reference)
+
+    return filtered, Chats._merge_retrieval_diagnostics(diagnostics)
+
+
+def _first_pass_selected_source_accepted_outputs(references: list[dict]) -> list[dict]:
+    accepted_outputs: list[dict[str, Any]] = []
+    for reference in references:
+        if not isinstance(reference, dict):
+            continue
+        source = reference.get("source") if isinstance(reference.get("source"), dict) else {}
+        documents = reference.get("document") if isinstance(reference.get("document"), list) else []
+        metadatas = reference.get("metadata") if isinstance(reference.get("metadata"), list) else []
+        snippet = str(documents[0] or "").strip() if documents else ""
+        if not snippet:
+            continue
+        metadata = metadatas[0] if metadatas and isinstance(metadatas[0], dict) else {}
+        accepted_outputs.append(
+            {
+                "type": "selected_source_evidence",
+                "source": {
+                    "id": str(source.get("id") or metadata.get("file_id") or ""),
+                    "name": str(source.get("name") or metadata.get("name") or ""),
+                    "type": str(source.get("type") or metadata.get("source_type") or ""),
+                },
+                "snippet": snippet,
+                "provenance": {
+                    "tool_name": "first_pass_selected_source_retrieval",
+                    "retrieval_round": 1,
+                },
+            }
+        )
+    return accepted_outputs
+
+
 def _constrain_retrieval_queries(
     *,
     original_query: str,
@@ -8567,6 +10317,14 @@ async def chat_completion_files_handler(
     sources = []
     retrieval_diagnostics: list[dict[str, Any]] = []
     performed_retrieval = False
+    retrieval_blocked_by_ambiguous_scope = False
+    retrieval_blocked_by_strategy = False
+    retrieval_blocked_by_profile_lock = False
+    first_pass_profile_lock: dict[str, Any] = {}
+    first_pass_strategy: dict[str, Any] = {}
+    first_pass_inventory_context: dict[str, Any] = {}
+    active_scope_files: list[dict] = []
+    active_retrieval_files: list[dict] = []
 
     metadata = body.setdefault("metadata", {})
     files = metadata.get("files", None)
@@ -8624,6 +10382,8 @@ async def chat_completion_files_handler(
         query_status_emitted = False
         retrieval_returned_candidates = False
         retrieval_blocked_by_ambiguous_scope = False
+        retrieval_blocked_by_strategy = False
+        retrieval_blocked_by_profile_lock = False
         prompt = _strip_attached_file_context(
             get_last_user_message(body["messages"]) or ""
         )
@@ -8658,6 +10418,101 @@ async def chat_completion_files_handler(
             active_retrieval_files = _filter_files_for_selected_files(
                 active_retrieval_files, active_scope_files
             )
+
+        first_pass_strategy = _first_pass_selected_source_strategy(
+            prompt=prompt,
+            body=body,
+            metadata=metadata,
+            retrieval_candidates=active_retrieval_files,
+            active_source_scope=metadata.get("active_source_scope"),
+        )
+        existing_targeted_request = (
+            metadata.get("selected_source_next_targeted_chunk_request")
+            if isinstance(metadata, dict)
+            else {}
+        )
+        if (
+            first_pass_strategy.get("metadata_first_intent")
+            and not first_pass_strategy.get("targeted_context_bounded")
+            and not (
+                isinstance(existing_targeted_request, dict)
+                and existing_targeted_request
+            )
+        ):
+            first_pass_inventory_context = await _build_first_pass_inventory_targeted_request(
+                query=prompt,
+                active_scope_files=active_scope_files,
+                strategy=first_pass_strategy,
+                request=request,
+                user=user,
+            )
+            if first_pass_inventory_context:
+                metadata["selected_source_next_targeted_chunk_request"] = {
+                    "query": str(first_pass_inventory_context.get("query") or ""),
+                    "source_ids": list(first_pass_inventory_context.get("source_ids") or []),
+                    "required_anchors": list(
+                        first_pass_inventory_context.get("required_anchors") or []
+                    ),
+                    "evidence_need": str(
+                        first_pass_inventory_context.get("evidence_need") or ""
+                    ),
+                }
+                metadata["selected_source_inventory_context"] = {
+                    "inventory_count": int(
+                        first_pass_inventory_context.get("inventory_count") or 0
+                    ),
+                    "shortlist_count": int(
+                        first_pass_inventory_context.get("shortlist_count") or 0
+                    ),
+                    "ordering_basis": str(
+                        first_pass_inventory_context.get("ordering_basis") or ""
+                    ),
+                    "source_ids": list(
+                        first_pass_inventory_context.get("source_ids") or []
+                    ),
+                }
+                first_pass_strategy = _first_pass_selected_source_strategy(
+                    prompt=prompt,
+                    body=body,
+                    metadata=metadata,
+                    retrieval_candidates=active_retrieval_files,
+                    active_source_scope=metadata.get("active_source_scope"),
+                )
+                first_pass_strategy["reason_codes"] = list(
+                    dict.fromkeys(
+                        [
+                            *(
+                                first_pass_strategy.get("reason_codes")
+                                if isinstance(first_pass_strategy.get("reason_codes"), list)
+                                else []
+                            ),
+                            "inventory_plan_targeted_context",
+                        ]
+                    )
+                )
+        metadata["first_pass_retrieval_strategy"] = first_pass_strategy
+        first_pass_profile_lock = _first_pass_profile_lock_incompatibility(
+            metadata=metadata,
+            strategy=first_pass_strategy,
+        )
+        if first_pass_profile_lock.get("incompatible"):
+            first_pass_strategy["reason_codes"] = list(
+                dict.fromkeys(
+                    [
+                        *(
+                            first_pass_strategy.get("reason_codes")
+                            if isinstance(first_pass_strategy.get("reason_codes"), list)
+                            else []
+                        ),
+                        *(
+                            first_pass_profile_lock.get("reason_codes")
+                            if isinstance(first_pass_profile_lock.get("reason_codes"), list)
+                            else []
+                        ),
+                    ]
+                )
+            )
+        metadata["first_pass_profile_lock"] = first_pass_profile_lock
 
         async def ensure_queries(retrieval_candidates: list[dict]) -> list[str]:
             nonlocal queries_cache, query_status_emitted, retrieval_diagnostics
@@ -8756,7 +10611,8 @@ async def chat_completion_files_handler(
 
         async def retrieve_sources(retrieval_candidates: list[dict]) -> list[dict]:
             nonlocal performed_retrieval, retrieval_returned_candidates
-            nonlocal retrieval_blocked_by_ambiguous_scope, retrieval_diagnostics
+            nonlocal retrieval_blocked_by_ambiguous_scope, retrieval_blocked_by_strategy
+            nonlocal retrieval_diagnostics
 
             if not retrieval_candidates:
                 return []
@@ -8773,6 +10629,51 @@ async def chat_completion_files_handler(
                         candidate_index=-1,
                         chunk_total=len(retrieval_candidates),
                     ),
+                )
+                return []
+
+            if (
+                first_pass_strategy.get("metadata_first_intent")
+                and not first_pass_strategy.get("semantic_chunk_lookup_ok")
+            ):
+                retrieval_blocked_by_strategy = True
+                _append_retrieval_diagnostic_once(
+                    retrieval_diagnostics,
+                    {
+                        "kind": "retrieval_quality",
+                        "classification": "no_evidence",
+                        "reason": "metadata_first_targeted_evidence_required",
+                        "candidate_index": -1,
+                        "chunk_total": len(retrieval_candidates),
+                        "usable_chunk_total": 0,
+                        "outcome": "blocked",
+                        "detail": {
+                            "strategy_used": {
+                                "evidence_need": str(
+                                    first_pass_strategy.get("evidence_need") or "none"
+                                ),
+                                "retrieval_strategy": str(
+                                    first_pass_strategy.get("retrieval_strategy")
+                                    or "semantic_chunks"
+                                ),
+                                "semantic_chunk_lookup_ok": bool(
+                                    first_pass_strategy.get("semantic_chunk_lookup_ok")
+                                ),
+                                "targeted_context_present": bool(
+                                    first_pass_strategy.get("targeted_context_present")
+                                ),
+                                "targeted_context_bounded": bool(
+                                    first_pass_strategy.get("targeted_context_bounded")
+                                ),
+                                "reason_codes": [
+                                    str(value)
+                                    for value in first_pass_strategy.get("reason_codes")
+                                    or []
+                                    if str(value).strip()
+                                ],
+                            }
+                        },
+                    },
                 )
                 return []
 
@@ -8836,7 +10737,36 @@ async def chat_completion_files_handler(
                 )
                 return []
 
-        if active_scope_ambiguous:
+        if first_pass_profile_lock.get("incompatible"):
+            performed_retrieval = True
+            retrieval_blocked_by_profile_lock = True
+            profile_lock_diagnostic = _safe_retrieval_diagnostic(
+                classification="no_evidence",
+                reason="selected_source_intent_profile_locked",
+                candidate_index=-1,
+                chunk_total=len(active_scope_files),
+                outcome="blocked",
+            )
+            profile_lock_diagnostic["detail"] = {
+                "non_promotion_reason": str(
+                    first_pass_profile_lock.get("non_promotion_reason")
+                    or "explicit_incompatible_profile"
+                ),
+                "classified_evidence_need": str(
+                    first_pass_profile_lock.get("classified_evidence_need")
+                    or "none"
+                ),
+                "resolved_execution_profile": str(
+                    first_pass_profile_lock.get("resolved_execution_profile")
+                    or "general"
+                ),
+            }
+            _append_retrieval_diagnostic_once(
+                retrieval_diagnostics,
+                profile_lock_diagnostic,
+            )
+            active_sources = []
+        elif active_scope_ambiguous:
             performed_retrieval = True
             retrieval_blocked_by_ambiguous_scope = True
             _append_retrieval_diagnostic_once(
@@ -8867,6 +10797,21 @@ async def chat_completion_files_handler(
 
             active_sources = [*active_inline_sources]
             active_sources.extend(await retrieve_sources(active_retrieval_files))
+            inventory_sources = (
+                first_pass_inventory_context.get("inventory_sources")
+                if isinstance(first_pass_inventory_context, dict)
+                else []
+            )
+            if (
+                first_pass_strategy.get("metadata_first_intent")
+                and isinstance(inventory_sources, list)
+                and inventory_sources
+                and not _has_usable_sources(active_sources)
+            ):
+                active_sources.extend(
+                    item for item in inventory_sources if isinstance(item, dict)
+                )
+                retrieval_returned_candidates = True
             sources.extend(active_sources)
 
             request_prior_attachments = _prompt_requests_prior_attachments(prompt)
@@ -8914,6 +10859,8 @@ async def chat_completion_files_handler(
             performed_retrieval
             and not retrieval_returned_candidates
             and not retrieval_blocked_by_ambiguous_scope
+            and not retrieval_blocked_by_strategy
+            and not retrieval_blocked_by_profile_lock
         ):
             _append_retrieval_diagnostic_once(
                 retrieval_diagnostics,
@@ -8970,6 +10917,7 @@ async def chat_completion_files_handler(
             "classification_counts": diagnostic_classification_counts(
                 retrieval_diagnostics
             ),
+            "strategy_used": first_pass_strategy if files else {},
             "active_source_scope": summarize_source_scope(
                 metadata.get("active_source_scope")
             ),
@@ -8977,12 +10925,254 @@ async def chat_completion_files_handler(
         },
     )
 
+    targeted_request = (
+        metadata.get("selected_source_next_targeted_chunk_request")
+        if isinstance(metadata, dict)
+        else {}
+    )
+    targeted_request = targeted_request if isinstance(targeted_request, dict) else {}
+    targeted_source_ids = _list_from_optional_strings(targeted_request.get("source_ids"))
+    if not targeted_source_ids:
+        single_targeted_source_id = str(targeted_request.get("source_id") or "").strip()
+        if single_targeted_source_id:
+            targeted_source_ids = [single_targeted_source_id]
+    required_anchors = _list_from_optional_strings(targeted_request.get("required_anchors"))
+    prompt_text = _normalize_retrieval_query_text(
+        _strip_attached_file_context(get_last_user_message(body["messages"]) or "")
+    )
+    structured_terms = _first_pass_structured_terms(
+        _normalize_retrieval_query_text(targeted_request.get("query") or prompt_text)
+    )
+    inventory_count = int(
+        (first_pass_inventory_context.get("inventory_count") or 0)
+        if isinstance(first_pass_inventory_context, dict)
+        else 0
+    )
+    shortlist_count = int(
+        (first_pass_inventory_context.get("shortlist_count") or 0)
+        if isinstance(first_pass_inventory_context, dict)
+        else 0
+    )
+    if inventory_count <= 0:
+        inventory_count = len(active_retrieval_files)
+    if shortlist_count <= 0:
+        shortlist_count = len(targeted_source_ids)
+    required_facets = list(
+        dict.fromkeys(
+            [
+                *structured_terms.get("evidence_facets", []),
+                *structured_terms.get("topic_terms", []),
+                *structured_terms.get("requested_types", []),
+            ]
+        )
+    )
+    references, metadata_first_gate_diagnostics = _first_pass_selected_source_references(
+        sources,
+        strategy=first_pass_strategy,
+        targeted_source_ids=targeted_source_ids,
+        required_anchors=required_anchors,
+        required_facets=required_facets,
+        prompt=prompt_text,
+        retrieval_round=1,
+    )
+    for diagnostic in metadata_first_gate_diagnostics:
+        _append_retrieval_diagnostic_once(retrieval_diagnostics, diagnostic)
+    for diagnostic in _first_pass_metadata_first_diagnostics(
+        query=prompt_text,
+        retrieval_round=1,
+        strategy=first_pass_strategy,
+        inventory_count=inventory_count,
+        shortlist_count=shortlist_count,
+        structured_terms=structured_terms,
+    ):
+        _append_retrieval_diagnostic_once(retrieval_diagnostics, diagnostic)
+    unsupported_claim_reason = next(
+        (
+            str(item.get("reason") or "").strip()
+            for item in retrieval_diagnostics
+            if isinstance(item, dict)
+            and str(item.get("reason") or "").strip().startswith("unsupported_")
+        ),
+        "",
+    )
+    if first_pass_strategy.get("metadata_first_intent") and unsupported_claim_reason:
+        references = []
+    accepted_outputs = _first_pass_selected_source_accepted_outputs(references)
+    active_scope = metadata.get("active_source_scope")
+    active_scope_state = (
+        str(active_scope.get("status") or "").strip().lower()
+        if isinstance(active_scope, dict)
+        else "none"
+    )
+    status = (
+        "success"
+        if accepted_outputs
+        else (
+            "blocked"
+            if (
+                retrieval_blocked_by_ambiguous_scope
+                or retrieval_blocked_by_strategy
+                or retrieval_blocked_by_profile_lock
+            )
+            else ("no_evidence" if performed_retrieval else "blocked")
+        )
+    )
+    terminal_reason = "success"
+    if status == "blocked":
+        if retrieval_blocked_by_profile_lock:
+            terminal_reason = "selected_source_intent_profile_locked"
+        elif retrieval_blocked_by_strategy:
+            terminal_reason = "metadata_first_targeted_evidence_required"
+        elif retrieval_blocked_by_ambiguous_scope:
+            terminal_reason = "ambiguous_retrieval_scope"
+        else:
+            terminal_reason = "source_scope_blocked"
+    elif status == "no_evidence":
+        terminal_reason = "no_retrieval_candidates"
+    if unsupported_claim_reason and status != "blocked":
+        status = "no_evidence"
+        terminal_reason = unsupported_claim_reason
+    metadata_first_diagnostics_only = bool(
+        first_pass_strategy.get("metadata_first_intent")
+        and status in {"blocked", "no_evidence"}
+        and not accepted_outputs
+        and not references
+    )
+    if metadata_first_diagnostics_only:
+        # Keep first-pass metadata/listing turns diagnostics-only: no raw source
+        # context should be returned for prompt injection or source cards.
+        sources = []
+
+    timeout_seconds = getattr(
+        request.app.state.config,
+        "SELECTED_SOURCE_RETRIEVAL_TIMEOUT_SECONDS",
+        None,
+    )
+    try:
+        timeout_value = float(timeout_seconds)
+    except Exception:
+        timeout_value = None
+    retry_policy = {
+        "max_retries": 0,
+        "retries_attempted": 0,
+        "retry_allowed": False,
+        "timeout_seconds": timeout_value,
+    }
+    first_pass_contract = {
+        "accepted_outputs": accepted_outputs,
+        "references": references,
+        "diagnostics": [item for item in retrieval_diagnostics if isinstance(item, dict)],
+        "status": status,
+        "authorization_context": {
+            "active_source_scope_state": active_scope_state or "none",
+            "active_source_scope": summarize_source_scope(active_scope),
+        },
+        "retry_policy": retry_policy,
+        "terminal_reason": terminal_reason,
+        "provenance": {
+            "worker_kind": "selected_source_retrieval",
+            "tool_name": "first_pass_selected_source_retrieval",
+            "status": status,
+            "terminal_reason": terminal_reason,
+            "strategy_used": first_pass_strategy if files else {},
+            "profile_lock": (
+                first_pass_profile_lock
+                if isinstance(first_pass_profile_lock, dict)
+                and first_pass_profile_lock.get("incompatible")
+                else {}
+            ),
+            "reason_codes": diagnostic_reason_codes(retrieval_diagnostics),
+            "classification_counts": diagnostic_classification_counts(
+                retrieval_diagnostics
+            ),
+            "retrieval_attempted": performed_retrieval,
+            "no_evidence": performed_retrieval and not accepted_outputs,
+            "compact_retrieval_provenance": {
+                # Persist a bounded strategy summary for QA without raw provider payloads.
+                "strategy": {
+                    "evidence_need": str(
+                        first_pass_strategy.get("evidence_need") or "none"
+                    ),
+                    "retrieval_strategy": str(
+                        first_pass_strategy.get("retrieval_strategy")
+                        or "semantic_chunks"
+                    ),
+                    "semantic_chunk_lookup_ok": bool(
+                        first_pass_strategy.get("semantic_chunk_lookup_ok")
+                    ),
+                },
+                "inventory_counts": {
+                    "selected_inventory_count": int(max(inventory_count, 0)),
+                    "scoped_inventory_count": int(
+                        max(inventory_count, len(active_retrieval_files), 0)
+                    ),
+                    "shortlist_count": int(max(shortlist_count, 0)),
+                },
+                "accepted_counts": {
+                    "reference_count": len(references),
+                    "accepted_output_count": len(accepted_outputs),
+                },
+                "fallback_used": bool(
+                    first_pass_strategy.get("metadata_first_intent")
+                    and str(first_pass_strategy.get("retrieval_strategy") or "")
+                    .strip()
+                    .lower()
+                    == "semantic_chunks"
+                ),
+                "basis": {
+                    "date_basis": (
+                        (
+                            (structured_terms.get("date_basis") or [None])[0]
+                            if (structured_terms.get("date_basis") or [None])
+                            else None
+                        )
+                        or (
+                            "structured_document_anchor"
+                            if structured_terms.get("document")
+                            else ""
+                        )
+                    ),
+                    "type_basis": (
+                        (
+                            (structured_terms.get("type_basis") or [None])[0]
+                            if (structured_terms.get("type_basis") or [None])
+                            else None
+                        )
+                        or (
+                            "structured_requested_types"
+                            if structured_terms.get("requested_types")
+                            else ""
+                        )
+                    ),
+                    "topic_basis": (
+                        (
+                            (structured_terms.get("topic_basis") or [None])[0]
+                            if (structured_terms.get("topic_basis") or [None])
+                            else None
+                        )
+                        or (
+                            "structured_topic_terms"
+                            if structured_terms.get("topic_terms")
+                            else ""
+                        )
+                    ),
+                },
+                "material_limitations": list(
+                    dict.fromkeys(diagnostic_reason_codes(retrieval_diagnostics))
+                ),
+            },
+        },
+    }
+
     return body, {
         "sources": sources,
         "retrieval_diagnostics": retrieval_diagnostics,
         "active_source_scope": metadata.get("active_source_scope"),
+        "first_pass_retrieval_strategy": metadata.get("first_pass_retrieval_strategy"),
+        "first_pass_profile_lock": metadata.get("first_pass_profile_lock"),
         "retrieval_attempted": performed_retrieval,
         "no_evidence": performed_retrieval and not sources,
+        **first_pass_contract,
     }
 
 
@@ -10601,7 +12791,24 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             form_data, flags = await chat_completion_files_handler(
                 request, form_data, extra_params, user
             )
-            sources.extend(flags.get("sources", []))
+            file_handler_sources = (
+                flags.get("sources") if isinstance(flags.get("sources"), list) else []
+            )
+            for key in (
+                "references",
+                "accepted_outputs",
+                "status",
+                "terminal_reason",
+                "provenance",
+                "authorization_context",
+                "retry_policy",
+                "retrieval_attempted",
+                "no_evidence",
+                "first_pass_retrieval_strategy",
+                "first_pass_profile_lock",
+            ):
+                if key in flags:
+                    metadata[key] = copy.deepcopy(flags.get(key))
             diagnostics = flags.get("retrieval_diagnostics", [])
             if isinstance(diagnostics, list):
                 retrieval_diagnostics.extend(
@@ -10610,7 +12817,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             active_source_scope = flags.get("active_source_scope")
             if isinstance(active_source_scope, dict) and active_source_scope:
                 metadata["active_source_scope"] = active_source_scope
-            retrieval_no_evidence = bool(flags.get("no_evidence"))
+            if _is_selected_source_metadata_first_diagnostics_only(flags):
+                file_handler_sources = []
+                retrieval_no_evidence = True
+            sources.extend(file_handler_sources)
+            retrieval_no_evidence = retrieval_no_evidence or bool(flags.get("no_evidence"))
         except Exception as e:
             log.exception(e)
 
@@ -10634,6 +12845,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         accepted_references=metadata.get("canonical_references"),
     ):
         sources = []
+        retrieval_no_evidence = True
         metadata["sources"] = []
         metadata.pop("references", None)
         metadata.pop("citations", None)
@@ -10662,6 +12874,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         )
     elif retrieval_no_evidence:
         form_data["messages"] = _append_no_evidence_guard(form_data["messages"])
+        if _is_selected_source_metadata_first_diagnostics_only(metadata):
+            form_data["messages"] = _append_selected_source_limitation_guard(
+                form_data["messages"],
+                terminal_reason=str(metadata.get("terminal_reason") or ""),
+                active_source_scope=(
+                    metadata.get("active_source_scope")
+                    if isinstance(metadata.get("active_source_scope"), dict)
+                    else None
+                ),
+            )
 
     # If there are citations, add them to the data_items
     sources = [
@@ -11237,21 +13459,65 @@ async def non_streaming_chat_response_handler(response, ctx):
                 if combined_embeds:
                     completion_metadata["embeds"] = combined_embeds
                 completion_metadata.update(reference_metadata)
+                completion_metadata = _enforce_selected_source_metadata_first_final_consistency(
+                    completion_metadata=completion_metadata,
+                    metadata=metadata,
+                )
+                content, response_output = _apply_selected_source_diagnostics_only_content_guard(
+                    content=content or "",
+                    output=response_output,
+                    metadata=metadata,
+                    completion_metadata=completion_metadata,
+                )
+                message["content"] = content
+                response_data["output"] = response_output
                 persisted_sources = _completion_sources_for_persistence(
                     completion_metadata
                 )
-                persisted_sources = Chats._merge_message_sources(
-                    persisted_sources,
-                    response_data.get("sources"),
+                suppress_completion_references = Chats._should_suppress_canonical_references(
+                    metadata=completion_metadata,
+                    diagnostics=completion_metadata.get("retrieval_diagnostics"),
                 )
+                if suppress_completion_references:
+                    persisted_sources = []
+                else:
+                    persisted_sources = _merge_persisted_and_response_sources(
+                        persisted_sources,
+                        response_data.get("sources"),
+                        completion_metadata=completion_metadata,
+                    )
                 persisted_sources = _filter_uncited_no_evidence_source_cards(
                     persisted_sources,
                     content=content or "",
+                    metadata=completion_metadata,
                 )
                 if persisted_sources:
                     completion_metadata["canonical_references"] = persisted_sources
+                    completion_metadata["reference_cards"] = Chats.build_reference_cards(
+                        persisted_sources
+                    )
                 else:
                     completion_metadata.pop("canonical_references", None)
+                    completion_metadata.pop("reference_cards", None)
+                completion_metadata = _enforce_selected_source_metadata_first_final_consistency(
+                    completion_metadata=completion_metadata,
+                    metadata=metadata,
+                )
+                content, response_output = _apply_selected_source_diagnostics_only_content_guard(
+                    content=content or "",
+                    output=response_output,
+                    metadata=metadata,
+                    completion_metadata=completion_metadata,
+                )
+                message["content"] = content
+                response_data["output"] = response_output
+                if _selected_source_metadata_first_diagnostics_lane(
+                    {**metadata, **completion_metadata}
+                ):
+                    persisted_sources = []
+                    completion_metadata.pop("canonical_references", None)
+                    completion_metadata.pop("reference_cards", None)
+
                 if persisted_sources:
                     response_data["sources"] = persisted_sources
                 else:
@@ -11386,27 +13652,80 @@ async def non_streaming_chat_response_handler(response, ctx):
             tool_outputs=response_output,
         )
         completion_metadata = dict(reference_metadata)
-        persisted_sources = _completion_sources_for_persistence(completion_metadata)
-        persisted_sources = Chats._merge_message_sources(
-            persisted_sources,
-            response_data.get("sources"),
+        completion_metadata = _enforce_selected_source_metadata_first_final_consistency(
+            completion_metadata=completion_metadata,
+            metadata=metadata,
         )
+        content, response_output = _apply_selected_source_diagnostics_only_content_guard(
+            content=content or "",
+            output=response_output,
+            metadata=metadata,
+            completion_metadata=completion_metadata,
+        )
+        message["content"] = content
+        response_data["output"] = response_output
+        persisted_sources = _completion_sources_for_persistence(completion_metadata)
+        suppress_completion_references = Chats._should_suppress_canonical_references(
+            metadata=completion_metadata,
+            diagnostics=completion_metadata.get("retrieval_diagnostics"),
+        )
+        if suppress_completion_references:
+            persisted_sources = []
+        else:
+            persisted_sources = _merge_persisted_and_response_sources(
+                persisted_sources,
+                response_data.get("sources"),
+                completion_metadata=completion_metadata,
+            )
         persisted_sources = _filter_uncited_no_evidence_source_cards(
             persisted_sources,
             content=content,
+            metadata=completion_metadata,
         )
         if persisted_sources:
             completion_metadata["canonical_references"] = persisted_sources
+            completion_metadata["reference_cards"] = Chats.build_reference_cards(
+                persisted_sources
+            )
             response_data["sources"] = persisted_sources
         else:
             completion_metadata.pop("canonical_references", None)
+            completion_metadata.pop("reference_cards", None)
             response_data.pop("sources", None)
+        completion_metadata = _enforce_selected_source_metadata_first_final_consistency(
+            completion_metadata=completion_metadata,
+            metadata=metadata,
+        )
+        content, response_output = _apply_selected_source_diagnostics_only_content_guard(
+            content=content or "",
+            output=response_output,
+            metadata=metadata,
+            completion_metadata=completion_metadata,
+        )
+        message["content"] = content
+        response_data["output"] = response_output
+        if _selected_source_metadata_first_diagnostics_lane(
+            {**metadata, **completion_metadata}
+        ):
+            completion_metadata.pop("canonical_references", None)
+            completion_metadata.pop("reference_cards", None)
+            response_data.pop("sources", None)
+            persisted_sources = []
         if completion_metadata:
             message_metadata = message.get("metadata")
             if isinstance(message_metadata, dict):
                 message_metadata.update(completion_metadata)
             else:
                 message["metadata"] = completion_metadata
+
+        _persist_assistant_completion_message(
+            metadata=metadata,
+            content=content,
+            output=response_output,
+            sources=persisted_sources,
+            usage=normalize_usage(response_data.get("usage", {}) or {}),
+            completion_metadata=completion_metadata,
+        )
 
         response = build_response_object(response, merge_events_into_response(response_data, events))
         return response
@@ -13316,17 +15635,50 @@ async def streaming_chat_response_handler(response, ctx):
                 if combined_embeds:
                     completion_metadata["embeds"] = combined_embeds
                 completion_metadata.update(reference_metadata)
+                completion_metadata = _enforce_selected_source_metadata_first_final_consistency(
+                    completion_metadata=completion_metadata,
+                    metadata=metadata,
+                )
+                guarded_content, output = _apply_selected_source_diagnostics_only_content_guard(
+                    content=final_payload.get("content", ""),
+                    output=output,
+                    metadata=metadata,
+                    completion_metadata=completion_metadata,
+                )
+                final_payload["content"] = guarded_content
                 persisted_sources = _completion_sources_for_persistence(
                     completion_metadata
                 )
                 persisted_sources = _filter_uncited_no_evidence_source_cards(
                     persisted_sources,
                     content=final_payload.get("content", ""),
+                    metadata=completion_metadata,
                 )
                 if persisted_sources:
                     completion_metadata["canonical_references"] = persisted_sources
+                    completion_metadata["reference_cards"] = Chats.build_reference_cards(
+                        persisted_sources
+                    )
                 else:
                     completion_metadata.pop("canonical_references", None)
+                    completion_metadata.pop("reference_cards", None)
+                completion_metadata = _enforce_selected_source_metadata_first_final_consistency(
+                    completion_metadata=completion_metadata,
+                    metadata=metadata,
+                )
+                guarded_content, output = _apply_selected_source_diagnostics_only_content_guard(
+                    content=final_payload.get("content", ""),
+                    output=output,
+                    metadata=metadata,
+                    completion_metadata=completion_metadata,
+                )
+                final_payload["content"] = guarded_content
+                if _selected_source_metadata_first_diagnostics_lane(
+                    {**metadata, **completion_metadata}
+                ):
+                    persisted_sources = []
+                    completion_metadata.pop("canonical_references", None)
+                    completion_metadata.pop("reference_cards", None)
 
                 data = {
                     "done": True,
@@ -13458,9 +15810,155 @@ async def streaming_chat_response_handler(response, ctx):
 
     else:
         # Fallback to the original response
+        persist_fallback_completion = (
+            not event_emitter
+            and not event_caller
+            and _is_persistable_chat_target(metadata)
+        )
+
         async def stream_wrapper(original_generator, events):
             def wrap_item(item):
                 return f"data: {item}\n\n"
+
+            stream_content_type = str(response.headers.get("Content-Type", "") or "").lower()
+            is_ndjson_stream = "application/x-ndjson" in stream_content_type
+            payload_buffer = ""
+            event_lines: list[str] = []
+            fallback_output: list[dict] = []
+            fallback_content = ""
+            fallback_sources: list[dict] = []
+            fallback_usage: dict[str, Any] = {}
+            fallback_seen_payload = False
+            fallback_stream_done = False
+
+            def build_sse_data_payload(lines: list[str]) -> Optional[str]:
+                data_lines: list[str] = []
+                for line in lines:
+                    if not line or line.startswith(":"):
+                        continue
+                    if ":" in line:
+                        field, value = line.split(":", 1)
+                        if value.startswith(" "):
+                            value = value[1:]
+                    else:
+                        field = line
+                        value = ""
+                    if field == "data":
+                        data_lines.append(value)
+                if not data_lines:
+                    return None
+                return "\n".join(data_lines)
+
+            def consume_stream_payloads(chunk_text: str) -> list[str]:
+                nonlocal payload_buffer, event_lines
+                payloads: list[str] = []
+                normalized = chunk_text.replace("\r\n", "\n").replace("\r", "\n")
+                payload_buffer += normalized
+
+                while "\n" in payload_buffer:
+                    line, payload_buffer = payload_buffer.split("\n", 1)
+                    if is_ndjson_stream:
+                        line = line.strip()
+                        if line:
+                            payloads.append(line)
+                        continue
+
+                    if line == "":
+                        payload = build_sse_data_payload(event_lines)
+                        if payload is not None:
+                            payloads.append(payload)
+                        event_lines = []
+                        continue
+
+                    event_lines.append(line)
+
+                return payloads
+
+            def flush_stream_payloads() -> list[str]:
+                nonlocal payload_buffer, event_lines
+                if is_ndjson_stream:
+                    trailing = payload_buffer.strip()
+                    payload_buffer = ""
+                    return [trailing] if trailing else []
+
+                if payload_buffer:
+                    event_lines.append(payload_buffer)
+                    payload_buffer = ""
+
+                if not event_lines:
+                    return []
+
+                payload = build_sse_data_payload(event_lines)
+                event_lines = []
+                return [payload] if payload is not None else []
+
+            def capture_fallback_stream_payload(payload_text: str) -> None:
+                nonlocal fallback_output, fallback_content, fallback_sources
+                nonlocal fallback_usage, fallback_seen_payload, fallback_stream_done
+
+                stripped = payload_text.strip()
+                if not stripped:
+                    return
+                if stripped == "[DONE]":
+                    fallback_stream_done = True
+                    return
+
+                try:
+                    data = json.loads(payload_text)
+                except Exception:
+                    return
+                if not isinstance(data, dict):
+                    return
+
+                fallback_seen_payload = True
+
+                if data.get("type", "").startswith("response."):
+                    fallback_output, response_metadata = handle_responses_streaming_event(
+                        data, fallback_output
+                    )
+                    if isinstance(response_metadata, dict):
+                        usage = response_metadata.get("usage")
+                        if isinstance(usage, dict) and usage:
+                            fallback_usage = normalize_usage(usage)
+                    return
+
+                raw_usage = data.get("usage", {}) or {}
+                if isinstance(data.get("timings"), dict):
+                    raw_usage.update(data.get("timings", {}))
+                if raw_usage:
+                    fallback_usage = normalize_usage(raw_usage)
+
+                sources = data.get("sources")
+                if isinstance(sources, list):
+                    fallback_sources = Chats._merge_message_sources(fallback_sources, sources)
+                elif isinstance(sources, dict):
+                    fallback_sources = Chats._merge_message_sources(fallback_sources, [sources])
+
+                output_payload = data.get("output")
+                if isinstance(output_payload, list):
+                    fallback_output = output_payload
+
+                choices = data.get("choices", [])
+                if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+                    return
+
+                delta = choices[0].get("delta")
+                if isinstance(delta, dict):
+                    delta_content = delta.get("content")
+                    if isinstance(delta_content, str) and delta_content:
+                        fallback_content = (
+                            f"{fallback_content}{_strip_bridge_details_blocks(delta_content)}"
+                        )
+
+                message = choices[0].get("message")
+                if not isinstance(message, dict):
+                    return
+
+                if isinstance(message.get("output"), list):
+                    fallback_output = message.get("output")
+                message_content = message.get("content")
+                if isinstance(message_content, str) and message_content.strip():
+                    fallback_content = message_content
 
             for event in events:
                 event, _ = await process_filter_functions(
@@ -13484,7 +15982,115 @@ async def streaming_chat_response_handler(response, ctx):
                 )
 
                 if data:
+                    if persist_fallback_completion:
+                        chunk_text = (
+                            data.decode("utf-8", "replace")
+                            if isinstance(data, bytes)
+                            else str(data)
+                        )
+                        for payload in consume_stream_payloads(chunk_text):
+                            capture_fallback_stream_payload(payload)
                     yield data
+
+            if persist_fallback_completion:
+                for payload in flush_stream_payloads():
+                    capture_fallback_stream_payload(payload)
+
+                if fallback_seen_payload or fallback_stream_done:
+                    fallback_output, fallback_payload = _build_chat_completion_payload(
+                        fallback_output,
+                        fallback_content=fallback_content,
+                    )
+                    fallback_content_value = (
+                        fallback_payload.get("content")
+                        or _fallback_answer_for_completed_tool_only_output(fallback_output)
+                        or ""
+                    )
+
+                    _merge_reference_sidecar_into_metadata(
+                        metadata,
+                        sources=fallback_sources,
+                        tool_outputs=fallback_output,
+                        legacy_tool_sources=True,
+                    )
+                    completion_metadata = _build_assistant_reference_persistence_metadata(
+                        metadata,
+                        tool_outputs=fallback_output,
+                    )
+                    completion_metadata = (
+                        _enforce_selected_source_metadata_first_final_consistency(
+                            completion_metadata=completion_metadata,
+                            metadata=metadata,
+                        )
+                    )
+                    fallback_content_value, fallback_output = (
+                        _apply_selected_source_diagnostics_only_content_guard(
+                            content=fallback_content_value,
+                            output=fallback_output,
+                            metadata=metadata,
+                            completion_metadata=completion_metadata,
+                        )
+                    )
+                    persisted_sources = _completion_sources_for_persistence(
+                        completion_metadata
+                    )
+                    suppress_completion_references = (
+                        Chats._should_suppress_canonical_references(
+                            metadata=completion_metadata,
+                            diagnostics=completion_metadata.get("retrieval_diagnostics"),
+                        )
+                    )
+                    if suppress_completion_references:
+                        persisted_sources = []
+                    else:
+                        persisted_sources = _merge_persisted_and_response_sources(
+                            persisted_sources,
+                            fallback_sources,
+                            completion_metadata=completion_metadata,
+                        )
+
+                    persisted_sources = _filter_uncited_no_evidence_source_cards(
+                        persisted_sources,
+                        content=fallback_content_value,
+                        metadata=completion_metadata,
+                    )
+                    if persisted_sources:
+                        completion_metadata["canonical_references"] = persisted_sources
+                        completion_metadata["reference_cards"] = Chats.build_reference_cards(
+                            persisted_sources
+                        )
+                    else:
+                        completion_metadata.pop("canonical_references", None)
+                        completion_metadata.pop("reference_cards", None)
+                    completion_metadata = (
+                        _enforce_selected_source_metadata_first_final_consistency(
+                            completion_metadata=completion_metadata,
+                            metadata=metadata,
+                        )
+                    )
+                    fallback_content_value, fallback_output = (
+                        _apply_selected_source_diagnostics_only_content_guard(
+                            content=fallback_content_value,
+                            output=fallback_output,
+                            metadata=metadata,
+                            completion_metadata=completion_metadata,
+                        )
+                    )
+                    if _selected_source_metadata_first_diagnostics_lane(
+                        {**metadata, **completion_metadata}
+                    ):
+                        persisted_sources = []
+                        completion_metadata.pop("canonical_references", None)
+                        completion_metadata.pop("reference_cards", None)
+
+                    _persist_assistant_completion_message(
+                        metadata=metadata,
+                        content=fallback_content_value,
+                        output=fallback_output,
+                        sources=persisted_sources,
+                        usage=fallback_usage,
+                        completion_metadata=completion_metadata,
+                    )
 
         return StreamingResponse(
             stream_wrapper(response.body_iterator, events),

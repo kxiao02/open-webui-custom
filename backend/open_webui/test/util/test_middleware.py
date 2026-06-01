@@ -13,11 +13,17 @@ from open_webui.utils.middleware import (
     _gate_retrieval_sources,
     _filter_inline_sources_for_selected_files,
     _completion_sources_for_persistence,
+    _filter_uncited_no_evidence_source_cards,
     _constrain_retrieval_queries,
     _compare_knowflow_retrieval_against_neutral_contract,
     _build_assistant_reference_seed_metadata,
     _build_assistant_reference_persistence_metadata,
+    _merge_persisted_and_response_sources,
     _build_chat_completion_payload,
+    _is_selected_source_metadata_first_diagnostics_only,
+    _apply_selected_source_diagnostics_only_content_guard,
+    _enforce_selected_source_metadata_first_final_consistency,
+    _append_selected_source_limitation_guard,
     _resolve_active_source_scope,
     apply_source_context_to_messages,
     handle_responses_streaming_event,
@@ -28,6 +34,7 @@ from open_webui.utils.task import (
     extract_session_user_facts,
     query_generation_template,
 )
+from open_webui.utils.tools import query_selected_knowledge_files
 
 
 def _local_file_source(
@@ -2314,6 +2321,802 @@ def test_fresh_multi_selected_explicit_multi_prompt_keeps_active_source_scope(
     ]
 
 
+def _first_pass_retrieval_request_stub():
+    return SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                config=SimpleNamespace(
+                    TOP_K=4,
+                    TOP_K_RERANKER=4,
+                    RELEVANCE_THRESHOLD=0.0,
+                    HYBRID_BM25_WEIGHT=0.0,
+                    ENABLE_RAG_HYBRID_SEARCH=False,
+                    RAG_FULL_CONTEXT=False,
+                ),
+                EMBEDDING_FUNCTION=lambda text, prefix=None, user=None: [0.1],
+                RERANKING_FUNCTION=None,
+            )
+        )
+    )
+
+
+def test_first_pass_metadata_first_without_bounded_targeted_context_fails_closed(
+    monkeypatch,
+):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "file": {"meta": {"name": "alpha-policy.txt"}},
+    }
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="semantic chunk should not be accepted for metadata-first first pass",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": "列出最近两年的政策文件并按类型统计。"}
+        ],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_inventory"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted_metadata = _build_assistant_reference_persistence_metadata(flags)
+
+    assert provider_calls["count"] == 0
+    assert flags["sources"] == []
+    assert flags["accepted_outputs"] == []
+    assert flags["references"] == []
+    assert flags["status"] == "blocked"
+    assert flags["terminal_reason"] == "metadata_first_targeted_evidence_required"
+    assert flags["authorization_context"]["active_source_scope_state"] == "resolved"
+    assert flags["retry_policy"]["max_retries"] == 0
+    assert any(
+        item.get("reason") == "metadata_first_targeted_evidence_required"
+        for item in flags["retrieval_diagnostics"]
+    )
+    assert flags["diagnostics"] == flags["retrieval_diagnostics"]
+    assert flags["provenance"]["strategy_used"]["retrieval_strategy"] == (
+        "metadata_first_then_targeted_chunks"
+    )
+    strategy = flags["first_pass_retrieval_strategy"]
+    assert strategy["retrieval_strategy"] == "metadata_first_then_targeted_chunks"
+    assert strategy["semantic_chunk_lookup_ok"] is False
+    assert "canonical_references" not in persisted_metadata
+    assert "reference_cards" not in persisted_metadata
+
+
+def test_first_pass_metadata_first_selected_collection_inventory_accepts_ordered_references(
+    monkeypatch,
+):
+    class _FakeFileModel:
+        def __init__(self, payload: dict):
+            self._payload = payload
+
+        def model_dump(self):
+            return self._payload
+
+    collection_candidate = {
+        "id": "collection-1",
+        "name": "Collection A",
+        "type": "collection",
+        "context": "full",
+        "status": "processed",
+    }
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [collection_candidate], [], [], [collection_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return []
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.Knowledges.get_files_by_id",
+        lambda _collection_id: [
+            _FakeFileModel(
+                {
+                    "id": "doc-a",
+                    "filename": "alpha-paper.txt",
+                    "updated_at": 50,
+                    "meta": {"name": "alpha-paper.txt"},
+                    "data": {"content": "ALPHA_MARKER runtime inventory row."},
+                }
+            ),
+            _FakeFileModel(
+                {
+                    "id": "doc-b",
+                    "filename": "beta-paper.txt",
+                    "updated_at": 80,
+                    "meta": {"name": "beta-paper.txt"},
+                    "data": {"content": "BETA_MARKER runtime inventory row."},
+                }
+            ),
+        ],
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": "请列出所选集合中的文档/文章标题，并说明你的排序依据。"}
+        ],
+        "metadata": {
+            "files": [collection_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_inventory"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted_metadata = _build_assistant_reference_persistence_metadata(flags)
+
+    assert provider_calls["count"] == 1
+    assert flags["status"] == "success"
+    assert flags["terminal_reason"] == "success"
+    assert len(flags["references"]) >= 1
+    assert len(flags["accepted_outputs"]) >= 1
+    assert flags["provenance"]["compact_retrieval_provenance"]["basis"]["date_basis"] == (
+        "file_updated_at"
+    )
+    assert flags["provenance"]["compact_retrieval_provenance"]["inventory_counts"] == {
+        "selected_inventory_count": 2,
+        "scoped_inventory_count": 2,
+        "shortlist_count": 2,
+    }
+    assert len(persisted_metadata["canonical_references"]) >= 1
+    assert len(persisted_metadata["reference_cards"]) >= 1
+    for reference in persisted_metadata["canonical_references"]:
+        for metadata_item in reference.get("metadata") or []:
+            assert metadata_item.get("chunk_type") == "inventory_row"
+
+
+def test_first_pass_metadata_first_selected_collection_missing_inventory_is_diagnostics_only(
+    monkeypatch,
+):
+    collection_candidate = {
+        "id": "collection-1",
+        "name": "Collection A",
+        "type": "collection",
+        "context": "full",
+        "status": "processed",
+    }
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [collection_candidate], [], [], [collection_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return []
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.Knowledges.get_files_by_id",
+        lambda _collection_id: [],
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "列出最近两年的政策文件并按类型统计。"}],
+        "metadata": {
+            "files": [collection_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_inventory"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted_metadata = _build_assistant_reference_persistence_metadata(flags)
+
+    assert provider_calls["count"] == 0
+    assert flags["status"] == "blocked"
+    assert flags["terminal_reason"] == "metadata_first_targeted_evidence_required"
+    assert flags["references"] == []
+    assert flags["accepted_outputs"] == []
+    reasons = {
+        str(item.get("reason") or "")
+        for item in flags.get("retrieval_diagnostics", [])
+        if isinstance(item, dict)
+    }
+    assert "inventory_unavailable" in reasons
+    assert "canonical_references" not in persisted_metadata
+    assert "reference_cards" not in persisted_metadata
+
+
+def test_first_pass_metadata_first_alias_hint_fails_closed_without_targeted_context(
+    monkeypatch,
+):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "file": {"meta": {"name": "alpha-policy.txt"}},
+    }
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="semantic chunk should not pass through metadata-first alias hints",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": "最近有哪些和风电相关的政策？请按清单列出。",
+            }
+        ],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_retrieval"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted_metadata = _build_assistant_reference_persistence_metadata(flags)
+
+    assert provider_calls["count"] == 0
+    assert flags["status"] == "blocked"
+    assert flags["terminal_reason"] == "metadata_first_targeted_evidence_required"
+    assert flags["references"] == []
+    assert flags["accepted_outputs"] == []
+    assert any(
+        item.get("reason") == "metadata_first_targeted_evidence_required"
+        for item in flags["retrieval_diagnostics"]
+    )
+    assert flags["first_pass_retrieval_strategy"]["metadata_first_intent"] is True
+    assert "canonical_references" not in persisted_metadata
+    assert "reference_cards" not in persisted_metadata
+
+
+def test_first_pass_metadata_first_blocked_clears_inline_sources_from_prompt_context(
+    monkeypatch,
+):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "file": {"meta": {"name": "alpha-policy.txt"}},
+    }
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return (
+            [retrieval_candidate],
+            [
+                _local_file_source(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                    content="inline chunk should not be injected for blocked metadata-first turn",
+                )
+            ],
+            [],
+            [retrieval_candidate],
+            [],
+        )
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="provider chunk should never be accepted in blocked metadata-first turn",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "列出最近的重要文章并按类型整理。"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_inventory"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 0
+    assert flags["status"] == "blocked"
+    assert flags["terminal_reason"] == "metadata_first_targeted_evidence_required"
+    assert flags["references"] == []
+    assert flags["accepted_outputs"] == []
+    assert flags["sources"] == []
+    assert flags["no_evidence"] is True
+    assert any(
+        str(item.get("reason") or "") == "metadata_first_targeted_evidence_required"
+        for item in flags["retrieval_diagnostics"]
+        if isinstance(item, dict)
+    )
+
+
+def test_selected_source_metadata_first_diagnostics_only_marker_detects_blocked_turn():
+    assert _is_selected_source_metadata_first_diagnostics_only(
+        {
+            "status": "blocked",
+            "references": [],
+            "accepted_outputs": [],
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+        }
+    )
+    assert not _is_selected_source_metadata_first_diagnostics_only(
+        {
+            "status": "success",
+            "references": [_local_file_source()],
+            "accepted_outputs": [{"type": "selected_source_evidence", "snippet": "ok"}],
+            "first_pass_retrieval_strategy": {"metadata_first_intent": True},
+        }
+    )
+
+
+def test_first_pass_narrow_fact_keeps_semantic_chunk_execution(monkeypatch):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "file": {"meta": {"name": "alpha-policy.txt"}},
+    }
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="Transformer grounding is a method for aligning model outputs with source text.",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "what is transformer grounding"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted_metadata = _build_assistant_reference_persistence_metadata(flags)
+
+    assert provider_calls["count"] == 1
+    assert flags["sources"]
+    assert flags["status"] == "success"
+    assert flags["references"]
+    assert flags["accepted_outputs"]
+    assert flags["terminal_reason"] == "success"
+    assert flags["diagnostics"] == flags["retrieval_diagnostics"]
+    strategy = flags["first_pass_retrieval_strategy"]
+    assert strategy["retrieval_strategy"] == "semantic_chunks"
+    assert strategy["semantic_chunk_lookup_ok"] is True
+    assert flags["provenance"]["strategy_used"]["retrieval_strategy"] == "semantic_chunks"
+    assert flags["active_source_scope"]["status"] == "resolved"
+    assert persisted_metadata["canonical_references"][0]["source"]["id"] == "alpha-file"
+
+
+def test_first_pass_explicit_general_profile_lock_blocks_selected_source_research_intent(
+    monkeypatch,
+):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "file": {"meta": {"name": "alpha-policy.txt"}},
+    }
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return (
+            [retrieval_candidate],
+            [
+                _local_file_source(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                    content="inline evidence should not leak under incompatible profile lock",
+                )
+            ],
+            [],
+            [retrieval_candidate],
+            [],
+        )
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="provider evidence should not run under incompatible profile lock",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "最近有哪些和输电相关的政策文件？"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "selected_source_research",
+                "non_promotion_reason": "explicit_incompatible_profile",
+                "resolved_execution_profile": "general",
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted_metadata = _build_assistant_reference_persistence_metadata(flags)
+
+    assert provider_calls["count"] == 0
+    assert flags["sources"] == []
+    assert flags["accepted_outputs"] == []
+    assert flags["references"] == []
+    assert flags["status"] == "blocked"
+    assert flags["terminal_reason"] == "selected_source_intent_profile_locked"
+    assert any(
+        item.get("reason") == "selected_source_intent_profile_locked"
+        for item in flags["retrieval_diagnostics"]
+    )
+    assert flags["first_pass_profile_lock"]["incompatible"] is True
+    assert flags["first_pass_profile_lock"]["resolved_execution_profile"] == "general"
+    assert "canonical_references" not in persisted_metadata
+
+
+def test_first_pass_chat_profile_lock_blocks_selected_source_research_intent(
+    monkeypatch,
+):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "file": {"meta": {"name": "alpha-policy.txt"}},
+    }
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="provider evidence should not run in chat profile lock",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "继续检索并补充证据"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "selected_source_research",
+                "non_promotion_reason": "chat_profile_zero_tool_lane",
+                "resolved_execution_profile": "chat",
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 0
+    assert flags["sources"] == []
+    assert flags["status"] == "blocked"
+    assert flags["terminal_reason"] == "selected_source_intent_profile_locked"
+    assert flags["first_pass_profile_lock"]["incompatible"] is True
+    assert flags["first_pass_profile_lock"]["resolved_execution_profile"] == "chat"
+
+
+def test_first_pass_selected_source_research_without_profile_lock_keeps_semantic_path(
+    monkeypatch,
+):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "file": {"meta": {"name": "alpha-policy.txt"}},
+    }
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="selected source research still uses semantic retrieval when profile lock is not explicit",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "继续检索并补充证据"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "selected_source_research",
+                "non_promotion_reason": "",
+                "resolved_execution_profile": "research",
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted_metadata = _build_assistant_reference_persistence_metadata(flags)
+
+    assert provider_calls["count"] == 1
+    assert flags["status"] == "success"
+    assert flags["sources"]
+    assert flags["accepted_outputs"]
+    assert flags["references"]
+    assert flags["first_pass_profile_lock"]["incompatible"] is False
+    assert persisted_metadata["canonical_references"][0]["source"]["id"] == "alpha-file"
+
+
 def test_source_aware_query_constraints_keep_original_query_only_by_default():
     files = [{"id": "alpha-file", "name": "alpha-policy.txt", "context": "partial"}]
 
@@ -3223,3 +4026,1958 @@ def test_web_diagnostics_do_not_normalize_into_sources_or_references():
     assert metadata["retrieval_diagnostics"][0]["reason"] == (
         "search_provider_denied_query"
     )
+
+
+def _selected_source_tool_request_stub():
+    return SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                config=SimpleNamespace(
+                    TOP_K=4,
+                    TOP_K_RERANKER=4,
+                    RELEVANCE_THRESHOLD=0.0,
+                    HYBRID_BM25_WEIGHT=0.0,
+                    ENABLE_RAG_HYBRID_SEARCH=False,
+                ),
+                EMBEDDING_FUNCTION=lambda text, prefix=None, user=None: [0.1],
+                RERANKING_FUNCTION=None,
+            )
+        )
+    )
+
+
+def _selected_source_file_candidate(file_id: str, name: str) -> dict:
+    return {
+        "id": file_id,
+        "name": name,
+        "type": "text",
+        "collection_name": file_id,
+        "context": "partial",
+        "file": {
+            "meta": {
+                "name": name,
+            }
+        },
+    }
+
+
+def test_selected_source_metadata_first_without_targeted_context_fails_closed(
+    monkeypatch,
+):
+    provider_calls = {"count": 0}
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="semantic chunk should not be accepted for metadata-first inventory",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="List recent policy documents about storage safety.",
+            source_ids=["alpha-file"],
+            evidence_need="metadata_first_inventory",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "alpha-policy.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 0
+    assert response["status"] == "no_evidence"
+    assert response["code"] == "metadata_first_targeted_evidence_required"
+    assert response["canonical_references"] == []
+    assert response["references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["diagnostics"] == response["retrieval_diagnostics"]
+    assert response["authorization_context"]["active_source_scope_state"] == "resolved"
+    assert response["retry_policy"]["retry_allowed"] is False
+    assert response["terminal_reason"] == "metadata_first_targeted_evidence_required"
+    assert response["provenance"]["strategy_used"]["retrieval_strategy"] == (
+        "metadata_first_then_targeted_chunks"
+    )
+    assert response["strategy_used"]["evidence_need"] == "metadata_first_inventory"
+    assert response["strategy_used"]["retrieval_strategy"] == (
+        "metadata_first_then_targeted_chunks"
+    )
+    assert response["strategy_used"]["semantic_chunk_lookup_ok"] is False
+    assert response["retrieval_diagnostics"][0]["reason"] == (
+        "metadata_first_targeted_evidence_required"
+    )
+    assert "semantic chunk should not be accepted" not in json.dumps(
+        response,
+        ensure_ascii=False,
+    )
+
+
+def test_selected_source_narrow_fact_keeps_semantic_chunk_execution(monkeypatch):
+    provider_calls = {"count": 0}
+
+    async def fake_get_sources_from_items(*_args, **kwargs):
+        provider_calls["count"] += 1
+        assert kwargs.get("queries") == ["what is transformer grounding"]
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="Transformer grounding is a method for aligning model outputs with source text.",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="what is transformer grounding",
+            source_ids=["alpha-file"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "alpha-policy.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 1
+    assert response["status"] == "success"
+    assert response["canonical_references"]
+    assert response["references"] == response["canonical_references"]
+    assert response["accepted_outputs"]
+    assert response["diagnostics"] == []
+    assert response["terminal_reason"] == "success"
+    assert response["provenance"]["strategy_used"]["retrieval_strategy"] == (
+        "semantic_chunks"
+    )
+    assert response["strategy_used"]["evidence_need"] == "narrow_fact"
+    assert response["strategy_used"]["retrieval_strategy"] == "semantic_chunks"
+    assert response["strategy_used"]["semantic_chunk_lookup_ok"] is True
+
+
+def test_selected_source_out_of_scope_ids_deny_before_retrieval(monkeypatch):
+    provider_calls = {"count": 0}
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return []
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="List recent policy documents about storage safety.",
+            source_ids=["beta-file"],
+            evidence_need="metadata_first_inventory",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "alpha-policy.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 0
+    assert response["status"] == "permission_denied"
+    assert response["code"] == "requested_source_out_of_scope"
+
+
+def test_selected_source_metadata_first_with_bounded_targeted_context_is_scoped(
+    monkeypatch,
+):
+    provider_calls = {"count": 0}
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content=(
+                    "policy-2026 2026 Safety Policy title abstract topic relation evidence for storage policy."
+                ),
+            ),
+            _local_file_source(
+                file_id="beta-file",
+                name="beta-policy.txt",
+                content=(
+                    "policy-2026 2026 Safety Policy title abstract topic relation evidence for storage policy."
+                ),
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=(
+                "document=2026 Safety Policy ; storage policy title abstract relation support"
+            ),
+            source_ids=["alpha-file"],
+            required_anchors=["2026 Safety Policy"],
+            evidence_need="metadata_first_inventory",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "alpha-policy.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 1
+    assert response["status"] == "success"
+    assert response["strategy_used"]["retrieval_strategy"] == (
+        "metadata_first_then_targeted_chunks"
+    )
+    assert response["strategy_used"]["semantic_chunk_lookup_ok"] is True
+    assert len(response["canonical_references"]) == 1
+    assert response["canonical_references"][0]["source"]["id"] == "alpha-file"
+    assert response["accepted_outputs"][0]["snippet"]
+    compact = response["provenance"]["compact_retrieval_provenance"]
+    assert compact["strategy"]["retrieval_strategy"] == (
+        "metadata_first_then_targeted_chunks"
+    )
+    assert compact["inventory_counts"]["shortlist_count"] == 1
+    assert compact["accepted_counts"]["reference_count"] == 1
+    assert compact["accepted_counts"]["accepted_output_count"] == 1
+
+
+def test_first_pass_metadata_first_bounded_context_rejects_off_shortlist_and_weak_chunks(
+    monkeypatch,
+):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "partial",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "file": {"meta": {"name": "alpha-policy.txt"}},
+    }
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            _local_file_source(
+                file_id="beta-file",
+                name="beta-policy.txt",
+                content="2026 Safety Policy explicitly discusses storage safety controls.",
+            ),
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="generic semantic drift paragraph without required anchor support",
+            ),
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": "请列出这个选定来源里和储能安全相关的政策材料。",
+            }
+        ],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_inventory"
+            },
+            "selected_source_next_targeted_chunk_request": {
+                "source_ids": ["alpha-file"],
+                "required_anchors": ["2026 Safety Policy"],
+                "query": "document=2026 Safety Policy; topic_terms=storage safety",
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted_metadata = _build_assistant_reference_persistence_metadata(flags)
+
+    assert flags["references"] == []
+    assert flags["accepted_outputs"] == []
+    assert flags["status"] == "no_evidence"
+    reasons = {
+        str(item.get("reason") or "")
+        for item in flags["retrieval_diagnostics"]
+        if isinstance(item, dict)
+    }
+    assert "off_shortlist_chunk" in reasons
+    assert "weak_targeted_chunk_evidence" in reasons
+    assert "canonical_references" not in persisted_metadata
+    assert "reference_cards" not in persisted_metadata
+
+
+def test_selected_source_metadata_first_tool_path_rejects_scoped_unsupported_chunks(
+    monkeypatch,
+):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="Storage Safety Notice includes storage safety evidence.",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=(
+                "document=Storage Safety Notice; topic_terms=storage safety; "
+                "list latest related policy updates"
+            ),
+            source_ids=["alpha-file"],
+            required_anchors=["Storage Safety Notice"],
+            evidence_need="metadata_first_inventory",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "alpha-policy.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["code"] == "unsupported_latest_or_recent_claim"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    reasons = {
+        str(item.get("reason") or "")
+        for item in response["retrieval_diagnostics"]
+        if isinstance(item, dict)
+    }
+    assert "missing_date_metadata" in reasons
+    assert "unsupported_latest_or_recent_claim" in reasons
+
+
+def test_diagnostics_only_blocked_persistence_keeps_reference_lanes_empty():
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "blocked",
+            "terminal_reason": "unsupported_latest_or_recent_claim",
+            "references": [
+                _local_file_source(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                    content="stale reference should not persist",
+                )
+            ],
+            "accepted_outputs": [
+                {
+                    "type": "selected_source_evidence",
+                    "source": {"id": "alpha-file", "name": "alpha-policy.txt"},
+                    "snippet": "stale snippet",
+                }
+            ],
+            "retrieval_diagnostics": [
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "no_evidence",
+                    "reason": "unsupported_latest_or_recent_claim",
+                    "outcome": "unsupported",
+                }
+            ],
+            "provenance": {
+                "compact_retrieval_provenance": {
+                    "strategy": {"retrieval_strategy": "metadata_first_then_targeted_chunks"},
+                    "material_limitations": ["unsupported_latest_or_recent_claim"],
+                }
+            },
+        }
+    )
+
+    assert "canonical_references" not in persisted
+    assert "reference_cards" not in persisted
+    assert "references" not in persisted
+    assert "accepted_outputs" not in persisted
+    assert persisted["retrieval_provenance"]["material_limitations"] == [
+        "unsupported_latest_or_recent_claim"
+    ]
+
+
+def test_blocked_selected_source_diagnostics_remove_stale_message_references():
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "blocked",
+            "terminal_reason": "metadata_first_targeted_evidence_required",
+            "references": [],
+            "accepted_outputs": [],
+            "retrieval_diagnostics": [
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "no_evidence",
+                    "reason": "metadata_first_targeted_evidence_required",
+                    "outcome": "blocked",
+                    "tool_name": "query_selected_knowledge_files",
+                }
+            ],
+        },
+        message_metadata={
+            "canonical_references": [
+                _local_file_source(
+                    file_id="stale-file",
+                    name="stale-policy.txt",
+                    content="stale evidence should be removed",
+                )
+            ],
+            "reference_cards": [
+                {
+                    "source": {"id": "stale-file", "name": "stale-policy.txt"},
+                    "document": ["stale evidence should be removed"],
+                }
+            ],
+        },
+    )
+
+    assert "canonical_references" not in persisted
+    assert "reference_cards" not in persisted
+    assert "references" not in persisted
+    assert "accepted_outputs" not in persisted
+    assert persisted["retrieval_diagnostics"][0]["reason"] == (
+        "metadata_first_targeted_evidence_required"
+    )
+
+
+def test_build_reference_sidecar_blocked_no_evidence_strips_stale_metadata_references():
+    stale_reference = _local_file_source(
+        file_id="stale-file",
+        name="stale-policy.txt",
+        content="stale evidence should never survive blocked/no-evidence turns",
+    )
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        metadata={
+            "status": "blocked",
+            "canonical_references": [stale_reference],
+            "reference_cards": [stale_reference],
+            "retrieval_diagnostics": [
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "no_evidence",
+                    "reason": "unsupported_document_type_claim",
+                    "outcome": "unsupported",
+                }
+            ],
+        },
+        sources=[stale_reference],
+    )
+
+    assert "canonical_references" not in sidecar
+    assert "reference_cards" not in sidecar
+    assert sidecar["retrieval_diagnostics"][0]["reason"] == (
+        "unsupported_document_type_claim"
+    )
+
+
+def test_build_reference_sidecar_success_keeps_current_selected_and_web_references():
+    local_reference = _local_file_source(
+        file_id="alpha-file",
+        name="alpha-policy.txt",
+        content="selected source evidence remains available on success",
+    )
+    web_reference = {
+        "source": {
+            "id": "https://example.com/policy",
+            "name": "https://example.com/policy",
+            "type": "web",
+            "url": "https://example.com/policy",
+        },
+        "document": ["official policy bulletin"],
+        "metadata": [{"title": "Policy Bulletin"}],
+        "provenance": {"tool_name": "visit_webpage"},
+    }
+
+    sidecar = Chats.build_reference_metadata_sidecar(
+        metadata={
+            "status": "success",
+            "retrieval_diagnostics": [
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "no_evidence",
+                    "reason": "stale_previous_turn_diagnostic",
+                    "outcome": "blocked",
+                }
+            ],
+        },
+        sources=[local_reference, web_reference],
+    )
+
+    assert len(sidecar["canonical_references"]) == 2
+    assert len(sidecar["reference_cards"]) == 2
+
+
+def test_selected_source_narrow_fact_semantic_path_still_works_with_compact_provenance(
+    monkeypatch,
+):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="Transformer grounding aligns model outputs with source text.",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="what is transformer grounding",
+            source_ids=["alpha-file"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "alpha-policy.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success"
+    assert response["canonical_references"]
+    assert response["accepted_outputs"]
+    compact = response["provenance"]["compact_retrieval_provenance"]
+    assert compact["strategy"]["retrieval_strategy"] == "semantic_chunks"
+
+
+def test_selected_source_limitation_only_persistence_keeps_diagnostics_without_refs():
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "no_evidence",
+            "terminal_reason": "unsupported_document_type_claim",
+            "references": [],
+            "retrieval_diagnostics": [
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "no_evidence",
+                    "reason": "unsupported_document_type_claim",
+                    "outcome": "unsupported",
+                    "tool_name": "query_selected_knowledge_files",
+                }
+            ],
+        },
+        message_metadata={
+            "canonical_references": [
+                _local_file_source(
+                    file_id="stale-file",
+                    name="stale-policy.txt",
+                    content="stale evidence should not survive limitation-only turns",
+                )
+            ],
+            "reference_cards": [
+                {
+                    "source": {"id": "stale-file", "name": "stale-policy.txt"},
+                    "document": ["stale evidence should not survive limitation-only turns"],
+                }
+            ],
+        },
+    )
+
+    assert "canonical_references" not in persisted
+    assert "reference_cards" not in persisted
+    assert persisted["retrieval_diagnostics"][0]["reason"] == (
+        "unsupported_document_type_claim"
+    )
+
+
+def test_selected_source_metadata_first_persistence_drops_unrelated_broad_chunk_bundle():
+    accepted_reference = _local_file_source(
+        file_id="alpha-file",
+        name="alpha-policy.txt",
+        content="2026 Safety Policy supports storage safety anchor.",
+    )
+    broad_sources = _local_file_source(
+        file_id="alpha-file",
+        name="alpha-policy.txt",
+        content="2026 Safety Policy supports storage safety anchor.",
+    )
+    broad_sources["document"].append("unrelated semantic chunk that should not be bundled")
+    broad_sources["metadata"].append({"file_id": "alpha-file", "name": "alpha-policy.txt"})
+
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "success",
+            "references": [accepted_reference],
+            "sources": [broad_sources],
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "targeted_context_bounded": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+        },
+        message_metadata={
+            "canonical_references": [broad_sources],
+            "reference_cards": [broad_sources],
+        },
+    )
+
+    assert len(persisted["canonical_references"]) == 1
+    persisted_reference = persisted["canonical_references"][0]
+    assert persisted_reference["source"]["id"] == "alpha-file"
+    assert persisted_reference["document"] == [
+        "2026 Safety Policy supports storage safety anchor."
+    ]
+    assert len(persisted["reference_cards"]) == 1
+    assert persisted["reference_cards"][0]["document"] == [
+        "2026 Safety Policy supports storage safety anchor."
+    ]
+
+
+def test_selected_source_inventory_success_merge_drops_generic_response_sources():
+    collection_id = "cd2569744b8911f18ca152cca89252d6"
+    persisted_sources = [
+        _local_file_source(
+            file_id=collection_id,
+            name="能源工程技术期刊",
+            content="能源工程技术2026年第1期（总第31期）正文-CTP.pdf",
+        ),
+        {
+            "source": {
+                "id": f"/api/openai/v1/files/{collection_id}/content",
+                "name": f"/api/openai/v1/files/{collection_id}/content",
+                "type": "generic_web",
+                "url": f"/api/openai/v1/files/{collection_id}/content",
+            },
+            "document": [
+                f"Error fetching /api/openai/v1/files/{collection_id}/content: Invalid URL"
+            ],
+            "metadata": [
+                {
+                    "source": f"/api/openai/v1/files/{collection_id}/content",
+                    "name": f"/api/openai/v1/files/{collection_id}/content",
+                    "source_class": "generic_web",
+                }
+            ],
+            "source_class": "generic_web",
+            "type": "retrieval_reference",
+        },
+    ]
+    completion_metadata = {
+        "status": "success",
+        "terminal_reason": "success",
+        "active_source_scope": {
+            "status": "resolved",
+            "source_set_mode": "single",
+            "source_ids": [collection_id],
+            "sources": [
+                {
+                    "id": collection_id,
+                    "name": "能源工程技术期刊",
+                    "type": "knowledge",
+                    "authority": "current_upload",
+                }
+            ],
+            "focus_state": "single",
+            "authority": "current_upload",
+        },
+        "first_pass_retrieval_strategy": {
+            "metadata_first_intent": True,
+            "retrieval_strategy": "metadata_first_then_targeted_chunks",
+        },
+    }
+
+    merged = _merge_persisted_and_response_sources(
+        persisted_sources,
+        persisted_sources,
+        completion_metadata=completion_metadata,
+    )
+    filtered = _filter_uncited_no_evidence_source_cards(
+        merged,
+        content="已按排序依据列出所选集合文档。[1]",
+        metadata=completion_metadata,
+    )
+
+    assert len(filtered) == 1
+    assert filtered[0]["source"]["id"] == collection_id
+    assert len(Chats.build_reference_cards(filtered)) == 1
+
+
+def test_selected_source_source_merge_keeps_narrow_fact_persisted_reference_only():
+    persisted_sources = [
+        _local_file_source(
+            file_id="alpha-file",
+            name="alpha-policy.txt",
+            content="Transformer grounding aligns model outputs with source text.",
+        )
+    ]
+    response_sources = [
+        {
+            **persisted_sources[0],
+            "document": [
+                "Transformer grounding aligns model outputs with source text.",
+                "unrelated bundled chunk should not persist for selected-source turn",
+            ],
+            "metadata": [
+                {"file_id": "alpha-file", "name": "alpha-policy.txt"},
+                {"file_id": "alpha-file", "name": "alpha-policy.txt"},
+            ],
+        }
+    ]
+    response_sources.append(
+        {
+            "source": {
+                "id": "https://example.com/offscope",
+                "name": "https://example.com/offscope",
+                "url": "https://example.com/offscope",
+                "type": "generic_web",
+            },
+            "document": ["off-scope web payload should not persist in selected-source lane"],
+            "metadata": [{"source": "https://example.com/offscope"}],
+            "source_class": "generic_web",
+            "type": "retrieval_reference",
+        }
+    )
+    completion_metadata = {
+        "active_source_scope": _resolved_active_source_scope(
+            file_id="alpha-file",
+            name="alpha-policy.txt",
+        ),
+        "first_pass_retrieval_strategy": {
+            "retrieval_strategy": "semantic_chunks",
+            "metadata_first_intent": False,
+        },
+    }
+
+    merged = _merge_persisted_and_response_sources(
+        persisted_sources,
+        response_sources,
+        completion_metadata=completion_metadata,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["document"] == [
+        "Transformer grounding aligns model outputs with source text."
+    ]
+    assert merged[0]["source"]["id"] == "alpha-file"
+
+
+def test_non_selected_web_success_merge_keeps_web_reference_cards():
+    web_reference = {
+        "source": {
+            "id": "https://www.example.com/article",
+            "name": "https://www.example.com/article",
+            "url": "https://www.example.com/article",
+            "type": "generic_web",
+        },
+        "document": ["Web search evidence"],
+        "metadata": [{"source": "https://www.example.com/article"}],
+        "source_class": "generic_web",
+        "type": "retrieval_reference",
+    }
+    merged = _merge_persisted_and_response_sources(
+        [],
+        [web_reference],
+        completion_metadata={"status": "success", "terminal_reason": "success"},
+    )
+    filtered = _filter_uncited_no_evidence_source_cards(
+        merged,
+        content="根据网页证据，结论如下。[1]",
+        metadata={"status": "success", "terminal_reason": "success"},
+    )
+
+    assert len(filtered) == 1
+    assert filtered[0]["source"]["id"] == "https://www.example.com/article"
+    assert len(Chats.build_reference_cards(filtered)) == 1
+
+
+def test_assistant_metadata_includes_compact_profile_routing_diagnostics():
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "blocked",
+            "references": [],
+            "first_pass_profile_lock": {
+                "incompatible": True,
+                "non_promotion_reason": "explicit_incompatible_profile",
+                "classified_evidence_need": "metadata_first_inventory",
+                "resolved_execution_profile": "general",
+            },
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_inventory",
+                "resolved_execution_profile": "general",
+                "promotion_reason": "",
+                "non_promotion_reason": "explicit_incompatible_profile",
+                "provider_payload": {"should": "not_leak"},
+            },
+        }
+    )
+
+    diagnostics = persisted.get("execution_profile_routing_diagnostics") or {}
+    assert diagnostics["resolved_execution_profile"] == "general"
+    assert diagnostics["classified_evidence_need"] == "metadata_first_inventory"
+    assert diagnostics["non_promotion_reason"] == "explicit_incompatible_profile"
+    assert diagnostics["explicit_profile_lock"] is True
+    assert "provider_payload" not in diagnostics
+
+
+def test_selected_source_persistence_trims_provider_bundle_to_accepted_chunk():
+    bundled_reference = {
+        "source": {
+            "id": "alpha-file",
+            "name": "alpha-policy.txt",
+            "type": "file",
+        },
+        "document": [
+            "chunk-1 unrelated introduction",
+            "chunk-2 accepted and relevant evidence",
+            "chunk-3 unrelated appendix",
+        ],
+        "metadata": [
+            {"file_id": "alpha-file", "name": "alpha-policy.txt", "chunk_id": "c1"},
+            {"file_id": "alpha-file", "name": "alpha-policy.txt", "chunk_id": "c2"},
+            {"file_id": "alpha-file", "name": "alpha-policy.txt", "chunk_id": "c3"},
+        ],
+    }
+
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "success",
+            "references": [bundled_reference],
+            "accepted_outputs": [
+                {
+                    "type": "selected_source_evidence",
+                    "source": {"id": "alpha-file", "name": "alpha-policy.txt"},
+                    "snippet": "chunk-2 accepted and relevant evidence",
+                }
+            ],
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "targeted_context_bounded": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+            "active_source_scope": _resolved_active_source_scope(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+            ),
+        }
+    )
+
+    assert len(persisted["canonical_references"]) == 1
+    trimmed = persisted["canonical_references"][0]
+    assert trimmed["document"] == ["chunk-2 accepted and relevant evidence"]
+    assert [item["chunk_id"] for item in trimmed["metadata"]] == ["c2"]
+
+
+def test_selected_source_narrow_fact_persistence_trims_unrelated_sibling_chunks():
+    bundled_reference = {
+        "source": {
+            "id": "alpha-file",
+            "name": "alpha-policy.txt",
+            "type": "file",
+        },
+        "document": [
+            "The answer author is Deng and Xu.",
+            "Unrelated sibling chunk should not persist.",
+            "Another unrelated sibling chunk.",
+        ],
+        "metadata": [
+            {"file_id": "alpha-file", "name": "alpha-policy.txt", "chunk_id": "a1"},
+            {"file_id": "alpha-file", "name": "alpha-policy.txt", "chunk_id": "a2"},
+            {"file_id": "alpha-file", "name": "alpha-policy.txt", "chunk_id": "a3"},
+        ],
+    }
+
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "success",
+            "references": [bundled_reference],
+            "accepted_outputs": [
+                {
+                    "type": "selected_source_evidence",
+                    "source": {"id": "alpha-file", "name": "alpha-policy.txt"},
+                    "snippet": "The answer author is Deng and Xu.",
+                }
+            ],
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": False,
+                "retrieval_strategy": "semantic_chunks",
+            },
+            "active_source_scope": _resolved_active_source_scope(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+            ),
+        }
+    )
+
+    assert len(persisted["canonical_references"]) == 1
+    assert persisted["canonical_references"][0]["document"] == [
+        "The answer author is Deng and Xu."
+    ]
+    assert len(persisted["reference_cards"]) == 1
+    assert persisted["reference_cards"][0]["document"] == [
+        "The answer author is Deng and Xu."
+    ]
+
+
+def test_missing_status_metadata_first_listing_becomes_diagnostics_only():
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "references": [
+                _local_file_source(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                    content="broad provider bundle should not persist for metadata-first listing",
+                )
+            ],
+            "accepted_outputs": [],
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "targeted_context_bounded": False,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+            "execution_profile_routing_diagnostics": {
+                "resolved_execution_profile": "research",
+                "classified_evidence_need": "none",
+            },
+            "active_source_scope": _resolved_active_source_scope(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+            ),
+        }
+    )
+
+    assert persisted["status"] == "blocked"
+    assert persisted["terminal_reason"] == "metadata_first_targeted_evidence_required"
+    assert "canonical_references" not in persisted
+    assert "reference_cards" not in persisted
+    reasons = {
+        str(item.get("reason") or "")
+        for item in persisted.get("retrieval_diagnostics", [])
+        if isinstance(item, dict)
+    }
+    assert "metadata_first_targeted_evidence_required" in reasons
+
+
+def test_metadata_first_listing_persists_compact_profile_classification():
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+                "evidence_need": "none",
+                "targeted_context_bounded": True,
+            },
+            "execution_profile_routing_diagnostics": {
+                "resolved_execution_profile": "general",
+                "classified_evidence_need": "none",
+                "promotion_reason": "",
+                "non_promotion_reason": "",
+            },
+        }
+    )
+
+    diagnostics = persisted.get("execution_profile_routing_diagnostics") or {}
+    assert diagnostics["resolved_execution_profile"] == "general"
+    assert diagnostics["classified_evidence_need"] == "metadata_first_inventory"
+
+
+def test_selected_source_limitation_guard_restricts_source_naming_to_active_scope():
+    messages = [{"role": "user", "content": "最近有哪些相关政策？"}]
+    guarded = _append_selected_source_limitation_guard(
+        messages,
+        terminal_reason="metadata_first_targeted_evidence_required",
+        active_source_scope={
+            "status": "resolved",
+            "source_set_mode": "single",
+            "source_ids": ["collection-1"],
+            "sources": [{"id": "collection-1", "name": "Collection A", "type": "collection"}],
+        },
+    )
+
+    system_message = next(
+        (item for item in guarded if isinstance(item, dict) and item.get("role") == "system"),
+        {},
+    )
+    content = str(system_message.get("content") or "")
+    assert "Collection A" in content
+    assert "Do not reuse previous-turn source-derived lists" in content
+
+
+def test_runtime_selected_collection_shape_inventory_fallback_accepts_references(
+    monkeypatch,
+):
+    class _FakeFileModel:
+        def __init__(self, payload: dict):
+            self._payload = payload
+
+        def model_dump(self):
+            return self._payload
+
+    runtime_collection = {
+        "type": "collection",
+        "id": "632843fb-69ed-4575-bf33-e28bf8c5e995",
+        "name": "e2e-capability-descriptor-smoke-20260513",
+        "context": "full",
+        "focus_tier": "active",
+        "focus_origin": "current_turn",
+        "user_id": "461a35be-3613-4fb1-8201-95e5dc21e468",
+        "meta": {"document_count": 2, "chunk_count": 2, "status": "1"},
+        "source": "knowledge",
+        "status": "processed",
+        "url": "632843fb-69ed-4575-bf33-e28bf8c5e995",
+        "files_count": 2,
+    }
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [runtime_collection], [], [], [runtime_collection], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return []
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.Knowledges.get_files_by_id",
+        lambda _collection_id: [
+            _FakeFileModel(
+                {
+                    "id": "7a5a6d75-16d9-4ab9-8ab8-9730ca38bc6d",
+                    "filename": "langfuse-e2e-alpha.txt",
+                    "updated_at": 1778654111,
+                    "meta": {"name": "langfuse-e2e-alpha.txt"},
+                    "data": {"content": "ALPHA_MARKER runtime row"},
+                }
+            ),
+            _FakeFileModel(
+                {
+                    "id": "298c2fd6-c376-48d8-a3f7-4225b16793d6",
+                    "filename": "langfuse-e2e-beta.txt",
+                    "updated_at": 1778654110,
+                    "meta": {"name": "langfuse-e2e-beta.txt"},
+                    "data": {"content": "BETA_MARKER runtime row"},
+                }
+            ),
+        ],
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": "请列出所选集合中的文档/文章标题，并说明你的排序依据。"}
+        ],
+        "metadata": {
+            "files": [runtime_collection],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_inventory"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted = _build_assistant_reference_persistence_metadata(flags)
+
+    assert flags["status"] == "success"
+    assert flags["terminal_reason"] == "success"
+    assert len(flags["references"]) >= 1
+    assert len(flags["accepted_outputs"]) >= 1
+    assert len(persisted["canonical_references"]) >= 1
+    assert len(persisted["reference_cards"]) >= 1
+    assert "off_facet_evidence" not in {
+        str(item.get("reason") or "")
+        for item in flags.get("retrieval_diagnostics", [])
+        if isinstance(item, dict)
+    }
+
+
+def test_runtime_selected_collection_shape_knowflow_inventory_fallback_accepts_refs_without_scope_widening(
+    monkeypatch,
+):
+    runtime_active_collection = {
+        "type": "collection",
+        "id": "cd2569744b8911f18ca152cca89252d6",
+        "name": "能源工程技术期刊",
+        "context": "full",
+        "focus_tier": "active",
+        "focus_origin": "current_turn",
+        "meta": {"document_count": 31, "chunk_count": 306, "status": "1"},
+        "source": "knowledge",
+        "status": "processed",
+        "url": "cd2569744b8911f18ca152cca89252d6",
+        "files_count": 31,
+    }
+    runtime_reference_collection = {
+        "type": "collection",
+        "id": "reference-collection-id",
+        "name": "Reference Collection",
+        "context": "snippet",
+        "focus_tier": "reference",
+        "focus_origin": "history",
+        "meta": {"document_count": 5, "chunk_count": 22, "status": "1"},
+        "source": "knowledge",
+        "status": "processed",
+        "url": "reference-collection-id",
+        "files_count": 5,
+    }
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return (
+            [runtime_active_collection, runtime_reference_collection],
+            [],
+            [],
+            [runtime_active_collection],
+            [runtime_reference_collection],
+        )
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return []
+
+    queried_ids: list[str] = []
+
+    async def fake_list_knowledge_documents(
+        _config,
+        _user,
+        knowledge_id,
+        *,
+        query=None,
+        order_by=None,
+        direction=None,
+        page=1,
+        page_size=30,
+        db=None,
+    ):
+        queried_ids.append(str(knowledge_id))
+        if str(knowledge_id) != runtime_active_collection["id"]:
+            return {"items": [], "total": 0}
+        return {
+            "items": [
+                {
+                    "id": "1e2457b94b8c11f1837f52cca89252d6",
+                    "filename": "能源工程技术2026年第1期（总第31期）正文-CTP.pdf",
+                    "updated_at": 1778320212,
+                    "meta": {"name": "能源工程技术2026年第1期（总第31期）正文-CTP.pdf"},
+                    "data": None,
+                    "collection": {
+                        "id": runtime_active_collection["id"],
+                        "name": runtime_active_collection["name"],
+                    },
+                },
+                {
+                    "id": "1dcf5f774b8c11f1992452cca89252d6",
+                    "filename": "能源工程技术2025年第4期（总第30期）正文-CTP.pdf",
+                    "updated_at": 1778320059,
+                    "meta": {"name": "能源工程技术2025年第4期（总第30期）正文-CTP.pdf"},
+                    "data": None,
+                    "collection": {
+                        "id": runtime_active_collection["id"],
+                        "name": runtime_active_collection["name"],
+                    },
+                },
+            ],
+            "total": 2,
+        }
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.Knowledges.get_files_by_id",
+        lambda _collection_id: [],
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.list_knowledge_documents",
+        fake_list_knowledge_documents,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": "请列出所选集合中的文档/文章标题，并说明你的排序依据。"}
+        ],
+        "metadata": {
+            "files": [runtime_active_collection, runtime_reference_collection],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_inventory"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted = _build_assistant_reference_persistence_metadata(flags)
+
+    assert queried_ids == [runtime_active_collection["id"]]
+    assert flags["status"] == "success"
+    assert flags["terminal_reason"] == "success"
+    assert len(flags["references"]) >= 1
+    assert len(flags["accepted_outputs"]) >= 1
+    assert all(
+        (item.get("source") or {}).get("id") == runtime_active_collection["id"]
+        for item in flags["references"]
+    )
+    assert len(persisted["canonical_references"]) >= 1
+    assert len(persisted["reference_cards"]) >= 1
+    assert all(
+        (item.get("source") or {}).get("id") == runtime_active_collection["id"]
+        for item in persisted["canonical_references"]
+    )
+    metadata_item = persisted["canonical_references"][0]["metadata"][0]
+    assert metadata_item["chunk_type"] == "inventory_row"
+    assert metadata_item["ordering_basis"] == "file_updated_at_desc"
+    assert metadata_item["date_basis"] == "file_updated_at"
+    assert "inventory_unavailable" not in {
+        str(item.get("reason") or "")
+        for item in flags.get("retrieval_diagnostics", [])
+        if isinstance(item, dict)
+    }
+
+
+def test_runtime_selected_collection_shape_knowflow_inventory_absent_is_diagnostics_only(
+    monkeypatch,
+):
+    runtime_collection = {
+        "type": "collection",
+        "id": "cd2569744b8911f18ca152cca89252d6",
+        "name": "能源工程技术期刊",
+        "context": "full",
+        "focus_tier": "active",
+        "focus_origin": "current_turn",
+        "meta": {"document_count": 31, "chunk_count": 306, "status": "1"},
+        "source": "knowledge",
+        "status": "processed",
+        "url": "cd2569744b8911f18ca152cca89252d6",
+        "files_count": 31,
+    }
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [runtime_collection], [], [], [runtime_collection], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return []
+
+    async def fake_list_knowledge_documents(*_args, **_kwargs):
+        return {"items": [], "total": 0}
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.Knowledges.get_files_by_id",
+        lambda _collection_id: [],
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.list_knowledge_documents",
+        fake_list_knowledge_documents,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": "请列出所选集合中的文档/文章标题，并说明你的排序依据。"}
+        ],
+        "metadata": {
+            "files": [runtime_collection],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_inventory"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted = _build_assistant_reference_persistence_metadata(flags)
+
+    assert flags["status"] == "blocked"
+    assert flags["terminal_reason"] == "metadata_first_targeted_evidence_required"
+    assert flags["references"] == []
+    assert flags["accepted_outputs"] == []
+    assert persisted.get("canonical_references") in (None, [])
+    assert persisted.get("reference_cards") in (None, [])
+    assert "inventory_unavailable" in {
+        str(item.get("reason") or "")
+        for item in flags.get("retrieval_diagnostics", [])
+        if isinstance(item, dict)
+    }
+
+
+def test_metadata_first_diagnostics_only_turn_forces_limitation_content():
+    concrete_content = (
+        "截至2026年5月，最近与风电相关的主要政策如下：1) A 2) B 3) C"
+    )
+    guarded_content, guarded_output = _apply_selected_source_diagnostics_only_content_guard(
+        content=concrete_content,
+        output=[
+            {
+                "type": "message",
+                "id": "msg-1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": concrete_content}],
+            }
+        ],
+        metadata={
+            "status": "no_evidence",
+            "terminal_reason": "no_retrieval_candidates",
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+            "retrieval_diagnostics": [
+                {
+                    "classification": "no_evidence",
+                    "reason": "unsupported_document_type_claim",
+                    "outcome": "unsupported",
+                }
+            ],
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["collection-1"],
+                "sources": [
+                    {
+                        "id": "collection-1",
+                        "name": "Collection A",
+                        "type": "collection",
+                        "authority": "selected_source",
+                    }
+                ],
+                "focus_state": "single",
+                "authority": "selected_source",
+            },
+        },
+        completion_metadata={
+            "status": "no_evidence",
+            "terminal_reason": "no_retrieval_candidates",
+            "retrieval_diagnostics": [
+                {
+                    "classification": "no_evidence",
+                    "reason": "unsupported_document_type_claim",
+                    "outcome": "unsupported",
+                }
+            ],
+        },
+    )
+
+    assert guarded_content != concrete_content
+    assert "无法给出具体文档列表或结论" in guarded_content
+    assert "Collection A" in guarded_content
+    assert guarded_output[-1]["content"][0]["text"] == guarded_content
+
+
+def test_metadata_first_diagnostics_only_with_missing_inventory_keeps_no_refs_cards():
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "no_evidence",
+            "terminal_reason": "no_retrieval_candidates",
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+                "targeted_context_bounded": True,
+            },
+            "retrieval_diagnostics": [
+                {
+                    "classification": "no_evidence",
+                    "reason": "inventory_unavailable",
+                    "outcome": "blocked",
+                }
+            ],
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["collection-1"],
+                "sources": [{"id": "collection-1", "name": "Collection A", "type": "collection"}],
+                "focus_state": "single",
+                "authority": "selected_source",
+            },
+            "canonical_references": [
+                _local_file_source(
+                    file_id="stale-file",
+                    name="stale.txt",
+                    content="stale reference should be removed",
+                )
+            ],
+        }
+    )
+
+    assert persisted["status"] == "no_evidence"
+    assert persisted["terminal_reason"] == "no_retrieval_candidates"
+    assert "canonical_references" not in persisted
+    assert "reference_cards" not in persisted
+
+
+def test_diagnostics_only_content_guard_does_not_change_narrow_fact_success():
+    original = "作者是邓某和徐某。"
+    guarded_content, guarded_output = _apply_selected_source_diagnostics_only_content_guard(
+        content=original,
+        output=[
+            {
+                "type": "message",
+                "id": "msg-1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": original}],
+            }
+        ],
+        metadata={
+            "status": "success",
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": False,
+                "retrieval_strategy": "semantic_chunks",
+            },
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["file-1"],
+                "sources": [{"id": "file-1", "name": "alpha.txt", "type": "file"}],
+                "focus_state": "single",
+                "authority": "selected_source",
+            },
+            "accepted_outputs": [{"type": "selected_source_evidence", "snippet": original}],
+        },
+        completion_metadata={
+            "status": "success",
+            "canonical_references": [
+                _local_file_source(file_id="file-1", name="alpha.txt", content=original)
+            ],
+        },
+    )
+
+    assert guarded_content == original
+    assert guarded_output[-1]["content"][0]["text"] == original
+
+
+def test_selected_source_metadata_first_success_with_inventory_refs_persists_cards():
+    inventory_reference = {
+        "source": {
+            "id": "632843fb-69ed-4575-bf33-e28bf8c5e995",
+            "name": "e2e-capability-descriptor-smoke-20260513",
+            "type": "collection",
+            "source": "knowledge",
+        },
+        "document": ["ALPHA_MARKER runtime inventory row."],
+        "metadata": [
+            {
+                "source": "632843fb-69ed-4575-bf33-e28bf8c5e995",
+                "name": "langfuse-e2e-alpha.txt",
+                "title": "langfuse-e2e-alpha.txt",
+                "chunk_type": "inventory_row",
+                "ordering_basis": "file_updated_at_desc",
+                "date_basis": "file_updated_at",
+            }
+        ],
+        "retrieval_outcome": "success",
+        "retrieval_classification": "injectable",
+        "source_class": "collection",
+        "type": "retrieval_reference",
+    }
+
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "success",
+            "terminal_reason": "success",
+            "references": [inventory_reference],
+            "accepted_outputs": [
+                {
+                    "type": "selected_source_evidence",
+                    "snippet": "ALPHA_MARKER runtime inventory row.",
+                    "source": {"id": "632843fb-69ed-4575-bf33-e28bf8c5e995"},
+                }
+            ],
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "targeted_context_bounded": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["632843fb-69ed-4575-bf33-e28bf8c5e995"],
+                "sources": [
+                    {
+                        "id": "632843fb-69ed-4575-bf33-e28bf8c5e995",
+                        "name": "e2e-capability-descriptor-smoke-20260513",
+                        "type": "knowledge",
+                        "authority": "current_upload",
+                    }
+                ],
+                "focus_state": "single",
+                "authority": "current_upload",
+            },
+            "retrieval_diagnostics": [
+                {
+                    "classification": "no_evidence",
+                    "reason": "missing_document_body",
+                    "outcome": "empty",
+                }
+            ],
+        }
+    )
+
+    assert persisted["status"] == "success"
+    assert persisted["terminal_reason"] == "success"
+    assert len(persisted.get("canonical_references") or []) == 1
+    assert len(persisted.get("reference_cards") or []) == 1
+    metadata_item = persisted["canonical_references"][0]["metadata"][0]
+    assert metadata_item["chunk_type"] == "inventory_row"
+    assert metadata_item["ordering_basis"] == "file_updated_at_desc"
+
+
+def test_metadata_first_success_without_refs_is_downgraded_before_final_persistence():
+    normalized = _enforce_selected_source_metadata_first_final_consistency(
+        completion_metadata={
+            "status": "success",
+            "terminal_reason": "success",
+            "retrieval_diagnostics": [
+                {"classification": "no_evidence", "reason": "missing_document_body"}
+            ],
+        },
+        metadata={
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["collection-1"],
+                "sources": [
+                    {
+                        "id": "collection-1",
+                        "name": "Collection A",
+                        "type": "collection",
+                        "authority": "current_upload",
+                    }
+                ],
+                "focus_state": "single",
+                "authority": "current_upload",
+            },
+        },
+    )
+
+    assert normalized["status"] == "no_evidence"
+    assert normalized["terminal_reason"] == "no_accepted_references"
+    assert any(
+        str(item.get("reason") or "") == "no_accepted_references"
+        for item in normalized.get("retrieval_diagnostics", [])
+        if isinstance(item, dict)
+    )
+
+
+def test_unsupported_selected_source_metadata_first_turn_drops_generic_web_refs_cards():
+    web_reference = {
+        "source": {
+            "id": "https://www.example.com/policy",
+            "name": "https://www.example.com/policy",
+            "url": "https://www.example.com/policy",
+            "type": "generic_web",
+            "authority": "generic",
+        },
+        "document": ["Wind policy page."],
+        "metadata": [
+            {
+                "source": "https://www.example.com/policy",
+                "name": "https://www.example.com/policy",
+                "url": "https://www.example.com/policy",
+                "tool_name": "visit_webpage",
+                "source_class": "generic_web",
+                "authority": "generic",
+            }
+        ],
+        "source_class": "generic_web",
+        "authority": "generic",
+        "type": "retrieval_reference",
+    }
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "no_evidence",
+            "terminal_reason": "unsupported_document_type_claim",
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["collection-1"],
+                "sources": [
+                    {
+                        "id": "collection-1",
+                        "name": "Collection A",
+                        "type": "collection",
+                        "authority": "current_upload",
+                    }
+                ],
+                "focus_state": "single",
+                "authority": "current_upload",
+            },
+            "retrieval_diagnostics": [
+                {
+                    "classification": "diagnostics",
+                    "reason": "missing_type_metadata",
+                    "outcome": "unsupported",
+                },
+                {
+                    "classification": "diagnostics",
+                    "reason": "missing_topic_metadata",
+                    "outcome": "unsupported",
+                },
+            ],
+        },
+        message_metadata={
+            "canonical_references": [web_reference],
+            "reference_cards": [web_reference],
+        },
+    )
+
+    assert persisted["status"] == "no_evidence"
+    assert persisted["terminal_reason"] == "unsupported_document_type_claim"
+    assert "canonical_references" not in persisted
+    assert "reference_cards" not in persisted
+
+
+def test_runtime_shape_inventory_success_without_refs_is_downgraded_and_guarded():
+    concrete_content = (
+        "基于所选集合的可用内容，包含如下文档，并按更新时间排序："
+        "1) A ... 2) B ..."
+    )
+    completion_metadata = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "success",
+            "terminal_reason": "success",
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["632843fb-69ed-4575-bf33-e28bf8c5e995"],
+                "sources": [
+                    {
+                        "id": "632843fb-69ed-4575-bf33-e28bf8c5e995",
+                        "name": "e2e-capability-descriptor-smoke-20260513",
+                        "type": "knowledge",
+                        "authority": "current_upload",
+                    }
+                ],
+                "focus_state": "single",
+                "authority": "current_upload",
+            },
+            "execution_profile_routing_diagnostics": {
+                "resolved_execution_profile": "general",
+                "classified_evidence_need": "metadata_first_inventory",
+                "promotion_reason": "",
+                "non_promotion_reason": "none",
+                "explicit_profile_lock": False,
+            },
+            "retrieval_diagnostics": [
+                {
+                    "classification": "no_evidence",
+                    "reason": "missing_document_body",
+                    "outcome": "empty",
+                }
+            ],
+        }
+    )
+    normalized = _enforce_selected_source_metadata_first_final_consistency(
+        completion_metadata=completion_metadata,
+        metadata={},
+    )
+    guarded_content, guarded_output = _apply_selected_source_diagnostics_only_content_guard(
+        content=concrete_content,
+        output=[
+            {
+                "type": "message",
+                "id": "msg-1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": concrete_content}],
+            }
+        ],
+        metadata={},
+        completion_metadata=normalized,
+    )
+
+    assert normalized["status"] == "no_evidence"
+    assert normalized["terminal_reason"] == "no_accepted_references"
+    assert "canonical_references" not in normalized
+    assert "reference_cards" not in normalized
+    assert "无法给出具体文档列表或结论" in guarded_content
+    assert guarded_output[-1]["content"][0]["text"] == guarded_content
+
+
+def test_selected_source_unsupported_lane_drops_generic_web_refs_in_final_filter():
+    web_reference = {
+        "source": {
+            "id": "https://www.example.com/policy",
+            "name": "https://www.example.com/policy",
+            "url": "https://www.example.com/policy",
+            "type": "generic_web",
+            "authority": "generic",
+        },
+        "document": ["web policy listing result"],
+        "metadata": [{"source": "https://www.example.com/policy"}],
+        "source_class": "generic_web",
+        "authority": "generic",
+        "type": "retrieval_reference",
+    }
+
+    filtered = _filter_uncited_no_evidence_source_cards(
+        [web_reference],
+        content="以下是最近政策列表：...",
+        metadata={
+            "status": "no_evidence",
+            "terminal_reason": "unsupported_document_type_claim",
+            "active_source_scope": {
+                "status": "resolved",
+                "source_set_mode": "single",
+                "source_ids": ["collection-1"],
+                "sources": [
+                    {
+                        "id": "collection-1",
+                        "name": "Collection A",
+                        "type": "collection",
+                        "authority": "current_upload",
+                    }
+                ],
+                "focus_state": "single",
+                "authority": "current_upload",
+            },
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "metadata_first_inventory"
+            },
+            "retrieval_diagnostics": [
+                {
+                    "classification": "diagnostics",
+                    "reason": "missing_type_metadata",
+                    "outcome": "unsupported",
+                },
+                {
+                    "classification": "diagnostics",
+                    "reason": "missing_topic_metadata",
+                    "outcome": "unsupported",
+                },
+            ],
+        },
+    )
+
+    assert filtered == []
+
+
+def test_unrelated_successful_web_references_still_persist():
+    web_reference = {
+        "source": {
+            "id": "https://www.example.com/article",
+            "name": "https://www.example.com/article",
+            "url": "https://www.example.com/article",
+            "type": "generic_web",
+            "authority": "generic",
+        },
+        "document": ["Web search evidence"],
+        "metadata": [{"source": "https://www.example.com/article"}],
+        "source_class": "generic_web",
+        "authority": "generic",
+        "type": "retrieval_reference",
+    }
+
+    filtered = _filter_uncited_no_evidence_source_cards(
+        [web_reference],
+        content="根据网页证据，结论如下。[1]",
+        metadata={"status": "success", "terminal_reason": "success"},
+    )
+
+    assert len(filtered) == 1
+    assert filtered[0]["source"]["id"] == "https://www.example.com/article"
+
+
+def test_final_limitation_guard_rewrites_unsupported_concrete_content_after_lane_enforcement():
+    concrete_content = "最近一年风电政策有 7 条，按时间倒序如下：..."
+    scope = {
+        "status": "resolved",
+        "source_set_mode": "single",
+        "source_ids": ["collection-1"],
+        "sources": [
+            {
+                "id": "collection-1",
+                "name": "Collection A",
+                "type": "collection",
+                "authority": "current_upload",
+            }
+        ],
+        "focus_state": "single",
+        "authority": "current_upload",
+    }
+    completion_metadata = _enforce_selected_source_metadata_first_final_consistency(
+        completion_metadata={
+            "status": "no_evidence",
+            "terminal_reason": "unsupported_document_type_claim",
+            "canonical_references": [
+                _local_file_source(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                    content="should be removed in unsupported lane",
+                )
+            ],
+            "reference_cards": [
+                _local_file_source(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                    content="should be removed in unsupported lane",
+                )
+            ],
+            "retrieval_diagnostics": [
+                {
+                    "classification": "diagnostics",
+                    "reason": "missing_type_metadata",
+                    "outcome": "unsupported",
+                }
+            ],
+        },
+        metadata={
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+            "active_source_scope": scope,
+        },
+    )
+    guarded_content, guarded_output = _apply_selected_source_diagnostics_only_content_guard(
+        content=concrete_content,
+        output=[
+            {
+                "type": "message",
+                "id": "msg-1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": concrete_content}],
+            }
+        ],
+        metadata={
+            "accepted_outputs": [],
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+            "active_source_scope": scope,
+        },
+        completion_metadata=completion_metadata,
+    )
+
+    assert "无法给出具体文档列表或结论" in guarded_content
+    assert guarded_content != concrete_content
+    assert guarded_output[-1]["content"][0]["text"] == guarded_content
