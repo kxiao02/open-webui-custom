@@ -2003,6 +2003,39 @@ class ChatTable:
             tool_name = self._retrieval_tool_name_from_payload(payload)
             if tool_name:
                 tool_names.add(tool_name)
+            payload_provenance = (
+                payload.get("provenance")
+                if isinstance(payload.get("provenance"), dict)
+                else {}
+            )
+            payload_provenance = dict(payload_provenance)
+            payload_provenance.setdefault("old_chat_compatibility_reader", True)
+            payload_provenance.setdefault(
+                "retrieval_authority", "historical_tool_output"
+            )
+            payload_provenance.setdefault("creates_new_retrieval_authority", False)
+            payload["provenance"] = payload_provenance
+            canonical_references = payload.get("canonical_references")
+            if isinstance(canonical_references, list):
+                for reference in canonical_references:
+                    if not isinstance(reference, dict):
+                        continue
+                    reference_provenance = (
+                        reference.get("provenance")
+                        if isinstance(reference.get("provenance"), dict)
+                        else {}
+                    )
+                    reference_provenance = dict(reference_provenance)
+                    reference_provenance.setdefault(
+                        "old_chat_compatibility_reader", True
+                    )
+                    reference_provenance.setdefault(
+                        "retrieval_authority", "historical_tool_output"
+                    )
+                    reference_provenance.setdefault(
+                        "creates_new_retrieval_authority", False
+                    )
+                    reference["provenance"] = reference_provenance
             diagnostic = self._diagnostic_from_retrieval_tool_payload(
                 payload, fallback_tool_name
             )

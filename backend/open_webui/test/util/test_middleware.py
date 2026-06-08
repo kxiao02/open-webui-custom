@@ -1,7 +1,23 @@
+import copy
 import asyncio
 import json
 from types import SimpleNamespace
 
+import open_webui.retrieval.utils as retrieval_utils
+import open_webui.utils.middleware as middleware
+from open_webui.retrieval.engine_adapter import build_retrieval_engine_request
+from retrieval_engine import (
+    AcceptedOutput,
+    AuthorizedScope,
+    Candidate,
+    ConnectorResponse,
+    Reference,
+    RetrievalDiagnostic,
+    RetrievalRequest,
+    RetrievalResult,
+    SourceCapability,
+)
+from retrieval_engine.contracts import WorkbookConnectorRequest
 from open_webui.utils.middleware import (
     Chats,
     _attach_generated_files_to_output,
@@ -25,6 +41,9 @@ from open_webui.utils.middleware import (
     _enforce_selected_source_metadata_first_final_consistency,
     _append_selected_source_limitation_guard,
     _resolve_active_source_scope,
+    _retrieval_engine_reference_dicts,
+    _retrieval_engine_observe_selected_source_lane,
+    _retrieval_engine_selected_source_lane_package,
     apply_source_context_to_messages,
     handle_responses_streaming_event,
 )
@@ -34,7 +53,7 @@ from open_webui.utils.task import (
     extract_session_user_facts,
     query_generation_template,
 )
-from open_webui.utils.tools import query_selected_knowledge_files
+from open_webui.utils.tools import query_selected_knowledge_files, read_selected_file
 
 
 def _local_file_source(
@@ -106,6 +125,764 @@ def _web_tool_output(
             "status": "completed",
         },
     ]
+
+
+def _retrieval_engine_result_for_reference(
+    *,
+    source_anchor: dict,
+    text: str = "Accepted engine evidence.",
+    source_id: str = "alpha-file",
+    reference_id: str = "reference:alpha",
+    output_id: str = "accepted:alpha",
+    degraded_location: bool = False,
+) -> RetrievalResult:
+    return RetrievalResult(
+        status="success",
+        request=RetrievalRequest(
+            query="engine query",
+            scope=AuthorizedScope(decision="authorized", source_ids=(source_id,)),
+            sources=(),
+        ),
+        accepted_outputs=(
+            AcceptedOutput(
+                output_id=output_id,
+                text=text,
+                evidence_bundle_ids=("bundle:alpha",),
+            ),
+        ),
+        references=(
+            Reference(
+                reference_id=reference_id,
+                source_id=source_id,
+                label="alpha-policy.txt",
+                source_anchor=source_anchor,
+                degraded_location=degraded_location,
+            ),
+        ),
+    )
+
+
+def test_retrieval_engine_adapter_builds_authorized_selected_file_scope():
+    result = build_retrieval_engine_request(
+        query="What is the Atlas launch date?",
+        selected_file_ids=("file-1", "file-2"),
+        selected_files=(
+            {
+                "id": "file-1",
+                "filename": "atlas-note.txt",
+                "hash": "hash-1",
+                "data": {"content": "Project Atlas launches on 2026-11-03."},
+                "meta": {"content_type": "text/plain", "vector_store": True},
+            },
+            {
+                "id": "file-2",
+                "filename": "off-scope.txt",
+                "data": {"content": "Do not retrieve this file."},
+                "meta": {"content_type": "text/plain", "vector_store": True},
+            },
+        ),
+        active_source_scope={
+            "status": "resolved",
+            "source_ids": ["file-1"],
+            "reason": "explicit_anchor",
+        },
+        authorization_generation="auth-gen-1",
+        vector_store_handles={
+            "file-1": {
+                "collection_name": "file-file-1",
+                "index_generation": "idx-1",
+                "capabilities": ["vector"],
+            },
+        },
+    )
+
+    assert result.request.scope.decision == "authorized"
+    assert result.request.scope.source_ids == ("file-1",)
+    assert [source.source_id for source in result.request.sources] == ["file-1"]
+    assert result.request.execution_context["authorization_generation"] == "auth-gen-1"
+    assert result.connectors
+
+    declarations = result.connectors[0].discover_capabilities(result.request.sources)
+    assert tuple(declarations) == ("file-1",)
+    assert declarations["file-1"].index_generation == "idx-1"
+
+
+def test_retrieval_engine_adapter_fails_closed_before_connector_construction():
+    denied = build_retrieval_engine_request(
+        query="What is in the selected file?",
+        selected_file_ids=("file-1",),
+        selected_files=({"id": "file-1", "filename": "atlas-note.txt"},),
+        active_source_scope={"status": "resolved", "source_ids": ["file-1"]},
+        authorization_decision={"decision": "denied", "reason": "policy_denied"},
+        vector_store_handles={"file-1": {"collection_name": "file-file-1"}},
+    )
+
+    assert denied.request.scope.decision == "denied"
+    assert denied.request.sources == ()
+    assert denied.connectors == ()
+    assert {diagnostic.code for diagnostic in denied.diagnostics} == {
+        "host_scope_denied"
+    }
+
+    unresolved = build_retrieval_engine_request(
+        query="What is in the selected file?",
+        selected_file_ids=("file-1",),
+        selected_files=({"id": "file-1", "filename": "atlas-note.txt"},),
+        active_source_scope={
+            "status": "unresolved",
+            "source_ids": ["file-1"],
+            "reason": "ambiguous_selected_source",
+        },
+        vector_store_handles={"file-1": {"collection_name": "file-file-1"}},
+    )
+
+    assert unresolved.request.scope.decision == "blocked"
+    assert unresolved.request.sources == ()
+    assert unresolved.connectors == ()
+    assert "active_source_scope_unresolved" in {
+        diagnostic.code for diagnostic in unresolved.diagnostics
+    }
+
+    missing = build_retrieval_engine_request(
+        query="What is in the selected file?",
+        selected_file_ids=("missing-file",),
+        selected_files=(),
+        active_source_scope={"status": "resolved", "source_ids": ["missing-file"]},
+        vector_store_handles={"missing-file": {"collection_name": "file-missing"}},
+    )
+
+    assert missing.request.scope.decision == "blocked"
+    assert missing.request.sources == ()
+    assert missing.connectors == ()
+    assert {"missing_selected_file", "unresolved_selected_source_scope"}.issubset(
+        {diagnostic.code for diagnostic in missing.diagnostics}
+    )
+
+
+def test_retrieval_engine_adapter_preserves_knowledge_knowflow_and_vector_metadata():
+    result = build_retrieval_engine_request(
+        query="Summarize the refinery knowledge base.",
+        selected_file_ids=("file-1",),
+        selected_files=(
+            {
+                "id": "file-1",
+                "filename": "refinery.pdf",
+                "meta": {"vector_store": True},
+            },
+        ),
+        knowledge_selections=(
+            {
+                "id": "knowledge-1",
+                "name": "Refinery Knowledge",
+                "description": "Operations corpus",
+                "files": [{"id": "file-1"}],
+            },
+        ),
+        active_source_scope={
+            "status": "resolved",
+            "source_ids": ["knowledge-1"],
+        },
+        vector_store_handles={
+            "knowledge-1": {
+                "collection_name": "knowledge-1",
+                "capabilities": ["vector", "metadata_inventory"],
+                "embedding_model_settings": {"model": "test-embedding"},
+            },
+        },
+        vector_config={"backend": "noop"},
+        knowflow_descriptors={
+            "knowledge-1": {
+                "dataset_id": "kf-dataset-1",
+                "capabilities": ["vector", "metadata_inventory"],
+                "index_generation": "knowflow-idx-9",
+            },
+        },
+    )
+
+    assert [source.source_id for source in result.request.sources] == ["knowledge-1"]
+    source = result.request.sources[0]
+    assert source.metadata["knowledge_id"] == "knowledge-1"
+    assert source.metadata["file_ids"] == ("file-1",)
+    assert source.metadata["knowflow"]["dataset_id"] == "kf-dataset-1"
+    assert result.connectors[0].vector_handles["knowledge-1"]["collection_name"] == (
+        "knowledge-1"
+    )
+
+    declarations = result.connectors[0].discover_capabilities(result.request.sources)
+    declaration = declarations["knowledge-1"]
+    assert declaration.contextual_embedding_metadata == {"model": "test-embedding"}
+    assert declaration.contextual_index_metadata["backend"] == "noop"
+
+
+def test_retrieval_engine_adapter_is_candidate_only_boundary():
+    result = build_retrieval_engine_request(
+        query="What is the Atlas launch date?",
+        selected_file_ids=("file-1",),
+        selected_files=(
+            {
+                "id": "file-1",
+                "filename": "atlas-note.txt",
+                "meta": {"vector_store": True},
+            },
+        ),
+        active_source_scope={"status": "resolved", "source_ids": ["file-1"]},
+        vector_store_handles={"file-1": {"collection_name": "file-file-1"}},
+    )
+
+    assert not hasattr(result, "accepted_outputs")
+    assert not hasattr(result, "references")
+    assert not hasattr(result, "source_cards")
+
+    response = result.connectors[0].generate_candidates(
+        request=result.request,
+        plan=SimpleNamespace(source_ids=("file-1",)),
+        sources=result.request.sources,
+    )
+    assert response.candidates == ()
+    assert not hasattr(response, "accepted_outputs")
+    assert not hasattr(response, "references")
+    assert response.diagnostics[0].code == "host_vector_retrieval_not_executed"
+
+
+def test_retrieval_engine_observe_lane_runs_without_legacy_retrieval_helper(
+    monkeypatch,
+):
+    async def fail_legacy_retrieval(*_args, **_kwargs):
+        raise AssertionError("engine observe must not call legacy retrieval")
+
+    raw_path = "/srv/open-webui/uploads/private/alpha-policy.txt"
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fail_legacy_retrieval,
+    )
+
+    observe = _retrieval_engine_observe_selected_source_lane(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "path": raw_path,
+                "meta": {"path": raw_path, "content_type": "text/plain"},
+                "data": {
+                    "content": (
+                        "Transformer grounding aligns model outputs with source text."
+                    )
+                },
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[_local_file_source(file_id="alpha-file")],
+        legacy_references=[{"source": {"id": "alpha-file"}}],
+        legacy_accepted_outputs=[{"output_id": "legacy:alpha-file"}],
+    )
+
+    assert observe["mode"] == "observe_parallel"
+    assert observe["authority"] == "retrieval_engine"
+    assert observe["status"] == "success"
+    assert observe["terminal_reason"] == "success"
+    assert observe["counts"]["accepted_output_count"] >= 1
+    assert observe["counts"]["reference_count"] >= 1
+    assert observe["plan_summary"]["evidence_shape"] == "narrow_chunk"
+    assert observe["plan_summary"]["source_ids"] == ["alpha-file"]
+    assert observe["plan_summary"]["first_pass_evidence_state"] == "accepted"
+    assert observe["comparison"]["user_visible_authority"] == "retrieval_engine"
+    assert observe["comparison"]["legacy_reference_count"] == 1
+    assert "accepted_outputs" not in observe
+    assert "references" not in observe
+    assert "source_cards" not in observe
+    assert raw_path not in repr(observe)
+
+
+def test_retrieval_engine_observe_failure_is_diagnostic_only(monkeypatch):
+    def fail_adapter(*_args, **_kwargs):
+        raise RuntimeError("adapter unavailable at /srv/private/should-not-leak")
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.engine_adapter.build_retrieval_engine_request",
+        fail_adapter,
+    )
+
+    observe = _retrieval_engine_observe_selected_source_lane(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {
+                    "content": (
+                        "Transformer grounding aligns model outputs with source text."
+                    )
+                },
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[_local_file_source(file_id="alpha-file")],
+        legacy_references=[{"source": {"id": "alpha-file"}}],
+        legacy_accepted_outputs=[{"output_id": "legacy:alpha-file"}],
+    )
+
+    assert observe["status"] == "error"
+    assert observe["terminal_reason"] == "engine_observe_error"
+    assert observe["counts"]["accepted_output_count"] == 0
+    assert observe["counts"]["reference_count"] == 0
+    assert observe["comparison"]["legacy_status"] == "success"
+    assert observe["comparison"]["legacy_reference_count"] == 1
+    assert observe["diagnostics"][0]["code"] == "retrieval_engine_observe_failed"
+    assert "accepted_outputs" not in observe
+    assert "references" not in observe
+    assert "source_cards" not in observe
+    assert "/srv/private/should-not-leak" not in repr(observe)
+
+
+class _FakeWorkbookContract:
+    def __init__(self, response=None):
+        self.calls = []
+        self.response = response
+
+    def build_workbook_request(
+        self,
+        *,
+        source_id,
+        workbook_handle,
+        workbook_request,
+        operation,
+    ):
+        self.calls.append(
+            {
+                "source_id": source_id,
+                "workbook_handle": workbook_handle,
+                "workbook_request": workbook_request,
+                "operation": operation,
+            }
+        )
+        if self.response is not None:
+            return self.response
+        return {
+            "tool": "xlsx_read_workbook",
+            "source_id": source_id,
+            "file_id": workbook_handle["file_id"],
+            "operation": operation,
+            "path": "/srv/open-webui/uploads/should-not-leak.xlsx",
+        }
+
+
+def test_retrieval_engine_adapter_builds_authorized_xlsx_workbook_boundary():
+    raw_path = "/srv/open-webui/uploads/private/budget.xlsx"
+    fake_contract = _FakeWorkbookContract(
+        response=ConnectorResponse(
+            candidates=(
+                Candidate(
+                    candidate_id="wb-candidate-1",
+                    source_id="workbook-1",
+                    capability=SourceCapability.WORKBOOK_RANGE,
+                    body="Summary B2 = 42",
+                    source_anchor={
+                        "sheet": "Summary",
+                        "cell": "B2",
+                        "server_path": raw_path,
+                    },
+                    provenance={"file_path": raw_path, "operation": "range"},
+                ),
+            ),
+            diagnostics=(
+                RetrievalDiagnostic(
+                    code="fake_workbook_contract_called",
+                    message="fake workbook call",
+                    phase="host_adapter",
+                    source_id="workbook-1",
+                    details={"path": raw_path, "sheet": "Summary"},
+                ),
+            ),
+        )
+    )
+    result = build_retrieval_engine_request(
+        query="What is the value in Summary!B2?",
+        selected_file_ids=("workbook-1", "workbook-2"),
+        selected_files=(
+            {
+                "id": "workbook-1",
+                "filename": "budget.xlsx",
+                "path": raw_path,
+                "meta": {
+                    "content_type": (
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    ),
+                    "path": raw_path,
+                    "workbook_descriptor_id": "wb-desc-1",
+                },
+            },
+            {
+                "id": "workbook-2",
+                "filename": "unselected.xlsx",
+                "path": "/srv/open-webui/uploads/private/unselected.xlsx",
+                "meta": {
+                    "content_type": (
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                },
+            },
+        ),
+        active_source_scope={"status": "resolved", "source_ids": ["workbook-1"]},
+        workbook_handles={
+            "workbook-1": {
+                "file_id": "workbook-1",
+                "filename": "budget.xlsx",
+                "storage_provider_handle": "files:workbook-1",
+                "server_path": raw_path,
+            },
+            "workbook-2": {
+                "file_id": "workbook-2",
+                "filename": "unselected.xlsx",
+                "server_path": "/srv/open-webui/uploads/private/unselected.xlsx",
+            },
+        },
+        workbook_contracts={"workbook-1": fake_contract},
+    )
+
+    assert [source.source_id for source in result.request.sources] == ["workbook-1"]
+    source = result.request.sources[0]
+    assert source.source_type == "workbook"
+    assert SourceCapability.WORKBOOK_RANGE in source.declared_capabilities
+    assert SourceCapability.SOURCE_ANCHORS in source.declared_capabilities
+    assert raw_path not in repr(result.request)
+
+    workbook_connector = next(
+        connector
+        for connector in result.connectors
+        if connector.connector_id == "open_webui_workbook"
+    )
+    assert tuple(workbook_connector.workbook_handles) == ("workbook-1",)
+    assert raw_path not in repr(workbook_connector.workbook_handles)
+
+    declarations = workbook_connector.discover_capabilities(result.request.sources)
+    assert tuple(declarations) == ("workbook-1",)
+    assert SourceCapability.WORKBOOK_RANGE in declarations["workbook-1"].capabilities
+
+    response = workbook_connector.generate_candidates(
+        request=result.request,
+        plan=SimpleNamespace(
+            workbook_request=WorkbookConnectorRequest(
+                needs_manifest=True,
+                needs_sheet_preview=True,
+                sheet_names=("Summary",),
+                ranges=("B2:C3",),
+                cells=("B2",),
+                table_refs=("RevenueTable",),
+                filter_rows=("Region=North",),
+                needs_formula_state=True,
+                needs_cache_state=True,
+                needs_coverage_state=True,
+                needs_source_anchor_hydration=True,
+            )
+        ),
+        sources=result.request.sources,
+    )
+
+    assert fake_contract.calls[0]["source_id"] == "workbook-1"
+    assert fake_contract.calls[0]["workbook_handle"] == {
+        "file_id": "workbook-1",
+        "filename": "budget.xlsx",
+        "storage_provider_handle": "files:workbook-1",
+    }
+    operation = fake_contract.calls[0]["operation"]
+    assert operation["manifest"] is True
+    assert operation["sheet_preview"] is True
+    assert operation["sheets"] == ("Summary",)
+    assert operation["ranges"] == ("B2:C3",)
+    assert operation["cells"] == ("B2",)
+    assert operation["table_refs"] == ("RevenueTable",)
+    assert operation["filter_rows"] == ("Region=North",)
+    assert operation["formula_state"] is True
+    assert operation["cache_state"] is True
+    assert operation["coverage_state"] is True
+    assert operation["source_anchor_hydration"] is True
+
+    assert response.candidates[0].source_anchor == {"sheet": "Summary", "cell": "B2"}
+    assert response.candidates[0].provenance == {"operation": "range"}
+    assert response.diagnostics[0].details == {"sheet": "Summary"}
+    assert raw_path not in repr(response)
+    assert not hasattr(response, "accepted_outputs")
+    assert not hasattr(response, "references")
+    assert not hasattr(response, "source_cards")
+
+
+def test_retrieval_engine_adapter_blocks_workbook_routing_when_scope_not_authorized():
+    workbook_file = {
+        "id": "workbook-1",
+        "filename": "budget.xlsx",
+        "meta": {
+            "content_type": (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        },
+    }
+    handle = {"workbook-1": {"file_id": "workbook-1", "filename": "budget.xlsx"}}
+
+    denied = build_retrieval_engine_request(
+        query="Read Summary!B2",
+        selected_file_ids=("workbook-1",),
+        selected_files=(workbook_file,),
+        active_source_scope={"status": "resolved", "source_ids": ["workbook-1"]},
+        authorization_decision={"decision": "denied", "reason": "policy_denied"},
+        workbook_handles=handle,
+    )
+    assert denied.request.scope.decision == "denied"
+    assert not any(
+        connector.connector_id == "open_webui_workbook"
+        for connector in denied.connectors
+    )
+
+    unresolved = build_retrieval_engine_request(
+        query="Read Summary!B2",
+        selected_file_ids=("workbook-1",),
+        selected_files=(workbook_file,),
+        active_source_scope={
+            "status": "unresolved",
+            "source_ids": ["workbook-1"],
+            "reason": "ambiguous_workbook",
+        },
+        workbook_handles=handle,
+    )
+    assert unresolved.request.scope.decision == "blocked"
+    assert not any(
+        connector.connector_id == "open_webui_workbook"
+        for connector in unresolved.connectors
+    )
+
+    missing = build_retrieval_engine_request(
+        query="Read Summary!B2",
+        selected_file_ids=("missing-workbook",),
+        selected_files=(),
+        active_source_scope={"status": "resolved", "source_ids": ["missing-workbook"]},
+        workbook_handles={
+            "missing-workbook": {
+                "file_id": "missing-workbook",
+                "filename": "missing.xlsx",
+            }
+        },
+    )
+    assert missing.request.scope.decision == "blocked"
+    assert not any(
+        connector.connector_id == "open_webui_workbook"
+        for connector in missing.connectors
+    )
+
+
+def test_retrieval_engine_adapter_rejects_non_xlsx_workbook_routing():
+    result = build_retrieval_engine_request(
+        query="Read Summary!B2",
+        selected_file_ids=("note-1",),
+        selected_files=(
+            {
+                "id": "note-1",
+                "filename": "notes.txt",
+                "meta": {"content_type": "text/plain"},
+            },
+        ),
+        active_source_scope={"status": "resolved", "source_ids": ["note-1"]},
+        workbook_handles={"note-1": {"file_id": "note-1", "filename": "notes.txt"}},
+    )
+
+    assert result.request.scope.decision == "authorized"
+    assert not any(
+        connector.connector_id == "open_webui_workbook"
+        for connector in result.connectors
+    )
+    assert "unsupported_workbook_source" in {
+        diagnostic.code for diagnostic in result.diagnostics
+    }
+
+
+def test_retrieval_engine_text_reference_normalizes_to_reference_card_with_anchor():
+    raw_path = "/srv/open-webui/uploads/private/alpha.txt"
+    result = _retrieval_engine_result_for_reference(
+        source_anchor={
+            "kind": "text_span",
+            "source_id": "alpha-file",
+            "chunk_id": "chunk-7",
+            "page": 4,
+            "start": 12,
+            "end": 38,
+            "server_path": raw_path,
+        },
+        text="Transformer grounding aligns outputs with source text.",
+        reference_id="reference:chunk-7",
+        output_id="accepted:chunk-7",
+    )
+
+    references, source_cards = _retrieval_engine_reference_dicts(
+        result,
+        {
+            "alpha-file": {
+                "id": "alpha-file",
+                "filename": "alpha-policy.txt",
+                "type": "file",
+            }
+        },
+    )
+
+    assert references == source_cards
+    reference = references[0]
+    metadata = reference["metadata"][0]
+    provenance = reference["provenance"]
+    assert reference["source"]["id"] == "alpha-file"
+    assert metadata["chunk_id"] == "chunk-7"
+    assert metadata["page"] == 4
+    assert metadata["text_span"] == {"start": 12, "end": 38}
+    assert metadata["source_id"] == "alpha-file"
+    assert metadata["reference_id"] == "reference:chunk-7"
+    assert metadata["output_id"] == "accepted:chunk-7"
+    assert metadata["source_location"]["state"] == "anchored"
+    assert provenance["source_anchor"]["chunk_id"] == "chunk-7"
+    assert raw_path not in repr(references)
+
+
+def test_retrieval_engine_workbook_reference_preserves_sheet_range_and_cell():
+    result = _retrieval_engine_result_for_reference(
+        source_id="workbook-1",
+        source_anchor={
+            "kind": "workbook_range",
+            "source_id": "workbook-1",
+            "sheet": "Summary",
+            "range": "B2:C3",
+            "cell": "B2",
+        },
+    )
+
+    references, _ = _retrieval_engine_reference_dicts(
+        result,
+        {"workbook-1": {"id": "workbook-1", "filename": "budget.xlsx", "type": "file"}},
+    )
+
+    metadata = references[0]["metadata"][0]
+    assert metadata["sheet"] == "Summary"
+    assert metadata["range"] == "B2:C3"
+    assert metadata["cell"] == "B2"
+    assert metadata["source_anchor"]["sheet"] == "Summary"
+    assert metadata["source_location"]["state"] == "anchored"
+
+
+def test_retrieval_engine_table_reference_preserves_structured_anchor_metadata():
+    result = _retrieval_engine_result_for_reference(
+        source_anchor={
+            "kind": "row",
+            "source_id": "table-source",
+            "table": "Table 4",
+            "row": 7,
+            "field": "labor",
+            "provider_region": "body",
+        },
+        source_id="table-source",
+    )
+
+    references, _ = _retrieval_engine_reference_dicts(
+        result,
+        {"table-source": {"id": "table-source", "filename": "quota-table.pdf"}},
+    )
+
+    metadata = references[0]["metadata"][0]
+    assert metadata["table"] == "Table 4"
+    assert metadata["row"] == 7
+    assert metadata["field"] == "labor"
+    assert metadata["provider_region"] == "body"
+    assert metadata["source_anchor"]["table"] == "Table 4"
+    assert metadata["source_location"]["state"] == "anchored"
+
+
+def test_retrieval_engine_degraded_location_is_explicit_without_invented_geometry():
+    result = _retrieval_engine_result_for_reference(
+        source_anchor={
+            "kind": "chunk",
+            "source_id": "alpha-file",
+            "chunk_id": "chunk-without-geometry",
+        },
+        degraded_location=True,
+    )
+
+    references, _ = _retrieval_engine_reference_dicts(
+        result,
+        {"alpha-file": {"id": "alpha-file", "filename": "alpha-policy.txt"}},
+    )
+
+    metadata = references[0]["metadata"][0]
+    assert metadata["chunk_id"] == "chunk-without-geometry"
+    assert metadata["degraded_location"] is True
+    assert metadata["source_location"]["state"] == "degraded"
+    assert metadata["source_location"]["reason"] == "engine_marked_degraded"
+    assert "page" not in metadata
+    assert "range" not in metadata
+    assert "text_span" not in metadata
+
+
+def test_retrieval_engine_diagnostics_only_result_does_not_create_reference_cards():
+    result = RetrievalResult(
+        status="no_evidence",
+        terminal_reason="no_accepted_evidence",
+        request=RetrievalRequest(
+            query="engine query",
+            scope=AuthorizedScope(decision="authorized", source_ids=("alpha-file",)),
+            sources=(),
+        ),
+        candidates=(
+            Candidate(
+                candidate_id="rejected-1",
+                source_id="alpha-file",
+                capability=SourceCapability.EXACT_TEXT,
+                body="Rejected diagnostic-only body.",
+                source_anchor={"kind": "diagnostic", "source_id": "alpha-file"},
+                weak=True,
+            ),
+        ),
+        diagnostics=(
+            RetrievalDiagnostic(
+                code="weak_candidate",
+                message="weak candidate",
+                kind="acceptance",
+                source_id="alpha-file",
+                candidate_id="rejected-1",
+            ),
+        ),
+    )
+
+    references, source_cards = _retrieval_engine_reference_dicts(
+        result,
+        {"alpha-file": {"id": "alpha-file", "filename": "alpha-policy.txt"}},
+    )
+
+    assert references == []
+    assert source_cards == []
+
+
+def test_historical_selected_source_reference_reads_without_engine_authority():
+    references = Chats.build_canonical_references(
+        {
+            "source": {
+                "id": "legacy-file",
+                "name": "legacy.txt",
+                "type": "file",
+            },
+            "document": ["Historical selected-source evidence."],
+            "metadata": [
+                {
+                    "source": "legacy-file",
+                    "file_id": "legacy-file",
+                    "chunk_id": "legacy-chunk",
+                }
+            ],
+        }
+    )
+
+    assert len(references) == 1
+    reference = references[0]
+    assert reference["source"]["id"] == "legacy-file"
+    assert reference["provenance"]["chunk_id"] == "legacy-chunk"
+    assert "engine_authority" not in reference
+    assert "engine_authority" not in reference.get("provenance", {})
 
 
 def test_response_completed_keeps_streamed_tool_items_when_final_output_drops_them():
@@ -2340,6 +3117,858 @@ def _first_pass_retrieval_request_stub():
     )
 
 
+def _retrieval_engine_result_stub(
+    *,
+    status: str,
+    terminal_reason: str,
+    diagnostics: list[dict],
+    source_id: str = "alpha-file",
+):
+    diagnostic_objects = [
+        SimpleNamespace(
+            code=str(item.get("code") or ""),
+            kind=str(item.get("kind") or "diagnostics"),
+            severity=str(item.get("severity") or "warning"),
+            phase=str(item.get("phase") or "acceptance"),
+            source_id=str(item.get("source_id") or source_id),
+            candidate_id=str(item.get("candidate_id") or "candidate:alpha"),
+            details=dict(item.get("details") or {}),
+        )
+        for item in diagnostics
+    ]
+    scope_decision = status if status in {"denied", "blocked"} else "authorized"
+    return SimpleNamespace(
+        status=status,
+        terminal_reason=terminal_reason,
+        accepted_outputs=(),
+        references=(),
+        diagnostics=diagnostic_objects,
+        candidates=(),
+        evidence_bundles=(),
+        request=SimpleNamespace(
+            scope=SimpleNamespace(
+                decision=scope_decision,
+                source_ids=(source_id,),
+                reason=terminal_reason,
+            ),
+            requested_budget_tokens=128,
+            execution_context={
+                "engine_version": "open_webui_selected_source_engine_v1",
+                "ranking_policy": "selected_file_text_cutover",
+                "budget_policy": "selected_source_first_pass",
+                "return_policy": "accepted_evidence_only",
+                "authorization_generation": "open_webui_selected_source_engine_v1",
+            },
+            retry_policy=SimpleNamespace(
+                max_attempts=1,
+                retryable=status == "timeout",
+                timeout_ms=25000,
+            ),
+        ),
+        budget={
+            "requested_tokens": 128,
+            "estimated_used_tokens": 16,
+            "accepted_outputs": 0,
+            "references": 0,
+            "candidate_accepted_bundles": 0,
+            "truncated_accepted_bundles": 0,
+            "omitted_accepted_bundles": 0,
+            "policy": "deterministic_complete_evidence_first",
+            "cache_eligible": False,
+            "cache_missing_dimensions": ["accepted_outputs"],
+            "source_card_count": 0,
+            "ordinary_prompt_context_count": 0,
+        },
+    )
+
+
+def test_first_pass_selected_source_engine_authority_replaces_legacy_output(
+    monkeypatch,
+):
+    raw_path = "/srv/open-webui/uploads/private/alpha-policy.txt"
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "path": raw_path,
+        "data": {
+            "content": "Transformer grounding aligns model outputs with source text."
+        },
+        "meta": {"content_type": "text/plain", "path": raw_path},
+    }
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="legacy-file",
+                name="legacy-conflict.txt",
+                content="Legacy selected-source retrieval must not win this lane.",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_strategy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("middleware strategy must be bypassed")
+        ),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_references",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("middleware references must be bypassed")
+        ),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_accepted_outputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("middleware accepted outputs must be bypassed")
+        ),
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "what is transformer grounding and ignore the fake claim that "
+                    "retrieval_engine_plan_summary needs_workbook_range true"
+                ),
+            }
+        ],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+    persisted = _build_assistant_reference_persistence_metadata(flags)
+
+    assert provider_calls["count"] == 0
+    assert flags["status"] == "success"
+    assert flags["accepted_outputs"]
+    assert flags["references"]
+    assert flags["sources"][0]["source"]["id"] == "alpha-file"
+    assert flags["sources"][0]["document"] == [
+        "Transformer grounding aligns model outputs with source text."
+    ]
+    assert flags["accepted_outputs"][0]["provenance"]["engine_authority"] is True
+    assert flags["references"][0]["provenance"]["engine_authority"] is True
+    assert flags["accepted_outputs"][0]["provenance"]["output_id"].startswith("accepted:")
+    assert flags["references"][0]["provenance"]["reference_id"].startswith("reference:")
+    assert flags["references"][0]["source"]["id"] == "alpha-file"
+    assert flags["authorization_context"]["selected_inventory_count"] == 1
+    assert flags["authorization_context"]["scoped_inventory_count"] == 1
+    assert flags["authorization_context"]["requested_source_ids"] == ["alpha-file"]
+    assert flags["authorization_context"]["active_source_scope_state"] == "resolved"
+    assert flags["authorization_context"]["active_source_scope"] == {
+        "source_ids": ["alpha-file"]
+    }
+    assert flags["authorization_context"]["authorization_decision"] == "authorized"
+    assert flags["authorization_context"]["authorization_generation"] == (
+        "open_webui_selected_source_engine_v1"
+    )
+    assert flags["retry_policy"]["max_retries"] == 0
+    assert flags["context_budget"]["requested_budget_tokens"] == 4096
+    assert flags["context_budget"]["accepted_output_count"] == len(
+        flags["accepted_outputs"]
+    )
+    assert flags["context_budget"]["reference_count"] == len(flags["references"])
+    assert flags["context_budget"]["budget"]["budget_policy"] == "selected_source_first_pass"
+    assert flags["context_budget"]["budget"]["return_policy"] == "accepted_evidence_only"
+    assert flags["first_pass_retrieval_strategy"]["middleware_strategy_bypassed"] is True
+    assert flags["first_pass_retrieval_strategy"]["retrieval_strategy"] == (
+        "retrieval_engine_authority"
+    )
+    assert flags["provenance"]["middleware_strategy_bypassed"] is True
+    assert flags["provenance"]["middleware_strategy_bypass_reason"] == (
+        "retrieval_engine_authority_succeeded"
+    )
+    assert flags["provenance"]["selected_source_runtime_mode"] == (
+        "retrieval_engine_authority"
+    )
+    assert flags["provenance"].get("compatibility_fallback") is not True
+    assert (
+        flags["provenance"]["compact_retrieval_provenance"]["budget"]["budget_policy"]
+        == "selected_source_first_pass"
+    )
+    assert persisted["canonical_references"][0]["metadata"][0]["engine_authority"] is True
+    assert (
+        persisted["canonical_references"][0]["metadata"][0][
+            "retrieval_engine_reference_id"
+        ].startswith("reference:")
+    )
+    assert (
+        persisted["retrieval_provenance"]["budget"]["authorization_generation"]
+        == "open_webui_selected_source_engine_v1"
+    )
+    assert repr(flags).find("legacy-conflict") == -1
+
+    observe = flags["retrieval_engine_observe"]
+    assert observe["mode"] == "observe_parallel"
+    assert observe["lane"] == "selected_file_text"
+    assert observe["authority"] == "retrieval_engine"
+    assert observe["status"] == "success"
+    assert observe["terminal_reason"] == "success"
+    assert observe["plan_summary"]["evidence_shape"] == "narrow_chunk"
+    assert observe["plan_summary"]["needs_workbook_range"] is False
+    assert observe["comparison"]["engine_reference_count"] == len(flags["references"])
+    assert "accepted_outputs" not in observe
+    assert "references" not in observe
+    assert "source_cards" not in observe
+    assert body["metadata"]["retrieval_engine_plan_summary"] == observe["plan_summary"]
+    assert flags["retrieval_engine_plan_summary"] == observe["plan_summary"]
+    assert raw_path not in repr(flags)
+
+
+def test_first_pass_selected_source_processed_local_file_uses_engine_authority(
+    monkeypatch,
+):
+    content = "The answer token is basalt-lantern-20260608."
+    prepared_file = {
+        "id": "alpha-file",
+        "name": "selected-source-public-chat.txt",
+        "context": "full",
+        "type": "file",
+        "focus_tier": "active",
+        "focus_origin": "user_selection",
+    }
+    inline_source = _local_file_source(
+        file_id="alpha-file",
+        name="selected-source-public-chat.txt",
+        content=content,
+    )
+    provider_calls = {"count": 0}
+    captured_selected_files: dict[str, list[dict]] = {}
+    original_package = middleware._retrieval_engine_selected_source_lane_package
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [prepared_file], [inline_source], [], [], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="legacy-file",
+                name="legacy-conflict.txt",
+                content="Legacy compatibility fallback must not win this lane.",
+            )
+        ]
+
+    class _SessionStub:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def recording_package(**kwargs):
+        captured_selected_files["value"] = copy.deepcopy(kwargs["selected_files"])
+        return original_package(**kwargs)
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.SessionLocal",
+        lambda: _SessionStub(),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.Files.get_file_by_id_and_user_id",
+        lambda file_id, user_id, db=None: SimpleNamespace(
+            id=file_id,
+            filename="selected-source-public-chat.txt",
+            data={"content": content, "status": "completed"},
+            meta={"content_type": "text/plain"},
+        ),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+        recording_package,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_strategy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("middleware strategy must be bypassed")
+        ),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_references",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("middleware references must be bypassed")
+        ),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_accepted_outputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("middleware accepted outputs must be bypassed")
+        ),
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is the answer token in the selected file?",
+            }
+        ],
+        "metadata": {
+            "files": [prepared_file],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1", role="user"),
+        )
+    )
+
+    assert provider_calls["count"] == 0
+    assert captured_selected_files["value"][0]["id"] == "alpha-file"
+    assert captured_selected_files["value"][0]["data"]["content"] == content
+    assert flags["status"] == "success"
+    assert flags["sources"][0]["source"]["id"] == "alpha-file"
+    assert flags["sources"][0]["document"] == [content]
+    assert flags["accepted_outputs"][0]["provenance"]["engine_authority"] is True
+    assert flags["references"][0]["provenance"]["engine_authority"] is True
+    assert flags["provenance"]["selected_source_runtime_mode"] == (
+        "retrieval_engine_authority"
+    )
+    assert flags["provenance"].get("compatibility_fallback") is not True
+    assert body["metadata"]["retrieval_engine_plan_summary"]["evidence_shape"] == (
+        "narrow_chunk"
+    )
+
+
+def test_first_pass_selected_source_engine_unsupported_shape_falls_back_to_legacy(
+    monkeypatch,
+):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "meta": {"content_type": "text/plain"},
+    }
+    provider_calls = {"count": 0}
+    strategy_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="Legacy fallback remains authoritative for unsupported shape.",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    original_strategy = middleware._first_pass_selected_source_strategy
+
+    def recording_strategy(*args, **kwargs):
+        strategy_calls["count"] += 1
+        return original_strategy(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_strategy",
+        recording_strategy,
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "what is transformer grounding"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 1
+    assert strategy_calls["count"] >= 1
+    assert flags["status"] == "success"
+    assert flags["sources"][0]["document"] == [
+        "Legacy fallback remains authoritative for unsupported shape."
+    ]
+    assert flags["provenance"]["selected_source_runtime_mode"] == (
+        "compatibility_fallback"
+    )
+    assert flags["provenance"]["compatibility_fallback"] is True
+    assert flags["provenance"]["compatibility_boundary"] == (
+        "legacy_selected_source_fallback_until_10_5"
+    )
+    assert (
+        flags["provenance"]["compact_retrieval_provenance"]["runtime_mode"]
+        == "compatibility_fallback"
+    )
+    observe = flags["retrieval_engine_observe"]
+    assert observe["status"] == "no_evidence"
+    assert observe["terminal_reason"] == "unsupported_source_shape"
+    assert observe["authority"] == "legacy_selected_source"
+    assert observe["diagnostics"][0]["code"] == (
+        "retrieval_engine_unsupported_source_shape"
+    )
+
+
+def test_first_pass_selected_source_compatibility_hybrid_events_are_bounded(
+    monkeypatch,
+):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "partial",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "meta": {"content_type": "text/plain"},
+    }
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return retrieval_utils.RetrievalSourceList(
+            [
+                _local_file_source(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                    content="Fallback Atlas evidence.",
+                )
+            ],
+            compatibility_provenance={
+                "events": [
+                    "hybrid_no_evidence_then_non_hybrid_fallback",
+                    "non_hybrid_fallback_success",
+                ]
+            },
+        )
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "what is atlas evidence"}],
+                "metadata": {"files": [retrieval_candidate]},
+            },
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert flags["status"] == "success"
+    assert flags["provenance"]["compatibility_hybrid_events"] == [
+        "hybrid_no_evidence_then_non_hybrid_fallback",
+        "non_hybrid_fallback_success",
+    ]
+    assert (
+        flags["provenance"]["compact_retrieval_provenance"][
+            "compatibility_hybrid_events"
+        ]
+        == ["hybrid_no_evidence_then_non_hybrid_fallback", "non_hybrid_fallback_success"]
+    )
+
+
+def test_retrieval_engine_cutover_denied_scope_is_fail_closed():
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {
+                    "content": "Transformer grounding aligns model outputs with source text."
+                },
+            }
+        ],
+        active_source_scope={
+            "status": "unresolved",
+            "source_ids": ["alpha-file"],
+            "reason": "ambiguous_selected_source",
+        },
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[_local_file_source(file_id="alpha-file")],
+        legacy_references=[{"source": {"id": "alpha-file"}}],
+        legacy_accepted_outputs=[{"output_id": "legacy:alpha-file"}],
+    )
+
+    assert package["authority"]["state"] == "fail_closed"
+    contract = package["contract"]
+    assert contract["status"] == "blocked"
+    assert contract["terminal_reason"] == "active_source_scope_unresolved"
+    assert contract["accepted_outputs"] == []
+    assert contract["references"] == []
+    assert contract["sources"] == []
+    assert package["observe"]["counts"]["accepted_output_count"] == 0
+    assert package["observe"]["counts"]["reference_count"] == 0
+
+
+def test_retrieval_engine_cutover_error_is_fallback_not_authority(monkeypatch):
+    def fail_adapter(*_args, **_kwargs):
+        raise RuntimeError("adapter exploded at /srv/private/should-not-leak")
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.engine_adapter.build_retrieval_engine_request",
+        fail_adapter,
+    )
+
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {
+                    "content": "Transformer grounding aligns model outputs with source text."
+                },
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[_local_file_source(file_id="alpha-file")],
+        legacy_references=[{"source": {"id": "alpha-file"}}],
+        legacy_accepted_outputs=[{"output_id": "legacy:alpha-file"}],
+    )
+
+    assert package["authority"]["state"] == "fallback"
+    observe = package["observe"]
+    assert observe["status"] == "error"
+    assert observe["terminal_reason"] == "engine_observe_error"
+    assert observe["counts"]["accepted_output_count"] == 0
+    assert observe["counts"]["reference_count"] == 0
+    assert "/srv/private/should-not-leak" not in repr(observe)
+
+
+def test_retrieval_engine_first_pass_contract_diagnostic_categories_zero_source_cards():
+    raw_path = "/srv/open-webui/uploads/private/alpha-policy.txt"
+    selected_files = [
+        {
+            "id": "alpha-file",
+            "name": "alpha-policy.txt",
+            "type": "text",
+            "path": raw_path,
+            "meta": {"path": raw_path},
+        }
+    ]
+    plan_summary = {
+        "evidence_shape": "narrow_chunk",
+        "required_capabilities": ["keyword"],
+        "first_pass_evidence_state": "diagnostics",
+    }
+    cases = [
+        ("no_evidence", "rejected_candidates_only", "candidate_rejected"),
+        ("no_evidence", "unsupported_capability", "unsupported_connector_capability"),
+        ("denied", "source_scope_violation", "source_scope_violation"),
+        ("blocked", "active_source_scope_unresolved", "active_source_scope_unresolved"),
+        ("no_evidence", "no_accepted_evidence", "no_accepted_evidence"),
+        ("timeout", "retrieval_timeout", "retrieval_timeout"),
+        ("malformed", "malformed_provider_output", "malformed_provider_output"),
+        ("partial", "parser_loss", "parser_loss"),
+    ]
+
+    for status, terminal_reason, diagnostic_code in cases:
+        result = _retrieval_engine_result_stub(
+            status=status,
+            terminal_reason=terminal_reason,
+            diagnostics=[
+                {
+                    "code": diagnostic_code,
+                    "details": {
+                        "raw_path": raw_path,
+                        "candidate_body": "candidate body must not become source cards",
+                    },
+                }
+            ],
+        )
+        contract = middleware._retrieval_engine_result_first_pass_contract(
+            result=result,
+            adapter_diagnostics=[],
+            selected_files=selected_files,
+            diagnostics=[],
+            plan_summary=plan_summary,
+        )
+
+        expected_runtime_mode = (
+            "retrieval_engine_fail_closed"
+            if status in {"denied", "blocked"}
+            else "retrieval_engine_diagnostics"
+        )
+        expected_bypass_reason = (
+            "retrieval_engine_fail_closed"
+            if status in {"denied", "blocked"}
+            else "retrieval_engine_diagnostics_only"
+        )
+        expected_authority_state = (
+            "fail_closed" if status in {"denied", "blocked"} else "diagnostics"
+        )
+
+        assert middleware._retrieval_engine_authority_state(result) == expected_authority_state
+        assert contract["status"] == status
+        assert contract["terminal_reason"] == terminal_reason
+        assert contract["accepted_outputs"] == []
+        assert contract["references"] == []
+        assert contract["sources"] == []
+        assert contract["authorization_context"]["requested_source_ids"] == ["alpha-file"]
+        assert contract["retry_policy"]["timeout_seconds"] == 25.0
+        assert contract["context_budget"]["accepted_output_count"] == 0
+        assert contract["context_budget"]["reference_count"] == 0
+        assert contract["provenance"]["selected_source_runtime_mode"] == expected_runtime_mode
+        assert contract["provenance"]["middleware_strategy_bypass_reason"] == (
+            expected_bypass_reason
+        )
+        assert contract["provenance"]["plan_summary"]["evidence_shape"] == "narrow_chunk"
+        assert contract["provenance"]["context_budget"]["accepted_output_count"] == 0
+        diagnostic = contract["diagnostics"][0]
+        assert diagnostic["reason"] == diagnostic_code
+        assert diagnostic["outcome"] == status
+        assert diagnostic["provenance"]["selected_source_runtime_mode"] == (
+            expected_runtime_mode
+        )
+        assert diagnostic["provenance"]["engine_owned"] is True
+        assert diagnostic["provenance"]["compatibility_fallback"] is False
+        assert raw_path not in json.dumps(
+            diagnostic["provenance"],
+            ensure_ascii=False,
+        )
+        assert raw_path not in json.dumps(diagnostic, ensure_ascii=False)
+        assert "candidate body must not become source cards" in json.dumps(
+            diagnostic,
+            ensure_ascii=False,
+        )
+        assert raw_path not in repr(contract["sources"])
+        assert raw_path not in repr(contract["accepted_outputs"])
+        assert raw_path not in repr(contract["references"])
+        assert "candidate body must not become source cards" not in json.dumps(
+            contract["sources"],
+            ensure_ascii=False,
+        )
+        assert "candidate body must not become source cards" not in json.dumps(
+            contract["accepted_outputs"],
+            ensure_ascii=False,
+        )
+        assert "candidate body must not become source cards" not in json.dumps(
+            contract["references"],
+            ensure_ascii=False,
+        )
+
+
+def test_first_pass_selected_source_engine_diagnostics_only_bypass_legacy_output(
+    monkeypatch,
+):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "meta": {"content_type": "text/plain"},
+    }
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def emit_event(_event):
+        return None
+
+    async def raise_legacy_provider(*_args, **_kwargs):
+        raise AssertionError("legacy provider should be bypassed")
+
+    diagnostic_contract = _engine_authority_tool_contract(
+        status="no_evidence",
+        terminal_reason="no_accepted_evidence",
+        include_evidence=False,
+        diagnostics=[
+            {
+                "classification": "no_evidence",
+                "reason": "no_accepted_evidence",
+                "outcome": "no_evidence",
+            }
+        ],
+    )
+    diagnostic_contract["diagnostics"] = copy.deepcopy(
+        diagnostic_contract["retrieval_diagnostics"]
+    )
+    diagnostic_contract["sources"] = []
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        raise_legacy_provider,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_strategy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("middleware strategy must be bypassed")
+        ),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+        lambda **_kwargs: {
+            "authority": {
+                "state": "diagnostics",
+                "reason": "no_accepted_evidence",
+            },
+            "contract": diagnostic_contract,
+            "observe": {
+                "mode": "observe_parallel",
+                "lane": "selected_file_text",
+                "authority": "retrieval_engine",
+                "status": "no_evidence",
+                "terminal_reason": "no_accepted_evidence",
+                "plan_summary": {"evidence_shape": "narrow_chunk"},
+                "counts": {
+                    "candidate_count": 0,
+                    "evidence_bundle_count": 0,
+                    "accepted_output_count": 0,
+                    "reference_count": 0,
+                    "diagnostic_count": 1,
+                },
+                "diagnostics": [
+                    {
+                        "code": "no_accepted_evidence",
+                        "kind": "diagnostics",
+                        "severity": "info",
+                        "phase": "acceptance",
+                    }
+                ],
+            },
+        },
+    )
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "what is atlas evidence"}],
+                "metadata": {"files": [retrieval_candidate]},
+            },
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert flags["status"] == "no_evidence"
+    assert flags["terminal_reason"] == "no_accepted_evidence"
+    assert flags["sources"] == []
+    assert flags["accepted_outputs"] == []
+    assert flags["references"] == []
+    assert flags["provenance"]["selected_source_runtime_mode"] == (
+        "retrieval_engine_diagnostics"
+    )
+    assert flags["provenance"]["middleware_strategy_bypass_reason"] == (
+        "retrieval_engine_diagnostics_only"
+    )
+    assert flags["first_pass_retrieval_strategy"]["retrieval_strategy"] == (
+        "retrieval_engine_diagnostics"
+    )
+    assert flags["retrieval_engine_observe"]["authority"] == "retrieval_engine"
+
+
 def test_first_pass_metadata_first_without_bounded_targeted_context_fails_closed(
     monkeypatch,
 ):
@@ -3740,6 +5369,11 @@ def test_second_pass_read_selected_file_success_persists_canonical_reference():
     assert sidecar["canonical_references"][0]["provenance"]["tool_name"] == (
         "read_selected_file"
     )
+    provenance = sidecar["canonical_references"][0]["provenance"]
+    assert provenance["old_chat_compatibility_reader"] is True
+    assert provenance["retrieval_authority"] == "historical_tool_output"
+    assert provenance["creates_new_retrieval_authority"] is False
+    assert provenance.get("engine_authority") is not True
     assert "retrieval_diagnostics" not in sidecar
 
 
@@ -4028,7 +5662,11 @@ def test_web_diagnostics_do_not_normalize_into_sources_or_references():
     )
 
 
-def _selected_source_tool_request_stub():
+def _selected_source_tool_request_stub(
+    *,
+    hybrid_enabled: bool = False,
+    hybrid_enriched_texts: bool = False,
+):
     return SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
@@ -4037,7 +5675,9 @@ def _selected_source_tool_request_stub():
                     TOP_K_RERANKER=4,
                     RELEVANCE_THRESHOLD=0.0,
                     HYBRID_BM25_WEIGHT=0.0,
-                    ENABLE_RAG_HYBRID_SEARCH=False,
+                    ENABLE_RAG_HYBRID_SEARCH=hybrid_enabled,
+                    ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS=hybrid_enriched_texts,
+                    BYPASS_EMBEDDING_AND_RETRIEVAL=False,
                 ),
                 EMBEDDING_FUNCTION=lambda text, prefix=None, user=None: [0.1],
                 RERANKING_FUNCTION=None,
@@ -4059,6 +5699,882 @@ def _selected_source_file_candidate(file_id: str, name: str) -> dict:
             }
         },
     }
+
+
+def _diagnostic_reason_set(payload: dict) -> set[str]:
+    return {
+        str(item.get("reason") or "")
+        for item in payload.get("retrieval_diagnostics", [])
+        if isinstance(item, dict)
+    }
+
+
+def _compatibility_query_result(
+    text: str | None,
+    *,
+    file_id: str = "alpha-file",
+    name: str = "alpha-policy.txt",
+) -> dict:
+    documents = [text] if text is not None else []
+    metadatas = [{"file_id": file_id, "name": name}] if text is not None else []
+    distances = [0.91] if text is not None else []
+    return {
+        "documents": [documents],
+        "metadatas": [metadatas],
+        "distances": [distances],
+    }
+
+
+def test_get_sources_from_items_hybrid_success_skips_non_hybrid_fallback(monkeypatch):
+    calls = {"hybrid": 0, "non_hybrid": 0}
+
+    async def fake_hybrid_search(**kwargs):
+        calls["hybrid"] += 1
+        assert kwargs["collection_names"] == {"alpha-file"}
+        assert kwargs["queries"] == ["atlas evidence"]
+        return _compatibility_query_result("Hybrid Atlas evidence.")
+
+    async def fake_non_hybrid_search(**_kwargs):
+        calls["non_hybrid"] += 1
+        return _compatibility_query_result("Non-hybrid fallback should stay unused.")
+
+    monkeypatch.setattr(retrieval_utils, "is_knowflow_enabled", lambda _config: False)
+    monkeypatch.setattr(
+        retrieval_utils,
+        "query_collection_with_hybrid_search",
+        fake_hybrid_search,
+    )
+    monkeypatch.setattr(retrieval_utils, "query_collection", fake_non_hybrid_search)
+
+    sources = asyncio.run(
+        retrieval_utils.get_sources_from_items(
+            request=_selected_source_tool_request_stub(hybrid_enabled=True),
+            items=[{"collection_name": "alpha-file", "name": "alpha-policy.txt"}],
+            queries=["atlas evidence"],
+            embedding_function=lambda text, prefix=None, user=None: [0.1],
+            k=2,
+            reranking_function=None,
+            k_reranker=4,
+            r=0.0,
+            hybrid_bm25_weight=0.25,
+            hybrid_search=True,
+            full_context=False,
+            user=SimpleNamespace(id="user-1", role="user"),
+        )
+    )
+
+    assert calls == {"hybrid": 1, "non_hybrid": 0}
+    assert sources[0]["document"] == ["Hybrid Atlas evidence."]
+    assert sources.compatibility_provenance["events"] == ["hybrid_success"]
+    assert sources.compatibility_diagnostics == []
+
+
+def test_get_sources_from_items_hybrid_empty_runs_non_hybrid_fallback(monkeypatch):
+    calls = {"hybrid": 0, "non_hybrid": 0}
+
+    async def fake_hybrid_search(**kwargs):
+        calls["hybrid"] += 1
+        assert kwargs["collection_names"] == {"alpha-file"}
+        assert kwargs["queries"] == ["atlas evidence"]
+        return _compatibility_query_result(None)
+
+    async def fake_non_hybrid_search(**kwargs):
+        calls["non_hybrid"] += 1
+        assert kwargs["collection_names"] == {"alpha-file"}
+        assert kwargs["queries"] == ["atlas evidence"]
+        return _compatibility_query_result("Fallback Atlas evidence.")
+
+    monkeypatch.setattr(retrieval_utils, "is_knowflow_enabled", lambda _config: False)
+    monkeypatch.setattr(
+        retrieval_utils,
+        "query_collection_with_hybrid_search",
+        fake_hybrid_search,
+    )
+    monkeypatch.setattr(retrieval_utils, "query_collection", fake_non_hybrid_search)
+
+    sources = asyncio.run(
+        retrieval_utils.get_sources_from_items(
+            request=_selected_source_tool_request_stub(hybrid_enabled=True),
+            items=[{"collection_name": "alpha-file", "name": "alpha-policy.txt"}],
+            queries=["atlas evidence"],
+            embedding_function=lambda text, prefix=None, user=None: [0.1],
+            k=2,
+            reranking_function=None,
+            k_reranker=4,
+            r=0.0,
+            hybrid_bm25_weight=0.25,
+            hybrid_search=True,
+            full_context=False,
+            user=SimpleNamespace(id="user-1", role="user"),
+        )
+    )
+
+    assert calls == {"hybrid": 1, "non_hybrid": 1}
+    assert sources[0]["document"] == ["Fallback Atlas evidence."]
+    assert sources.compatibility_provenance["events"] == [
+        "hybrid_no_evidence_then_non_hybrid_fallback",
+        "non_hybrid_fallback_success",
+    ]
+    assert sources.compatibility_diagnostics == []
+
+
+def test_get_sources_from_items_hybrid_error_reports_no_silent_empty_result(
+    monkeypatch,
+):
+    raw_path = "/srv/open-webui/uploads/private/alpha-policy.txt"
+
+    async def fake_hybrid_search(**_kwargs):
+        raise asyncio.TimeoutError(f"hybrid timed out while reading {raw_path}")
+
+    async def fake_non_hybrid_search(**kwargs):
+        assert kwargs["collection_names"] == {"alpha-file"}
+        assert kwargs["queries"] == ["atlas evidence"]
+        return _compatibility_query_result(None)
+
+    monkeypatch.setattr(retrieval_utils, "is_knowflow_enabled", lambda _config: False)
+    monkeypatch.setattr(
+        retrieval_utils,
+        "query_collection_with_hybrid_search",
+        fake_hybrid_search,
+    )
+    monkeypatch.setattr(retrieval_utils, "query_collection", fake_non_hybrid_search)
+
+    sources = asyncio.run(
+        retrieval_utils.get_sources_from_items(
+            request=_selected_source_tool_request_stub(hybrid_enabled=True),
+            items=[{"collection_name": "alpha-file", "name": "alpha-policy.txt"}],
+            queries=["atlas evidence"],
+            embedding_function=lambda text, prefix=None, user=None: [0.1],
+            k=2,
+            reranking_function=None,
+            k_reranker=4,
+            r=0.0,
+            hybrid_bm25_weight=0.25,
+            hybrid_search=True,
+            full_context=False,
+            user=SimpleNamespace(id="user-1", role="user"),
+        )
+    )
+
+    assert sources == []
+    assert sources.compatibility_provenance["events"] == [
+        "hybrid_error_then_non_hybrid_fallback",
+        "non_hybrid_fallback_no_evidence",
+    ]
+    assert _diagnostic_reason_set(
+        {"retrieval_diagnostics": sources.compatibility_diagnostics}
+    ) == {
+        "hybrid_error_then_non_hybrid_fallback",
+        "non_hybrid_fallback_no_evidence",
+    }
+    assert raw_path not in repr(sources.compatibility_diagnostics)
+
+
+def _engine_authority_tool_contract(
+    *,
+    status: str = "success",
+    source_id: str = "alpha-file",
+    terminal_reason: str = "success",
+    include_evidence: bool = True,
+    diagnostics: list[dict] | None = None,
+) -> dict:
+    raw_path = "/srv/open-webui/uploads/private/alpha-policy.txt"
+    engine_authority = status in {"success", "partial"} and include_evidence
+    runtime_mode = (
+        "retrieval_engine_authority"
+        if engine_authority
+        else (
+            "retrieval_engine_fail_closed"
+            if status in {"denied", "blocked"}
+            else "retrieval_engine_diagnostics"
+        )
+    )
+    bypass_reason = (
+        "retrieval_engine_authority_succeeded"
+        if runtime_mode == "retrieval_engine_authority"
+        else (
+            "retrieval_engine_fail_closed"
+            if runtime_mode == "retrieval_engine_fail_closed"
+            else "retrieval_engine_diagnostics_only"
+        )
+    )
+    reference = {
+        "source": {
+            "id": source_id,
+            "name": "alpha-policy.txt",
+            "type": "file",
+            "path": raw_path,
+        },
+        "document": ["Engine accepted evidence for Atlas policy."],
+        "metadata": [
+            {
+                "file_id": source_id,
+                "name": "alpha-policy.txt",
+                "retrieval_engine_reference_id": "reference:alpha-file",
+                "retrieval_engine_output_id": "accepted:bundle:alpha-file",
+                "source_anchor": {"kind": "text_span", "start": 0, "end": 42},
+                "path": raw_path,
+                "engine_authority": True,
+            }
+        ],
+        "provenance": {
+            "engine_authority": True,
+            "reference_id": "reference:alpha-file",
+            "output_id": "accepted:bundle:alpha-file",
+            "server_path": raw_path,
+        },
+    }
+    accepted_output = {
+        "output_id": "accepted:bundle:alpha-file",
+        "type": "selected_source_evidence",
+        "tool_name": "query_selected_knowledge_files",
+        "source": {"id": source_id, "name": "alpha-policy.txt", "type": "file"},
+        "snippet": "Engine accepted evidence for Atlas policy.",
+        "provenance": {
+            "engine_authority": True,
+            "file_id": source_id,
+            "reference_id": "reference:alpha-file",
+            "output_id": "accepted:bundle:alpha-file",
+            "source_anchor": {"kind": "text_span", "start": 0, "end": 42},
+            "evidence_bundle_ids": ["bundle:alpha-file"],
+            "file_path": raw_path,
+        },
+    }
+    return {
+        "status": status,
+        "terminal_reason": terminal_reason,
+        "accepted_outputs": [accepted_output] if include_evidence else [],
+        "references": [reference] if include_evidence else [],
+        "retrieval_diagnostics": diagnostics or [],
+        "authorization_context": {
+            "selected_inventory_count": 1,
+            "scoped_inventory_count": 1,
+            "active_source_scope_state": "resolved",
+            "requested_source_ids": [source_id],
+            "authorization_generation": "open_webui_selected_source_engine_v1",
+        },
+        "retry_policy": {
+            "max_retries": 0,
+            "retries_attempted": 0,
+            "retry_allowed": False,
+            "timeout_seconds": 25.0,
+        },
+        "context_budget": {
+            "requested_budget_tokens": 128,
+            "estimated_used_tokens": 32,
+            "accepted_output_count": 1 if include_evidence else 0,
+            "reference_count": 1 if include_evidence else 0,
+            "candidate_accepted_bundle_count": 1 if include_evidence else 0,
+            "truncated_accepted_bundle_count": (
+                1 if status == "partial" and terminal_reason == "budget_limited" else 0
+            ),
+            "omitted_accepted_bundle_count": 0,
+            "truncated": bool(
+                status == "partial" and terminal_reason == "budget_limited"
+            ),
+            "budget": {
+                "policy": "deterministic_complete_evidence_first",
+                "budget_policy": "selected_source_first_pass",
+                "return_policy": "accepted_evidence_only",
+                "ranking_policy": "selected_file_text_cutover",
+                "engine_version": "open_webui_selected_source_engine_v1",
+                "authorization_generation": "open_webui_selected_source_engine_v1",
+                "cache_eligible": True,
+                "cache_missing_dimensions": [],
+                "source_card_count": 1 if include_evidence else 0,
+                "ordinary_prompt_context_count": 1 if include_evidence else 0,
+            },
+        },
+        "plan_summary": {
+            "evidence_shape": "narrow_chunk",
+            "selected_source_ids": [source_id],
+            "selected_source_count": 1,
+            "first_pass_evidence_state": status,
+        },
+        "provenance": {
+            "engine_authority": engine_authority,
+            "middleware_strategy_bypassed": True,
+            "selected_source_runtime_mode": runtime_mode,
+            "engine_owned": True,
+            "middleware_strategy_bypass_reason": bypass_reason,
+        },
+    }
+
+
+def _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch):
+    def raise_legacy_policy(*_args, **_kwargs):
+        raise AssertionError("legacy selected-source tool policy should be bypassed")
+
+    async def raise_legacy_exact_lookup(*_args, **_kwargs):
+        raise AssertionError("legacy exact lookup should be bypassed")
+
+    for name, replacement in {
+        "_selected_retrieval_normalize_strategy": raise_legacy_policy,
+        "_selected_retrieval_run_local_exact_lookup": raise_legacy_exact_lookup,
+        "_selected_retrieval_apply_structured_precision_guard": raise_legacy_policy,
+        "_selected_retrieval_accepted_outputs": raise_legacy_policy,
+        "_filter_selected_retrieval_sources_by_query": raise_legacy_policy,
+    }.items():
+        monkeypatch.setattr(f"open_webui.utils.tools.{name}", replacement)
+
+    async def raise_legacy_provider(*_args, **_kwargs):
+        raise AssertionError("legacy retrieval provider should be bypassed")
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        raise_legacy_provider,
+    )
+
+
+def test_query_selected_knowledge_files_uses_engine_authority_without_legacy_policy(
+    monkeypatch,
+):
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+    raw_path = "/srv/open-webui/uploads/private/alpha-policy.txt"
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=(
+                "anchor=08063 answer_slot=labor filter=recent "
+                "What does Atlas say?"
+            ),
+            source_ids=["alpha-file"],
+            evidence_need="structured_exact",
+            __request__=_selected_source_tool_request_stub(hybrid_enabled=True),
+            __files__=[],
+            __metadata__={
+                "retrieval_engine_first_pass_contract": _engine_authority_tool_contract(),
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                ),
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success"
+    assert response["canonical_references"] == response["references"]
+    assert response["canonical_references"][0]["source"]["id"] == "alpha-file"
+    assert response["accepted_outputs"][0]["snippet"] == (
+        "Engine accepted evidence for Atlas policy."
+    )
+    assert response["strategy_used"]["retrieval_strategy"] == "retrieval_engine_authority"
+    assert response["strategy_used"]["tool_handler_policy_bypassed"] is True
+    assert response["provenance"]["tool_handler_policy_bypassed"] is True
+    assert response["provenance"]["tool_handler_bypass_reason"] == (
+        "retrieval_engine_authority_succeeded"
+    )
+    assert response["retrieval_engine_plan_summary"]["evidence_shape"] == "narrow_chunk"
+    assert raw_path not in repr(response)
+
+
+def test_read_selected_file_uses_engine_authority_without_legacy_policy(monkeypatch):
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+    raw_path = "/srv/open-webui/uploads/private/alpha-policy.txt"
+
+    response = asyncio.run(
+        read_selected_file(
+            source_id="alpha-file",
+            query="read the selected file exactly",
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__={
+                "retrieval_engine_first_pass_contract": _engine_authority_tool_contract(),
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                ),
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success"
+    assert response["source_id"] == "alpha-file"
+    assert response["canonical_references"][0]["source"]["id"] == "alpha-file"
+    assert response["accepted_outputs"][0]["source"]["id"] == "alpha-file"
+    assert response["strategy_used"]["retrieval_strategy"] == "retrieval_engine_authority"
+    assert response["provenance"]["tool_handler_bypass_reason"] == (
+        "retrieval_engine_authority_succeeded"
+    )
+    assert raw_path not in repr(response)
+
+
+def test_selected_source_tool_engine_partial_maps_budget_and_keeps_diagnostics_separate(
+    monkeypatch,
+):
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+    rejected_candidate = "Rejected candidate body must stay out of accepted lanes."
+    diagnostics = [
+        {
+            "classification": "diagnostics",
+            "reason": "budget_limited",
+            "outcome": "partial",
+            "detail": {"candidate_body": rejected_candidate},
+        }
+    ]
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="What does Atlas say with a strict budget?",
+            source_ids=["alpha-file"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__={
+                "retrieval_engine_first_pass_contract": _engine_authority_tool_contract(
+                    status="partial",
+                    terminal_reason="budget_limited",
+                    diagnostics=diagnostics,
+                ),
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                ),
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "partial"
+    assert response["terminal_reason"] == "budget_limited"
+    assert response["accepted_outputs"]
+    assert response["references"]
+    assert response["context_budget"]["truncated"] is True
+    assert response["context_budget"]["budget"]["budget_policy"] == (
+        "selected_source_first_pass"
+    )
+    assert response["authorization_context"]["authorization_generation"] == (
+        "open_webui_selected_source_engine_v1"
+    )
+    assert response["provenance"]["selected_source_runtime_mode"] == (
+        "retrieval_engine_authority"
+    )
+    assert response["provenance"]["compact_retrieval_provenance"]["budget"] == {
+        "requested_budget_tokens": 128,
+        "estimated_used_tokens": 32,
+        "accepted_output_count": 1,
+        "reference_count": 1,
+        "candidate_accepted_bundle_count": 1,
+        "truncated_accepted_bundle_count": 1,
+        "omitted_accepted_bundle_count": 0,
+        "truncated": True,
+        "policy": "deterministic_complete_evidence_first",
+        "budget_policy": "selected_source_first_pass",
+        "return_policy": "accepted_evidence_only",
+        "ranking_policy": "selected_file_text_cutover",
+        "engine_version": "open_webui_selected_source_engine_v1",
+        "authorization_generation": "open_webui_selected_source_engine_v1",
+        "cache_eligible": True,
+        "cache_miss_reason": "",
+        "cache_missing_dimensions": [],
+        "source_card_count": 1,
+        "ordinary_prompt_context_count": 1,
+    }
+    assert rejected_candidate not in json.dumps(
+        response["accepted_outputs"],
+        ensure_ascii=False,
+    )
+    assert rejected_candidate not in json.dumps(
+        response["references"],
+        ensure_ascii=False,
+    )
+
+
+def test_selected_source_tool_engine_denied_scope_fails_closed(monkeypatch):
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+    diagnostics = [
+        {
+            "classification": "diagnostics",
+            "reason": "source_scope_violation",
+            "outcome": "denied",
+            "severity": "error",
+        }
+    ]
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="What does Atlas say?",
+            source_ids=["alpha-file"],
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__={
+                "retrieval_engine_first_pass_contract": _engine_authority_tool_contract(
+                    status="denied",
+                    terminal_reason="source_scope_violation",
+                    include_evidence=False,
+                    diagnostics=diagnostics,
+                ),
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                ),
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "denied"
+    assert response["canonical_references"] == []
+    assert response["references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["retrieval_diagnostics"][0]["reason"] == "source_scope_violation"
+    assert response["retrieval_diagnostics"][0]["outcome"] == "denied"
+    assert response["retrieval_diagnostics"][0]["provenance"][
+        "selected_source_runtime_mode"
+    ] == "retrieval_engine_fail_closed"
+    assert response["strategy_used"]["tool_handler_policy_bypassed"] is True
+    assert response["provenance"]["tool_handler_bypass_reason"] == (
+        "retrieval_engine_fail_closed"
+    )
+    assert response["provenance"]["selected_source_runtime_mode"] == (
+        "retrieval_engine_fail_closed"
+    )
+
+
+def test_selected_source_tool_engine_diagnostic_categories_zero_accepted_lanes(
+    monkeypatch,
+):
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+    raw_path = "/srv/open-webui/uploads/private/alpha-policy.txt"
+    candidate_body = "candidate body must not leak into accepted lanes"
+    cases = [
+        (
+            "no_evidence",
+            "rejected_candidates_only",
+            "candidate_rejected",
+            "retrieval_engine_diagnostics",
+            "retrieval_engine_diagnostics_only",
+        ),
+        (
+            "no_evidence",
+            "unsupported_capability",
+            "unsupported_connector_capability",
+            "retrieval_engine_diagnostics",
+            "retrieval_engine_diagnostics_only",
+        ),
+        (
+            "denied",
+            "source_scope_violation",
+            "source_scope_violation",
+            "retrieval_engine_fail_closed",
+            "retrieval_engine_fail_closed",
+        ),
+        (
+            "blocked",
+            "active_source_scope_unresolved",
+            "active_source_scope_unresolved",
+            "retrieval_engine_fail_closed",
+            "retrieval_engine_fail_closed",
+        ),
+        (
+            "no_evidence",
+            "no_accepted_evidence",
+            "no_accepted_evidence",
+            "retrieval_engine_diagnostics",
+            "retrieval_engine_diagnostics_only",
+        ),
+        (
+            "timeout",
+            "retrieval_timeout",
+            "retrieval_timeout",
+            "retrieval_engine_diagnostics",
+            "retrieval_engine_diagnostics_only",
+        ),
+        (
+            "malformed",
+            "malformed_provider_output",
+            "malformed_provider_output",
+            "retrieval_engine_diagnostics",
+            "retrieval_engine_diagnostics_only",
+        ),
+        (
+            "partial",
+            "parser_loss",
+            "parser_loss",
+            "retrieval_engine_diagnostics",
+            "retrieval_engine_diagnostics_only",
+        ),
+    ]
+
+    for status, terminal_reason, diagnostic_reason, expected_mode, expected_bypass_reason in cases:
+        response = asyncio.run(
+            query_selected_knowledge_files(
+                query="What does Atlas say?",
+                source_ids=["alpha-file"],
+                evidence_need="narrow_fact",
+                __request__=_selected_source_tool_request_stub(),
+                __files__=[],
+                __metadata__={
+                    "retrieval_engine_first_pass_contract": _engine_authority_tool_contract(
+                        status=status,
+                        terminal_reason=terminal_reason,
+                        include_evidence=False,
+                        diagnostics=[
+                            {
+                                "classification": (
+                                    "no_evidence"
+                                    if status in {"no_evidence", "denied", "blocked", "timeout"}
+                                    else "diagnostics"
+                                ),
+                                "reason": diagnostic_reason,
+                                "outcome": status,
+                                "detail": {
+                                    "raw_path": raw_path,
+                                    "candidate_body": candidate_body,
+                                },
+                            }
+                        ],
+                    ),
+                    "active_source_scope": _resolved_active_source_scope(
+                        file_id="alpha-file",
+                        name="alpha-policy.txt",
+                    ),
+                },
+                __user_model__=SimpleNamespace(id="user-1"),
+            )
+        )
+
+        assert response["status"] == status
+        assert response["terminal_reason"] == terminal_reason
+        assert response["canonical_references"] == []
+        assert response["references"] == []
+        assert response["accepted_outputs"] == []
+        assert response["context_budget"]["accepted_output_count"] == 0
+        assert response["context_budget"]["reference_count"] == 0
+        assert response["authorization_context"]["requested_source_ids"] == ["alpha-file"]
+        assert response["retry_policy"]["timeout_seconds"] == 25.0
+        assert response["strategy_used"]["retrieval_strategy"] == expected_mode
+        assert response["provenance"]["selected_source_runtime_mode"] == expected_mode
+        assert response["provenance"]["tool_handler_bypass_reason"] == (
+            expected_bypass_reason
+        )
+        assert response["provenance"]["engine_owned"] is True
+        assert response["retrieval_engine_plan_summary"]["evidence_shape"] == "narrow_chunk"
+        diagnostic = response["retrieval_diagnostics"][0]
+        assert diagnostic["reason"] == diagnostic_reason
+        assert diagnostic["outcome"] == status
+        assert diagnostic["provenance"]["selected_source_runtime_mode"] == expected_mode
+        assert diagnostic["provenance"]["engine_owned"] is True
+        assert diagnostic["provenance"]["compatibility_fallback"] is False
+        assert (
+            diagnostic["provenance"]["compact_retrieval_provenance"]["runtime_mode"]
+            == expected_mode
+        )
+        assert "budget" in diagnostic["provenance"]["compact_retrieval_provenance"]
+        assert raw_path not in json.dumps(
+            diagnostic["provenance"],
+            ensure_ascii=False,
+        )
+        assert raw_path not in json.dumps(diagnostic, ensure_ascii=False)
+        assert candidate_body in json.dumps(diagnostic, ensure_ascii=False)
+        assert candidate_body not in json.dumps(
+            response["accepted_outputs"],
+            ensure_ascii=False,
+        )
+        assert candidate_body not in json.dumps(
+            response["canonical_references"],
+            ensure_ascii=False,
+        )
+        assert candidate_body not in json.dumps(
+            response["references"],
+            ensure_ascii=False,
+        )
+
+
+def test_selected_source_tool_compatibility_diagnostics_stay_marked_compatibility(
+    monkeypatch,
+):
+    raw_path = "/srv/open-webui/uploads/private/alpha-policy.txt"
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return retrieval_utils.RetrievalSourceList(
+            [],
+            compatibility_provenance={
+                "events": ["hybrid_error_then_non_hybrid_fallback"],
+            },
+            compatibility_diagnostics=[
+                {
+                    "kind": "retrieval_quality",
+                    "classification": "no_evidence",
+                    "reason": "non_hybrid_fallback_no_evidence",
+                    "outcome": "no_evidence",
+                    "detail": {"raw_path": raw_path},
+                }
+            ],
+        )
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    untrusted_contract = _engine_authority_tool_contract(
+        status="no_evidence",
+        terminal_reason="no_accepted_evidence",
+        include_evidence=False,
+        diagnostics=[
+            {
+                "classification": "no_evidence",
+                "reason": "candidate_rejected",
+                "outcome": "no_evidence",
+            }
+        ],
+    )
+    untrusted_contract["provenance"] = {}
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="fallback evidence",
+            source_ids=["alpha-file"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(hybrid_enabled=True),
+            __files__=[_selected_source_file_candidate("alpha-file", "alpha-policy.txt")],
+            __metadata__={
+                "retrieval_engine_first_pass_contract": untrusted_contract,
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                ),
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["provenance"]["selected_source_runtime_mode"] == (
+        "compatibility_fallback"
+    )
+    assert response["provenance"]["compatibility_fallback"] is True
+    assert response["provenance"]["engine_owned"] is False
+    diagnostic = response["retrieval_diagnostics"][0]
+    assert diagnostic["reason"] == "non_hybrid_fallback_no_evidence"
+    assert diagnostic["provenance"]["selected_source_runtime_mode"] == (
+        "compatibility_fallback"
+    )
+    assert diagnostic["provenance"]["compatibility_fallback"] is True
+    assert diagnostic["provenance"]["engine_owned"] is False
+    assert diagnostic["provenance"].get("engine_authority") is not True
+    assert raw_path not in json.dumps(diagnostic["provenance"], ensure_ascii=False)
+
+
+def test_selected_source_tool_untrusted_engine_contract_uses_legacy_fallback(
+    monkeypatch,
+):
+    provider_calls = {"count": 0}
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="Legacy compatibility fallback evidence.",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    untrusted_contract = _engine_authority_tool_contract()
+    untrusted_contract["provenance"] = {}
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="fallback evidence",
+            source_ids=["alpha-file"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "alpha-policy.txt")],
+            __metadata__={
+                "retrieval_engine_first_pass_contract": untrusted_contract,
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                ),
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 1
+    assert response["status"] == "success"
+    assert response["strategy_used"]["retrieval_strategy"] == "semantic_chunks"
+    assert response["provenance"]["strategy_used"]["retrieval_strategy"] == "semantic_chunks"
+    assert response["provenance"]["selected_source_runtime_mode"] == (
+        "compatibility_fallback"
+    )
+    assert response["provenance"]["compatibility_fallback"] is True
+    assert response["provenance"]["compatibility_boundary"] == (
+        "legacy_selected_source_fallback_until_10_5"
+    )
+    compact = response["provenance"]["compact_retrieval_provenance"]
+    assert compact["runtime_mode"] == "compatibility_fallback"
+    assert compact["compatibility_fallback"] is True
+    assert compact["engine_owned"] is False
+    assert response["accepted_outputs"][0]["snippet"] == (
+        "Legacy compatibility fallback evidence."
+    )
+
+
+def test_selected_source_tool_preserves_hybrid_fallback_provenance(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return retrieval_utils.RetrievalSourceList(
+            [
+                _local_file_source(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                    content="Fallback Atlas evidence.",
+                )
+            ],
+            compatibility_provenance={
+                "events": [
+                    "hybrid_no_evidence_then_non_hybrid_fallback",
+                    "non_hybrid_fallback_success",
+                ]
+            },
+        )
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="atlas evidence",
+            source_ids=["alpha-file"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(hybrid_enabled=True),
+            __files__=[_selected_source_file_candidate("alpha-file", "alpha-policy.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="alpha-policy.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success"
+    assert response["provenance"]["compatibility_hybrid_events"] == [
+        "hybrid_no_evidence_then_non_hybrid_fallback",
+        "non_hybrid_fallback_success",
+    ]
+    assert (
+        response["provenance"]["compact_retrieval_provenance"][
+            "compatibility_hybrid_events"
+        ]
+        == ["hybrid_no_evidence_then_non_hybrid_fallback", "non_hybrid_fallback_success"]
+    )
+    assert response["accepted_outputs"][0]["snippet"] == "Fallback Atlas evidence."
 
 
 def test_selected_source_metadata_first_without_targeted_context_fails_closed(
@@ -4174,6 +6690,9 @@ def test_selected_source_narrow_fact_keeps_semantic_chunk_execution(monkeypatch)
     assert response["strategy_used"]["evidence_need"] == "narrow_fact"
     assert response["strategy_used"]["retrieval_strategy"] == "semantic_chunks"
     assert response["strategy_used"]["semantic_chunk_lookup_ok"] is True
+    assert response["strategy_used"]["structured_fact_intent"] == "none"
+    assert response["strategy_used"]["structured_routing_allowed"] is False
+    assert response["strategy_used"]["structured_fact_plan"]["answer_slots"] == []
 
 
 def test_selected_source_out_of_scope_ids_deny_before_retrieval(monkeypatch):
@@ -4260,7 +6779,7 @@ def test_selected_source_metadata_first_with_bounded_targeted_context_is_scoped(
     )
 
     assert provider_calls["count"] == 1
-    assert response["status"] == "success"
+    assert response["status"] == "success", json.dumps(response, ensure_ascii=False)
     assert response["strategy_used"]["retrieval_strategy"] == (
         "metadata_first_then_targeted_chunks"
     )
@@ -4418,6 +6937,1717 @@ def test_selected_source_metadata_first_tool_path_rejects_scoped_unsupported_chu
     assert "unsupported_latest_or_recent_claim" in reasons
 
 
+def test_structured_fact_standard_value_requires_direct_value_anchor(monkeypatch):
+    provider_payloads = [
+        [
+            _local_file_source(
+                file_id="alpha-file",
+                name="sl190-table.txt",
+                content=(
+                    "SL190-2007 水土保持标准映射：北方土石山区允许土壤流失量"
+                    "为 200t/(km2·a)。"
+                ),
+            )
+        ],
+        [
+            _local_file_source(
+                file_id="alpha-file",
+                name="sl190-table.txt",
+                content=(
+                    "SL190-2007 水土保持标准映射：北方土石山区属于一级分区，"
+                    "该段未给出允许土壤流失量数值。"
+                ),
+            )
+        ],
+    ]
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return provider_payloads.pop(0)
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    base_kwargs = {
+        "query": "SL190-2007 标准里北方土石山区允许土壤流失量是多少？",
+        "source_ids": ["alpha-file"],
+        "required_anchors": ["北方土石山区", "200t/(km2·a)"],
+        "evidence_need": "narrow_fact",
+        "__request__": _selected_source_tool_request_stub(),
+        "__files__": [_selected_source_file_candidate("alpha-file", "sl190-table.txt")],
+        "__metadata__": {
+            "active_source_scope": _resolved_active_source_scope(
+                file_id="alpha-file",
+                name="sl190-table.txt",
+            )
+        },
+        "__user_model__": SimpleNamespace(id="user-1"),
+    }
+
+    supported = asyncio.run(query_selected_knowledge_files(**base_kwargs))
+    assert supported["status"] == "success"
+    assert supported["terminal_reason"] == "success"
+    assert supported["canonical_references"]
+    assert supported["accepted_outputs"]
+    plan = supported["strategy_used"]["structured_fact_plan"]
+    assert supported["strategy_used"]["structured_fact_intent"] == "standard_value"
+    assert supported["strategy_used"]["structured_routing_allowed"] is True
+    assert supported["strategy_used"]["structured_query_variants"]
+    assert supported["strategy_used"]["structured_rejected_query_variants"]
+    assert "structured_engineering_fact" in plan["intent_labels"]
+    assert "standard_value" in plan["intent_labels"]
+    assert "SL190-2007" in plan["anchor_groups"]["standard_numbers"]
+    assert "200t/(km2·a)" in plan["anchor_groups"]["units"]
+    assert "北方土石山区" in plan["hard_anchors"]
+    assert "200t/(km2·a)" in plan["hard_anchors"]
+    supported_doc = " ".join(supported["canonical_references"][0]["document"])
+    assert "北方土石山区" in supported_doc
+    assert "200t/(km2·a)" in supported_doc
+    exact_candidates = supported["strategy_used"].get("exact_anchor_candidates") or []
+    assert any(item.get("anchor") == "SL190-2007" for item in exact_candidates)
+
+    missing_value = asyncio.run(query_selected_knowledge_files(**base_kwargs))
+    assert missing_value["status"] == "no_evidence"
+    assert missing_value["terminal_reason"] in {
+        "structured_precision_guard_no_supported_fields",
+        "structured_precision_guard_incomplete_fields",
+    }
+    assert missing_value["canonical_references"] == []
+    assert missing_value["accepted_outputs"] == []
+    reasons = _diagnostic_reason_set(missing_value)
+    assert "missing_standard_mapping" in reasons or "missing_unit" in reasons
+    assert (
+        "structured_precision_guard_no_supported_fields" in reasons
+        or "structured_precision_guard_incomplete_fields" in reasons
+    )
+
+
+def test_structured_fact_quota_08063_direct_row_supports_requested_fields(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="quota-08063.txt",
+                content=(
+                    "定额 08063 行：labor=12工日；farmyard manure=3m3；"
+                    "other material cost=46元；拖拉机37w=0.75台班。"
+                ),
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=(
+                "请从定额08063提取 labor、farmyard manure、"
+                "other material cost 和 拖拉机37w 的取值。"
+            ),
+            source_ids=["alpha-file"],
+            required_anchors=[
+                "08063",
+                "labor",
+                "farmyard manure",
+                "other material cost",
+                "拖拉机37w",
+            ],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "quota-08063.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-08063.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success", json.dumps(response, ensure_ascii=False)
+    assert response["terminal_reason"] == "success"
+    assert response["canonical_references"]
+    assert response["accepted_outputs"]
+    plan = response["strategy_used"]["structured_fact_plan"]
+    assert response["strategy_used"]["structured_fact_intent"] == (
+        "multi_field_slot_extraction"
+    )
+    assert response["strategy_used"]["structured_routing_allowed"] is True
+    assert "08063" in plan["anchor_groups"]["quota_ids"]
+    assert plan["source_scope"]["requested_source_ids"] == ["alpha-file"]
+    expected_slots = ["labor", "farmyard manure", "other material cost", "拖拉机37w"]
+    assert plan["answer_slots"] == expected_slots
+    assert "other material cost 和 拖拉机37w 的取值" not in plan["answer_slots"]
+    for slot in expected_slots:
+        assert slot in plan["hard_anchors"]
+    structured_fields = response["structured_fact_fields"]
+    assert len(structured_fields) == 4
+    assert {
+        str(field.get("field_name")): str(field.get("support_state"))
+        for field in structured_fields
+        if isinstance(field, dict)
+    } == {
+        "labor": "supported",
+        "farmyard manure": "supported",
+        "other material cost": "supported",
+        "拖拉机37w": "supported",
+    }
+    assert all(field.get("source_anchor_kind") == "compatibility_text" for field in structured_fields)
+    assert all(
+        field.get("source_anchor_note") == "compatibility_only_anchor_text"
+        for field in structured_fields
+    )
+    structured_outputs = [
+        item
+        for item in response["accepted_outputs"]
+        if isinstance(item, dict) and item.get("type") == "structured_fact_field"
+    ]
+    assert len(structured_outputs) == 4
+    assert all(str(item.get("support_state")) == "supported" for item in structured_outputs)
+    assert all(item.get("strategy_name") == "multi_field_slot_extraction" for item in structured_outputs)
+    assert all(item.get("source_anchor_kind") == "compatibility_text" for item in structured_outputs)
+    assert all(
+        (field.get("evidence_bundle") or {}).get("binding") == "direct_field_value"
+        for field in structured_fields
+    )
+    exact_candidates = response["strategy_used"].get("exact_anchor_candidates") or []
+    assert any(item.get("anchor") == "08063" for item in exact_candidates)
+    assert plan["focused_queries"]
+    assert all(
+        bool(item.get("answer_slot")) for item in plan["focused_queries"] if isinstance(item, dict)
+    )
+    supported_doc = " ".join(response["canonical_references"][0]["document"])
+    accepted_snippets = " ".join(
+        str(item.get("snippet") or "")
+        for item in response["accepted_outputs"]
+        if isinstance(item, dict)
+    )
+    for pair in (
+        "labor=12工日",
+        "farmyard manure=3m3",
+        "other material cost=46元",
+        "拖拉机37w=0.75台班",
+    ):
+        assert pair in supported_doc
+        assert pair in accepted_snippets
+    assert not any(
+        reason.startswith("unsupported_") for reason in _diagnostic_reason_set(response)
+    )
+
+
+def test_structured_fact_quota_08063_split_table_headers_bind_fields(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            {
+                "source": {
+                    "id": "alpha-file",
+                    "name": "quota-08063-markdown.txt",
+                    "url": "/api/v1/files/alpha-file/content",
+                    "type": "file",
+                },
+                "document": [
+                    "表 4-1 定额消耗量",
+                    "| 定额 | labor | farmyard manure | other material cost | 拖拉机37w |",
+                    "| 单位 | 工日 | m3 | 元 | 台班 |",
+                    "| 08063 | 12 | 3 | 46 | 0.75 |",
+                ],
+                "metadata": [
+                    {
+                        "source": "alpha-file",
+                        "name": "quota-08063-markdown.txt",
+                        "file_id": "alpha-file",
+                        "table_title": "表 4-1 定额消耗量",
+                        "page": 21,
+                    },
+                    {
+                        "source": "alpha-file",
+                        "name": "quota-08063-markdown.txt",
+                        "file_id": "alpha-file",
+                        "table_title": "表 4-1 定额消耗量",
+                        "page": 21,
+                    },
+                    {
+                        "source": "alpha-file",
+                        "name": "quota-08063-markdown.txt",
+                        "file_id": "alpha-file",
+                        "table_title": "表 4-1 定额消耗量",
+                        "page": 21,
+                    },
+                    {
+                        "source": "alpha-file",
+                        "name": "quota-08063-markdown.txt",
+                        "file_id": "alpha-file",
+                        "table_title": "表 4-1 定额消耗量",
+                        "page": 21,
+                    },
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=(
+                "请从定额08063提取 labor、farmyard manure、"
+                "other material cost 和 拖拉机37w 的取值。"
+            ),
+            source_ids=["alpha-file"],
+            required_anchors=[
+                "08063",
+                "labor",
+                "farmyard manure",
+                "other material cost",
+                "拖拉机37w",
+            ],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[
+                _selected_source_file_candidate("alpha-file", "quota-08063-markdown.txt")
+            ],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-08063-markdown.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success", json.dumps(response, ensure_ascii=False)
+    fields = {
+        str(field.get("field_name")): field
+        for field in response["structured_fact_fields"]
+        if isinstance(field, dict)
+    }
+    assert {name: field.get("value") for name, field in fields.items()} == {
+        "labor": "12工日",
+        "farmyard manure": "3m3",
+        "other material cost": "46元",
+        "拖拉机37w": "0.75台班",
+    }
+    assert all(field.get("support_state") == "supported" for field in fields.values())
+    assert all(
+        (field.get("evidence_bundle") or {}).get("binding") == "table_row_header_unit"
+        for field in fields.values()
+    )
+    assert response["canonical_references"]
+    docs = " ".join(response["canonical_references"][0]["document"])
+    assert "labor" in docs
+    assert "单位" in docs
+    assert "08063" in docs
+
+
+def test_structured_fact_quota_08063_adjacent_unit_row_binds_values(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            {
+                "source": {
+                    "id": "alpha-file",
+                    "name": "quota-08063-units.txt",
+                    "url": "/api/v1/files/alpha-file/content",
+                    "type": "file",
+                },
+                "document": [
+                    "| 定额 | labor | farmyard manure | other material cost | 拖拉机37w |",
+                    "| 单位 | 工日 | m3 | 元 | 台班 |",
+                    "| 08063 | 12 | 3 | 46 | 0.75 |",
+                ],
+                "metadata": [
+                    {"source": "alpha-file", "name": "quota-08063-units.txt", "file_id": "alpha-file"},
+                    {"source": "alpha-file", "name": "quota-08063-units.txt", "file_id": "alpha-file"},
+                    {"source": "alpha-file", "name": "quota-08063-units.txt", "file_id": "alpha-file"},
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="请从定额08063提取 labor 和 farmyard manure 的取值。",
+            source_ids=["alpha-file"],
+            required_anchors=["08063", "labor", "farmyard manure"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "quota-08063-units.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-08063-units.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success", json.dumps(response, ensure_ascii=False)
+    values = {
+        str(field.get("field_name")): str(field.get("value") or "")
+        for field in response["structured_fact_fields"]
+        if isinstance(field, dict)
+    }
+    assert values == {"labor": "12工日", "farmyard manure": "3m3"}
+
+
+def test_structured_fact_quota_08063_missing_headers_are_unsupported(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            {
+                "source": {
+                    "id": "alpha-file",
+                    "name": "quota-08063-no-header.txt",
+                    "url": "/api/v1/files/alpha-file/content",
+                    "type": "file",
+                },
+                "document": [
+                    "表 4-1 定额消耗量",
+                    "| 单位 | 工日 | m3 | 元 | 台班 |",
+                    "| 08063 | 12 | 3 | 46 | 0.75 |",
+                ],
+                "metadata": [
+                    {"source": "alpha-file", "name": "quota-08063-no-header.txt", "file_id": "alpha-file"},
+                    {"source": "alpha-file", "name": "quota-08063-no-header.txt", "file_id": "alpha-file"},
+                    {"source": "alpha-file", "name": "quota-08063-no-header.txt", "file_id": "alpha-file"},
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="请从定额08063提取 labor 和 farmyard manure 的取值。",
+            source_ids=["alpha-file"],
+            required_anchors=["08063", "labor", "farmyard manure"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "quota-08063-no-header.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-08063-no-header.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    reasons = _diagnostic_reason_set(response)
+    assert "missing_table_header" in reasons
+    assert "structured_precision_guard_no_supported_fields" in reasons
+    assert all(
+        field.get("support_state") == "unsupported"
+        for field in response.get("structured_fact_fields", [])
+        if isinstance(field, dict)
+    )
+
+
+def test_structured_fact_quota_08063_row_only_parser_loss_is_unsupported(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="quota-08063-row-only.txt",
+                content="08063 12 3 46 0.75",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="quota_id=08063; answer_fields=labor,farmyard manure,other material cost,拖拉机37w",
+            source_ids=["alpha-file"],
+            required_anchors=[
+                "08063",
+                "labor",
+                "farmyard manure",
+                "other material cost",
+                "拖拉机37w",
+            ],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "quota-08063-row-only.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-08063-row-only.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    reasons = _diagnostic_reason_set(response)
+    assert "missing_table_header" in reasons
+    assert (
+        "structured_precision_guard_no_supported_fields" in reasons
+        or "structured_precision_guard_incomplete_fields" in reasons
+    )
+    assert "12" not in json.dumps(response["accepted_outputs"], ensure_ascii=False)
+
+
+def test_structured_fact_standard_value_split_neighbor_chunks_bundle_support(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            {
+                "source": {
+                    "id": "alpha-file",
+                    "name": "sl190-split.txt",
+                    "url": "/api/v1/files/alpha-file/content",
+                    "type": "file",
+                },
+                    "document": [
+                        "SL190-2007 标准映射：本项目位于北方土石山区，属于一级分区。",
+                        "200t/(km2·a)",
+                    ],
+                "metadata": [
+                    {
+                        "source": "alpha-file",
+                        "name": "sl190-split.txt",
+                        "file_id": "alpha-file",
+                        "heading": "附录A 分区说明",
+                        "page": 12,
+                    },
+                    {
+                        "source": "alpha-file",
+                        "name": "sl190-split.txt",
+                        "file_id": "alpha-file",
+                        "heading": "附录A 分区说明",
+                        "page": 13,
+                    },
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="SL190-2007 标准中北方土石山区允许土壤流失量是否为 200t/(km2·a)？",
+            source_ids=["alpha-file"],
+            required_anchors=["SL190-2007", "北方土石山区", "200t/(km2·a)"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "sl190-split.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="sl190-split.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success"
+    assert response["terminal_reason"] == "success"
+    assert response["canonical_references"]
+    supported_docs = " ".join(response["canonical_references"][0]["document"])
+    assert "SL190-2007" in supported_docs
+    assert "200t/(km2·a)" in supported_docs
+    fields = response["structured_fact_fields"]
+    assert len(fields) == 1
+    assert fields[0]["field_name"] == "standard_value"
+    assert fields[0]["support_state"] == "supported"
+    assert fields[0]["value"] == "200t/(km2·a)"
+    bundle = fields[0].get("evidence_bundle") or {}
+    assert bundle.get("standard_anchor_hits", 0) >= 1
+    assert bundle.get("classification_hits", 0) >= 1
+    assert bundle.get("value_hits", 0) >= 1
+
+
+def test_structured_fact_standard_value_rejects_unrelated_same_file_value_anchor(
+    monkeypatch,
+):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            {
+                "source": {
+                    "id": "alpha-file",
+                    "name": "sl190-unrelated-value.txt",
+                    "url": "/api/v1/files/alpha-file/content",
+                    "type": "file",
+                },
+                "document": [
+                    "SL190-2007 标准映射：本项目位于北方土石山区，属于一级分区。",
+                    "本段仅说明治理范围和监测点位，未给出允许土壤流失量。",
+                    "施工运输章节示例：车辆荷载控制值为 200t/(km2·a)，与分区标准表无关。",
+                ],
+                "metadata": [
+                    {
+                        "source": "alpha-file",
+                        "name": "sl190-unrelated-value.txt",
+                        "file_id": "alpha-file",
+                        "heading": "附录A 分区说明",
+                        "page": 12,
+                    },
+                    {
+                        "source": "alpha-file",
+                        "name": "sl190-unrelated-value.txt",
+                        "file_id": "alpha-file",
+                        "heading": "附录A 分区说明",
+                        "page": 13,
+                    },
+                    {
+                        "source": "alpha-file",
+                        "name": "sl190-unrelated-value.txt",
+                        "file_id": "alpha-file",
+                        "heading": "施工运输参数",
+                        "page": 88,
+                    },
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="SL190-2007 标准中北方土石山区允许土壤流失量是否为 200t/(km2·a)？",
+            source_ids=["alpha-file"],
+            required_anchors=["SL190-2007", "北方土石山区", "200t/(km2·a)"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[
+                _selected_source_file_candidate(
+                    "alpha-file",
+                    "sl190-unrelated-value.txt",
+                )
+            ],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="sl190-unrelated-value.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["references"] == []
+    assert response["accepted_outputs"] == []
+    reasons = _diagnostic_reason_set(response)
+    assert "missing_standard_mapping" in reasons or "missing_unit" in reasons
+    assert (
+        "structured_precision_guard_no_supported_fields" in reasons
+        or "structured_precision_guard_incomplete_fields" in reasons
+    )
+    fields = response.get("structured_fact_fields", [])
+    assert fields
+    assert fields[0]["support_state"] == "unsupported"
+    assert fields[0]["value"] == ""
+
+
+def test_structured_fact_standard_value_conflicting_values_are_not_verified(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            {
+                "source": {
+                    "id": "alpha-file",
+                    "name": "sl190-conflict.txt",
+                    "url": "/api/v1/files/alpha-file/content",
+                    "type": "file",
+                },
+                "document": [
+                    "SL190-2007 规定：北方土石山区允许土壤流失量为 200t/(km2·a)。",
+                    "SL190-2007 另一处表述：北方土石山区允许土壤流失量为 300t/(km2·a)。",
+                ],
+                "metadata": [
+                    {"source": "alpha-file", "name": "sl190-conflict.txt", "file_id": "alpha-file"},
+                    {"source": "alpha-file", "name": "sl190-conflict.txt", "file_id": "alpha-file"},
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+                query=(
+                    "SL190-2007 下北方土石山区允许土壤流失量是否出现 "
+                    "200t/(km2·a) 与 300t/(km2·a) 两个值？"
+                ),
+                source_ids=["alpha-file"],
+                required_anchors=["SL190-2007", "北方土石山区", "200t/(km2·a)"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "sl190-conflict.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="sl190-conflict.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    reasons = _diagnostic_reason_set(response)
+    assert "conflicting_value" in reasons
+    assert (
+        "structured_precision_guard_no_supported_fields" in reasons
+        or "structured_precision_guard_incomplete_fields" in reasons
+    )
+    fields = response.get("structured_fact_fields", [])
+    assert fields
+    assert fields[0]["support_state"] == "conflicting"
+    assert fields[0]["limitation_reason"] == "conflicting_value"
+
+
+def test_structured_fact_standard_value_budget_truncation_keeps_no_evidence(monkeypatch):
+    documents = [
+        f"SL190-2007 北方土石山区标准映射说明，第{i}段仅包含分类上下文。"
+        for i in range(1, 11)
+    ]
+    documents.append(
+        "SL190-2007 北方土石山区允许土壤流失量为 200t/(km2·a)。"
+    )
+    metadata = [
+        {
+            "source": "alpha-file",
+            "name": "sl190-budget.txt",
+            "file_id": "alpha-file",
+            "page": index + 1,
+        }
+        for index in range(len(documents))
+    ]
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            {
+                "source": {
+                    "id": "alpha-file",
+                    "name": "sl190-budget.txt",
+                    "url": "/api/v1/files/alpha-file/content",
+                    "type": "file",
+                },
+                "document": documents,
+                "metadata": metadata,
+            }
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+                query="请核对 SL190-2007 中北方土石山区允许土壤流失量是否为 200t/(km2·a)。",
+                source_ids=["alpha-file"],
+                required_anchors=["SL190-2007", "北方土石山区", "200t/(km2·a)"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "sl190-budget.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="sl190-budget.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["context_budget"]["truncated"] is True
+    reasons = _diagnostic_reason_set(response)
+    assert "budget_truncation" in reasons
+    fields = response.get("structured_fact_fields", [])
+    assert fields
+    assert fields[0]["support_state"] == "truncated"
+    assert fields[0]["limitation_reason"] == "budget_truncation"
+
+
+def test_structured_fact_standard_value_requires_standard_anchor_match(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+                _local_file_source(
+                    file_id="alpha-file",
+                    name="sl190-no-anchor.txt",
+                    content="该标准条目说明北方土石山区允许土壤流失量是否为 200t/(km2·a)，但文本未出现标准编号。",
+                )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+                query="SL190-2007 北方土石山区允许土壤流失量是否为 200t/(km2·a)？",
+                source_ids=["alpha-file"],
+                required_anchors=["北方土石山区", "200t/(km2·a)"],
+                evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "sl190-no-anchor.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="sl190-no-anchor.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    reasons = _diagnostic_reason_set(response)
+    assert "no_anchor_match" in reasons
+
+
+def test_structured_fact_unit_only_measurement_prompt_stays_semantic(monkeypatch):
+    provider_calls = {"count": 0}
+    query = "200t/(km2·a) 换算成 kg/m2 约等于多少？"
+
+    async def fake_get_sources_from_items(*_args, **kwargs):
+        provider_calls["count"] += 1
+        assert kwargs.get("queries") == [query]
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="unit-conversion.txt",
+                content="200t/(km2·a) 换算成 kg/m2 约等于 0.2kg/m2。",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=query,
+            source_ids=["alpha-file"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "unit-conversion.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="unit-conversion.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 1
+    assert response["status"] == "success"
+    assert response["strategy_used"]["retrieval_strategy"] == "semantic_chunks"
+    assert response["strategy_used"]["structured_fact_intent"] == "none"
+    assert response["strategy_used"]["structured_routing_allowed"] is False
+    plan = response["strategy_used"]["structured_fact_plan"]
+    assert "200t/(km2·a)" in plan["anchor_groups"]["units"]
+    assert plan["has_exact_anchor_signal"] is False
+    assert plan["has_multi_field_signal"] is False
+    assert plan["intent_labels"] == []
+
+
+def test_structured_fact_precision_guard_blocks_unrelated_table_row_values(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="quota-mixed-rows.txt",
+                content=(
+                    "定额08063 行：labor=12工日；farmyard manure=；"
+                    "other material cost=；拖拉机37w=。"
+                    "定额08064 行：labor=10工日；farmyard manure=3m3；"
+                    "other material cost=46元；拖拉机37w=0.75台班。"
+                ),
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=(
+                "请从定额08063提取 labor、farmyard manure、"
+                "other material cost 和 拖拉机37w 的取值。"
+            ),
+            source_ids=["alpha-file"],
+            required_anchors=[
+                "08063",
+                "labor",
+                "farmyard manure",
+                "other material cost",
+                "拖拉机37w",
+            ],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "quota-mixed-rows.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-mixed-rows.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["terminal_reason"] in {
+        "structured_precision_guard_no_supported_fields",
+        "structured_precision_guard_incomplete_fields",
+    }
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["structured_fact_fields"]
+    states = {
+        str(field.get("field_name")): str(field.get("support_state"))
+        for field in response["structured_fact_fields"]
+        if isinstance(field, dict)
+    }
+    assert states
+    assert any(state in {"unsupported", "conflicting", "truncated"} for state in states.values())
+    reasons = _diagnostic_reason_set(response)
+    assert (
+        "missing_table_header" in reasons
+        or "missing_field_mapping" in reasons
+        or "conflicting_field_values" in reasons
+    )
+    assert (
+        "structured_precision_guard_no_supported_fields" in reasons
+        or "structured_precision_guard_incomplete_fields" in reasons
+    )
+    assert "exact_anchor_lookup_unavailable" not in reasons
+    assert "08064" not in json.dumps(response, ensure_ascii=False)
+
+
+def test_structured_fact_precision_guard_disabled_mode_keeps_semantic_baseline(
+    monkeypatch,
+):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="quota-mixed-rows.txt",
+                content=(
+                    "定额08063 行：labor=12工日；farmyard manure=；"
+                    "other material cost=；拖拉机37w=。"
+                    "定额08064 行：labor=10工日；farmyard manure=3m3；"
+                    "other material cost=46元；拖拉机37w=0.75台班。"
+                ),
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=(
+                "请从定额08063提取 labor、farmyard manure、"
+                "other material cost 和 拖拉机37w 的取值。"
+            ),
+            source_ids=["alpha-file"],
+            required_anchors=[
+                "08063",
+                "labor",
+                "farmyard manure",
+                "other material cost",
+                "拖拉机37w",
+            ],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "quota-mixed-rows.txt")],
+            __metadata__={
+                "structured_fact_precision_mode": "disabled",
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-mixed-rows.txt",
+                ),
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["terminal_reason"] == "structured_precision_guard_disabled_context_only"
+    assert response["structured_fact_fields"]
+    states = {
+        str(field.get("field_name")): str(field.get("support_state"))
+        for field in response["structured_fact_fields"]
+        if isinstance(field, dict)
+    }
+    assert states
+    assert any(state in {"unsupported", "conflicting", "truncated"} for state in states.values())
+    reasons = _diagnostic_reason_set(response)
+    assert "structured_precision_guard_disabled_context_only" in reasons
+    assert response["strategy_used"]["structured_fact_intent"] == (
+        "multi_field_slot_extraction"
+    )
+
+
+def test_read_selected_file_disabled_precision_mode_blocks_structured_references(
+    monkeypatch,
+):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="quota-mixed-rows.txt",
+                content=(
+                    "定额08063 行：labor=12工日；farmyard manure=；"
+                    "other material cost=；拖拉机37w=。"
+                    "定额08064 行：labor=10工日；farmyard manure=3m3；"
+                    "other material cost=46元；拖拉机37w=0.75台班。"
+                ),
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        read_selected_file(
+            source_id="alpha-file",
+            query=(
+                "请从定额08063提取 labor、farmyard manure、"
+                "other material cost 和 拖拉机37w 的取值。"
+            ),
+            required_anchors=[
+                "08063",
+                "labor",
+                "farmyard manure",
+                "other material cost",
+                "拖拉机37w",
+            ],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "quota-mixed-rows.txt")],
+            __metadata__={
+                "structured_fact_precision_mode": "disabled",
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-mixed-rows.txt",
+                ),
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["terminal_reason"] == "structured_precision_guard_disabled_context_only"
+    assert response["structured_fact_fields"]
+    reasons = _diagnostic_reason_set(response)
+    assert "structured_precision_guard_disabled_context_only" in reasons
+
+
+def test_structured_fact_partial_fields_block_in_enabled_mode(monkeypatch):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="quota-partial-08063.txt",
+                content="定额08063 行：labor=12工日；farmyard manure=。",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="请从定额08063提取 labor 和 farmyard manure 的取值。",
+            source_ids=["alpha-file"],
+            required_anchors=["08063", "labor", "farmyard manure"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "quota-partial-08063.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-partial-08063.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["terminal_reason"] == "structured_precision_guard_incomplete_fields"
+    states = {
+        str(field.get("field_name")): str(field.get("support_state"))
+        for field in response.get("structured_fact_fields", [])
+        if isinstance(field, dict)
+    }
+    assert states.get("labor") == "supported"
+    assert states.get("farmyard manure") in {"unsupported", "truncated"}
+    exact_candidates = response["strategy_used"].get("exact_anchor_candidates") or []
+    assert exact_candidates
+    assert any(item.get("anchor") == "08063" for item in exact_candidates)
+
+
+def test_read_selected_file_structured_fact_partial_fields_block_in_enabled_mode(
+    monkeypatch,
+):
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="quota-partial-08063.txt",
+                content="定额08063 行：labor=12工日；farmyard manure=。",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        read_selected_file(
+            source_id="alpha-file",
+            query="请从定额08063提取 labor 和 farmyard manure 的取值。",
+            required_anchors=["08063", "labor", "farmyard manure"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "quota-partial-08063.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-partial-08063.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["terminal_reason"] == "structured_precision_guard_incomplete_fields"
+    reasons = _diagnostic_reason_set(response)
+    assert "structured_precision_guard_incomplete_fields" in reasons
+
+
+def test_structured_fact_negative_weak_or_anchor_incomplete_evidence_is_not_accepted(
+    monkeypatch,
+):
+    cases = [
+        {
+            "query": "SL190-2007 北方土石山区允许土壤流失量数值与单位。",
+            "required_anchors": ["SL190-2007", "北方土石山区", "200t/(km2·a)"],
+            "content": (
+                "NEG_STANDARD_MAPPING_ONLY SL190-2007 仅说明北方土石山区分区名称，"
+                "未提供允许土壤流失量对应数值。"
+            ),
+            "marker": "NEG_STANDARD_MAPPING_ONLY",
+        },
+        {
+            "query": "quota_id=08063; evidence_facets=labor,other material cost,拖拉机37w",
+            "required_anchors": ["08063", "labor", "other material cost", "拖拉机37w"],
+            "content": (
+                "NEG_TABLE_HEADER_MISSING 08063 12 46 0.75 仅有裸行数值，"
+                "无字段表头可绑定。"
+            ),
+            "marker": "NEG_TABLE_HEADER_MISSING",
+        },
+        {
+            "query": "quota_id=08063; evidence_facets=farmyard manure unit row",
+            "required_anchors": ["08063", "farmyard manure", "m3"],
+            "content": (
+                "NEG_UNIT_ROW_MISSING 定额08063 包含 farmyard manure=3 ，"
+                "但文段缺失单位行。"
+            ),
+            "marker": "NEG_UNIT_ROW_MISSING",
+        },
+        {
+            "query": "quota_id=08063; evidence_facets=labor,other material cost field mapping",
+            "required_anchors": ["08063", "labor", "other material cost", "field mapping"],
+            "content": (
+                "NEG_FIELD_MAPPING_MISSING 08063 labor 12 与 cost 46 出现，"
+                "但没有字段到列位映射说明。"
+            ),
+            "marker": "NEG_FIELD_MAPPING_MISSING",
+        },
+    ]
+
+    provider_payloads = [
+        [
+            _local_file_source(
+                file_id="alpha-file",
+                name="quota-negative.txt",
+                content=case["content"],
+            )
+        ]
+        for case in cases
+    ]
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return provider_payloads.pop(0)
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    for case in cases:
+        response = asyncio.run(
+            query_selected_knowledge_files(
+                query=case["query"],
+                source_ids=["alpha-file"],
+                required_anchors=case["required_anchors"],
+                evidence_need="narrow_fact",
+                __request__=_selected_source_tool_request_stub(),
+                __files__=[
+                    _selected_source_file_candidate("alpha-file", "quota-negative.txt")
+                ],
+                __metadata__={
+                    "active_source_scope": _resolved_active_source_scope(
+                        file_id="alpha-file",
+                        name="quota-negative.txt",
+                    )
+                },
+                __user_model__=SimpleNamespace(id="user-1"),
+            )
+        )
+
+        assert response["status"] == "no_evidence"
+        assert response["canonical_references"] == []
+        assert response["accepted_outputs"] == []
+        reasons = _diagnostic_reason_set(response)
+        assert (
+            "off_anchor_evidence" in reasons
+            or "off_facet_evidence" in reasons
+            or "weak_targeted_chunk_evidence" in reasons
+            or "weak_or_indirect_evidence" in reasons
+            or "no_injectable_evidence" in reasons
+            or "structured_precision_guard_no_supported_fields" in reasons
+            or "structured_precision_guard_incomplete_fields" in reasons
+        )
+        assert (
+            "no_injectable_evidence" in reasons
+            or "structured_precision_guard_no_supported_fields" in reasons
+            or "structured_precision_guard_incomplete_fields" in reasons
+        )
+        assert response.get("structured_fact_fields", []) == [] or all(
+            str(field.get("support_state") or "") != "supported"
+            for field in response.get("structured_fact_fields", [])
+            if isinstance(field, dict)
+        )
+        assert case["marker"] not in json.dumps(response, ensure_ascii=False)
+
+
+def test_structured_fact_long_incidental_context_uses_anchor_preserving_variants(
+    monkeypatch,
+):
+    provider_calls = {"count": 0}
+    long_query = (
+        "project_id=HB-2026-05; contractor=示例单位A; supervisor=示例单位B; "
+        "项目涉及多个地市、多个施工标段、多个管理变量，这些信息仅作背景上下文。"
+        "请基于 SL190-2007 说明北方土石山区允许土壤流失量，并核对"
+        " 200t/(km2·a) 是否有直接证据。"
+    )
+
+    async def fake_get_sources_from_items(*_args, **kwargs):
+        provider_calls["count"] += 1
+        queries = kwargs.get("queries") or []
+        assert long_query in queries
+        assert any("SL190-2007" in value for value in queries)
+        assert any("北方土石山区" in value for value in queries)
+        assert any("200t/(km2·a)" in value for value in queries)
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="sl190-focused.txt",
+                content=(
+                    "SL190-2007 明确：北方土石山区允许土壤流失量为 200t/(km2·a)。"
+                ),
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=long_query,
+            source_ids=["alpha-file"],
+            required_anchors=["SL190-2007", "北方土石山区", "200t/(km2·a)"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "sl190-focused.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="sl190-focused.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 1
+    assert response["query"] == long_query
+    assert response["status"] == "success"
+    assert response["terminal_reason"] == "success"
+    assert response["canonical_references"]
+    assert response["accepted_outputs"]
+    plan = response["strategy_used"]["structured_fact_plan"]
+    assert response["strategy_used"]["structured_fact_intent"] == "standard_value"
+    assert response["strategy_used"]["structured_routing_allowed"] is True
+    assert response["strategy_used"]["structured_rejected_query_variants"]
+    assert response["strategy_used"]["structured_query_variants"]
+    assert response["strategy_used"].get("exact_anchor_candidates")
+    assert "project_id=HB-2026-05" in plan["soft_context_terms"]
+    assert "contractor=示例单位A" in plan["soft_context_terms"]
+    assert plan["focused_queries"]
+    assert all(
+        "project_id=" not in str(item.get("query") or "")
+        for item in plan["focused_queries"]
+        if isinstance(item, dict)
+    )
+    reasons = _diagnostic_reason_set(response)
+    assert "exact_anchor_lookup_unavailable" not in reasons
+
+
+def test_structured_fact_false_positive_anchor_mention_stays_semantic(monkeypatch):
+    provider_calls = {"count": 0}
+    query = "08063路公交首班车时间是什么？"
+
+    async def fake_get_sources_from_items(*_args, **kwargs):
+        provider_calls["count"] += 1
+        assert kwargs.get("queries") == [query]
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="general-note.txt",
+                content="08063路公交首班车时间是 06:30。",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=query,
+            source_ids=["alpha-file"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "general-note.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="general-note.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 1
+    assert response["status"] == "success"
+    assert response["strategy_used"]["retrieval_strategy"] == "semantic_chunks"
+    assert response["strategy_used"]["structured_fact_intent"] == "none"
+    assert response["strategy_used"]["structured_routing_allowed"] is False
+    plan = response["strategy_used"]["structured_fact_plan"]
+    assert "08063" in plan["hard_anchors"]
+    assert plan["has_exact_anchor_signal"] is False
+    assert plan["intent_labels"] == []
+    assert response["strategy_used"].get("exact_anchor_candidates") in (None, [])
+    assert "exact_anchor_lookup_unavailable" not in _diagnostic_reason_set(response)
+
+
+def test_structured_fact_plan_extracts_document_and_table_anchors(monkeypatch):
+    query = (
+        "请根据文号：国能发〔2024〕12号，在表3.2中核对“北方土石山区”"
+        "对应允许土壤流失量 200t/(km2·a)。"
+    )
+
+    async def fake_get_sources_from_items(*_args, **kwargs):
+        queries = kwargs.get("queries") or []
+        assert query in queries
+        assert all("国能发〔2024〕12号" in value for value in queries)
+        assert all("表3.2" in value for value in queries)
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="doc-anchor.txt",
+                content=(
+                    "国能发〔2024〕12号 表3.2 说明：北方土石山区允许土壤流失量"
+                    " 200t/(km2·a)。"
+                ),
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=query,
+            source_ids=["alpha-file"],
+            required_anchors=["国能发〔2024〕12号", "表3.2", "北方土石山区", "200t/(km2·a)"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "doc-anchor.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="doc-anchor.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success"
+    plan = response["strategy_used"]["structured_fact_plan"]
+    assert "国能发〔2024〕12号" in plan["anchor_groups"]["document_numbers"]
+    assert "表3.2" in plan["anchor_groups"]["row_or_table_labels"]
+    assert "北方土石山区" in plan["anchor_groups"]["quoted_terms"]
+    assert "200t/(km2·a)" in plan["anchor_groups"]["units"]
+    exact_candidates = response["strategy_used"].get("exact_anchor_candidates") or []
+    assert any(item.get("anchor") == "国能发〔2024〕12号" for item in exact_candidates)
+
+
+def test_structured_fact_exact_lookup_normalizes_punctuation_and_width(monkeypatch):
+    query = "SL190-2007 中“北方土石山区”的允许土壤流失量是否为 200t/(km2·a)？"
+
+    async def fake_get_sources_from_items(*_args, **kwargs):
+        queries = kwargs.get("queries") or []
+        assert query in queries
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="sl190-variant.txt",
+                content="SL190-2007 规定：『北方土石山区』允许土壤流失量为 200t/（km²·a）。",
+            )
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=query,
+            source_ids=["alpha-file"],
+            required_anchors=["SL190-2007", "北方土石山区", "200t/(km2·a)"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "sl190-variant.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="sl190-variant.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] in {"success", "no_evidence"}
+    exact_candidates = response["strategy_used"].get("exact_anchor_candidates") or []
+    unit_candidates = [
+        item for item in exact_candidates if item.get("anchor") == "200t/(km2·a)"
+    ]
+    assert unit_candidates
+    assert all(item.get("span_basis") in {"normalized_direct_text", "normalized_compact_text"} for item in unit_candidates)
+    assert all(isinstance(item.get("normalized_text_span"), list) for item in unit_candidates)
+    assert all(item.get("match_span") == item.get("normalized_text_span") for item in unit_candidates)
+    if response["status"] == "no_evidence":
+        assert (
+            "structured_precision_guard_no_supported_fields"
+            in _diagnostic_reason_set(response)
+            or "structured_precision_guard_incomplete_fields"
+            in _diagnostic_reason_set(response)
+        )
+
+
+def test_structured_fact_exact_candidates_survive_filtered_no_evidence_and_scope_bound(
+    monkeypatch,
+):
+    query = "请从定额08063提取 labor 和 farmyard manure 的 m3 取值。"
+
+    async def fake_get_sources_from_items(*_args, **kwargs):
+        items = kwargs.get("items") or []
+        assert items
+        assert all(str(item.get("id")) == "alpha-file" for item in items if isinstance(item, dict))
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="quota-08063-partial.txt",
+                content="定额08063 行：labor=12工日；farmyard manure=。",
+            ),
+            _local_file_source(
+                file_id="beta-file",
+                name="quota-08063-unrelated-LEAK_NAME.txt",
+                content="LEAK_CONTENT_MARKER 定额08063 行：labor=12工日；farmyard manure=3m3。",
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=query,
+            source_ids=["alpha-file"],
+            required_anchors=["08063", "labor", "farmyard manure", "m3"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "quota-08063-partial.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="quota-08063-partial.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["terminal_reason"] in {
+        "weak_or_empty_retrieval_result",
+        "structured_precision_guard_incomplete_fields",
+    }
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    exact_candidates = response["strategy_used"].get("exact_anchor_candidates") or []
+    assert exact_candidates
+    assert all(item.get("source_id") == "alpha-file" for item in exact_candidates)
+    assert all(
+        str(reference.get("source", {}).get("id") or "") == "alpha-file"
+        for reference in response.get("canonical_references", [])
+        if isinstance(reference, dict)
+    )
+    reasons = _diagnostic_reason_set(response)
+    assert "source_scope_mismatch" in reasons
+    assert (
+        "off_anchor_evidence" in reasons
+        or "no_injectable_evidence" in reasons
+        or "structured_precision_guard_incomplete_fields" in reasons
+    )
+    payload_json = json.dumps(response, ensure_ascii=False)
+    assert "beta-file" not in payload_json
+    assert "quota-08063-unrelated-LEAK_NAME.txt" not in payload_json
+    assert "LEAK_CONTENT_MARKER" not in payload_json
+
+
+def test_structured_fact_exact_lookup_unavailable_requires_local_searchable_text(
+    monkeypatch,
+):
+    query = "请根据文号：国能发〔2024〕12号核对“北方土石山区”对应允许土壤流失量。"
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        return [
+            {
+                "source": {
+                    "id": "",
+                    "name": "",
+                    "url": "",
+                    "type": "file",
+                },
+                "document": [""],
+                "metadata": [{}],
+            }
+        ]
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.utils.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query=query,
+            source_ids=["alpha-file"],
+            required_anchors=["国能发〔2024〕12号", "北方土石山区"],
+            evidence_need="narrow_fact",
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[_selected_source_file_candidate("alpha-file", "sl190-empty.txt")],
+            __metadata__={
+                "active_source_scope": _resolved_active_source_scope(
+                    file_id="alpha-file",
+                    name="sl190-empty.txt",
+                )
+            },
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "no_evidence"
+    assert response["canonical_references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["strategy_used"]["structured_routing_allowed"] is True
+    assert response["strategy_used"]["structured_fact_intent"] != "none"
+    reasons = _diagnostic_reason_set(response)
+    assert "exact_anchor_lookup_unavailable" in reasons
+
+
+def test_structured_fact_unsupported_candidate_is_gated_from_prompt_context():
+    unsupported_candidate = "08063 labor=12; farmyard manure=3; other material cost=46"
+    concrete_content = f"定额08063答案如下：{unsupported_candidate}"
+
+    guarded_content, guarded_output = _apply_selected_source_diagnostics_only_content_guard(
+        content=concrete_content,
+        output=[
+            {
+                "type": "message",
+                "id": "msg-structured-fact",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": concrete_content}],
+            }
+        ],
+        metadata={
+            "status": "no_evidence",
+            "terminal_reason": "metadata_first_targeted_evidence_required",
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+            "retrieval_diagnostics": [
+                {
+                    "classification": "no_evidence",
+                    "reason": "missing_field_mapping",
+                    "outcome": "unsupported",
+                }
+            ],
+            "active_source_scope": _resolved_active_source_scope(
+                file_id="alpha-file",
+                name="quota-08063.txt",
+            ),
+        },
+        completion_metadata={
+            "status": "no_evidence",
+            "terminal_reason": "metadata_first_targeted_evidence_required",
+            "retrieval_diagnostics": [
+                {
+                    "classification": "no_evidence",
+                    "reason": "missing_field_mapping",
+                    "outcome": "unsupported",
+                }
+            ],
+            "accepted_outputs": [],
+            "canonical_references": [],
+        },
+    )
+
+    assert guarded_content != concrete_content
+    assert unsupported_candidate not in guarded_content
+    assert "无法给出具体文档列表或结论" in guarded_content
+    assert guarded_output[-1]["content"][0]["text"] == guarded_content
+
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "no_evidence",
+            "terminal_reason": "metadata_first_targeted_evidence_required",
+            "references": [
+                _local_file_source(
+                    file_id="alpha-file",
+                    name="quota-08063.txt",
+                    content=unsupported_candidate,
+                )
+            ],
+            "accepted_outputs": [
+                {
+                    "type": "selected_source_evidence",
+                    "source": {"id": "alpha-file", "name": "quota-08063.txt"},
+                    "snippet": unsupported_candidate,
+                }
+            ],
+            "first_pass_retrieval_strategy": {
+                "metadata_first_intent": True,
+                "targeted_context_bounded": False,
+                "retrieval_strategy": "metadata_first_then_targeted_chunks",
+            },
+            "active_source_scope": _resolved_active_source_scope(
+                file_id="alpha-file",
+                name="quota-08063.txt",
+            ),
+            "retrieval_diagnostics": [
+                {
+                    "classification": "no_evidence",
+                    "reason": "missing_field_mapping",
+                    "outcome": "unsupported",
+                }
+            ],
+        }
+    )
+
+    assert "canonical_references" not in persisted
+    assert "reference_cards" not in persisted
+    assert persisted["terminal_reason"] == "metadata_first_targeted_evidence_required"
+
+
 def test_diagnostics_only_blocked_persistence_keeps_reference_lanes_empty():
     persisted = _build_assistant_reference_persistence_metadata(
         {
@@ -4504,6 +8734,66 @@ def test_blocked_selected_source_diagnostics_remove_stale_message_references():
     assert persisted["retrieval_diagnostics"][0]["reason"] == (
         "metadata_first_targeted_evidence_required"
     )
+
+
+def test_engine_diagnostics_only_persistence_suppresses_stale_source_aliases():
+    rejected_candidate_body = "Rejected candidate body must stay diagnostic-only."
+    stale_reference = _local_file_source(
+        file_id="stale-file",
+        name="stale-policy.txt",
+        content="stale source-card body should not survive diagnostic-only engine turns",
+    )
+
+    persisted = _build_assistant_reference_persistence_metadata(
+        {
+            "status": "no_evidence",
+            "terminal_reason": "rejected_candidates_only",
+            "sources": [stale_reference],
+            "references": [],
+            "accepted_outputs": [],
+            "retrieval_diagnostics": [
+                {
+                    "kind": "retrieval_engine",
+                    "classification": "no_evidence",
+                    "reason": "candidate_rejected",
+                    "outcome": "no_evidence",
+                    "tool_name": "query_selected_knowledge_files",
+                    "detail": {
+                        "candidate_body": rejected_candidate_body,
+                        "candidate_id": "candidate:rejected",
+                    },
+                    "provenance": {
+                        "worker_kind": "selected_source_retrieval",
+                        "selected_source_runtime_mode": "retrieval_engine_diagnostics",
+                        "engine_owned": True,
+                        "compatibility_fallback": False,
+                    },
+                }
+            ],
+            "active_source_scope": _resolved_active_source_scope(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+            ),
+        },
+        message_metadata={
+            "sources": [stale_reference],
+            "references": [stale_reference],
+            "canonical_references": [stale_reference],
+            "reference_cards": [stale_reference],
+        },
+    )
+
+    assert persisted["status"] == "no_evidence"
+    assert persisted["terminal_reason"] == "rejected_candidates_only"
+    assert "canonical_references" not in persisted
+    assert "reference_cards" not in persisted
+    assert "references" not in persisted
+    assert "accepted_outputs" not in persisted
+    assert rejected_candidate_body in json.dumps(
+        persisted["retrieval_diagnostics"],
+        ensure_ascii=False,
+    )
+    assert "stale source-card body" not in json.dumps(persisted, ensure_ascii=False)
 
 
 def test_build_reference_sidecar_blocked_no_evidence_strips_stale_metadata_references():

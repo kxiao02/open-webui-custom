@@ -1665,6 +1665,20 @@ def save_docs_to_vector_db(
             ),
             timeout=embedding_timeout,
         )
+        embedding_engine = (
+            str(request.app.state.config.RAG_EMBEDDING_ENGINE or "").strip() or "local"
+        )
+        embedding_model = str(request.app.state.config.RAG_EMBEDDING_MODEL or "").strip()
+
+        if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+            actual_count = len(embeddings) if isinstance(embeddings, list) else 0
+            raise RuntimeError(
+                f"{embedding_engine} embedding generation failed for model "
+                f"{embedding_model}: provider returned {actual_count} embeddings "
+                f"for {len(texts)} inputs. Check upstream embedding authorization "
+                "and provider configuration."
+            )
+
         log.info(f"embeddings generated {len(embeddings)} for {len(texts)} items")
 
         items = [

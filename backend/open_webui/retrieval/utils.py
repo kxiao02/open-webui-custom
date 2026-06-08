@@ -466,6 +466,109 @@ def merge_and_sort_query_results(query_results: list[dict], k: int) -> dict:
     }
 
 
+class RetrievalSourceList(list):
+    """List result wrapper for compatibility-path provenance and diagnostics."""
+
+    def __init__(
+        self,
+        iterable=(),
+        *,
+        compatibility_provenance: dict[str, Any] | None = None,
+        compatibility_diagnostics: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(iterable)
+        self.compatibility_provenance = (
+            compatibility_provenance
+            if isinstance(compatibility_provenance, dict)
+            else {}
+        )
+        self.compatibility_diagnostics = (
+            compatibility_diagnostics
+            if isinstance(compatibility_diagnostics, list)
+            else []
+        )
+
+
+def _query_result_has_usable_documents(query_result: Any) -> bool:
+    if not isinstance(query_result, dict):
+        return False
+    documents = query_result.get("documents")
+    if not isinstance(documents, list) or not documents:
+        return False
+    rows = documents[0]
+    if not isinstance(rows, list) or not rows:
+        return False
+    return any(str(document or "").strip() for document in rows)
+
+
+def _compatibility_retrieval_detail(
+    *,
+    collection_names: list[str] | set[str] | tuple[str, ...],
+    queries: list[str] | tuple[str, ...],
+    reason: str = "",
+) -> dict[str, Any]:
+    return {
+        "collection_count": len(
+            [name for name in collection_names if str(name or "").strip()]
+        ),
+        "query_count": len([query for query in queries if str(query or "").strip()]),
+        "reason": str(reason or "").strip(),
+    }
+
+
+def _record_compatibility_retrieval_event(
+    compatibility_provenance: dict[str, Any],
+    event: str,
+    *,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    if not isinstance(compatibility_provenance, dict):
+        return
+
+    normalized_event = str(event or "").strip()
+    if not normalized_event:
+        return
+
+    events = compatibility_provenance.setdefault("events", [])
+    if normalized_event not in events:
+        events.append(normalized_event)
+
+    event_counts = compatibility_provenance.setdefault("event_counts", {})
+    event_counts[normalized_event] = int(event_counts.get(normalized_event) or 0) + 1
+
+    if isinstance(detail, dict) and detail:
+        transition_details = compatibility_provenance.setdefault(
+            "transition_details", []
+        )
+        transition_details.append({"event": normalized_event, **detail})
+
+
+def _compatibility_retrieval_diagnostic(
+    *,
+    reason: str,
+    outcome: str,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_reason = str(reason or "").strip()
+    normalized_outcome = str(outcome or "").strip() or "diagnostics"
+    diagnostic = {
+        "kind": "retrieval_provider",
+        "classification": (
+            "no_evidence" if normalized_reason == "non_hybrid_fallback_no_evidence" else "diagnostics"
+        ),
+        "reason": normalized_reason,
+        "outcome": normalized_outcome,
+    }
+    if isinstance(detail, dict) and detail:
+        diagnostic["detail"] = detail
+    return diagnostic
+
+
+def _compatibility_retrieval_error_kind(exc: Exception) -> str:
+    timeout_types = (TimeoutError, asyncio.TimeoutError)
+    return "timeout" if isinstance(exc, timeout_types) else "provider_error"
+
+
 def get_all_items_from_collections(collection_names: list[str]) -> dict:
     results = []
 
@@ -1259,6 +1362,13 @@ async def get_sources_from_items(
     knowflow_enabled = is_knowflow_enabled(request.app.state.config)
     primary_query = _first_non_empty_query(queries)
 
+    compatibility_provenance: dict[str, Any] = {
+        "hybrid_requested": bool(hybrid_search),
+        "events": [],
+        "event_counts": {},
+    }
+    compatibility_diagnostics: list[dict[str, Any]] = []
+
     for item in items:
         query_result = None
         collection_names = []
@@ -1529,8 +1639,13 @@ async def get_sources_from_items(
                 else:
                     query_result = None  # Initialize to None
                     if hybrid_search:
+                        hybrid_transition_reason = ""
+                        hybrid_transition_detail = _compatibility_retrieval_detail(
+                            collection_names=collection_names,
+                            queries=queries,
+                        )
                         try:
-                            query_result = await query_collection_with_hybrid_search(
+                            hybrid_result = await query_collection_with_hybrid_search(
                                 collection_names=collection_names,
                                 queries=queries,
                                 embedding_function=embedding_function,
@@ -1542,9 +1657,147 @@ async def get_sources_from_items(
                                 enable_enriched_texts=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS,
                             )
                         except Exception as e:
+                            hybrid_transition_reason = (
+                                "hybrid_error_then_non_hybrid_fallback"
+                            )
+                            hybrid_transition_detail = {
+                                **hybrid_transition_detail,
+                                "error_kind": _compatibility_retrieval_error_kind(e),
+                            }
                             log.debug(
                                 "Error when using hybrid search, using non hybrid search as fallback."
                             )
+                        else:
+                            if _query_result_has_usable_documents(hybrid_result):
+                                query_result = hybrid_result
+                                _record_compatibility_retrieval_event(
+                                    compatibility_provenance,
+                                    "hybrid_success",
+                                    detail=hybrid_transition_detail,
+                                )
+                            else:
+                                hybrid_transition_reason = (
+                                    "hybrid_no_evidence_then_non_hybrid_fallback"
+                                )
+
+                        if query_result is None:
+                            if hybrid_transition_reason:
+                                _record_compatibility_retrieval_event(
+                                    compatibility_provenance,
+                                    hybrid_transition_reason,
+                                    detail=hybrid_transition_detail,
+                                )
+
+                            fallback_skip_reason = ""
+                            if not any(str(query or "").strip() for query in queries):
+                                fallback_skip_reason = "missing_queries"
+                            elif not callable(embedding_function):
+                                fallback_skip_reason = "embedding_function_unavailable"
+
+                            if fallback_skip_reason:
+                                fallback_detail = _compatibility_retrieval_detail(
+                                    collection_names=collection_names,
+                                    queries=queries,
+                                    reason=fallback_skip_reason,
+                                )
+                                _record_compatibility_retrieval_event(
+                                    compatibility_provenance,
+                                    "hybrid_fallback_skipped_with_reason",
+                                    detail=fallback_detail,
+                                )
+                                if hybrid_transition_reason:
+                                    compatibility_diagnostics.append(
+                                        _compatibility_retrieval_diagnostic(
+                                            reason=hybrid_transition_reason,
+                                            outcome="fallback",
+                                            detail=hybrid_transition_detail,
+                                        )
+                                    )
+                                compatibility_diagnostics.append(
+                                    _compatibility_retrieval_diagnostic(
+                                        reason="hybrid_fallback_skipped_with_reason",
+                                        outcome="blocked",
+                                        detail=fallback_detail,
+                                    )
+                                )
+                            else:
+                                try:
+                                    query_result = await query_collection(
+                                        collection_names=collection_names,
+                                        queries=queries,
+                                        embedding_function=embedding_function,
+                                        k=k,
+                                    )
+                                except Exception as e:
+                                    fallback_error_kind = (
+                                        _compatibility_retrieval_error_kind(e)
+                                    )
+                                    fallback_detail = {
+                                        **_compatibility_retrieval_detail(
+                                            collection_names=collection_names,
+                                            queries=queries,
+                                        ),
+                                        "error_kind": fallback_error_kind,
+                                    }
+                                    _record_compatibility_retrieval_event(
+                                        compatibility_provenance,
+                                        "non_hybrid_fallback_error",
+                                        detail=fallback_detail,
+                                    )
+                                    if hybrid_transition_reason:
+                                        compatibility_diagnostics.append(
+                                            _compatibility_retrieval_diagnostic(
+                                                reason=hybrid_transition_reason,
+                                                outcome="fallback",
+                                                detail=hybrid_transition_detail,
+                                            )
+                                        )
+                                    compatibility_diagnostics.append(
+                                        _compatibility_retrieval_diagnostic(
+                                            reason="non_hybrid_fallback_error",
+                                            outcome=(
+                                                "timeout"
+                                                if fallback_error_kind == "timeout"
+                                                else "malformed"
+                                            ),
+                                            detail=fallback_detail,
+                                        )
+                                    )
+                                else:
+                                    if _query_result_has_usable_documents(query_result):
+                                        _record_compatibility_retrieval_event(
+                                            compatibility_provenance,
+                                            "non_hybrid_fallback_success",
+                                            detail=_compatibility_retrieval_detail(
+                                                collection_names=collection_names,
+                                                queries=queries,
+                                            ),
+                                        )
+                                    else:
+                                        no_evidence_detail = _compatibility_retrieval_detail(
+                                            collection_names=collection_names,
+                                            queries=queries,
+                                        )
+                                        _record_compatibility_retrieval_event(
+                                            compatibility_provenance,
+                                            "non_hybrid_fallback_no_evidence",
+                                            detail=no_evidence_detail,
+                                        )
+                                        if hybrid_transition_reason:
+                                            compatibility_diagnostics.append(
+                                                _compatibility_retrieval_diagnostic(
+                                                    reason=hybrid_transition_reason,
+                                                    outcome="fallback",
+                                                    detail=hybrid_transition_detail,
+                                                )
+                                            )
+                                        compatibility_diagnostics.append(
+                                            _compatibility_retrieval_diagnostic(
+                                                reason="non_hybrid_fallback_no_evidence",
+                                                outcome="empty",
+                                                detail=no_evidence_detail,
+                                            )
+                                        )
 
                     # fallback to non-hybrid search
                     if not hybrid_search and query_result is None:
@@ -1559,7 +1812,7 @@ async def get_sources_from_items(
 
             extracted_collections.extend(collection_names)
 
-        if query_result:
+        if _query_result_has_usable_documents(query_result):
             if "data" in item:
                 del item["data"]
             query_results.append({**query_result, "file": item})
@@ -1580,7 +1833,11 @@ async def get_sources_from_items(
                     sources.append(source)
         except Exception as e:
             log.exception(e)
-    return sources
+    return RetrievalSourceList(
+        sources,
+        compatibility_provenance=compatibility_provenance,
+        compatibility_diagnostics=compatibility_diagnostics,
+    )
 
 
 def get_model_path(model: str, update_model: bool = False):
