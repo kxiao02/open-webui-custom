@@ -56,19 +56,19 @@ ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 ENV GITHUB_MIRROR_PREFIX=${GITHUB_MIRROR_PREFIX}
 ENV ONNXRUNTIME_NODE_INSTALL_CUDA=${ONNXRUNTIME_NODE_INSTALL_CUDA}
 
-COPY scripts/github-mirror.js /app/scripts/github-mirror.js
-COPY package.json package-lock.json ./
+COPY open-webui/scripts/github-mirror.js /app/scripts/github-mirror.js
+COPY open-webui/package.json open-webui/package-lock.json ./
 RUN if [ -n "$NPM_CONFIG_REGISTRY" ]; then npm config set registry "$NPM_CONFIG_REGISTRY"; fi
 ENV NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE} --require /app/scripts/github-mirror.js"
 RUN npm ci --force
 
 # Copy only the frontend inputs so backend-only changes keep the prebaked
 # node_modules layer and frontend build cache intact.
-COPY CHANGELOG.md ./CHANGELOG.md
-COPY postcss.config.js svelte.config.js tailwind.config.js tsconfig.json vite.config.ts ./
-COPY src ./src
-COPY static ./static
-COPY scripts ./scripts
+COPY open-webui/CHANGELOG.md ./CHANGELOG.md
+COPY open-webui/postcss.config.js open-webui/svelte.config.js open-webui/tailwind.config.js open-webui/tsconfig.json open-webui/vite.config.ts ./
+COPY open-webui/src ./src
+COPY open-webui/static ./static
+COPY open-webui/scripts ./scripts
 # Keep the deploy/version hash late so changing it does not invalidate the
 # cached frontend dependency install.
 ARG BUILD_HASH
@@ -205,8 +205,10 @@ RUN if [ -n "$APT_MIRROR" ] || [ -n "$APT_SECURITY_MIRROR" ]; then \
     && rm -rf /var/lib/apt/lists/*
 
 # install python dependencies
-COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
-COPY --chown=$UID:$GID ./backend/requirements-min.txt ./requirements-min.txt
+COPY --chown=$UID:$GID open-webui/backend/requirements.txt ./requirements.txt
+COPY --chown=$UID:$GID open-webui/backend/requirements-min.txt ./requirements-min.txt
+COPY --chown=$UID:$GID retrieval-engine/pyproject.toml /tmp/retrieval-engine/pyproject.toml
+COPY --chown=$UID:$GID retrieval-engine/retrieval_engine /tmp/retrieval-engine/retrieval_engine
 
 RUN set -e; \
     pip3 install --no-cache-dir uv && \
@@ -237,6 +239,10 @@ RUN set -e; \
     pip3 install --no-cache-dir psycopg2-binary==2.9.11 pgvector==0.4.2 && \
     mkdir -p /app/backend/data && chown -R $UID:$GID /app/backend/data/ && \
     rm -rf /var/lib/apt/lists/*;
+
+# Install the standalone retrieval-engine package into the runtime image so
+# Open WebUI can import it without relying on sibling source paths or mounts.
+RUN pip3 install --no-cache-dir /tmp/retrieval-engine
 
 # S3-backed deployments require boto3 at runtime even when the slim/min install
 # path skips the full backend requirements layer.
@@ -304,6 +310,7 @@ required_modules = {
     "ctranslate2": "ctranslate2",
     "faster_whisper": "faster-whisper",
     "modelscope": "modelscope",
+    "retrieval_engine": "retrieval-engine",
     "unstructured": "unstructured",
     "xlrd": "xlrd",
 }
@@ -325,7 +332,7 @@ PY
 # Preload NLTK resources required by unstructured Excel/document loaders.
 # Keep the preload logic in a real Python module so classic Docker builds do
 # not silently keep a stale heredoc script when only the logic changes.
-COPY --chown=$UID:$GID ./backend/open_webui/utils/nltk_preload.py /tmp/nltk_preload.py
+COPY --chown=$UID:$GID open-webui/backend/open_webui/utils/nltk_preload.py /tmp/nltk_preload.py
 RUN mkdir -p "$NLTK_DATA" && \
     printf 'nltk-preload-v7\n' > "$NLTK_DATA/.image-marker" && \
     python3 /tmp/nltk_preload.py --build-preload
@@ -348,7 +355,16 @@ COPY --chown=$UID:$GID --from=build /app/CHANGELOG.md /app/CHANGELOG.md
 COPY --chown=$UID:$GID --from=build /app/package.json /app/package.json
 
 # copy backend files
-COPY --chown=$UID:$GID ./backend .
+COPY --chown=$UID:$GID open-webui/backend .
+
+# Fail the build if the packaged retrieval engine or its Open WebUI adapter
+# still cannot be imported from the final runtime filesystem.
+RUN python3 - <<'PY'
+import retrieval_engine
+import open_webui.retrieval.engine_adapter
+
+print(f"Retrieval engine import OK: {retrieval_engine.__file__}")
+PY
 
 # Keep the runtime API's build hash aligned with the frontend assets without
 # invalidating the heavy dependency layers when the deploy tag changes.
