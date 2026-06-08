@@ -352,7 +352,17 @@ def upload_file_handler(
                     user,
                     db=db,
                 )
-                return {"status": True, **file_item.model_dump()}
+                refreshed_file = Files.get_file_by_id(file_item.id, db=db)
+                if refreshed_file and (
+                    refreshed_file.user_id == user.id
+                    or user.role == "admin"
+                    or has_access_to_file(file_item.id, "read", user, db=db)
+                ):
+                    return {"status": True, **refreshed_file.model_dump()}
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
+                )
         else:
             if file_item:
                 return file_item
