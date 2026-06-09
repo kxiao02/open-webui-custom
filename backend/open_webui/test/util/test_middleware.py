@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import open_webui.retrieval.utils as retrieval_utils
 import open_webui.utils.middleware as middleware
 from open_webui.retrieval.engine_adapter import build_retrieval_engine_request
+from open_webui.retrieval.engine_contract import (
+    _retrieval_engine_authority_state,
+    _retrieval_engine_reference_dicts,
+    _retrieval_engine_result_first_pass_contract,
+)
 from retrieval_engine import (
     AcceptedOutput,
     AuthorizedScope,
@@ -37,11 +42,11 @@ from open_webui.utils.middleware import (
     _merge_persisted_and_response_sources,
     _build_chat_completion_payload,
     _is_selected_source_metadata_first_diagnostics_only,
+    _selected_source_requires_stable_limitation_response,
     _apply_selected_source_diagnostics_only_content_guard,
     _enforce_selected_source_metadata_first_final_consistency,
     _append_selected_source_limitation_guard,
     _resolve_active_source_scope,
-    _retrieval_engine_reference_dicts,
     _retrieval_engine_observe_selected_source_lane,
     _retrieval_engine_selected_source_lane_package,
     apply_source_context_to_messages,
@@ -3777,7 +3782,7 @@ def test_retrieval_engine_first_pass_contract_diagnostic_categories_zero_source_
                 }
             ],
         )
-        contract = middleware._retrieval_engine_result_first_pass_contract(
+        contract = _retrieval_engine_result_first_pass_contract(
             result=result,
             adapter_diagnostics=[],
             selected_files=selected_files,
@@ -3799,7 +3804,7 @@ def test_retrieval_engine_first_pass_contract_diagnostic_categories_zero_source_
             "fail_closed" if status in {"denied", "blocked"} else "diagnostics"
         )
 
-        assert middleware._retrieval_engine_authority_state(result) == expected_authority_state
+        assert _retrieval_engine_authority_state(result) == expected_authority_state
         assert contract["status"] == status
         assert contract["terminal_reason"] == terminal_reason
         assert contract["accepted_outputs"] == []
@@ -9355,6 +9360,118 @@ def test_selected_source_limitation_guard_restricts_source_naming_to_active_scop
     content = str(system_message.get("content") or "")
     assert "Collection A" in content
     assert "Do not reuse previous-turn source-derived lists" in content
+
+
+def test_selected_source_ambiguous_scope_requires_stable_limitation_without_metadata_first():
+    metadata = {
+        "status": "blocked",
+        "terminal_reason": "ambiguous_retrieval_scope",
+        "first_pass_retrieval_strategy": {
+            "metadata_first_intent": False,
+            "retrieval_strategy": "semantic_chunks",
+        },
+        "active_source_scope": {
+            "status": "ambiguous",
+            "source_set_mode": "none",
+            "source_ids": ["alpha-file", "beta-file"],
+            "sources": [
+                {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+                {"id": "beta-file", "name": "beta-policy.txt", "type": "file"},
+            ],
+            "reason": "ambiguous_retrieval_scope",
+            "confidence": "low",
+        },
+        "retrieval_diagnostics": [
+            {
+                "classification": "diagnostics",
+                "reason": "ambiguous_retrieval_scope",
+                "candidate_index": -1,
+            }
+        ],
+    }
+
+    assert _selected_source_requires_stable_limitation_response(metadata) is True
+
+
+def test_ambiguous_selected_source_content_guard_rewrites_generic_reupload_answer():
+    generic_reupload_answer = (
+        "当前对话中我没有检测到任何已上传或已选的文件，因此无法从中提取“储备比例”。"
+        "请上传您要参考的文件。"
+    )
+    metadata = {
+        "status": "blocked",
+        "terminal_reason": "ambiguous_retrieval_scope",
+        "first_pass_retrieval_strategy": {
+            "metadata_first_intent": False,
+            "retrieval_strategy": "semantic_chunks",
+        },
+        "active_source_scope": {
+            "status": "ambiguous",
+            "source_set_mode": "none",
+            "source_ids": ["alpha-file", "beta-file"],
+            "sources": [
+                {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+                {"id": "beta-file", "name": "beta-policy.txt", "type": "file"},
+            ],
+            "reason": "ambiguous_retrieval_scope",
+            "confidence": "low",
+        },
+        "retrieval_diagnostics": [
+            {
+                "classification": "diagnostics",
+                "reason": "ambiguous_retrieval_scope",
+                "candidate_index": -1,
+            }
+        ],
+    }
+
+    guarded_content, guarded_output = _apply_selected_source_diagnostics_only_content_guard(
+        content=generic_reupload_answer,
+        output=[
+            {
+                "type": "message",
+                "id": "msg-1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": generic_reupload_answer}],
+            }
+        ],
+        metadata=metadata,
+        completion_metadata={},
+    )
+
+    assert "alpha-policy.txt" in guarded_content
+    assert "beta-policy.txt" in guarded_content
+    assert "无法判断您指的是哪一个" in guarded_content
+    assert "请上传" not in guarded_content
+    assert guarded_output[-1]["content"][0]["text"] == guarded_content
+
+
+def test_selected_source_limitation_guard_for_ambiguous_scope_forbids_no_upload_claim():
+    messages = [{"role": "user", "content": "这个文件的储备比例是多少？"}]
+    guarded = _append_selected_source_limitation_guard(
+        messages,
+        terminal_reason="ambiguous_retrieval_scope",
+        active_source_scope={
+            "status": "ambiguous",
+            "source_set_mode": "none",
+            "source_ids": ["alpha-file", "beta-file"],
+            "sources": [
+                {"id": "alpha-file", "name": "alpha-policy.txt", "type": "file"},
+                {"id": "beta-file", "name": "beta-policy.txt", "type": "file"},
+            ],
+            "reason": "ambiguous_retrieval_scope",
+            "confidence": "low",
+        },
+    )
+
+    system_message = next(
+        (item for item in guarded if isinstance(item, dict) and item.get("role") == "system"),
+        {},
+    )
+    content = str(system_message.get("content") or "")
+    assert "Do not say no file was uploaded" in content
+    assert "name the target file" in content
 
 
 def test_runtime_selected_collection_shape_inventory_fallback_accepts_references(
