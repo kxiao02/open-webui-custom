@@ -31,6 +31,10 @@ from retrieval_engine import (  # noqa: E402
     Candidate,
     ConnectorCapabilityDeclaration,
     ConnectorResponse,
+    InMemoryDocument,
+    InMemoryExactTextConnector,
+    InMemoryFullContextConnector,
+    InMemoryKeywordConnector,
     RetrievalDiagnostic,
     RetrievalPlan,
     RetrievalRequest,
@@ -69,6 +73,16 @@ class OpenWebUIRetrievalAdapterResult:
     connectors: tuple[Any, ...] = ()
     diagnostics: tuple[RetrievalDiagnostic, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OpenWebUISelectedSourceLanePackage:
+    """Selected-source lane package normalized for middleware orchestration."""
+
+    observed_files: tuple[dict[str, Any], ...] = ()
+    adapter_result: OpenWebUIRetrievalAdapterResult | None = None
+    runtime_connectors: tuple[Any, ...] = ()
+    unsupported_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -436,6 +450,66 @@ def build_retrieval_engine_request(
     )
 
 
+def build_selected_source_retrieval_engine_package(
+    *,
+    query: str,
+    selected_files: Sequence[Any],
+    active_source_scope: Mapping[str, Any] | None = None,
+    authorization_generation: str | None = None,
+    execution_context: Mapping[str, Any] | None = None,
+) -> OpenWebUISelectedSourceLanePackage | None:
+    """Normalize selected-file state and package retrieval-engine inputs."""
+
+    observed_files = _selected_source_observed_files(selected_files)
+    selected_file_ids = _stable_ids(
+        _string_or_none(file_item.get("id"))
+        for file_item in observed_files
+    )
+    if not selected_file_ids:
+        return None
+
+    documents = tuple(
+        InMemoryDocument(
+            source_id=str(file_item["id"]),
+            label=str(
+                file_item.get("filename") or file_item.get("name") or file_item["id"]
+            ),
+            text=str((file_item.get("data") or {}).get("content") or ""),
+            metadata={
+                "canonical_text_available": True,
+                "canonical_range_available": True,
+            },
+        )
+        for file_item in observed_files
+        if str((file_item.get("data") or {}).get("content") or "").strip()
+    )
+    if not documents:
+        return OpenWebUISelectedSourceLanePackage(
+            observed_files=observed_files,
+            unsupported_reason="unsupported_source_shape",
+        )
+
+    adapter_result = build_retrieval_engine_request(
+        query=query,
+        selected_file_ids=selected_file_ids,
+        selected_files=observed_files,
+        active_source_scope=active_source_scope,
+        authorization_generation=authorization_generation,
+        execution_context=execution_context,
+    )
+    runtime_connectors = (
+        *adapter_result.connectors,
+        InMemoryExactTextConnector(documents),
+        InMemoryKeywordConnector(documents),
+        InMemoryFullContextConnector(documents),
+    )
+    return OpenWebUISelectedSourceLanePackage(
+        observed_files=observed_files,
+        adapter_result=adapter_result,
+        runtime_connectors=runtime_connectors,
+    )
+
+
 def _source_descriptors(
     *,
     selected_files: Sequence[Any],
@@ -483,6 +557,64 @@ def _source_descriptors(
         descriptors.append(_knowledge_source_descriptor(item, knowflow_descriptors))
 
     return tuple(descriptors)
+
+
+def _selected_source_observed_files(selected_files: Sequence[Any]) -> tuple[dict[str, Any], ...]:
+    observed: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for file_item in selected_files:
+        item = _as_mapping(file_item)
+        file_id = _string_or_none(item.get("id"))
+        if not file_id or file_id in seen:
+            continue
+        seen.add(file_id)
+        meta = _safe_mapping(item.get("meta"))
+        content_type = (
+            _string_or_none(item.get("content_type"))
+            or _string_or_none(meta.get("content_type"))
+        )
+        descriptor: dict[str, Any] = {
+            "id": file_id,
+            "filename": (
+                _string_or_none(item.get("filename"))
+                or _string_or_none(item.get("name"))
+                or file_id
+            ),
+            "name": (
+                _string_or_none(item.get("name"))
+                or _string_or_none(item.get("filename"))
+                or file_id
+            ),
+            "type": _string_or_none(item.get("type")) or "file",
+            "meta": dict(meta),
+        }
+        if content_type:
+            descriptor["content_type"] = content_type
+        collection_name = _string_or_none(item.get("collection_name"))
+        if collection_name:
+            descriptor["collection_name"] = collection_name
+        text_content = _selected_source_observed_file_text(item)
+        if text_content:
+            descriptor["data"] = {"content": text_content}
+        observed.append(descriptor)
+    return tuple(observed)
+
+
+def _selected_source_observed_file_text(file_item: Mapping[str, Any]) -> str:
+    candidates: list[Any] = []
+    data = file_item.get("data")
+    if isinstance(data, Mapping):
+        candidates.append(data.get("content"))
+    nested_file = file_item.get("file")
+    if isinstance(nested_file, Mapping):
+        nested_data = nested_file.get("data")
+        if isinstance(nested_data, Mapping):
+            candidates.append(nested_data.get("content"))
+    candidates.extend([file_item.get("content"), file_item.get("text")])
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def _file_source_descriptor(

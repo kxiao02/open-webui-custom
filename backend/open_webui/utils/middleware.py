@@ -11572,14 +11572,10 @@ def _retrieval_engine_selected_source_lane_package(
         return None
 
     try:
-        from open_webui.retrieval.engine_adapter import build_retrieval_engine_request
-        from retrieval_engine import (
-            InMemoryDocument,
-            InMemoryExactTextConnector,
-            InMemoryFullContextConnector,
-            InMemoryKeywordConnector,
-            RetrievalEngine,
+        from open_webui.retrieval.engine_adapter import (
+            build_selected_source_retrieval_engine_package,
         )
+        from retrieval_engine import RetrievalEngine
     except Exception as exc:
         observe = _retrieval_engine_observe_failure(
             code="retrieval_engine_observe_unavailable",
@@ -11593,46 +11589,10 @@ def _retrieval_engine_selected_source_lane_package(
         )
         return {"observe": observe, "authority": {"state": "fallback", "reason": "adapter_unavailable"}}
 
-    observed_files = _retrieval_engine_observe_file_descriptors(selected_files)
-    selected_file_ids = tuple(
-        str(file_item.get("id") or "").strip()
-        for file_item in observed_files
-        if str(file_item.get("id") or "").strip()
-    )
-    if not selected_file_ids:
-        return None
-
-    documents = tuple(
-        InMemoryDocument(
-            source_id=str(file_item["id"]),
-            label=str(
-                file_item.get("filename") or file_item.get("name") or file_item["id"]
-            ),
-            text=str((file_item.get("data") or {}).get("content") or ""),
-            metadata={
-                "canonical_text_available": True,
-                "canonical_range_available": True,
-            },
-        )
-        for file_item in observed_files
-        if str((file_item.get("data") or {}).get("content") or "").strip()
-    )
-    if not documents:
-        observe = _retrieval_engine_observe_unsupported(
-            reason="unsupported_source_shape",
-            legacy_status=legacy_status,
-            legacy_terminal_reason=legacy_terminal_reason,
-            legacy_sources=legacy_sources,
-            legacy_references=legacy_references,
-            legacy_accepted_outputs=legacy_accepted_outputs,
-        )
-        return {"observe": observe, "authority": {"state": "fallback", "reason": "unsupported_source_shape"}}
-
     try:
-        adapter_result = build_retrieval_engine_request(
+        lane_package = build_selected_source_retrieval_engine_package(
             query=prompt,
-            selected_file_ids=selected_file_ids,
-            selected_files=observed_files,
+            selected_files=selected_files,
             active_source_scope=active_source_scope,
             authorization_generation="open_webui_selected_source_engine_v1",
             execution_context={
@@ -11644,15 +11604,29 @@ def _retrieval_engine_selected_source_lane_package(
                 "reranker_model_settings": {"provider": "none"},
             },
         )
-        connectors: list[Any] = list(adapter_result.connectors)
-        connectors.extend(
-            [
-                InMemoryExactTextConnector(documents),
-                InMemoryKeywordConnector(documents),
-                InMemoryFullContextConnector(documents),
-            ]
-        )
-        result = RetrievalEngine(connectors=tuple(connectors)).run(
+        if lane_package is None:
+            return None
+        observed_files = list(lane_package.observed_files)
+        if lane_package.unsupported_reason:
+            observe = _retrieval_engine_observe_unsupported(
+                reason=lane_package.unsupported_reason,
+                legacy_status=legacy_status,
+                legacy_terminal_reason=legacy_terminal_reason,
+                legacy_sources=legacy_sources,
+                legacy_references=legacy_references,
+                legacy_accepted_outputs=legacy_accepted_outputs,
+            )
+            return {
+                "observe": observe,
+                "authority": {
+                    "state": "fallback",
+                    "reason": lane_package.unsupported_reason,
+                },
+            }
+        adapter_result = lane_package.adapter_result
+        if adapter_result is None:
+            return None
+        result = RetrievalEngine(connectors=tuple(lane_package.runtime_connectors)).run(
             adapter_result.request
         )
     except Exception as exc:

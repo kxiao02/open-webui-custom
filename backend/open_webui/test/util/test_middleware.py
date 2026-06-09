@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import open_webui.retrieval.utils as retrieval_utils
 import open_webui.utils.middleware as middleware
-from open_webui.retrieval.engine_adapter import build_retrieval_engine_request
+from open_webui.retrieval.engine_adapter import (
+    build_retrieval_engine_request,
+    build_selected_source_retrieval_engine_package,
+)
 from open_webui.retrieval.engine_contract import (
     _retrieval_engine_authority_state,
     _retrieval_engine_reference_dicts,
@@ -347,6 +350,70 @@ def test_retrieval_engine_adapter_is_candidate_only_boundary():
     assert not hasattr(response, "accepted_outputs")
     assert not hasattr(response, "references")
     assert response.diagnostics[0].code == "host_vector_retrieval_not_executed"
+
+
+def test_selected_source_engine_package_normalizes_selected_files_in_adapter():
+    raw_path = "/srv/open-webui/uploads/private/atlas-note.txt"
+    package = build_selected_source_retrieval_engine_package(
+        query="What is the Atlas launch date?",
+        selected_files=(
+            {
+                "id": "file-1",
+                "filename": "atlas-note.txt",
+                "path": raw_path,
+                "meta": {"path": raw_path, "content_type": "text/plain"},
+                "data": {"content": "Project Atlas launches on 2026-11-03."},
+            },
+            {
+                "id": "file-1",
+                "filename": "atlas-note-duplicate.txt",
+                "data": {"content": "Duplicate should be ignored."},
+            },
+        ),
+        active_source_scope={
+            "status": "resolved",
+            "source_ids": ["file-1"],
+            "reason": "explicit_anchor",
+        },
+        authorization_generation="auth-gen-1",
+        execution_context={"engine_version": "open_webui_selected_source_engine_v1"},
+    )
+
+    assert package is not None
+    assert package.unsupported_reason == ""
+    assert len(package.observed_files) == 1
+    assert package.observed_files[0]["id"] == "file-1"
+    assert package.observed_files[0]["data"]["content"] == "Project Atlas launches on 2026-11-03."
+    assert raw_path not in repr(package.observed_files)
+    assert package.adapter_result is not None
+    assert package.adapter_result.request.scope.source_ids == ("file-1",)
+    assert len(package.runtime_connectors) == 3
+
+
+def test_selected_source_engine_package_reports_unsupported_source_shape():
+    package = build_selected_source_retrieval_engine_package(
+        query="What is the Atlas launch date?",
+        selected_files=(
+            {
+                "id": "file-1",
+                "filename": "atlas-note.txt",
+                "meta": {"content_type": "text/plain"},
+            },
+        ),
+        active_source_scope={
+            "status": "resolved",
+            "source_ids": ["file-1"],
+            "reason": "explicit_anchor",
+        },
+        authorization_generation="auth-gen-1",
+        execution_context={"engine_version": "open_webui_selected_source_engine_v1"},
+    )
+
+    assert package is not None
+    assert package.unsupported_reason == "unsupported_source_shape"
+    assert package.adapter_result is None
+    assert package.runtime_connectors == ()
+    assert package.observed_files[0]["id"] == "file-1"
 
 
 def test_retrieval_engine_observe_lane_runs_without_legacy_retrieval_helper(
