@@ -94,6 +94,7 @@ from open_webui.routers import (
     folders,
     configs,
     groups,
+    generated_artifacts,
     files,
     functions,
     memories,
@@ -1740,6 +1741,11 @@ app.include_router(skills.router, prefix="/api/v1/skills", tags=["skills"])
 app.include_router(memories.router, prefix="/api/v1/memories", tags=["memories"])
 app.include_router(folders.router, prefix="/api/v1/folders", tags=["folders"])
 app.include_router(groups.router, prefix="/api/v1/groups", tags=["groups"])
+app.include_router(
+    generated_artifacts.router,
+    prefix="/api/v1/generated-artifacts",
+    tags=["generated-artifacts"],
+)
 app.include_router(files.router, prefix="/api/v1/files", tags=["files"])
 app.include_router(functions.router, prefix="/api/v1/functions", tags=["functions"])
 app.include_router(

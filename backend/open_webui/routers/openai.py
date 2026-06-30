@@ -1592,6 +1592,66 @@ async def generate_chat_completion(
         if _is_deepagent_bridge_url(url)
         else None
     )
+
+    # Server-mint scoped artifact publication context for agent use.
+    # This is independent of client metadata filtering — the scope token is
+    # always minted server-side when the target is a DeepAgent bridge, even
+    # if no other client metadata survives the allowlist.
+    if _is_deepagent_bridge_url(url) and user:
+        try:
+            from open_webui.models.chats import Chats
+            from open_webui.internal.db import get_db_context
+            from open_webui.utils.artifact_publication_scope import (
+                mint_artifact_publication_scope,
+            )
+
+            # Resolve chat_id: prefer metadata, fallback to top-level payload
+            # only after verifying the current user owns/can access that chat.
+            raw_chat_id = (
+                (metadata.get("chat_id") if isinstance(metadata, dict) else None)
+                or payload.get("chat_id")
+            )
+            chat_id = None
+            if isinstance(raw_chat_id, str) and raw_chat_id.strip():
+                candidate = raw_chat_id.strip()
+                # Reject synthetic/local chat IDs that don't map to persisted chats.
+                if candidate.startswith("local:"):
+                    chat_id = None
+                else:
+                    with get_db_context() as db:
+                        if user.role == "admin":
+                            chat = Chats.get_chat_by_id(candidate, db=db)
+                        else:
+                            chat = Chats.get_chat_by_id_and_user_id(
+                                candidate, user.id, db=db
+                            )
+                        if chat:
+                            chat_id = candidate
+
+            owner_message_id = (
+                (metadata.get("message_id") if isinstance(metadata, dict) else None)
+                or payload.get("message_id")
+            )
+            if owner_message_id:
+                owner_message_id = str(owner_message_id).strip() or None
+
+            # Require verified chat_id to bind scope to a verified chat context.
+            if chat_id:
+                scope_token = mint_artifact_publication_scope(
+                    user_id=user.id,
+                    chat_id=chat_id,
+                    owner_message_id=owner_message_id,
+                )
+                # Ensure bridge_metadata exists before injecting scope.
+                if bridge_metadata is None:
+                    bridge_metadata = {}
+                bridge_metadata["artifact_publication_scope"] = scope_token
+        except Exception as exc:
+            log.warning(
+                "Failed to mint artifact publication scope; omitting scope for this request: %s",
+                exc,
+            )
+
     if bridge_metadata:
         payload["metadata"] = json.loads(
             json.dumps(bridge_metadata, ensure_ascii=False, default=str)
