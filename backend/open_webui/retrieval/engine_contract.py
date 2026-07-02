@@ -19,6 +19,552 @@ _RETRIEVAL_ENGINE_OBSERVE_RAW_PATH_KEYS = {
     "upload_path",
 }
 
+ENGINE_CONTRACT_VERSION = "open_webui_selected_source_engine_contract_v1"
+ENGINE_CONTRACT_BOUNDARY_OWNER = "open_webui.retrieval.engine_contract"
+ENGINE_CONTRACT_ENGINE_VERSION = "open_webui_selected_source_engine_v1"
+
+ENGINE_TERMINAL_STATUSES = {
+    "success",
+    "partial",
+    "no_evidence",
+    "denied",
+    "blocked",
+    "malformed",
+    "timeout",
+    "error",
+}
+
+ENGINE_FALLBACK_REASONS = {
+    "adapter_unavailable",
+    "request_construction_error",
+    "unsupported_source_shape",
+    "operator_disabled",
+}
+
+
+def _normalized_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalized_status(value: Any) -> str:
+    return _normalized_text(value).lower()
+
+
+def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    return [item for item in (value or []) if isinstance(item, dict)]
+
+
+def _source_scope_echo(
+    *,
+    active_source_scope: dict[str, Any] | None = None,
+    authorization_context: dict[str, Any] | None = None,
+    selected_files: list[dict] | None = None,
+) -> dict[str, Any]:
+    active_source_scope = active_source_scope if isinstance(active_source_scope, dict) else {}
+    authorization_context = (
+        authorization_context if isinstance(authorization_context, dict) else {}
+    )
+    requested_source_ids = authorization_context.get("requested_source_ids")
+    if not isinstance(requested_source_ids, list):
+        requested_source_ids = active_source_scope.get("source_ids")
+    if not isinstance(requested_source_ids, list):
+        requested_source_ids = [
+            item.get("id")
+            for item in (selected_files or [])
+            if isinstance(item, dict) and _normalized_text(item.get("id"))
+        ]
+    source_ids = list(
+        dict.fromkeys(
+            _normalized_text(item)
+            for item in (requested_source_ids or [])
+            if _normalized_text(item)
+        )
+    )
+    return _retrieval_engine_observe_safe_mapping(
+        {
+            "status": (
+                _normalized_text(
+                    active_source_scope.get("status")
+                    or authorization_context.get("active_source_scope_state")
+                )
+                or "none"
+            ),
+            "source_ids": source_ids,
+            "authorization_generation": _normalized_text(
+                authorization_context.get("authorization_generation")
+            )
+            or ENGINE_CONTRACT_ENGINE_VERSION,
+        }
+    )
+
+
+def _apply_engine_contract_trust_fields(
+    contract: dict[str, Any],
+    *,
+    active_source_scope: dict[str, Any] | None = None,
+    selected_files: list[dict] | None = None,
+) -> dict[str, Any]:
+    prepared = copy.deepcopy(contract)
+    authorization_context = (
+        prepared.get("authorization_context")
+        if isinstance(prepared.get("authorization_context"), dict)
+        else {}
+    )
+    context_budget = (
+        prepared.get("context_budget")
+        if isinstance(prepared.get("context_budget"), dict)
+        else {}
+    )
+    budget = context_budget.get("budget") if isinstance(context_budget, dict) else {}
+    budget = budget if isinstance(budget, dict) else {}
+    engine_version = (
+        _normalized_text(prepared.get("engine_version"))
+        or _normalized_text(budget.get("engine_version"))
+        or ENGINE_CONTRACT_ENGINE_VERSION
+    )
+    prepared["contract_version"] = ENGINE_CONTRACT_VERSION
+    prepared["engine_version"] = engine_version
+    prepared["boundary_owned"] = True
+    prepared["boundary_owner"] = ENGINE_CONTRACT_BOUNDARY_OWNER
+    prepared["source_scope_echo"] = _source_scope_echo(
+        active_source_scope=active_source_scope,
+        authorization_context=authorization_context,
+        selected_files=selected_files,
+    )
+    provenance = (
+        copy.deepcopy(prepared.get("provenance"))
+        if isinstance(prepared.get("provenance"), dict)
+        else {}
+    )
+    provenance["contract_version"] = ENGINE_CONTRACT_VERSION
+    provenance["engine_version"] = engine_version
+    provenance["boundary_owned"] = True
+    provenance["boundary_owner"] = ENGINE_CONTRACT_BOUNDARY_OWNER
+    provenance["retrieval_runtime_mode"] = "engine_owned"
+    prepared["provenance"] = provenance
+    return prepared
+
+
+def _engine_runtime_mode_for_contract(contract: dict[str, Any]) -> str:
+    status = _normalized_status(contract.get("status"))
+    references = _list_of_dicts(contract.get("references"))
+    accepted_outputs = _list_of_dicts(contract.get("accepted_outputs"))
+    if status in {"success", "partial"} and references and accepted_outputs:
+        return "retrieval_engine_authority"
+    if status in {"denied", "blocked", "error"} or _normalized_status(
+        contract.get("terminal_reason")
+    ) == "invalid_engine_contract":
+        return "retrieval_engine_fail_closed"
+    return "retrieval_engine_diagnostics"
+
+
+def _engine_bypass_reason_for_runtime(runtime_mode: str) -> str:
+    if runtime_mode == "retrieval_engine_authority":
+        return "retrieval_engine_authority_succeeded"
+    if runtime_mode == "retrieval_engine_fail_closed":
+        return "retrieval_engine_fail_closed"
+    return "retrieval_engine_diagnostics_only"
+
+
+def _invalid_engine_contract_diagnostic(
+    *,
+    invalid_reasons: list[str] | None = None,
+) -> dict[str, Any]:
+    return _retrieval_engine_observe_safe_value(
+        {
+            "kind": "retrieval_engine",
+            "classification": "no_evidence",
+            "reason": "invalid_engine_contract",
+            "outcome": "error",
+            "candidate_index": -1,
+            "provenance": {
+                "worker_kind": "selected_source_retrieval",
+                "tool_name": "retrieval_engine_selected_source_retrieval",
+                "status": "error",
+                "terminal_reason": "invalid_engine_contract",
+                "selected_source_runtime_mode": "retrieval_engine_fail_closed",
+                "retrieval_runtime_mode": "engine_owned",
+                "engine_owned": True,
+                "engine_authority": False,
+                "compatibility_fallback": False,
+                "failure_class": "invalid_engine_contract",
+                "contract_version": ENGINE_CONTRACT_VERSION,
+                "engine_version": ENGINE_CONTRACT_ENGINE_VERSION,
+                "boundary_owned": True,
+                "boundary_owner": ENGINE_CONTRACT_BOUNDARY_OWNER,
+            },
+            "detail": {
+                "invalid_reasons": list(
+                    dict.fromkeys(invalid_reasons or ["invalid_engine_contract"])
+                )
+            },
+        }
+    )
+
+
+def build_engine_error_contract(
+    *,
+    terminal_reason: str,
+    diagnostics: list[dict[str, Any]] | None = None,
+    active_source_scope: dict[str, Any] | None = None,
+    selected_files: list[dict] | None = None,
+    failure_class: str = "engine_error",
+) -> dict[str, Any]:
+    reason = _normalized_text(terminal_reason) or "engine_error"
+    diagnostic_items = [
+        item for item in (diagnostics or []) if isinstance(item, dict)
+    ] or [
+        {
+            "kind": "retrieval_engine",
+            "classification": "no_evidence",
+            "reason": reason,
+            "outcome": "error",
+            "candidate_index": -1,
+        }
+    ]
+    contract = {
+        "accepted_outputs": [],
+        "references": [],
+        "sources": [],
+        "diagnostics": diagnostic_items,
+        "status": "error",
+        "terminal_reason": reason,
+        "authorization_context": {
+            "active_source_scope_state": _normalized_text(
+                (active_source_scope or {}).get("status")
+            )
+            or "none",
+            "requested_source_ids": list(
+                dict.fromkeys(
+                    _normalized_text(item.get("id"))
+                    for item in (selected_files or [])
+                    if isinstance(item, dict) and _normalized_text(item.get("id"))
+                )
+            ),
+            "authorization_generation": ENGINE_CONTRACT_ENGINE_VERSION,
+        },
+        "retry_policy": {
+            "max_retries": 0,
+            "retries_attempted": 0,
+            "retry_allowed": False,
+            "timeout_seconds": None,
+        },
+        "context_budget": {
+            "requested_budget_tokens": 0,
+            "estimated_used_tokens": 0,
+            "accepted_output_count": 0,
+            "reference_count": 0,
+            "candidate_accepted_bundle_count": 0,
+            "truncated_accepted_bundle_count": 0,
+            "omitted_accepted_bundle_count": 0,
+            "truncated": False,
+            "budget": {
+                "budget_policy": "selected_source_first_pass",
+                "return_policy": "accepted_evidence_only",
+                "ranking_policy": "selected_file_text_cutover",
+                "engine_version": ENGINE_CONTRACT_ENGINE_VERSION,
+                "authorization_generation": ENGINE_CONTRACT_ENGINE_VERSION,
+            },
+        },
+        "provenance": {
+            "worker_kind": "selected_source_retrieval",
+            "tool_name": "retrieval_engine_selected_source_retrieval",
+            "status": "error",
+            "terminal_reason": reason,
+            "engine_authority": False,
+            "middleware_strategy_bypassed": True,
+            "middleware_strategy_bypass_reason": "retrieval_engine_fail_closed",
+            "selected_source_runtime_mode": "retrieval_engine_fail_closed",
+            "retrieval_runtime_mode": "engine_owned",
+            "engine_owned": True,
+            "compatibility_fallback": False,
+            "failure_class": failure_class,
+        },
+    }
+    return _apply_engine_contract_trust_fields(
+        contract,
+        active_source_scope=active_source_scope,
+        selected_files=selected_files,
+    )
+
+
+def _invalid_engine_contract(
+    *,
+    invalid_reasons: list[str],
+    active_source_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return build_engine_error_contract(
+        terminal_reason="invalid_engine_contract",
+        diagnostics=[
+            _invalid_engine_contract_diagnostic(invalid_reasons=invalid_reasons)
+        ],
+        active_source_scope=active_source_scope,
+        selected_files=[],
+        failure_class="invalid_engine_contract",
+    )
+
+
+def _contract_source_ids(contract: dict[str, Any]) -> list[str]:
+    echo = contract.get("source_scope_echo")
+    echo = echo if isinstance(echo, dict) else {}
+    source_ids = echo.get("source_ids")
+    if not isinstance(source_ids, list):
+        authorization_context = contract.get("authorization_context")
+        authorization_context = (
+            authorization_context if isinstance(authorization_context, dict) else {}
+        )
+        source_ids = authorization_context.get("requested_source_ids")
+    return [
+        _normalized_text(item)
+        for item in (source_ids or [])
+        if _normalized_text(item)
+    ]
+
+
+def _expected_source_ids(active_source_scope: dict[str, Any] | None) -> list[str]:
+    active_source_scope = active_source_scope if isinstance(active_source_scope, dict) else {}
+    source_ids = active_source_scope.get("source_ids")
+    return [
+        _normalized_text(item)
+        for item in (source_ids or [])
+        if _normalized_text(item)
+    ]
+
+
+def validate_engine_contract(
+    contract: Any,
+    *,
+    active_source_scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate a boundary-owned selected-source engine contract."""
+
+    invalid_reasons: list[str] = []
+    if not isinstance(contract, dict):
+        invalid_reasons.append("contract_not_mapping")
+        contract = {}
+    payload = copy.deepcopy(contract)
+    status = _normalized_status(payload.get("status"))
+    terminal_reason = _normalized_text(payload.get("terminal_reason"))
+    provenance = payload.get("provenance")
+    provenance = provenance if isinstance(provenance, dict) else {}
+
+    if payload.get("contract_version") != ENGINE_CONTRACT_VERSION:
+        invalid_reasons.append("missing_or_invalid_contract_version")
+    if payload.get("engine_version") != ENGINE_CONTRACT_ENGINE_VERSION:
+        invalid_reasons.append("missing_or_invalid_engine_version")
+    if payload.get("boundary_owned") is not True or provenance.get("boundary_owned") is not True:
+        invalid_reasons.append("missing_boundary_owned_marker")
+    if (
+        payload.get("boundary_owner") != ENGINE_CONTRACT_BOUNDARY_OWNER
+        or provenance.get("boundary_owner") != ENGINE_CONTRACT_BOUNDARY_OWNER
+    ):
+        invalid_reasons.append("missing_boundary_owner")
+    if status not in ENGINE_TERMINAL_STATUSES:
+        invalid_reasons.append("unknown_terminal_status")
+    if status != "success" and not terminal_reason:
+        invalid_reasons.append("missing_terminal_reason")
+
+    references = _list_of_dicts(payload.get("references"))
+    accepted_outputs = _list_of_dicts(payload.get("accepted_outputs"))
+    sources = _list_of_dicts(payload.get("sources"))
+    if status not in {"success", "partial"} and (
+        references or accepted_outputs or sources
+    ):
+        invalid_reasons.append("accepted_evidence_on_non_accepting_status")
+
+    source_scope_echo = payload.get("source_scope_echo")
+    if not isinstance(source_scope_echo, dict):
+        invalid_reasons.append("missing_source_scope_echo")
+    contract_source_ids = _contract_source_ids(payload)
+    expected_source_ids = _expected_source_ids(active_source_scope)
+    if expected_source_ids and sorted(contract_source_ids) != sorted(expected_source_ids):
+        invalid_reasons.append("source_scope_mismatch")
+
+    valid = not invalid_reasons
+    effective_contract = payload if valid else _invalid_engine_contract(
+        invalid_reasons=invalid_reasons,
+        active_source_scope=active_source_scope,
+    )
+    runtime_mode = _engine_runtime_mode_for_contract(effective_contract)
+    terminal_status = _normalized_status(effective_contract.get("status")) or "error"
+    effective_terminal_reason = (
+        _normalized_text(effective_contract.get("terminal_reason"))
+        or terminal_status
+    )
+    return {
+        "valid": valid,
+        "contract_present": bool(contract),
+        "contract": effective_contract,
+        "terminal_status": terminal_status,
+        "terminal_reason": effective_terminal_reason,
+        "selected_source_runtime_mode": runtime_mode,
+        "bypass_reason": _engine_bypass_reason_for_runtime(runtime_mode),
+        "failure_class": "" if valid else "invalid_engine_contract",
+        "invalid_reasons": list(dict.fromkeys(invalid_reasons)),
+    }
+
+
+def read_engine_contract_for_turn(metadata: dict | None) -> dict[str, Any]:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for key in (
+        "retrieval_engine_first_pass_contract",
+        "retrieval_engine_contract",
+        "selected_source_retrieval_engine_contract",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, dict):
+            return copy.deepcopy(value)
+    return {}
+
+
+def classify_engine_attempt(
+    *,
+    package: dict[str, Any] | None = None,
+    metadata: dict | None = None,
+    active_source_scope: dict[str, Any] | None = None,
+    contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    package = package if isinstance(package, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    authority = package.get("authority")
+    authority = authority if isinstance(authority, dict) else {}
+    attempt = package.get("attempt")
+    if not isinstance(attempt, dict):
+        attempt = metadata.get("retrieval_engine_attempt")
+    attempt = attempt if isinstance(attempt, dict) else {}
+    contract_source = ""
+    raw_contract = contract if isinstance(contract, dict) else None
+    if raw_contract is not None:
+        contract_source = "argument"
+    if raw_contract is None:
+        package_contract = package.get("contract")
+        raw_contract = package_contract if isinstance(package_contract, dict) else None
+        if raw_contract is not None:
+            contract_source = "package"
+    if raw_contract is None:
+        metadata_contract = read_engine_contract_for_turn(metadata)
+        raw_contract = metadata_contract if metadata_contract else None
+        if raw_contract is not None:
+            contract_source = "metadata"
+
+    if raw_contract is not None:
+        validation = validate_engine_contract(
+            raw_contract,
+            active_source_scope=active_source_scope,
+        )
+        if contract_source == "metadata" and (
+            attempt.get("boundary_owned") is not True
+            or attempt.get("boundary_owner") != ENGINE_CONTRACT_BOUNDARY_OWNER
+            or attempt.get("engine_invoked") is not True
+            or attempt.get("contract_version") != ENGINE_CONTRACT_VERSION
+            or attempt.get("engine_version") != ENGINE_CONTRACT_ENGINE_VERSION
+        ):
+            invalid_reasons = [
+                *validation.get("invalid_reasons", []),
+                "missing_boundary_attempt_metadata",
+            ]
+            validation = {
+                "valid": False,
+                "contract_present": True,
+                "contract": _invalid_engine_contract(
+                    invalid_reasons=invalid_reasons,
+                    active_source_scope=active_source_scope,
+                ),
+                "terminal_status": "error",
+                "terminal_reason": "invalid_engine_contract",
+                "selected_source_runtime_mode": "retrieval_engine_fail_closed",
+                "bypass_reason": "retrieval_engine_fail_closed",
+                "failure_class": "invalid_engine_contract",
+                "invalid_reasons": list(dict.fromkeys(invalid_reasons)),
+            }
+        state = "engine_owned" if validation["valid"] else "fail_closed"
+        return {
+            **validation,
+            "state": state,
+            "engine_owned": True,
+            "engine_invoked": True,
+            "fallback_eligible": False,
+            "runtime_mode": "engine_owned",
+            "retrieval_runtime_mode": "engine_owned",
+            "fallback_reason": "",
+            "attempt_metadata": {
+                "engine_invoked": True,
+                "contract_present": True,
+                "contract_valid": bool(validation["valid"]),
+                "contract_version": ENGINE_CONTRACT_VERSION,
+                "engine_version": ENGINE_CONTRACT_ENGINE_VERSION,
+                "terminal_status": validation["terminal_status"],
+                "terminal_reason": validation["terminal_reason"],
+                "runtime_mode": "engine_owned",
+                "retrieval_runtime_mode": "engine_owned",
+                "selected_source_runtime_mode": validation[
+                    "selected_source_runtime_mode"
+                ],
+                "fallback_reason": "",
+                "failure_class": validation["failure_class"],
+                "invalid_reasons": validation["invalid_reasons"],
+            },
+        }
+
+    fallback_reason = (
+        _normalized_status(attempt.get("fallback_reason"))
+        or _normalized_status(attempt.get("failure_class"))
+        or _normalized_status(authority.get("reason"))
+    )
+    fallback_eligible = fallback_reason in ENGINE_FALLBACK_REASONS and not bool(
+        attempt.get("engine_invoked")
+    )
+    failure_class = fallback_reason or "engine_contract_absent"
+    return {
+        "valid": False,
+        "contract_present": False,
+        "contract": {},
+        "terminal_status": "",
+        "terminal_reason": "",
+        "selected_source_runtime_mode": "compatibility_fallback",
+        "bypass_reason": "",
+        "failure_class": failure_class,
+        "invalid_reasons": [],
+        "state": "fallback_eligible" if fallback_eligible else "no_contract",
+        "engine_owned": False,
+        "engine_invoked": False,
+        "fallback_eligible": fallback_eligible,
+        "runtime_mode": "legacy_fallback" if fallback_eligible else "unavailable",
+        "retrieval_runtime_mode": "legacy_fallback" if fallback_eligible else "unavailable",
+        "fallback_reason": fallback_reason if fallback_eligible else "",
+        "attempt_metadata": {
+            "engine_invoked": False,
+            "contract_present": False,
+            "contract_valid": False,
+            "contract_version": ENGINE_CONTRACT_VERSION,
+            "engine_version": ENGINE_CONTRACT_ENGINE_VERSION,
+            "terminal_status": "",
+            "terminal_reason": "",
+            "runtime_mode": "legacy_fallback" if fallback_eligible else "unavailable",
+            "retrieval_runtime_mode": "legacy_fallback" if fallback_eligible else "unavailable",
+            "selected_source_runtime_mode": "compatibility_fallback",
+            "fallback_reason": fallback_reason if fallback_eligible else "",
+            "failure_class": failure_class,
+            "invalid_reasons": [],
+        },
+    }
+
+
+def persist_engine_attempt(
+    metadata: dict,
+    classification: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    attempt = copy.deepcopy(classification.get("attempt_metadata") or {})
+    attempt["boundary_owned"] = True
+    attempt["boundary_owner"] = ENGINE_CONTRACT_BOUNDARY_OWNER
+    metadata["retrieval_engine_attempt"] = attempt
+    contract = classification.get("contract")
+    if classification.get("engine_owned") and isinstance(contract, dict) and contract:
+        metadata["retrieval_engine_first_pass_contract"] = copy.deepcopy(contract)
+    return attempt
+
 
 def _retrieval_engine_authority_state(result: Any) -> str:
     status = str(getattr(result, "status", "") or "").strip().lower()
@@ -103,7 +649,7 @@ def _retrieval_engine_result_first_pass_contract(
     )
     context_budget = _retrieval_engine_context_budget(result)
     compact_budget = _retrieval_engine_compact_budget_provenance(context_budget)
-    return {
+    contract = {
         "accepted_outputs": accepted_outputs,
         "references": references,
         "sources": source_cards,
@@ -122,6 +668,7 @@ def _retrieval_engine_result_first_pass_contract(
             "middleware_strategy_bypassed": True,
             "middleware_strategy_bypass_reason": bypass_reason,
             "selected_source_runtime_mode": runtime_mode,
+            "retrieval_runtime_mode": "engine_owned",
             "engine_owned": authority_state != "fallback",
             "compatibility_fallback": authority_state == "fallback",
             "context_budget": copy.deepcopy(context_budget),
@@ -167,6 +714,10 @@ def _retrieval_engine_result_first_pass_contract(
         },
         "observe_diagnostics": diagnostics[:12],
     }
+    return _apply_engine_contract_trust_fields(
+        contract,
+        selected_files=selected_files,
+    )
 
 
 def _retrieval_engine_reference_dicts(

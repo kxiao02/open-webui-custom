@@ -85,6 +85,9 @@ from open_webui.models.functions import Functions
 from open_webui.models.models import Models
 
 from open_webui.retrieval.engine_contract import (
+    build_engine_error_contract,
+    classify_engine_attempt,
+    persist_engine_attempt,
     _retrieval_engine_authority_state,
     _retrieval_engine_bypass_reason,
     _retrieval_engine_observe_safe_mapping,
@@ -9336,14 +9339,33 @@ def _first_pass_selected_source_strategy(
 def _retrieval_engine_bypassed_first_pass_strategy(
     *,
     engine_contract: dict[str, Any],
-    authority_state: str,
+    authority_state: str = "",
+    attempt_classification: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    attempt_classification = (
+        attempt_classification if isinstance(attempt_classification, dict) else {}
+    )
     status = str(engine_contract.get("status") or "").strip().lower()
     terminal_reason = str(engine_contract.get("terminal_reason") or "").strip()
-    reason = _retrieval_engine_bypass_reason(authority_state)
+    provenance = (
+        engine_contract.get("provenance")
+        if isinstance(engine_contract.get("provenance"), dict)
+        else {}
+    )
+    runtime_mode = str(
+        attempt_classification.get("selected_source_runtime_mode")
+        or provenance.get("selected_source_runtime_mode")
+        or _retrieval_engine_runtime_mode(authority_state)
+    )
+    reason = str(
+        attempt_classification.get("bypass_reason")
+        or provenance.get("middleware_strategy_bypass_reason")
+        or _retrieval_engine_bypass_reason(authority_state)
+    )
     return {
         "evidence_need": "engine_owned",
-        "retrieval_strategy": _retrieval_engine_runtime_mode(authority_state),
+        "retrieval_strategy": runtime_mode,
+        "retrieval_runtime_mode": "engine_owned",
         "metadata_first_intent": False,
         "semantic_chunk_lookup_ok": False,
         "targeted_context_present": False,
@@ -9353,6 +9375,7 @@ def _retrieval_engine_bypassed_first_pass_strategy(
         "engine_authority_state": str(authority_state or ""),
         "engine_status": status,
         "engine_terminal_reason": terminal_reason,
+        "failure_class": str(attempt_classification.get("failure_class") or ""),
         "reason_codes": [
             "middleware_strategy_bypassed",
             reason,
@@ -10458,6 +10481,9 @@ async def chat_completion_files_handler(
     first_pass_strategy: dict[str, Any] = {}
     first_pass_inventory_context: dict[str, Any] = {}
     retrieval_engine_cutover: dict[str, Any] = {}
+    retrieval_engine_attempt_classification: dict[str, Any] = {}
+    engine_contract: dict[str, Any] = {}
+    engine_has_valid_contract = False
     active_scope_files: list[dict] = []
     active_retrieval_files: list[dict] = []
 
@@ -10599,20 +10625,28 @@ async def chat_completion_files_handler(
             if isinstance(retrieval_engine_cutover.get("authority"), dict)
             else ""
         )
+        retrieval_engine_attempt_classification = classify_engine_attempt(
+            package=retrieval_engine_cutover,
+            active_source_scope=metadata.get("active_source_scope"),
+        )
         engine_contract = (
-            retrieval_engine_cutover.get("contract")
-            if isinstance(retrieval_engine_cutover.get("contract"), dict)
+            retrieval_engine_attempt_classification.get("contract")
+            if isinstance(
+                retrieval_engine_attempt_classification.get("contract"), dict
+            )
             else {}
         )
-        engine_authority_bypasses_middleware = engine_authority_state in {
-            "authoritative",
-            "fail_closed",
-            "diagnostics",
-        }
+        engine_has_valid_contract = bool(
+            retrieval_engine_attempt_classification.get("engine_owned")
+            and engine_contract
+        )
+        persist_engine_attempt(metadata, retrieval_engine_attempt_classification)
+        engine_authority_bypasses_middleware = bool(engine_has_valid_contract)
         if engine_authority_bypasses_middleware:
             first_pass_strategy = _retrieval_engine_bypassed_first_pass_strategy(
                 engine_contract=engine_contract,
                 authority_state=engine_authority_state,
+                attempt_classification=retrieval_engine_attempt_classification,
             )
             metadata["first_pass_retrieval_strategy"] = first_pass_strategy
             metadata["first_pass_profile_lock"] = {}
@@ -10689,6 +10723,16 @@ async def chat_completion_files_handler(
                         )
                     )
             metadata["first_pass_retrieval_strategy"] = first_pass_strategy
+            if retrieval_engine_attempt_classification.get("fallback_eligible"):
+                first_pass_strategy["compatibility_fallback"] = True
+                first_pass_strategy["compatibility_boundary"] = (
+                    "legacy_selected_source_fallback_until_engine_available"
+                )
+                first_pass_strategy["retrieval_runtime_mode"] = "legacy_fallback"
+                first_pass_strategy["fallback_reason"] = str(
+                    retrieval_engine_attempt_classification.get("fallback_reason")
+                    or ""
+                )
             first_pass_profile_lock = _first_pass_profile_lock_incompatibility(
                 metadata=metadata,
                 strategy=first_pass_strategy,
@@ -11000,16 +11044,23 @@ async def chat_completion_files_handler(
             active_sources: list[dict] = []
         else:
             active_sources = [*active_inline_sources]
-            if engine_authority_state == "authoritative":
+            if engine_has_valid_contract:
                 performed_retrieval = True
-                retrieval_returned_candidates = True
-                active_sources.extend(
-                    item for item in engine_contract.get("sources", []) if isinstance(item, dict)
-                )
-            elif engine_authority_state == "fail_closed":
-                performed_retrieval = True
-                retrieval_blocked_by_strategy = True
-                active_sources = []
+                engine_sources = [
+                    item
+                    for item in engine_contract.get("sources", [])
+                    if isinstance(item, dict)
+                ]
+                active_sources = [*active_inline_sources, *engine_sources]
+                retrieval_returned_candidates = bool(engine_sources)
+                if (
+                    retrieval_engine_attempt_classification.get(
+                        "selected_source_runtime_mode"
+                    )
+                    == "retrieval_engine_fail_closed"
+                ):
+                    retrieval_blocked_by_strategy = True
+                    active_sources = []
                 for diagnostic in engine_contract.get("diagnostics", []):
                     if isinstance(diagnostic, dict):
                         _append_retrieval_diagnostic_once(
@@ -11017,7 +11068,16 @@ async def chat_completion_files_handler(
                             diagnostic,
                         )
             else:
-                active_sources.extend(await retrieve_sources(active_retrieval_files))
+                legacy_sources = await retrieve_sources(active_retrieval_files)
+                if retrieval_engine_attempt_classification.get("fallback_eligible"):
+                    for source_card in legacy_sources:
+                        if not isinstance(source_card, dict):
+                            continue
+                        source = source_card.get("source")
+                        if isinstance(source, dict):
+                            source["origin"] = "legacy_fallback"
+                        source_card.setdefault("origin", "legacy_fallback")
+                active_sources.extend(legacy_sources)
             inventory_sources = (
                 first_pass_inventory_context.get("inventory_sources")
                 if isinstance(first_pass_inventory_context, dict)
@@ -11149,11 +11209,6 @@ async def chat_completion_files_handler(
     prompt_text = _normalize_retrieval_query_text(
         _strip_attached_file_context(get_last_user_message(body["messages"]) or "")
     )
-    engine_contract = (
-        retrieval_engine_cutover.get("contract")
-        if isinstance(retrieval_engine_cutover.get("contract"), dict)
-        else {}
-    )
     engine_authority = (
         (retrieval_engine_cutover.get("authority") or {}).get("state")
         if isinstance(retrieval_engine_cutover.get("authority"), dict)
@@ -11170,7 +11225,11 @@ async def chat_completion_files_handler(
     }
     inventory_count = 0
     shortlist_count = 0
-    if engine_authority in {"authoritative", "fail_closed", "diagnostics"}:
+    engine_has_valid_contract = bool(
+        retrieval_engine_attempt_classification.get("engine_owned")
+        and engine_contract
+    )
+    if engine_has_valid_contract:
         references = [
             item for item in engine_contract.get("references", []) if isinstance(item, dict)
         ]
@@ -11293,7 +11352,7 @@ async def chat_completion_files_handler(
     if unsupported_claim_reason and status != "blocked":
         status = "no_evidence"
         terminal_reason = unsupported_claim_reason
-    if engine_authority in {"authoritative", "fail_closed", "diagnostics"}:
+    if engine_has_valid_contract:
         status = str(engine_contract.get("status") or status)
         terminal_reason = str(engine_contract.get("terminal_reason") or terminal_reason)
     metadata_first_diagnostics_only = bool(
@@ -11322,7 +11381,18 @@ async def chat_completion_files_handler(
         "retry_allowed": False,
         "timeout_seconds": timeout_value,
     }
-    first_pass_runtime_mode = _retrieval_engine_runtime_mode(engine_authority)
+    first_pass_runtime_mode = str(
+        retrieval_engine_attempt_classification.get("selected_source_runtime_mode")
+        or _retrieval_engine_runtime_mode(engine_authority)
+    )
+    first_pass_retrieval_runtime_mode = str(
+        retrieval_engine_attempt_classification.get("retrieval_runtime_mode")
+        or (
+            "engine_owned"
+            if first_pass_runtime_mode != "compatibility_fallback"
+            else "legacy_fallback"
+        )
+    )
     first_pass_contract = {
         "accepted_outputs": accepted_outputs,
         "references": references,
@@ -11341,8 +11411,15 @@ async def chat_completion_files_handler(
             "terminal_reason": terminal_reason,
             "strategy_used": first_pass_strategy if files else {},
             "selected_source_runtime_mode": first_pass_runtime_mode,
+            "retrieval_runtime_mode": first_pass_retrieval_runtime_mode,
             "engine_owned": first_pass_runtime_mode != "compatibility_fallback",
             "compatibility_fallback": first_pass_runtime_mode == "compatibility_fallback",
+            "fallback_reason": str(
+                retrieval_engine_attempt_classification.get("fallback_reason") or ""
+            ),
+            "failure_class": str(
+                retrieval_engine_attempt_classification.get("failure_class") or ""
+            ),
             "compatibility_boundary": (
                 "legacy_selected_source_fallback_until_10_5"
                 if first_pass_runtime_mode == "compatibility_fallback"
@@ -11389,9 +11466,13 @@ async def chat_completion_files_handler(
                     "accepted_output_count": len(accepted_outputs),
                 },
                 "runtime_mode": first_pass_runtime_mode,
+                "retrieval_runtime_mode": first_pass_retrieval_runtime_mode,
                 "engine_owned": first_pass_runtime_mode != "compatibility_fallback",
                 "engine_authority": engine_authority == "authoritative",
                 "compatibility_fallback": first_pass_runtime_mode == "compatibility_fallback",
+                "fallback_reason": str(
+                    retrieval_engine_attempt_classification.get("fallback_reason") or ""
+                ),
                 "compatibility_boundary": (
                     "legacy_selected_source_fallback_until_10_5"
                     if first_pass_runtime_mode == "compatibility_fallback"
@@ -11451,7 +11532,7 @@ async def chat_completion_files_handler(
             },
         },
     }
-    if engine_authority in {"authoritative", "fail_closed", "diagnostics"}:
+    if engine_has_valid_contract:
         for key in (
             "accepted_outputs",
             "references",
@@ -11516,6 +11597,11 @@ async def chat_completion_files_handler(
         if isinstance(plan_summary, dict) and plan_summary:
             metadata["retrieval_engine_plan_summary"] = plan_summary
 
+    # Always store engine contract in metadata when the engine was invoked,
+    # so tools can find it via _selected_retrieval_engine_contract_source().
+    if engine_has_valid_contract:
+        metadata["retrieval_engine_first_pass_contract"] = engine_contract
+
     return body, {
         "sources": sources,
         "retrieval_diagnostics": retrieval_diagnostics,
@@ -11526,6 +11612,8 @@ async def chat_completion_files_handler(
         "no_evidence": performed_retrieval and not sources,
         "retrieval_engine_observe": metadata.get("retrieval_engine_observe"),
         "retrieval_engine_plan_summary": metadata.get("retrieval_engine_plan_summary"),
+        "retrieval_engine_attempt": metadata.get("retrieval_engine_attempt"),
+        "retrieval_engine_first_pass_contract": metadata.get("retrieval_engine_first_pass_contract"),
         **first_pass_contract,
     }
 
@@ -11587,7 +11675,15 @@ def _retrieval_engine_selected_source_lane_package(
             legacy_references=legacy_references,
             legacy_accepted_outputs=legacy_accepted_outputs,
         )
-        return {"observe": observe, "authority": {"state": "fallback", "reason": "adapter_unavailable"}}
+        return {
+            "observe": observe,
+            "authority": {"state": "fallback", "reason": "adapter_unavailable"},
+            "attempt": {
+                "engine_invoked": False,
+                "fallback_reason": "adapter_unavailable",
+                "failure_class": "adapter_unavailable",
+            },
+        }
 
     try:
         lane_package = build_selected_source_retrieval_engine_package(
@@ -11604,8 +11700,38 @@ def _retrieval_engine_selected_source_lane_package(
                 "reranker_model_settings": {"provider": "none"},
             },
         )
-        if lane_package is None:
-            return None
+    except Exception as exc:
+        observe = _retrieval_engine_observe_failure(
+            code="retrieval_engine_request_construction_failed",
+            reason="request_construction_error",
+            exc=exc,
+            legacy_status=legacy_status,
+            legacy_terminal_reason=legacy_terminal_reason,
+            legacy_sources=legacy_sources,
+            legacy_references=legacy_references,
+            legacy_accepted_outputs=legacy_accepted_outputs,
+        )
+        return {
+            "observe": observe,
+            "authority": {"state": "fallback", "reason": "request_construction_error"},
+            "attempt": {
+                "engine_invoked": False,
+                "fallback_reason": "request_construction_error",
+                "failure_class": "request_construction_error",
+            },
+        }
+
+    if lane_package is None:
+        return {
+            "authority": {"state": "fallback", "reason": "request_construction_error"},
+            "attempt": {
+                "engine_invoked": False,
+                "fallback_reason": "request_construction_error",
+                "failure_class": "request_construction_error",
+            },
+        }
+
+    try:
         observed_files = list(lane_package.observed_files)
         if lane_package.unsupported_reason:
             observe = _retrieval_engine_observe_unsupported(
@@ -11622,10 +11748,25 @@ def _retrieval_engine_selected_source_lane_package(
                     "state": "fallback",
                     "reason": lane_package.unsupported_reason,
                 },
+                "attempt": {
+                    "engine_invoked": False,
+                    "fallback_reason": lane_package.unsupported_reason,
+                    "failure_class": lane_package.unsupported_reason,
+                },
             }
         adapter_result = lane_package.adapter_result
         if adapter_result is None:
-            return None
+            return {
+                "authority": {
+                    "state": "fallback",
+                    "reason": "request_construction_error",
+                },
+                "attempt": {
+                    "engine_invoked": False,
+                    "fallback_reason": "request_construction_error",
+                    "failure_class": "request_construction_error",
+                },
+            }
         result = RetrievalEngine(connectors=tuple(lane_package.runtime_connectors)).run(
             adapter_result.request
         )
@@ -11640,7 +11781,30 @@ def _retrieval_engine_selected_source_lane_package(
             legacy_references=legacy_references,
             legacy_accepted_outputs=legacy_accepted_outputs,
         )
-        return {"observe": observe, "authority": {"state": "fallback", "reason": "engine_observe_error"}}
+        contract = build_engine_error_contract(
+            terminal_reason="engine_observe_error",
+            diagnostics=[
+                {
+                    "kind": "retrieval_engine",
+                    "classification": "no_evidence",
+                    "reason": "engine_observe_error",
+                    "outcome": "error",
+                    "candidate_index": -1,
+                }
+            ],
+            active_source_scope=active_source_scope,
+            selected_files=observed_files if "observed_files" in locals() else [],
+            failure_class="engine_observe_error",
+        )
+        return {
+            "observe": observe,
+            "authority": {"state": "engine_owned", "reason": "engine_observe_error"},
+            "contract": contract,
+            "attempt": {
+                "engine_invoked": True,
+                "failure_class": "engine_observe_error",
+            },
+        }
 
     diagnostics = [
         *_retrieval_engine_observe_diagnostics(adapter_result.diagnostics),
@@ -11672,6 +11836,10 @@ def _retrieval_engine_selected_source_lane_package(
             "reason": contract.get("terminal_reason") or result.terminal_reason or result.status,
         },
         "contract": contract,
+        "attempt": {
+            "engine_invoked": True,
+            "failure_class": "",
+        },
     }
 
 

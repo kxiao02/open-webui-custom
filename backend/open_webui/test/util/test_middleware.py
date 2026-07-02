@@ -499,16 +499,63 @@ def test_retrieval_engine_observe_failure_is_diagnostic_only(monkeypatch):
     )
 
     assert observe["status"] == "error"
-    assert observe["terminal_reason"] == "engine_observe_error"
+    assert observe["terminal_reason"] == "request_construction_error"
     assert observe["counts"]["accepted_output_count"] == 0
     assert observe["counts"]["reference_count"] == 0
     assert observe["comparison"]["legacy_status"] == "success"
     assert observe["comparison"]["legacy_reference_count"] == 1
-    assert observe["diagnostics"][0]["code"] == "retrieval_engine_observe_failed"
+    assert observe["diagnostics"][0]["code"] == (
+        "retrieval_engine_request_construction_failed"
+    )
     assert "accepted_outputs" not in observe
     assert "references" not in observe
     assert "source_cards" not in observe
     assert "/srv/private/should-not-leak" not in repr(observe)
+
+
+def test_selected_source_engine_post_invocation_exception_returns_typed_error_contract(
+    monkeypatch,
+):
+    class RaisingEngine:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, _request):
+            raise RuntimeError("engine failed after invocation")
+
+    monkeypatch.setattr("retrieval_engine.RetrievalEngine", RaisingEngine)
+
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="What does the selected file say?",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "type": "text",
+                "data": {"content": "Alpha selected file text."},
+                "meta": {"content_type": "text/plain"},
+            }
+        ],
+        active_source_scope=_resolved_active_source_scope(
+            file_id="alpha-file",
+            name="alpha-policy.txt",
+        ),
+        legacy_status="pending",
+        legacy_terminal_reason="pending",
+        legacy_sources=[],
+        legacy_references=[],
+        legacy_accepted_outputs=[],
+    )
+
+    assert isinstance(package, dict)
+    contract = package.get("contract")
+    assert isinstance(contract, dict)
+    assert contract["status"] == "error"
+    assert contract["terminal_reason"] == "engine_observe_error"
+    assert contract["accepted_outputs"] == []
+    assert contract["references"] == []
+    assert contract["sources"] == []
+    assert package["authority"]["state"] == "engine_owned"
 
 
 class _FakeWorkbookContract:
@@ -3771,7 +3818,7 @@ def test_retrieval_engine_cutover_denied_scope_is_fail_closed():
     assert package["observe"]["counts"]["reference_count"] == 0
 
 
-def test_retrieval_engine_cutover_error_is_fallback_not_authority(monkeypatch):
+def test_retrieval_engine_request_construction_error_is_marked_fallback(monkeypatch):
     def fail_adapter(*_args, **_kwargs):
         raise RuntimeError("adapter exploded at /srv/private/should-not-leak")
 
@@ -3800,9 +3847,12 @@ def test_retrieval_engine_cutover_error_is_fallback_not_authority(monkeypatch):
     )
 
     assert package["authority"]["state"] == "fallback"
+    assert package["authority"]["reason"] == "request_construction_error"
+    assert package["attempt"]["engine_invoked"] is False
+    assert package["attempt"]["fallback_reason"] == "request_construction_error"
     observe = package["observe"]
     assert observe["status"] == "error"
-    assert observe["terminal_reason"] == "engine_observe_error"
+    assert observe["terminal_reason"] == "request_construction_error"
     assert observe["counts"]["accepted_output_count"] == 0
     assert observe["counts"]["reference_count"] == 0
     assert "/srv/private/should-not-leak" not in repr(observe)
@@ -6013,6 +6063,15 @@ def _engine_authority_tool_contract(
         },
     }
     return {
+        "contract_version": "open_webui_selected_source_engine_contract_v1",
+        "engine_version": "open_webui_selected_source_engine_v1",
+        "boundary_owned": True,
+        "boundary_owner": "open_webui.retrieval.engine_contract",
+        "source_scope_echo": {
+            "status": "resolved",
+            "source_ids": [source_id],
+            "authorization_generation": "open_webui_selected_source_engine_v1",
+        },
         "status": status,
         "terminal_reason": terminal_reason,
         "accepted_outputs": [accepted_output] if include_evidence else [],
@@ -6067,9 +6126,49 @@ def _engine_authority_tool_contract(
             "engine_authority": engine_authority,
             "middleware_strategy_bypassed": True,
             "selected_source_runtime_mode": runtime_mode,
+            "retrieval_runtime_mode": "engine_owned",
             "engine_owned": True,
             "middleware_strategy_bypass_reason": bypass_reason,
+            "contract_version": "open_webui_selected_source_engine_contract_v1",
+            "engine_version": "open_webui_selected_source_engine_v1",
+            "boundary_owned": True,
+            "boundary_owner": "open_webui.retrieval.engine_contract",
         },
+    }
+
+
+def _trusted_engine_tool_metadata(
+    contract: dict,
+    *,
+    file_id: str = "alpha-file",
+    name: str = "alpha-policy.txt",
+) -> dict:
+    return {
+        "retrieval_engine_first_pass_contract": contract,
+        "retrieval_engine_attempt": {
+            "engine_invoked": True,
+            "contract_present": True,
+            "contract_valid": True,
+            "contract_version": "open_webui_selected_source_engine_contract_v1",
+            "engine_version": "open_webui_selected_source_engine_v1",
+            "terminal_status": str(contract.get("status") or ""),
+            "terminal_reason": str(contract.get("terminal_reason") or ""),
+            "runtime_mode": "engine_owned",
+            "retrieval_runtime_mode": "engine_owned",
+            "selected_source_runtime_mode": str(
+                (contract.get("provenance") or {}).get("selected_source_runtime_mode")
+                or ""
+            ),
+            "fallback_reason": "",
+            "failure_class": "",
+            "invalid_reasons": [],
+            "boundary_owned": True,
+            "boundary_owner": "open_webui.retrieval.engine_contract",
+        },
+        "active_source_scope": _resolved_active_source_scope(
+            file_id=file_id,
+            name=name,
+        ),
     }
 
 
@@ -6114,13 +6213,9 @@ def test_query_selected_knowledge_files_uses_engine_authority_without_legacy_pol
             evidence_need="structured_exact",
             __request__=_selected_source_tool_request_stub(hybrid_enabled=True),
             __files__=[],
-            __metadata__={
-                "retrieval_engine_first_pass_contract": _engine_authority_tool_contract(),
-                "active_source_scope": _resolved_active_source_scope(
-                    file_id="alpha-file",
-                    name="alpha-policy.txt",
-                ),
-            },
+            __metadata__=_trusted_engine_tool_metadata(
+                _engine_authority_tool_contract(),
+            ),
             __user_model__=SimpleNamespace(id="user-1"),
         )
     )
@@ -6152,13 +6247,9 @@ def test_read_selected_file_uses_engine_authority_without_legacy_policy(monkeypa
             evidence_need="narrow_fact",
             __request__=_selected_source_tool_request_stub(),
             __files__=[],
-            __metadata__={
-                "retrieval_engine_first_pass_contract": _engine_authority_tool_contract(),
-                "active_source_scope": _resolved_active_source_scope(
-                    file_id="alpha-file",
-                    name="alpha-policy.txt",
-                ),
-            },
+            __metadata__=_trusted_engine_tool_metadata(
+                _engine_authority_tool_contract(),
+            ),
             __user_model__=SimpleNamespace(id="user-1"),
         )
     )
@@ -6195,17 +6286,13 @@ def test_selected_source_tool_engine_partial_maps_budget_and_keeps_diagnostics_s
             evidence_need="narrow_fact",
             __request__=_selected_source_tool_request_stub(),
             __files__=[],
-            __metadata__={
-                "retrieval_engine_first_pass_contract": _engine_authority_tool_contract(
+            __metadata__=_trusted_engine_tool_metadata(
+                _engine_authority_tool_contract(
                     status="partial",
                     terminal_reason="budget_limited",
                     diagnostics=diagnostics,
                 ),
-                "active_source_scope": _resolved_active_source_scope(
-                    file_id="alpha-file",
-                    name="alpha-policy.txt",
-                ),
-            },
+            ),
             __user_model__=SimpleNamespace(id="user-1"),
         )
     )
@@ -6272,18 +6359,14 @@ def test_selected_source_tool_engine_denied_scope_fails_closed(monkeypatch):
             source_ids=["alpha-file"],
             __request__=_selected_source_tool_request_stub(),
             __files__=[],
-            __metadata__={
-                "retrieval_engine_first_pass_contract": _engine_authority_tool_contract(
+            __metadata__=_trusted_engine_tool_metadata(
+                _engine_authority_tool_contract(
                     status="denied",
                     terminal_reason="source_scope_violation",
                     include_evidence=False,
                     diagnostics=diagnostics,
                 ),
-                "active_source_scope": _resolved_active_source_scope(
-                    file_id="alpha-file",
-                    name="alpha-policy.txt",
-                ),
-            },
+            ),
             __user_model__=SimpleNamespace(id="user-1"),
         )
     )
@@ -6379,8 +6462,8 @@ def test_selected_source_tool_engine_diagnostic_categories_zero_accepted_lanes(
                 evidence_need="narrow_fact",
                 __request__=_selected_source_tool_request_stub(),
                 __files__=[],
-                __metadata__={
-                    "retrieval_engine_first_pass_contract": _engine_authority_tool_contract(
+                __metadata__=_trusted_engine_tool_metadata(
+                    _engine_authority_tool_contract(
                         status=status,
                         terminal_reason=terminal_reason,
                         include_evidence=False,
@@ -6400,11 +6483,7 @@ def test_selected_source_tool_engine_diagnostic_categories_zero_accepted_lanes(
                             }
                         ],
                     ),
-                    "active_source_scope": _resolved_active_source_scope(
-                        file_id="alpha-file",
-                        name="alpha-policy.txt",
-                    ),
-                },
+                ),
                 __user_model__=SimpleNamespace(id="user-1"),
             )
         )
@@ -6456,7 +6535,7 @@ def test_selected_source_tool_engine_diagnostic_categories_zero_accepted_lanes(
         )
 
 
-def test_selected_source_tool_compatibility_diagnostics_stay_marked_compatibility(
+def test_selected_source_tool_missing_engine_contract_uses_marked_compatibility(
     monkeypatch,
 ):
     raw_path = "/srv/open-webui/uploads/private/alpha-policy.txt"
@@ -6483,20 +6562,6 @@ def test_selected_source_tool_compatibility_diagnostics_stay_marked_compatibilit
         fake_get_sources_from_items,
     )
 
-    untrusted_contract = _engine_authority_tool_contract(
-        status="no_evidence",
-        terminal_reason="no_accepted_evidence",
-        include_evidence=False,
-        diagnostics=[
-            {
-                "classification": "no_evidence",
-                "reason": "candidate_rejected",
-                "outcome": "no_evidence",
-            }
-        ],
-    )
-    untrusted_contract["provenance"] = {}
-
     response = asyncio.run(
         query_selected_knowledge_files(
             query="fallback evidence",
@@ -6505,7 +6570,12 @@ def test_selected_source_tool_compatibility_diagnostics_stay_marked_compatibilit
             __request__=_selected_source_tool_request_stub(hybrid_enabled=True),
             __files__=[_selected_source_file_candidate("alpha-file", "alpha-policy.txt")],
             __metadata__={
-                "retrieval_engine_first_pass_contract": untrusted_contract,
+                "retrieval_engine_attempt": {
+                    "engine_invoked": False,
+                    "runtime_mode": "legacy_fallback",
+                    "fallback_reason": "adapter_unavailable",
+                    "failure_class": "adapter_unavailable",
+                },
                 "active_source_scope": _resolved_active_source_scope(
                     file_id="alpha-file",
                     name="alpha-policy.txt",
@@ -6522,6 +6592,8 @@ def test_selected_source_tool_compatibility_diagnostics_stay_marked_compatibilit
     assert response["provenance"]["selected_source_runtime_mode"] == (
         "compatibility_fallback"
     )
+    assert response["provenance"]["retrieval_runtime_mode"] == "legacy_fallback"
+    assert response["provenance"]["fallback_reason"] == "adapter_unavailable"
     assert response["provenance"]["compatibility_fallback"] is True
     assert response["provenance"]["engine_owned"] is False
     diagnostic = response["retrieval_diagnostics"][0]
@@ -6535,7 +6607,7 @@ def test_selected_source_tool_compatibility_diagnostics_stay_marked_compatibilit
     assert raw_path not in json.dumps(diagnostic["provenance"], ensure_ascii=False)
 
 
-def test_selected_source_tool_untrusted_engine_contract_uses_legacy_fallback(
+def test_selected_source_tool_invalid_present_engine_contract_fails_closed(
     monkeypatch,
 ):
     provider_calls = {"count": 0}
@@ -6575,24 +6647,23 @@ def test_selected_source_tool_untrusted_engine_contract_uses_legacy_fallback(
         )
     )
 
-    assert provider_calls["count"] == 1
-    assert response["status"] == "success"
-    assert response["strategy_used"]["retrieval_strategy"] == "semantic_chunks"
-    assert response["provenance"]["strategy_used"]["retrieval_strategy"] == "semantic_chunks"
+    assert provider_calls["count"] == 0
+    assert response["status"] == "error"
+    assert response["terminal_reason"] == "invalid_engine_contract"
+    assert response["code"] == "invalid_engine_contract"
+    assert response["canonical_references"] == []
+    assert response["references"] == []
+    assert response["accepted_outputs"] == []
+    assert response["retrieval_diagnostics"][0]["reason"] == "invalid_engine_contract"
+    assert response["strategy_used"]["retrieval_strategy"] == (
+        "retrieval_engine_fail_closed"
+    )
     assert response["provenance"]["selected_source_runtime_mode"] == (
-        "compatibility_fallback"
+        "retrieval_engine_fail_closed"
     )
-    assert response["provenance"]["compatibility_fallback"] is True
-    assert response["provenance"]["compatibility_boundary"] == (
-        "legacy_selected_source_fallback_until_10_5"
-    )
-    compact = response["provenance"]["compact_retrieval_provenance"]
-    assert compact["runtime_mode"] == "compatibility_fallback"
-    assert compact["compatibility_fallback"] is True
-    assert compact["engine_owned"] is False
-    assert response["accepted_outputs"][0]["snippet"] == (
-        "Legacy compatibility fallback evidence."
-    )
+    assert response["provenance"]["retrieval_runtime_mode"] == "engine_owned"
+    assert response["provenance"]["engine_owned"] is True
+    assert response["provenance"]["compatibility_fallback"] is False
 
 
 def test_selected_source_tool_preserves_hybrid_fallback_provenance(monkeypatch):
@@ -10455,3 +10526,912 @@ def test_final_limitation_guard_rewrites_unsupported_concrete_content_after_lane
     assert "无法给出具体文档列表或结论" in guarded_content
     assert guarded_content != concrete_content
     assert guarded_output[-1]["content"][0]["text"] == guarded_content
+
+
+# ---------------------------------------------------------------------------
+# Engine contract always bypasses legacy when engine produced a valid result
+# ---------------------------------------------------------------------------
+
+
+def _engine_contract_bypass_legacy_fixture(
+    *,
+    engine_status: str,
+    engine_terminal_reason: str = "",
+    include_evidence: bool = True,
+    diagnostics: list[dict] | None = None,
+    authority_state: str = "",
+):
+    """Build a middleware monkeypatch set that intercepts legacy calls."""
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "meta": {"content_type": "text/plain"},
+    }
+
+    contract = _engine_authority_tool_contract(
+        status=engine_status,
+        terminal_reason=engine_terminal_reason or engine_status,
+        include_evidence=include_evidence,
+        diagnostics=diagnostics,
+    )
+    # The middleware reads engine_contract.get("sources", []) for source cards.
+    # Mirror what _retrieval_engine_result_first_pass_contract produces.
+    if "sources" not in contract:
+        contract["sources"] = list(contract.get("references") or [])
+
+    if not authority_state:
+        if engine_status in {"success", "partial"} and include_evidence:
+            authority_state = "authoritative"
+        elif engine_status in {"denied", "blocked"}:
+            authority_state = "fail_closed"
+        else:
+            authority_state = "diagnostics"
+
+    return retrieval_candidate, contract, authority_state
+
+
+def test_engine_success_contract_bypasses_legacy_and_maps_references(monkeypatch):
+    retrieval_candidate, contract, authority_state = _engine_contract_bypass_legacy_fixture(
+        engine_status="success",
+    )
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def emit_event(_event):
+        return None
+
+    legacy_calls = {"count": 0}
+
+    async def raise_legacy_provider(*_args, **_kwargs):
+        legacy_calls["count"] += 1
+        raise AssertionError("legacy provider must be bypassed when engine has valid contract")
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        raise_legacy_provider,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_strategy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("middleware strategy must be bypassed")
+        ),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+        lambda **_kwargs: {
+            "authority": {"state": authority_state, "reason": "success"},
+            "contract": contract,
+            "observe": {
+                "mode": "observe_parallel",
+                "lane": "selected_file_text",
+                "authority": "retrieval_engine",
+                "status": "success",
+                "terminal_reason": "success",
+                "plan_summary": {"evidence_shape": "narrow_chunk"},
+                "counts": {
+                    "candidate_count": 1,
+                    "evidence_bundle_count": 1,
+                    "accepted_output_count": 1,
+                    "reference_count": 1,
+                    "diagnostic_count": 0,
+                },
+                "diagnostics": [],
+            },
+        },
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "what is transformer grounding"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert legacy_calls["count"] == 0
+    assert flags["status"] == "success"
+    assert flags["accepted_outputs"]
+    assert flags["references"]
+    assert flags["sources"][0]["source"]["id"] == "alpha-file"
+
+
+def test_engine_no_evidence_contract_bypasses_legacy_zero_source_cards(monkeypatch):
+    retrieval_candidate, contract, authority_state = _engine_contract_bypass_legacy_fixture(
+        engine_status="no_evidence",
+        engine_terminal_reason="no_accepted_evidence",
+        include_evidence=False,
+        diagnostics=[
+            {
+                "classification": "no_evidence",
+                "reason": "no_accepted_evidence",
+                "outcome": "no_evidence",
+            }
+        ],
+    )
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def emit_event(_event):
+        return None
+
+    legacy_calls = {"count": 0}
+
+    async def raise_legacy_provider(*_args, **_kwargs):
+        legacy_calls["count"] += 1
+        raise AssertionError("legacy provider must be bypassed on engine no_evidence")
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        raise_legacy_provider,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_strategy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("middleware strategy must be bypassed on engine no_evidence")
+        ),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+        lambda **_kwargs: {
+            "authority": {"state": authority_state, "reason": "no_accepted_evidence"},
+            "contract": contract,
+            "observe": {
+                "mode": "observe_parallel",
+                "lane": "selected_file_text",
+                "authority": "retrieval_engine",
+                "status": "no_evidence",
+                "terminal_reason": "no_accepted_evidence",
+                "plan_summary": {"evidence_shape": "narrow_chunk"},
+                "counts": {
+                    "candidate_count": 0,
+                    "evidence_bundle_count": 0,
+                    "accepted_output_count": 0,
+                    "reference_count": 0,
+                    "diagnostic_count": 1,
+                },
+                "diagnostics": [
+                    {
+                        "classification": "no_evidence",
+                        "reason": "no_accepted_evidence",
+                        "outcome": "no_evidence",
+                    }
+                ],
+            },
+        },
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "what is transformer grounding"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert legacy_calls["count"] == 0
+    assert flags["status"] == "no_evidence"
+    assert not flags["sources"]
+    assert not flags.get("accepted_outputs")
+    assert flags["retrieval_diagnostics"]
+
+
+def test_engine_denied_contract_bypasses_legacy_zero_source_cards(monkeypatch):
+    for denied_status in ("denied", "blocked"):
+        retrieval_candidate, contract, authority_state = _engine_contract_bypass_legacy_fixture(
+            engine_status=denied_status,
+            engine_terminal_reason="source_scope_violation",
+            include_evidence=False,
+            diagnostics=[
+                {
+                    "classification": denied_status,
+                    "reason": "source_scope_violation",
+                    "outcome": denied_status,
+                }
+            ],
+        )
+
+        async def fake_prepare_files(*_args, **_kwargs):
+            return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+        async def emit_event(_event):
+            return None
+
+        legacy_calls = {"count": 0}
+
+        async def raise_legacy_provider(*_args, **_kwargs):
+            legacy_calls["count"] += 1
+            raise AssertionError(f"legacy provider must be bypassed on engine {denied_status}")
+
+        monkeypatch.setattr(
+            "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+            fake_prepare_files,
+        )
+        monkeypatch.setattr(
+            "open_webui.utils.middleware.get_sources_from_items",
+            raise_legacy_provider,
+        )
+        monkeypatch.setattr(
+            "open_webui.utils.middleware.ensure_retrieval_runtime",
+            lambda _app: None,
+        )
+        monkeypatch.setattr(
+            "open_webui.utils.middleware._first_pass_selected_source_strategy",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"middleware strategy must be bypassed on engine {denied_status}")
+            ),
+        )
+        monkeypatch.setattr(
+            "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+            lambda **_kwargs: {
+                "authority": {"state": authority_state, "reason": "source_scope_violation"},
+                "contract": contract,
+                "observe": {
+                    "mode": "observe_parallel",
+                    "lane": "selected_file_text",
+                    "authority": "retrieval_engine",
+                    "status": denied_status,
+                    "terminal_reason": "source_scope_violation",
+                    "plan_summary": {"evidence_shape": "narrow_chunk"},
+                    "counts": {
+                        "candidate_count": 0,
+                        "evidence_bundle_count": 0,
+                        "accepted_output_count": 0,
+                        "reference_count": 0,
+                        "diagnostic_count": 1,
+                    },
+                    "diagnostics": [
+                        {
+                            "classification": denied_status,
+                            "reason": "source_scope_violation",
+                            "outcome": denied_status,
+                        }
+                    ],
+                },
+            },
+        )
+
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "what is transformer grounding"}],
+            "metadata": {
+                "files": [retrieval_candidate],
+                "execution_profile_routing_diagnostics": {
+                    "classified_evidence_need": "narrow_fact"
+                },
+            },
+        }
+
+        _, flags = asyncio.run(
+            chat_completion_files_handler(
+                _first_pass_retrieval_request_stub(),
+                body,
+                {"__event_emitter__": emit_event},
+                SimpleNamespace(id="user-1"),
+            )
+        )
+
+        assert legacy_calls["count"] == 0, f"legacy ran for {denied_status}"
+        assert flags["status"] == denied_status, f"wrong status for {denied_status}"
+        assert not flags["sources"], f"sources exist for {denied_status}"
+        assert not flags.get("accepted_outputs"), f"accepted_outputs exist for {denied_status}"
+
+
+def test_invalid_present_engine_contract_fails_closed_without_legacy(monkeypatch):
+    retrieval_candidate, invalid_contract, authority_state = (
+        _engine_contract_bypass_legacy_fixture(
+            engine_status="denied",
+            engine_terminal_reason="source_scope_violation",
+            include_evidence=True,
+            authority_state="fail_closed",
+        )
+    )
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def emit_event(_event):
+        return None
+
+    legacy_calls = {"count": 0}
+
+    async def raise_legacy_provider(*_args, **_kwargs):
+        legacy_calls["count"] += 1
+        raise AssertionError("legacy provider must not run for invalid engine contract")
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        raise_legacy_provider,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_strategy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("first-pass strategy must be bypassed for invalid contract")
+        ),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+        lambda **_kwargs: {
+            "authority": {"state": authority_state, "reason": "source_scope_violation"},
+            "contract": invalid_contract,
+            "observe": {
+                "mode": "observe_parallel",
+                "lane": "selected_file_text",
+                "authority": "retrieval_engine",
+                "status": "denied",
+                "terminal_reason": "source_scope_violation",
+                "plan_summary": {"evidence_shape": "narrow_chunk"},
+                "counts": {
+                    "candidate_count": 1,
+                    "evidence_bundle_count": 1,
+                    "accepted_output_count": 1,
+                    "reference_count": 1,
+                    "diagnostic_count": 0,
+                },
+                "diagnostics": [],
+            },
+        },
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "what is transformer grounding"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert legacy_calls["count"] == 0
+    assert flags["status"] == "error"
+    assert flags["terminal_reason"] == "invalid_engine_contract"
+    assert flags["accepted_outputs"] == []
+    assert flags["references"] == []
+    assert flags["sources"] == []
+    assert _diagnostic_reason_set(flags) == {"invalid_engine_contract"}
+    attempt = flags["retrieval_engine_attempt"]
+    assert attempt["engine_invoked"] is True
+    assert attempt["runtime_mode"] == "engine_owned"
+    assert attempt["failure_class"] == "invalid_engine_contract"
+
+
+def test_engine_timeout_and_error_contracts_bypass_legacy_zero_source_cards(
+    monkeypatch,
+):
+    for status, terminal_reason in (
+        ("timeout", "retrieval_timeout"),
+        ("error", "engine_runtime_error"),
+    ):
+        retrieval_candidate, contract, authority_state = (
+            _engine_contract_bypass_legacy_fixture(
+                engine_status=status,
+                engine_terminal_reason=terminal_reason,
+                include_evidence=False,
+                diagnostics=[
+                    {
+                        "classification": "no_evidence",
+                        "reason": terminal_reason,
+                        "outcome": status,
+                    }
+                ],
+            )
+        )
+
+        async def fake_prepare_files(*_args, **_kwargs):
+            return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+        async def emit_event(_event):
+            return None
+
+        legacy_calls = {"count": 0}
+
+        async def raise_legacy_provider(*_args, **_kwargs):
+            legacy_calls["count"] += 1
+            raise AssertionError(f"legacy provider must be bypassed on engine {status}")
+
+        monkeypatch.setattr(
+            "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+            fake_prepare_files,
+        )
+        monkeypatch.setattr(
+            "open_webui.utils.middleware.get_sources_from_items",
+            raise_legacy_provider,
+        )
+        monkeypatch.setattr(
+            "open_webui.utils.middleware.ensure_retrieval_runtime",
+            lambda _app: None,
+        )
+        monkeypatch.setattr(
+            "open_webui.utils.middleware._first_pass_selected_source_strategy",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"strategy must be bypassed on engine {status}")
+            ),
+        )
+        monkeypatch.setattr(
+            "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+            lambda **_kwargs: {
+                "authority": {"state": authority_state, "reason": terminal_reason},
+                "contract": contract,
+                "observe": {
+                    "mode": "observe_parallel",
+                    "lane": "selected_file_text",
+                    "authority": "retrieval_engine",
+                    "status": status,
+                    "terminal_reason": terminal_reason,
+                    "plan_summary": {"evidence_shape": "narrow_chunk"},
+                    "counts": {
+                        "candidate_count": 0,
+                        "evidence_bundle_count": 0,
+                        "accepted_output_count": 0,
+                        "reference_count": 0,
+                        "diagnostic_count": 1,
+                    },
+                    "diagnostics": [],
+                },
+            },
+        )
+
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "what is transformer grounding"}],
+            "metadata": {
+                "files": [retrieval_candidate],
+                "execution_profile_routing_diagnostics": {
+                    "classified_evidence_need": "narrow_fact"
+                },
+            },
+        }
+
+        _, flags = asyncio.run(
+            chat_completion_files_handler(
+                _first_pass_retrieval_request_stub(),
+                body,
+                {"__event_emitter__": emit_event},
+                SimpleNamespace(id="user-1"),
+            )
+        )
+
+        assert legacy_calls["count"] == 0
+        assert flags["status"] == status
+        assert flags["terminal_reason"] == terminal_reason
+        assert flags["sources"] == []
+        assert flags["accepted_outputs"] == []
+        assert flags["retrieval_engine_attempt"]["engine_invoked"] is True
+        assert flags["retrieval_engine_attempt"]["terminal_status"] == status
+
+
+def test_engine_diagnostics_only_contract_bypasses_legacy_source_publication(monkeypatch):
+    retrieval_candidate, contract, authority_state = _engine_contract_bypass_legacy_fixture(
+        engine_status="no_evidence",
+        engine_terminal_reason="rejected_candidates_only",
+        include_evidence=False,
+        diagnostics=[
+            {
+                "classification": "diagnostics",
+                "reason": "rejected_candidates_only",
+                "outcome": "no_evidence",
+            }
+        ],
+    )
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def emit_event(_event):
+        return None
+
+    legacy_calls = {"count": 0}
+
+    async def raise_legacy_provider(*_args, **_kwargs):
+        legacy_calls["count"] += 1
+        raise AssertionError("legacy provider must be bypassed on diagnostics-only")
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        raise_legacy_provider,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._first_pass_selected_source_strategy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("middleware strategy must be bypassed on diagnostics-only")
+        ),
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+        lambda **_kwargs: {
+            "authority": {"state": authority_state, "reason": "rejected_candidates_only"},
+            "contract": contract,
+            "observe": {
+                "mode": "observe_parallel",
+                "lane": "selected_file_text",
+                "authority": "retrieval_engine",
+                "status": "no_evidence",
+                "terminal_reason": "rejected_candidates_only",
+                "plan_summary": {"evidence_shape": "narrow_chunk"},
+                "counts": {
+                    "candidate_count": 2,
+                    "evidence_bundle_count": 0,
+                    "accepted_output_count": 0,
+                    "reference_count": 0,
+                    "diagnostic_count": 1,
+                },
+                "diagnostics": [
+                    {
+                        "classification": "diagnostics",
+                        "reason": "rejected_candidates_only",
+                        "outcome": "no_evidence",
+                    }
+                ],
+            },
+        },
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "what is transformer grounding"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert legacy_calls["count"] == 0
+    assert flags["status"] == "no_evidence"
+    assert not flags["sources"]
+    assert not flags.get("accepted_outputs")
+
+
+def test_missing_engine_contract_allows_compatibility_fallback(monkeypatch):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "meta": {"content_type": "text/plain"},
+    }
+
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="Legacy compatibility fallback evidence.",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+
+    # Engine returns fallback (adapter error) — no contract key
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+        lambda **_kwargs: {
+            "authority": {"state": "fallback", "reason": "adapter_unavailable"},
+            "observe": {
+                "mode": "observe_parallel",
+                "lane": "selected_file_text",
+                "authority": "legacy_selected_source",
+                "status": "error",
+                "terminal_reason": "engine_observe_error",
+                "plan_summary": {},
+                "counts": {
+                    "candidate_count": 0,
+                    "evidence_bundle_count": 0,
+                    "accepted_output_count": 0,
+                    "reference_count": 0,
+                    "diagnostic_count": 0,
+                },
+                "diagnostics": [],
+            },
+        },
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "what is transformer grounding"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 1
+    assert flags["sources"]
+    assert flags["sources"][0]["source"]["id"] == "alpha-file"
+    assert flags["sources"][0]["source"]["origin"] == "legacy_fallback"
+    strategy = flags.get("first_pass_retrieval_strategy") or {}
+    assert strategy.get("compatibility_fallback") is True
+    assert strategy.get("retrieval_runtime_mode") == "legacy_fallback"
+    assert strategy.get("fallback_reason") == "adapter_unavailable"
+    attempt = flags["retrieval_engine_attempt"]
+    assert attempt["engine_invoked"] is False
+    assert attempt["runtime_mode"] == "legacy_fallback"
+    assert attempt["fallback_reason"] == "adapter_unavailable"
+    assert attempt["failure_class"] == "adapter_unavailable"
+
+
+def test_unsupported_source_shape_allows_marked_compatibility_fallback(monkeypatch):
+    retrieval_candidate = {
+        "id": "alpha-file",
+        "name": "alpha-policy.txt",
+        "context": "full",
+        "type": "text",
+        "collection_name": "alpha-file",
+        "meta": {"content_type": "text/plain"},
+    }
+
+    provider_calls = {"count": 0}
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def fake_get_sources_from_items(*_args, **_kwargs):
+        provider_calls["count"] += 1
+        return [
+            _local_file_source(
+                file_id="alpha-file",
+                name="alpha-policy.txt",
+                content="Legacy fallback evidence for unsupported source shape.",
+            )
+        ]
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        fake_get_sources_from_items,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+        lambda **_kwargs: {
+            "authority": {"state": "fallback", "reason": "unsupported_source_shape"},
+            "observe": {
+                "mode": "observe_parallel",
+                "lane": "selected_file_text",
+                "authority": "legacy_selected_source",
+                "status": "no_evidence",
+                "terminal_reason": "unsupported_source_shape",
+                "plan_summary": {},
+                "counts": {
+                    "candidate_count": 0,
+                    "evidence_bundle_count": 0,
+                    "accepted_output_count": 0,
+                    "reference_count": 0,
+                    "diagnostic_count": 1,
+                },
+                "diagnostics": [],
+            },
+        },
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "what is transformer grounding"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert provider_calls["count"] == 1
+    assert flags["sources"][0]["source"]["origin"] == "legacy_fallback"
+    strategy = flags.get("first_pass_retrieval_strategy") or {}
+    assert strategy.get("retrieval_runtime_mode") == "legacy_fallback"
+    assert strategy.get("fallback_reason") == "unsupported_source_shape"
+    assert flags["retrieval_engine_attempt"]["fallback_reason"] == (
+        "unsupported_source_shape"
+    )
+
+
+def test_engine_contract_always_stored_in_metadata_when_invoked(monkeypatch):
+    retrieval_candidate, contract, authority_state = _engine_contract_bypass_legacy_fixture(
+        engine_status="no_evidence",
+        engine_terminal_reason="no_accepted_evidence",
+        include_evidence=False,
+        diagnostics=[
+            {
+                "classification": "no_evidence",
+                "reason": "no_accepted_evidence",
+                "outcome": "no_evidence",
+            }
+        ],
+    )
+
+    async def fake_prepare_files(*_args, **_kwargs):
+        return [retrieval_candidate], [], [], [retrieval_candidate], []
+
+    async def emit_event(_event):
+        return None
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._prepare_chat_files_for_retrieval",
+        fake_prepare_files,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.get_sources_from_items",
+        lambda *_a, **_k: [],
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ensure_retrieval_runtime",
+        lambda _app: None,
+    )
+    monkeypatch.setattr(
+        "open_webui.utils.middleware._retrieval_engine_selected_source_lane_package",
+        lambda **_kwargs: {
+            "authority": {"state": authority_state, "reason": "no_accepted_evidence"},
+            "contract": contract,
+            "observe": {
+                "mode": "observe_parallel",
+                "lane": "selected_file_text",
+                "authority": "retrieval_engine",
+                "status": "no_evidence",
+                "terminal_reason": "no_accepted_evidence",
+                "plan_summary": {"evidence_shape": "narrow_chunk"},
+                "counts": {
+                    "candidate_count": 0,
+                    "evidence_bundle_count": 0,
+                    "accepted_output_count": 0,
+                    "reference_count": 0,
+                    "diagnostic_count": 1,
+                },
+                "diagnostics": [],
+            },
+        },
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "what is transformer grounding"}],
+        "metadata": {
+            "files": [retrieval_candidate],
+            "execution_profile_routing_diagnostics": {
+                "classified_evidence_need": "narrow_fact"
+            },
+        },
+    }
+
+    _, flags = asyncio.run(
+        chat_completion_files_handler(
+            _first_pass_retrieval_request_stub(),
+            body,
+            {"__event_emitter__": emit_event},
+            SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert flags.get("retrieval_engine_first_pass_contract") or flags.get(
+        "retrieval_engine_contract"
+    ), "engine contract must be stored in metadata when engine was invoked"

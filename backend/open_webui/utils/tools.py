@@ -54,6 +54,10 @@ from open_webui.env import (
     FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
 )
 from open_webui.utils.headers import include_user_info_headers
+from open_webui.retrieval.engine_contract import (
+    classify_engine_attempt,
+    read_engine_contract_for_turn,
+)
 from open_webui.tools.builtin import (
     search_web,
     fetch_url,
@@ -3322,8 +3326,14 @@ def _selected_retrieval_worker_contract_lanes(
         provenance.get("selected_source_runtime_mode")
         or ("retrieval_engine_authority" if engine_owned else "compatibility_fallback")
     )
+    retrieval_runtime_mode = str(
+        provenance.get("retrieval_runtime_mode")
+        or ("engine_owned" if engine_owned else "legacy_fallback")
+    )
+    fallback_reason = str(provenance.get("fallback_reason") or "")
     engine_owned = bool(provenance.get("engine_owned")) if "engine_owned" in provenance else engine_owned
     provenance.setdefault("selected_source_runtime_mode", runtime_mode)
+    provenance.setdefault("retrieval_runtime_mode", retrieval_runtime_mode)
     provenance.setdefault("engine_owned", engine_owned)
     if not engine_owned:
         provenance.setdefault("compatibility_fallback", True)
@@ -3331,6 +3341,8 @@ def _selected_retrieval_worker_contract_lanes(
             "compatibility_boundary",
             "legacy_selected_source_fallback_until_10_5",
         )
+        if fallback_reason:
+            provenance.setdefault("fallback_reason", fallback_reason)
     authorization_context = (
         payload.get("authorization_context")
         if isinstance(payload.get("authorization_context"), dict)
@@ -3385,10 +3397,12 @@ def _selected_retrieval_worker_contract_lanes(
             "accepted_output_count": len(payload.get("accepted_outputs") or []),
         },
         "runtime_mode": runtime_mode,
+        "retrieval_runtime_mode": retrieval_runtime_mode,
         "engine_owned": engine_owned,
         "engine_authority": bool(provenance.get("engine_authority")),
         "compatibility_fallback": bool(provenance.get("compatibility_fallback")),
         "compatibility_boundary": str(provenance.get("compatibility_boundary") or ""),
+        "fallback_reason": str(provenance.get("fallback_reason") or ""),
         "compatibility_hybrid_events": compatibility_hybrid_events,
         "fallback_used": bool(
             strategy_used.get("metadata_first_intent")
@@ -3440,10 +3454,12 @@ def _selected_retrieval_worker_contract_lanes(
             "status": status,
             "terminal_reason": terminal_reason,
             "selected_source_runtime_mode": runtime_mode,
+            "retrieval_runtime_mode": retrieval_runtime_mode,
             "engine_owned": engine_owned,
             "engine_authority": bool(provenance.get("engine_authority")),
             "compatibility_fallback": bool(provenance.get("compatibility_fallback")),
             "compatibility_boundary": str(provenance.get("compatibility_boundary") or ""),
+            "fallback_reason": str(provenance.get("fallback_reason") or ""),
             "compact_retrieval_provenance": compact,
         }.items():
             if value not in (None, "", [], {}):
@@ -3486,97 +3502,7 @@ def _selected_retrieval_looks_like_raw_path(value: str) -> bool:
 
 
 def _selected_retrieval_engine_contract_source(metadata: dict | None) -> dict[str, Any]:
-    metadata = metadata if isinstance(metadata, dict) else {}
-    for key in (
-        "retrieval_engine_first_pass_contract",
-        "retrieval_engine_contract",
-        "selected_source_retrieval_engine_contract",
-    ):
-        value = metadata.get(key)
-        if isinstance(value, dict):
-            return copy.deepcopy(value)
-    if any(
-        key in metadata
-        for key in (
-            "accepted_outputs",
-            "references",
-            "canonical_references",
-            "retrieval_diagnostics",
-            "diagnostics",
-        )
-    ):
-        return copy.deepcopy(metadata)
-    return {}
-
-
-def _selected_retrieval_engine_contract_is_trusted(
-    payload: dict[str, Any],
-    metadata: dict | None,
-) -> bool:
-    metadata = metadata if isinstance(metadata, dict) else {}
-    provenance = payload.get("provenance")
-    provenance = provenance if isinstance(provenance, dict) else {}
-    compact = provenance.get("compact_retrieval_provenance")
-    compact = compact if isinstance(compact, dict) else {}
-    strategy = payload.get("strategy_used")
-    strategy = strategy if isinstance(strategy, dict) else {}
-    first_pass_strategy = metadata.get("first_pass_retrieval_strategy")
-    first_pass_strategy = first_pass_strategy if isinstance(first_pass_strategy, dict) else {}
-    return bool(
-        provenance.get("engine_authority")
-        or provenance.get("middleware_strategy_bypassed")
-        or compact.get("engine_authority")
-        or compact.get("middleware_strategy_bypassed")
-        or strategy.get("middleware_strategy_bypassed")
-        or first_pass_strategy.get("middleware_strategy_bypassed")
-    )
-
-
-def _selected_retrieval_engine_scope_failure(payload: dict[str, Any]) -> bool:
-    status = str(payload.get("status") or "").strip().lower()
-    terminal_reason = str(payload.get("terminal_reason") or payload.get("code") or "")
-    terminal_reason = terminal_reason.strip().lower()
-    if status in {"blocked", "denied", "permission_denied"}:
-        return True
-    if any(
-        token in terminal_reason
-        for token in (
-            "denied",
-            "blocked",
-            "scope",
-            "source_identity",
-            "source_scope",
-            "out_of_scope",
-        )
-    ):
-        return True
-    for item in [
-        *(payload.get("diagnostics") if isinstance(payload.get("diagnostics"), list) else []),
-        *(
-            payload.get("retrieval_diagnostics")
-            if isinstance(payload.get("retrieval_diagnostics"), list)
-            else []
-        ),
-    ]:
-        if not isinstance(item, dict):
-            continue
-        reason = str(item.get("reason") or item.get("code") or "").strip().lower()
-        outcome = str(item.get("outcome") or item.get("status") or "").strip().lower()
-        if outcome in {"denied", "blocked", "permission_denied"}:
-            return True
-        if any(
-            token in reason
-            for token in (
-                "denied",
-                "blocked",
-                "scope",
-                "source_identity",
-                "source_scope",
-                "out_of_scope",
-            )
-        ):
-            return True
-    return False
+    return read_engine_contract_for_turn(metadata)
 
 
 def _selected_retrieval_engine_authority_response(
@@ -3590,9 +3516,22 @@ def _selected_retrieval_engine_authority_response(
     source_id: str = "",
 ) -> dict[str, Any] | None:
     metadata = metadata if isinstance(metadata, dict) else {}
-    payload = _selected_retrieval_engine_contract_source(metadata)
-    if not payload or not _selected_retrieval_engine_contract_is_trusted(payload, metadata):
+    active_source_scope = (
+        metadata.get("active_source_scope")
+        if isinstance(metadata.get("active_source_scope"), dict)
+        else {}
+    )
+    attempt_classification = classify_engine_attempt(
+        metadata=metadata,
+        active_source_scope=active_source_scope,
+    )
+    if not attempt_classification.get("engine_owned"):
         return None
+    payload = (
+        attempt_classification.get("contract")
+        if isinstance(attempt_classification.get("contract"), dict)
+        else {}
+    )
 
     status = str(payload.get("status") or "").strip().lower()
     terminal_reason = (
@@ -3615,54 +3554,37 @@ def _selected_retrieval_engine_authority_response(
     diagnostics = [item for item in (diagnostics or []) if isinstance(item, dict)]
     provenance = payload.get("provenance")
     provenance = copy.deepcopy(provenance) if isinstance(provenance, dict) else {}
-    payload_runtime_mode = str(
-        provenance.get("selected_source_runtime_mode") or ""
-    ).strip().lower()
     engine_success = status in {"success", "partial"} and bool(
         references and accepted_outputs
     )
-    fail_closed = (
-        payload_runtime_mode == "retrieval_engine_fail_closed"
-        or _selected_retrieval_engine_scope_failure(payload)
+    runtime_mode = str(
+        attempt_classification.get("selected_source_runtime_mode")
+        or provenance.get("selected_source_runtime_mode")
+        or ("retrieval_engine_authority" if engine_success else "retrieval_engine_diagnostics")
     )
-    engine_diagnostics = bool(
-        not engine_success
-        and not fail_closed
-        and payload_runtime_mode != "compatibility_fallback"
-        and (
-            provenance.get("engine_owned")
-            or provenance.get("middleware_strategy_bypassed")
-            or provenance.get("tool_handler_policy_bypassed")
-            or payload_runtime_mode.startswith("retrieval_engine_")
+    bypass_reason = str(
+        attempt_classification.get("bypass_reason")
+        or provenance.get("middleware_strategy_bypass_reason")
+        or (
+            "retrieval_engine_authority_succeeded"
+            if runtime_mode == "retrieval_engine_authority"
+            else "retrieval_engine_fail_closed"
+            if runtime_mode == "retrieval_engine_fail_closed"
+            else "retrieval_engine_diagnostics_only"
         )
     )
-    if not engine_success and not fail_closed and not engine_diagnostics:
-        return None
-
-    runtime_mode = (
-        "retrieval_engine_authority"
-        if engine_success
-        else "retrieval_engine_fail_closed"
-        if fail_closed
-        else "retrieval_engine_diagnostics"
-    )
-    bypass_reason = (
-        "retrieval_engine_authority_succeeded"
-        if engine_success
-        else "retrieval_engine_fail_closed"
-        if fail_closed
-        else "retrieval_engine_diagnostics_only"
-    )
     retrieval_strategy = runtime_mode
-    response_status = status or ("blocked" if fail_closed else "error")
+    response_status = status or "error"
     provenance["worker_kind"] = "selected_source_retrieval"
     provenance["tool_name"] = tool_name
     provenance["status"] = response_status
     provenance["terminal_reason"] = terminal_reason
     provenance["engine_authority"] = bool(engine_success)
     provenance["selected_source_runtime_mode"] = runtime_mode
+    provenance["retrieval_runtime_mode"] = "engine_owned"
     provenance["engine_owned"] = True
     provenance["compatibility_fallback"] = False
+    provenance["failure_class"] = str(attempt_classification.get("failure_class") or "")
     provenance["tool_handler_policy_bypassed"] = True
     provenance["tool_handler_bypass_reason"] = bypass_reason
 
@@ -3690,6 +3612,8 @@ def _selected_retrieval_engine_authority_response(
         "tool_handler_policy_bypassed": True,
         "engine_status": status,
         "engine_terminal_reason": terminal_reason,
+        "retrieval_runtime_mode": "engine_owned",
+        "failure_class": str(attempt_classification.get("failure_class") or ""),
         "reason_codes": [
             "tool_handler_policy_bypassed",
             bypass_reason,
@@ -5380,6 +5304,29 @@ def compute_deepagent_builtin_retrieval_revision(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _selected_retrieval_apply_engine_attempt_metadata(
+    response: dict[str, Any],
+    metadata: dict | None,
+) -> dict[str, Any]:
+    payload = copy.deepcopy(response) if isinstance(response, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    attempt = metadata.get("retrieval_engine_attempt")
+    if not isinstance(attempt, dict):
+        return payload
+    provenance = payload.get("provenance")
+    provenance = copy.deepcopy(provenance) if isinstance(provenance, dict) else {}
+    if attempt.get("fallback_reason"):
+        provenance.setdefault("retrieval_runtime_mode", "legacy_fallback")
+        provenance.setdefault("fallback_reason", str(attempt.get("fallback_reason") or ""))
+        provenance.setdefault("failure_class", str(attempt.get("failure_class") or ""))
+    elif attempt.get("engine_invoked"):
+        provenance.setdefault("retrieval_runtime_mode", "engine_owned")
+        provenance.setdefault("failure_class", str(attempt.get("failure_class") or ""))
+    if provenance:
+        payload["provenance"] = provenance
+    return payload
+
+
 async def query_selected_knowledge_files(
     query: str,
     source_ids: Optional[list[str]] = None,
@@ -5430,7 +5377,7 @@ async def query_selected_knowledge_files(
 
     def finalize(response: dict[str, Any]) -> dict[str, Any]:
         return _selected_retrieval_worker_contract_lanes(
-            response,
+            _selected_retrieval_apply_engine_attempt_metadata(response, metadata),
             tool_name="query_selected_knowledge_files",
             normalized_timeout_seconds=normalized_timeout_seconds,
         )
@@ -6192,7 +6139,7 @@ async def read_selected_file(
 
     def finalize(response: dict[str, Any]) -> dict[str, Any]:
         return _selected_retrieval_worker_contract_lanes(
-            response,
+            _selected_retrieval_apply_engine_attempt_metadata(response, metadata),
             tool_name="read_selected_file",
             normalized_timeout_seconds=normalized_timeout_seconds,
         )
