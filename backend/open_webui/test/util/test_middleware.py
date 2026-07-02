@@ -63,6 +63,21 @@ from open_webui.utils.task import (
 )
 from open_webui.utils.tools import query_selected_knowledge_files, read_selected_file
 
+# Controlled fixtures from retrieval-engine/tests/fixtures/local_file_text/
+try:
+    from tests.fixtures.local_file_text.contracts import (
+        engine_authority_contract as _engine_authority_contract_fixture,
+        engine_result_stub as _engine_result_stub_fixture,
+        engine_contract_bypass_legacy_fixture as _engine_contract_bypass_legacy_pack_fixture,
+    )
+    from tests.fixtures.local_file_text.sources import (
+        local_file_source as _local_file_source_fixture,
+        local_file_reference as _local_file_reference_fixture,
+    )
+    _HAS_FIXTURE_PACK = True
+except ImportError:
+    _HAS_FIXTURE_PACK = False
+
 
 def _local_file_source(
     *,
@@ -11435,3 +11450,36 @@ def test_engine_contract_always_stored_in_metadata_when_invoked(monkeypatch):
     assert flags.get("retrieval_engine_first_pass_contract") or flags.get(
         "retrieval_engine_contract"
     ), "engine contract must be stored in metadata when engine was invoked"
+
+
+# ---------------------------------------------------------------------------
+# Fixture pack wiring
+# ---------------------------------------------------------------------------
+
+
+def test_fixture_pack_is_available():
+    """Verify the controlled fixture pack from retrieval-engine is importable."""
+    assert _HAS_FIXTURE_PACK, (
+        "retrieval-engine/tests/fixtures/local_file_text/ must be importable. "
+        "Ensure retrieval-engine is on sys.path (e.g. pip install -e retrieval-engine)."
+    )
+
+
+def test_fixture_pack_contract_matches_local_contract():
+    """Verify the fixture pack produces the same contract shape as the local helper."""
+    if not _HAS_FIXTURE_PACK:
+        return  # skip if fixture pack not available
+    local_contract = _engine_authority_tool_contract(
+        status="success",
+        terminal_reason="success",
+        include_evidence=True,
+    )
+    pack_contract = _engine_authority_contract_fixture(
+        status="success",
+        terminal_reason="success",
+        include_evidence=True,
+    )
+    assert local_contract.keys() == pack_contract.keys()
+    assert local_contract["status"] == pack_contract["status"]
+    assert len(local_contract["references"]) == len(pack_contract["references"])
+    assert len(local_contract["accepted_outputs"]) == len(pack_contract["accepted_outputs"])
