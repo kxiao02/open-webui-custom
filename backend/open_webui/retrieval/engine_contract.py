@@ -22,6 +22,7 @@ _RETRIEVAL_ENGINE_OBSERVE_RAW_PATH_KEYS = {
 ENGINE_CONTRACT_VERSION = "open_webui_selected_source_engine_contract_v1"
 ENGINE_CONTRACT_BOUNDARY_OWNER = "open_webui.retrieval.engine_contract"
 ENGINE_CONTRACT_ENGINE_VERSION = "open_webui_selected_source_engine_v1"
+ENGINE_INVOCATION_TIMEOUT_SECONDS = 25.0
 
 ENGINE_TERMINAL_STATUSES = {
     "success",
@@ -209,8 +210,10 @@ def build_engine_error_contract(
     active_source_scope: dict[str, Any] | None = None,
     selected_files: list[dict] | None = None,
     failure_class: str = "engine_error",
+    status: str = "error",
 ) -> dict[str, Any]:
     reason = _normalized_text(terminal_reason) or "engine_error"
+    effective_status = _normalized_text(status) or "error"
     diagnostic_items = [
         item for item in (diagnostics or []) if isinstance(item, dict)
     ] or [
@@ -218,7 +221,7 @@ def build_engine_error_contract(
             "kind": "retrieval_engine",
             "classification": "no_evidence",
             "reason": reason,
-            "outcome": "error",
+            "outcome": effective_status,
             "candidate_index": -1,
         }
     ]
@@ -227,7 +230,7 @@ def build_engine_error_contract(
         "references": [],
         "sources": [],
         "diagnostics": diagnostic_items,
-        "status": "error",
+        "status": effective_status,
         "terminal_reason": reason,
         "authorization_context": {
             "active_source_scope_state": _normalized_text(
@@ -269,7 +272,7 @@ def build_engine_error_contract(
         "provenance": {
             "worker_kind": "selected_source_retrieval",
             "tool_name": "retrieval_engine_selected_source_retrieval",
-            "status": "error",
+            "status": effective_status,
             "terminal_reason": reason,
             "engine_authority": False,
             "middleware_strategy_bypassed": True,

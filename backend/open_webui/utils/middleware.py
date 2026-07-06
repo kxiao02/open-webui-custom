@@ -85,6 +85,7 @@ from open_webui.models.functions import Functions
 from open_webui.models.models import Models
 
 from open_webui.retrieval.engine_contract import (
+    ENGINE_INVOCATION_TIMEOUT_SECONDS,
     build_engine_error_contract,
     classify_engine_attempt,
     persist_engine_attempt,
@@ -11767,9 +11768,81 @@ def _retrieval_engine_selected_source_lane_package(
                     "failure_class": "request_construction_error",
                 },
             }
-        result = RetrievalEngine(connectors=tuple(lane_package.runtime_connectors)).run(
-            adapter_result.request
-        )
+        engine = RetrievalEngine(connectors=tuple(lane_package.runtime_connectors))
+        pool = ThreadPoolExecutor(max_workers=1)
+        timed_out = False
+        future = pool.submit(engine.run, adapter_result.request)
+        try:
+            result = future.result(timeout=ENGINE_INVOCATION_TIMEOUT_SECONDS)
+        except TimeoutError:
+            timed_out = True
+            pool.shutdown(wait=False, cancel_futures=True)
+            contract = build_engine_error_contract(
+                terminal_reason="retrieval_timeout",
+                diagnostics=[
+                    {
+                        "kind": "retrieval_engine",
+                        "classification": "no_evidence",
+                        "reason": "retrieval_timeout",
+                        "outcome": "timeout",
+                        "candidate_index": -1,
+                    }
+                ],
+                active_source_scope=active_source_scope,
+                selected_files=observed_files if "observed_files" in locals() else [],
+                failure_class="retrieval_timeout",
+                status="timeout",
+            )
+            contract.setdefault("retry_policy", {})["timeout_seconds"] = (
+                ENGINE_INVOCATION_TIMEOUT_SECONDS
+            )
+            return {
+                "observe": {
+                    "mode": "observe_parallel",
+                    "lane": "selected_file_text",
+                    "authority": "retrieval_engine",
+                    "status": "timeout",
+                    "terminal_reason": "retrieval_timeout",
+                    "counts": {
+                        "candidate_count": 0,
+                        "evidence_bundle_count": 0,
+                        "accepted_output_count": 0,
+                        "reference_count": 0,
+                        "diagnostic_count": 1,
+                    },
+                    "diagnostics": [
+                        {
+                            "code": "retrieval_timeout",
+                            "kind": "retrieval_engine",
+                            "severity": "error",
+                            "phase": "invocation",
+                        }
+                    ],
+                    "plan_summary": {},
+                    "comparison": {
+                        "user_visible_authority": "retrieval_engine",
+                        "legacy_status": legacy_status,
+                        "legacy_terminal_reason": legacy_terminal_reason,
+                        "legacy_reference_count": len(legacy_references or []),
+                        "engine_reference_count": 0,
+                    },
+                },
+                "authority": {
+                    "state": "fail_closed",
+                    "reason": "retrieval_timeout",
+                },
+                "contract": contract,
+                "attempt": {
+                    "engine_invoked": True,
+                    "failure_class": "retrieval_timeout",
+                    "runtime_mode": "retrieval_engine_fail_closed",
+                    "terminal_status": "timeout",
+                    "terminal_reason": "retrieval_timeout",
+                },
+            }
+        finally:
+            if not timed_out:
+                pool.shutdown(wait=True)
     except Exception as exc:
         observe = _retrieval_engine_observe_failure(
             code="retrieval_engine_observe_failed",

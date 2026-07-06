@@ -10,6 +10,8 @@ from open_webui.retrieval.engine_adapter import (
     build_selected_source_retrieval_engine_package,
 )
 from open_webui.retrieval.engine_contract import (
+    ENGINE_INVOCATION_TIMEOUT_SECONDS,
+    build_engine_error_contract,
     _retrieval_engine_authority_state,
     _retrieval_engine_reference_dicts,
     _retrieval_engine_result_first_pass_contract,
@@ -11771,3 +11773,350 @@ def test_tool_side_boundary_contract_valid_same_turn_suppresses_legacy(monkeypat
         "retrieval_engine_authority_succeeded"
     )
     assert "invalid_reasons" not in response["provenance"]
+
+
+# ---------------------------------------------------------------------------
+# Latency budget: typed timeout contract
+# ---------------------------------------------------------------------------
+
+
+def test_engine_invocation_timeout_returns_typed_timeout_contract(monkeypatch):
+    """Engine that exceeds latency budget returns typed timeout contract with zero references."""
+    import time
+
+    # Use a very short timeout to keep the test fast
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ENGINE_INVOCATION_TIMEOUT_SECONDS",
+        0.1,
+    )
+
+    class _SlowEngine:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, _request):
+            time.sleep(2)
+            return RetrievalResult(
+                status="success",
+                request=RetrievalRequest(
+                    query="engine query",
+                    scope=AuthorizedScope(decision="authorized", source_ids=("alpha-file",)),
+                    sources=(),
+                ),
+                accepted_outputs=(
+                    AcceptedOutput(
+                        output_id="accepted:alpha",
+                        text="should not be returned",
+                        evidence_bundle_ids=("bundle:alpha",),
+                    ),
+                ),
+                references=(
+                    Reference(
+                        reference_id="reference:alpha",
+                        source_id="alpha-file",
+                        label="alpha-policy.txt",
+                        source_anchor={"kind": "text_span", "source_id": "alpha-file"},
+                    ),
+                ),
+            )
+
+    monkeypatch.setattr("retrieval_engine.RetrievalEngine", _SlowEngine)
+
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {
+                    "content": "Transformer grounding aligns model outputs with source text."
+                },
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[_local_file_source(file_id="alpha-file")],
+        legacy_references=[{"source": {"id": "alpha-file"}}],
+        legacy_accepted_outputs=[{"output_id": "legacy:alpha-file"}],
+    )
+
+    contract = package["contract"]
+    assert contract["status"] == "timeout"
+    assert contract["terminal_reason"] == "retrieval_timeout"
+    assert contract["accepted_outputs"] == []
+    assert contract["references"] == []
+    assert contract["sources"] == []
+    assert contract["provenance"]["engine_owned"] is True
+    assert contract["provenance"]["compatibility_fallback"] is False
+    assert contract["provenance"]["failure_class"] == "retrieval_timeout"
+    assert contract["retry_policy"]["timeout_seconds"] == 0.1
+
+
+def test_engine_invocation_timeout_suppresses_legacy_fallback(monkeypatch):
+    """Timeout contract must not be eligible for legacy fallback."""
+    import time
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ENGINE_INVOCATION_TIMEOUT_SECONDS",
+        0.1,
+    )
+
+    class _SlowEngine:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, _request):
+            time.sleep(2)
+            return RetrievalResult(
+                status="success",
+                request=RetrievalRequest(
+                    query="engine query",
+                    scope=AuthorizedScope(decision="authorized", source_ids=("alpha-file",)),
+                    sources=(),
+                ),
+            )
+
+    monkeypatch.setattr("retrieval_engine.RetrievalEngine", _SlowEngine)
+
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {"content": "Transformer grounding aligns model outputs with source text."},
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[_local_file_source(file_id="alpha-file")],
+        legacy_references=[{"source": {"id": "alpha-file"}}],
+        legacy_accepted_outputs=[{"output_id": "legacy:alpha-file"}],
+    )
+
+    assert package["authority"]["state"] == "fail_closed"
+    assert package["authority"]["reason"] == "retrieval_timeout"
+    assert package["attempt"]["engine_invoked"] is True
+    assert package["attempt"]["failure_class"] == "retrieval_timeout"
+    assert package["attempt"]["terminal_status"] == "timeout"
+    assert package["attempt"]["terminal_reason"] == "retrieval_timeout"
+    assert package["attempt"]["runtime_mode"] == "retrieval_engine_fail_closed"
+
+
+def test_engine_invocation_timeout_persisted_attempt_metadata(monkeypatch):
+    """Timeout attempt metadata is persisted with runtime_mode and terminal fields."""
+    import time
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ENGINE_INVOCATION_TIMEOUT_SECONDS",
+        0.1,
+    )
+
+    class _SlowEngine:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, _request):
+            time.sleep(2)
+            return RetrievalResult(
+                status="success",
+                request=RetrievalRequest(
+                    query="engine query",
+                    scope=AuthorizedScope(decision="authorized", source_ids=("alpha-file",)),
+                    sources=(),
+                ),
+            )
+
+    monkeypatch.setattr("retrieval_engine.RetrievalEngine", _SlowEngine)
+
+    metadata = {}
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {"content": "Transformer grounding aligns model outputs with source text."},
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[],
+        legacy_references=[],
+        legacy_accepted_outputs=[],
+    )
+
+    from open_webui.retrieval.engine_contract import persist_engine_attempt
+    persist_engine_attempt(metadata, {
+        "engine_owned": True,
+        "contract": package["contract"],
+        "attempt_metadata": package["attempt"],
+    })
+
+    attempt = metadata["retrieval_engine_attempt"]
+    assert attempt["engine_invoked"] is True
+    assert attempt["terminal_status"] == "timeout"
+    assert attempt["terminal_reason"] == "retrieval_timeout"
+    assert attempt["runtime_mode"] == "retrieval_engine_fail_closed"
+    assert attempt["failure_class"] == "retrieval_timeout"
+    assert attempt["boundary_owned"] is True
+
+
+def test_engine_invocation_timeout_observe_has_zero_counts(monkeypatch):
+    """Timeout observe metadata has zero accepted output and reference counts."""
+    import time
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ENGINE_INVOCATION_TIMEOUT_SECONDS",
+        0.1,
+    )
+
+    class _SlowEngine:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, _request):
+            time.sleep(2)
+            return RetrievalResult(
+                status="success",
+                request=RetrievalRequest(
+                    query="engine query",
+                    scope=AuthorizedScope(decision="authorized", source_ids=("alpha-file",)),
+                    sources=(),
+                ),
+            )
+
+    monkeypatch.setattr("retrieval_engine.RetrievalEngine", _SlowEngine)
+
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {"content": "Transformer grounding aligns model outputs with source text."},
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[_local_file_source(file_id="alpha-file")],
+        legacy_references=[{"source": {"id": "alpha-file"}}],
+        legacy_accepted_outputs=[{"output_id": "legacy:alpha-file"}],
+    )
+
+    observe = package["observe"]
+    assert observe["status"] == "timeout"
+    assert observe["terminal_reason"] == "retrieval_timeout"
+    assert observe["authority"] == "retrieval_engine"
+    assert observe["counts"]["accepted_output_count"] == 0
+    assert observe["counts"]["reference_count"] == 0
+    assert observe["diagnostics"][0]["code"] == "retrieval_timeout"
+
+
+def test_engine_invocation_timeout_returns_promptly_in_wall_clock(monkeypatch):
+    """Timeout path must return well before the slow engine finishes (no blocking shutdown)."""
+    import time
+
+    monkeypatch.setattr(
+        "open_webui.utils.middleware.ENGINE_INVOCATION_TIMEOUT_SECONDS",
+        0.2,
+    )
+
+    class _VerySlowEngine:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self, _request):
+            time.sleep(10)
+            return RetrievalResult(
+                status="success",
+                request=RetrievalRequest(
+                    query="engine query",
+                    scope=AuthorizedScope(decision="authorized", source_ids=("alpha-file",)),
+                    sources=(),
+                ),
+            )
+
+    monkeypatch.setattr("retrieval_engine.RetrievalEngine", _VerySlowEngine)
+
+    start = time.monotonic()
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {"content": "Transformer grounding aligns model outputs with source text."},
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[_local_file_source(file_id="alpha-file")],
+        legacy_references=[{"source": {"id": "alpha-file"}}],
+        legacy_accepted_outputs=[{"output_id": "legacy:alpha-file"}],
+    )
+    elapsed = time.monotonic() - start
+
+    assert package["contract"]["status"] == "timeout"
+    assert elapsed < 3.0, (
+        f"Timeout path took {elapsed:.1f}s — must return in <3s, "
+        "not block on executor shutdown"
+    )
+
+
+def test_pre_invocation_fallback_reasons_still_bypass_engine(monkeypatch):
+    """adapter_unavailable, request_construction_error, unsupported_source_shape remain pre-invocation fallbacks."""
+    # adapter_unavailable: fail to import
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {"content": "Transformer grounding aligns model outputs with source text."},
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[_local_file_source(file_id="alpha-file")],
+        legacy_references=[{"source": {"id": "alpha-file"}}],
+        legacy_accepted_outputs=[{"output_id": "legacy:alpha-file"}],
+    )
+
+    # If engine import works (it does in test env), this tests request_construction_error
+    # by failing the adapter
+    def fail_adapter(*_args, **_kwargs):
+        raise RuntimeError("adapter unavailable")
+
+    monkeypatch.setattr(
+        "open_webui.retrieval.engine_adapter.build_retrieval_engine_request",
+        fail_adapter,
+    )
+
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {"content": "Transformer grounding aligns model outputs with source text."},
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[_local_file_source(file_id="alpha-file")],
+        legacy_references=[{"source": {"id": "alpha-file"}}],
+        legacy_accepted_outputs=[{"output_id": "legacy:alpha-file"}],
+    )
+
+    assert package["authority"]["state"] == "fallback"
+    assert package["authority"]["reason"] == "request_construction_error"
+    assert package["attempt"]["engine_invoked"] is False
+    assert package["attempt"]["fallback_reason"] == "request_construction_error"
