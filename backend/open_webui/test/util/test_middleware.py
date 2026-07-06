@@ -6157,9 +6157,13 @@ def _trusted_engine_tool_metadata(
     *,
     file_id: str = "alpha-file",
     name: str = "alpha-policy.txt",
+    turn_id: str = "turn-current-42",
+    message_id: str = "msg-current-42",
 ) -> dict:
     return {
         "retrieval_engine_first_pass_contract": contract,
+        "turn_id": turn_id,
+        "message_id": message_id,
         "retrieval_engine_attempt": {
             "engine_invoked": True,
             "contract_present": True,
@@ -6177,6 +6181,8 @@ def _trusted_engine_tool_metadata(
             "fallback_reason": "",
             "failure_class": "",
             "invalid_reasons": [],
+            "turn_id": turn_id,
+            "message_id": message_id,
             "boundary_owned": True,
             "boundary_owner": "open_webui.retrieval.engine_contract",
         },
@@ -8947,10 +8953,10 @@ def test_engine_diagnostics_only_persistence_suppresses_stale_source_aliases():
     assert "reference_cards" not in persisted
     assert "references" not in persisted
     assert "accepted_outputs" not in persisted
-    assert rejected_candidate_body in json.dumps(
-        persisted["retrieval_diagnostics"],
-        ensure_ascii=False,
+    assert persisted["retrieval_diagnostics"][0]["reason"] == (
+        "rejected_candidates_only"
     )
+    assert rejected_candidate_body not in json.dumps(persisted, ensure_ascii=False)
     assert "stale source-card body" not in json.dumps(persisted, ensure_ascii=False)
 
 
@@ -11479,7 +11485,289 @@ def test_fixture_pack_contract_matches_local_contract():
         terminal_reason="success",
         include_evidence=True,
     )
-    assert local_contract.keys() == pack_contract.keys()
+    core_contract_keys = {
+        "status",
+        "terminal_reason",
+        "accepted_outputs",
+        "references",
+        "retrieval_diagnostics",
+        "authorization_context",
+        "retry_policy",
+        "context_budget",
+        "provenance",
+    }
+    assert core_contract_keys.issubset(local_contract.keys())
+    assert core_contract_keys.issubset(pack_contract.keys())
+    assert {
+        "contract_version",
+        "engine_version",
+        "boundary_owned",
+        "boundary_owner",
+        "source_scope_echo",
+    }.issubset(local_contract.keys())
     assert local_contract["status"] == pack_contract["status"]
     assert len(local_contract["references"]) == len(pack_contract["references"])
     assert len(local_contract["accepted_outputs"]) == len(pack_contract["accepted_outputs"])
+
+
+# ---------------------------------------------------------------------------
+# Boundary contract: tool-side scope binding
+# ---------------------------------------------------------------------------
+
+
+def test_tool_side_boundary_contract_missing_scope_binding_fails_closed(monkeypatch):
+    """Metadata contract present but caller and attempt both lack scope binding → fail closed."""
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+
+    contract = _engine_authority_tool_contract()
+    metadata = _trusted_engine_tool_metadata(contract)
+    # Strip all scope binding: caller IDs AND attempt IDs
+    metadata["retrieval_engine_attempt"].pop("turn_id", None)
+    metadata["retrieval_engine_attempt"].pop("message_id", None)
+    metadata.pop("turn_id", None)
+    metadata.pop("message_id", None)
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="What does Atlas say?",
+            source_ids=["alpha-file"],
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__=metadata,
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "error"
+    assert response["terminal_reason"] == "invalid_engine_contract"
+    assert response["provenance"]["failure_class"] == "invalid_engine_contract"
+    invalid_reasons = response["provenance"].get("invalid_reasons", [])
+    assert "missing_current_turn_scope_binding" in invalid_reasons
+    assert "missing_boundary_attempt_scope_binding" in invalid_reasons
+
+
+def test_tool_side_boundary_contract_stale_replay_fails_closed(monkeypatch):
+    """A contract from a different turn/message must fail closed as stale replay."""
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+
+    contract = _engine_authority_tool_contract()
+    metadata = _trusted_engine_tool_metadata(contract)
+    # Bind attempt to a DIFFERENT turn/message
+    metadata["retrieval_engine_attempt"]["turn_id"] = "turn-other-999"
+    metadata["retrieval_engine_attempt"]["message_id"] = "msg-other-999"
+    # Current turn/message context
+    metadata["turn_id"] = "turn-current-42"
+    metadata["message_id"] = "msg-current-42"
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="What does Atlas say?",
+            source_ids=["alpha-file"],
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__=metadata,
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "error"
+    assert response["terminal_reason"] == "invalid_engine_contract"
+    assert response["provenance"]["failure_class"] == "invalid_engine_contract"
+    invalid_reasons = response["provenance"].get("invalid_reasons", [])
+    assert "stale_boundary_attempt_turn_mismatch" in invalid_reasons
+
+
+def test_tool_side_boundary_contract_forged_marker_fails_closed(monkeypatch):
+    """Forged trust markers (wrong boundary_owner) must fail closed."""
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+
+    contract = _engine_authority_tool_contract()
+    metadata = _trusted_engine_tool_metadata(contract)
+    # Forge the boundary_owner to a wrong value
+    metadata["retrieval_engine_attempt"]["boundary_owner"] = "forged.owner.module"
+    metadata["retrieval_engine_attempt"]["turn_id"] = "turn-current-42"
+    metadata["retrieval_engine_attempt"]["message_id"] = "msg-current-42"
+    metadata["turn_id"] = "turn-current-42"
+    metadata["message_id"] = "msg-current-42"
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="What does Atlas say?",
+            source_ids=["alpha-file"],
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__=metadata,
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "error"
+    assert response["terminal_reason"] == "invalid_engine_contract"
+    assert response["provenance"]["failure_class"] == "invalid_engine_contract"
+    assert "forged_boundary_attempt_metadata" in response["provenance"].get(
+        "invalid_reasons", []
+    )
+
+
+def test_tool_side_boundary_contract_same_turn_valid_suppresses_legacy(monkeypatch):
+    """A valid same-turn contract must suppress legacy fallback and return engine evidence."""
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+
+    contract = _engine_authority_tool_contract()
+    metadata = _trusted_engine_tool_metadata(contract)
+    # Bind attempt to the SAME turn/message as the current context
+    metadata["retrieval_engine_attempt"]["turn_id"] = "turn-current-42"
+    metadata["retrieval_engine_attempt"]["message_id"] = "msg-current-42"
+    metadata["turn_id"] = "turn-current-42"
+    metadata["message_id"] = "msg-current-42"
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="What does Atlas say?",
+            source_ids=["alpha-file"],
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__=metadata,
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success"
+    assert response["canonical_references"][0]["source"]["id"] == "alpha-file"
+    assert response["accepted_outputs"][0]["snippet"] == (
+        "Engine accepted evidence for Atlas policy."
+    )
+    assert response["strategy_used"]["retrieval_strategy"] == "retrieval_engine_authority"
+    assert response["provenance"]["tool_handler_policy_bypassed"] is True
+    assert response["provenance"]["tool_handler_bypass_reason"] == (
+        "retrieval_engine_authority_succeeded"
+    )
+
+
+def test_tool_side_boundary_contract_partial_binding_turn_only_fails_closed(monkeypatch):
+    """Attempt has matching turn_id but missing message_id → fail closed."""
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+
+    contract = _engine_authority_tool_contract()
+    metadata = _trusted_engine_tool_metadata(contract)
+    # Attempt has turn_id but no message_id — partial binding
+    metadata["retrieval_engine_attempt"]["turn_id"] = "turn-current-42"
+    metadata["retrieval_engine_attempt"].pop("message_id", None)
+    metadata["turn_id"] = "turn-current-42"
+    metadata["message_id"] = "msg-current-42"
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="What does Atlas say?",
+            source_ids=["alpha-file"],
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__=metadata,
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "error"
+    assert response["terminal_reason"] == "invalid_engine_contract"
+    assert response["provenance"]["failure_class"] == "invalid_engine_contract"
+    assert "missing_boundary_attempt_scope_binding" in response["provenance"].get(
+        "invalid_reasons", []
+    )
+
+
+def test_tool_side_boundary_contract_partial_binding_message_only_fails_closed(monkeypatch):
+    """Attempt has matching message_id but missing turn_id → fail closed."""
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+
+    contract = _engine_authority_tool_contract()
+    metadata = _trusted_engine_tool_metadata(contract)
+    # Attempt has message_id but no turn_id — partial binding
+    metadata["retrieval_engine_attempt"].pop("turn_id", None)
+    metadata["retrieval_engine_attempt"]["message_id"] = "msg-current-42"
+    metadata["turn_id"] = "turn-current-42"
+    metadata["message_id"] = "msg-current-42"
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="What does Atlas say?",
+            source_ids=["alpha-file"],
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__=metadata,
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "error"
+    assert response["terminal_reason"] == "invalid_engine_contract"
+    assert response["provenance"]["failure_class"] == "invalid_engine_contract"
+    assert "missing_boundary_attempt_scope_binding" in response["provenance"].get(
+        "invalid_reasons", []
+    )
+
+
+def test_tool_side_boundary_contract_missing_caller_scope_fails_closed(monkeypatch):
+    """Top-level metadata lacks turn_id/message_id while contract/attempt is present → fail closed."""
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+
+    contract = _engine_authority_tool_contract()
+    metadata = _trusted_engine_tool_metadata(contract)
+    # Attempt has scope binding, but caller (top-level metadata) does not
+    metadata["retrieval_engine_attempt"]["turn_id"] = "turn-current-42"
+    metadata["retrieval_engine_attempt"]["message_id"] = "msg-current-42"
+    metadata.pop("turn_id", None)
+    metadata.pop("message_id", None)
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="What does Atlas say?",
+            source_ids=["alpha-file"],
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__=metadata,
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "error"
+    assert response["terminal_reason"] == "invalid_engine_contract"
+    assert response["provenance"]["failure_class"] == "invalid_engine_contract"
+    assert "missing_current_turn_scope_binding" in response["provenance"].get(
+        "invalid_reasons", []
+    )
+
+
+def test_tool_side_boundary_contract_valid_same_turn_suppresses_legacy(monkeypatch):
+    """Valid same-turn/same-message contract suppresses legacy fallback."""
+    _patch_selected_source_legacy_policy_helpers_to_raise(monkeypatch)
+
+    contract = _engine_authority_tool_contract()
+    metadata = _trusted_engine_tool_metadata(contract)
+    # Both caller and attempt carry matching scope IDs
+    metadata["retrieval_engine_attempt"]["turn_id"] = "turn-current-42"
+    metadata["retrieval_engine_attempt"]["message_id"] = "msg-current-42"
+    metadata["turn_id"] = "turn-current-42"
+    metadata["message_id"] = "msg-current-42"
+
+    response = asyncio.run(
+        query_selected_knowledge_files(
+            query="What does Atlas say?",
+            source_ids=["alpha-file"],
+            __request__=_selected_source_tool_request_stub(),
+            __files__=[],
+            __metadata__=metadata,
+            __user_model__=SimpleNamespace(id="user-1"),
+        )
+    )
+
+    assert response["status"] == "success"
+    assert response["canonical_references"][0]["source"]["id"] == "alpha-file"
+    assert response["accepted_outputs"][0]["snippet"] == (
+        "Engine accepted evidence for Atlas policy."
+    )
+    assert response["strategy_used"]["retrieval_strategy"] == "retrieval_engine_authority"
+    assert response["provenance"]["tool_handler_policy_bypassed"] is True
+    assert response["provenance"]["tool_handler_bypass_reason"] == (
+        "retrieval_engine_authority_succeeded"
+    )
+    assert "invalid_reasons" not in response["provenance"]

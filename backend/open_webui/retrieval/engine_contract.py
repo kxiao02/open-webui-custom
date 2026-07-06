@@ -417,12 +417,51 @@ def read_engine_contract_for_turn(metadata: dict | None) -> dict[str, Any]:
     return {}
 
 
+def _validate_boundary_attempt_scope(
+    *,
+    attempt: dict[str, Any],
+    turn_id: str,
+    message_id: str,
+) -> list[str]:
+    """Validate that a boundary attempt record is bound to the current turn/message scope.
+
+    Strict all-or-nothing contract:
+    - Caller MUST provide both turn_id and message_id.
+    - Attempt MUST carry both turn_id and message_id.
+    - Both IDs MUST match exactly.
+    Partial binding or missing caller scope fails closed.
+    """
+    invalid_reasons: list[str] = []
+    normalized_turn = _normalized_text(turn_id)
+    normalized_message = _normalized_text(message_id)
+
+    attempt_turn = _normalized_text(attempt.get("turn_id"))
+    attempt_message = _normalized_text(attempt.get("message_id"))
+
+    if not normalized_turn or not normalized_message:
+        invalid_reasons.append("missing_current_turn_scope_binding")
+    if not attempt_turn or not attempt_message:
+        invalid_reasons.append("missing_boundary_attempt_scope_binding")
+
+    if invalid_reasons:
+        return invalid_reasons
+
+    if normalized_turn != attempt_turn:
+        invalid_reasons.append("stale_boundary_attempt_turn_mismatch")
+    if normalized_message != attempt_message:
+        invalid_reasons.append("stale_boundary_attempt_message_mismatch")
+
+    return invalid_reasons
+
+
 def classify_engine_attempt(
     *,
     package: dict[str, Any] | None = None,
     metadata: dict | None = None,
     active_source_scope: dict[str, Any] | None = None,
     contract: dict[str, Any] | None = None,
+    turn_id: str = "",
+    message_id: str = "",
 ) -> dict[str, Any]:
     package = package if isinstance(package, dict) else {}
     metadata = metadata if isinstance(metadata, dict) else {}
@@ -459,9 +498,20 @@ def classify_engine_attempt(
             or attempt.get("contract_version") != ENGINE_CONTRACT_VERSION
             or attempt.get("engine_version") != ENGINE_CONTRACT_ENGINE_VERSION
         ):
+            trust_reasons: list[str] = []
+            if attempt.get("boundary_owner") != ENGINE_CONTRACT_BOUNDARY_OWNER:
+                trust_reasons.append("forged_boundary_attempt_metadata")
+            if attempt.get("boundary_owned") is not True:
+                trust_reasons.append("missing_boundary_attempt_metadata")
+            if attempt.get("engine_invoked") is not True:
+                trust_reasons.append("uninvoked_boundary_attempt")
+            if attempt.get("contract_version") != ENGINE_CONTRACT_VERSION:
+                trust_reasons.append("boundary_attempt_contract_version_mismatch")
+            if attempt.get("engine_version") != ENGINE_CONTRACT_ENGINE_VERSION:
+                trust_reasons.append("boundary_attempt_engine_version_mismatch")
             invalid_reasons = [
                 *validation.get("invalid_reasons", []),
-                "missing_boundary_attempt_metadata",
+                *trust_reasons,
             ]
             validation = {
                 "valid": False,
@@ -477,6 +527,31 @@ def classify_engine_attempt(
                 "failure_class": "invalid_engine_contract",
                 "invalid_reasons": list(dict.fromkeys(invalid_reasons)),
             }
+        elif contract_source == "metadata" and validation.get("valid"):
+            scope_invalid_reasons = _validate_boundary_attempt_scope(
+                attempt=attempt,
+                turn_id=turn_id,
+                message_id=message_id,
+            )
+            if scope_invalid_reasons:
+                invalid_reasons = [
+                    *validation.get("invalid_reasons", []),
+                    *scope_invalid_reasons,
+                ]
+                validation = {
+                    "valid": False,
+                    "contract_present": True,
+                    "contract": _invalid_engine_contract(
+                        invalid_reasons=invalid_reasons,
+                        active_source_scope=active_source_scope,
+                    ),
+                    "terminal_status": "error",
+                    "terminal_reason": "invalid_engine_contract",
+                    "selected_source_runtime_mode": "retrieval_engine_fail_closed",
+                    "bypass_reason": "retrieval_engine_fail_closed",
+                    "failure_class": "invalid_engine_contract",
+                    "invalid_reasons": list(dict.fromkeys(invalid_reasons)),
+                }
         state = "engine_owned" if validation["valid"] else "fail_closed"
         return {
             **validation,
@@ -559,6 +634,12 @@ def persist_engine_attempt(
     attempt = copy.deepcopy(classification.get("attempt_metadata") or {})
     attempt["boundary_owned"] = True
     attempt["boundary_owner"] = ENGINE_CONTRACT_BOUNDARY_OWNER
+    turn_id = _normalized_text(metadata.get("turn_id"))
+    message_id = _normalized_text(metadata.get("message_id"))
+    if turn_id:
+        attempt.setdefault("turn_id", turn_id)
+    if message_id:
+        attempt.setdefault("message_id", message_id)
     metadata["retrieval_engine_attempt"] = attempt
     contract = classification.get("contract")
     if classification.get("engine_owned") and isinstance(contract, dict) and contract:

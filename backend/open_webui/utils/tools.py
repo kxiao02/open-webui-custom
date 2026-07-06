@@ -3524,6 +3524,8 @@ def _selected_retrieval_engine_authority_response(
     attempt_classification = classify_engine_attempt(
         metadata=metadata,
         active_source_scope=active_source_scope,
+        turn_id=str(metadata.get("turn_id") or "").strip(),
+        message_id=str(metadata.get("message_id") or "").strip(),
     )
     if not attempt_classification.get("engine_owned"):
         return None
@@ -3585,6 +3587,9 @@ def _selected_retrieval_engine_authority_response(
     provenance["engine_owned"] = True
     provenance["compatibility_fallback"] = False
     provenance["failure_class"] = str(attempt_classification.get("failure_class") or "")
+    invalid_reasons = list(attempt_classification.get("invalid_reasons") or [])
+    if invalid_reasons:
+        provenance["invalid_reasons"] = invalid_reasons
     provenance["tool_handler_policy_bypassed"] = True
     provenance["tool_handler_bypass_reason"] = bypass_reason
 
