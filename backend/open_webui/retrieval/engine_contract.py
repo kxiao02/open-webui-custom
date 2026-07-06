@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from typing import Any
 
 
@@ -41,6 +42,38 @@ ENGINE_FALLBACK_REASONS = {
     "unsupported_source_shape",
     "operator_disabled",
 }
+
+SELECTED_SOURCE_ENGINE_OPERATOR_DISABLE_ENV = (
+    "RETRIEVAL_ENGINE_SELECTED_SOURCE_DISABLED"
+)
+_OPERATOR_DISABLE_TRUTHY = {"1", "true", "yes", "on"}
+
+ENGINE_ANSWER_POLICIES = {
+    "success": "answer_from_accepted_evidence",
+    "partial": "answer_with_limitations",
+    "no_evidence": "report_no_evidence",
+    "denied": "refuse_scope_or_permission",
+    "blocked": "refuse_scope_or_permission",
+    "timeout": "report_retrieval_error",
+    "error": "report_retrieval_error",
+    "malformed": "report_retrieval_error",
+}
+
+
+def selected_source_engine_operator_disabled() -> bool:
+    """Operator kill switch: disable selected-source engine invocation globally."""
+    return (
+        os.environ.get(SELECTED_SOURCE_ENGINE_OPERATOR_DISABLE_ENV, "")
+        .strip()
+        .lower()
+        in _OPERATOR_DISABLE_TRUTHY
+    )
+
+
+def answer_policy_for_terminal_status(status: Any) -> str:
+    return ENGINE_ANSWER_POLICIES.get(
+        _normalized_status(status), "report_retrieval_error"
+    )
 
 
 def _normalized_text(value: Any) -> str:
@@ -556,6 +589,11 @@ def classify_engine_attempt(
                     "invalid_reasons": list(dict.fromkeys(invalid_reasons)),
                 }
         state = "engine_owned" if validation["valid"] else "fail_closed"
+        answer_policy = (
+            answer_policy_for_terminal_status(validation["terminal_status"])
+            if validation["valid"]
+            else "report_retrieval_error"
+        )
         return {
             **validation,
             "state": state,
@@ -565,6 +603,7 @@ def classify_engine_attempt(
             "runtime_mode": "engine_owned",
             "retrieval_runtime_mode": "engine_owned",
             "fallback_reason": "",
+            "answer_policy": answer_policy,
             "attempt_metadata": {
                 "engine_invoked": True,
                 "contract_present": True,
@@ -579,6 +618,7 @@ def classify_engine_attempt(
                     "selected_source_runtime_mode"
                 ],
                 "fallback_reason": "",
+                "answer_policy": answer_policy,
                 "failure_class": validation["failure_class"],
                 "invalid_reasons": validation["invalid_reasons"],
             },
@@ -610,6 +650,7 @@ def classify_engine_attempt(
         "runtime_mode": "legacy_fallback" if fallback_eligible else "unavailable",
         "retrieval_runtime_mode": "legacy_fallback" if fallback_eligible else "unavailable",
         "fallback_reason": fallback_reason if fallback_eligible else "",
+        "answer_policy": "",
         "attempt_metadata": {
             "engine_invoked": False,
             "contract_present": False,
@@ -622,6 +663,7 @@ def classify_engine_attempt(
             "retrieval_runtime_mode": "legacy_fallback" if fallback_eligible else "unavailable",
             "selected_source_runtime_mode": "compatibility_fallback",
             "fallback_reason": fallback_reason if fallback_eligible else "",
+            "answer_policy": "",
             "failure_class": failure_class,
             "invalid_reasons": [],
         },
@@ -648,6 +690,88 @@ def persist_engine_attempt(
     if classification.get("engine_owned") and isinstance(contract, dict) and contract:
         metadata["retrieval_engine_first_pass_contract"] = copy.deepcopy(contract)
     return attempt
+
+
+_SELECTED_SOURCE_TELEMETRY_COUNTERS: dict[str, int] = {}
+
+
+def _source_card_origin_is_legacy(card: Any) -> bool:
+    if not isinstance(card, dict):
+        return False
+    if _normalized_status(card.get("origin")) == "legacy_fallback":
+        return True
+    source = card.get("source")
+    return (
+        isinstance(source, dict)
+        and _normalized_status(source.get("origin")) == "legacy_fallback"
+    )
+
+
+def record_selected_source_retrieval_telemetry(
+    *,
+    classification: dict[str, Any] | None,
+    active_sources: list[Any] | None = None,
+    source_shape: str = "local_file_text",
+) -> dict[str, Any]:
+    """Aggregate per-turn selected-source retrieval telemetry.
+
+    Counts runtime mode, terminal status, fallback reason, and source shape,
+    and flags the boundary violation where any present engine contract
+    coexists with legacy-origin selected-source cards."""
+    classification = classification if isinstance(classification, dict) else {}
+    contract = classification.get("contract")
+    contract = contract if isinstance(contract, dict) else {}
+    references = _list_of_dicts(contract.get("references"))
+    legacy_cards = [
+        card for card in (active_sources or []) if _source_card_origin_is_legacy(card)
+    ]
+    contract_present = bool(classification.get("contract_present"))
+    boundary_violation = bool(contract_present and legacy_cards)
+    runtime_mode = (
+        _normalized_status(classification.get("retrieval_runtime_mode"))
+        or "unavailable"
+    )
+    terminal_status = _normalized_status(classification.get("terminal_status"))
+    fallback_reason = _normalized_status(classification.get("fallback_reason"))
+    shape = _normalized_status(source_shape) or "local_file_text"
+    snapshot = {
+        "runtime_mode": runtime_mode,
+        "selected_source_runtime_mode": _normalized_status(
+            classification.get("selected_source_runtime_mode")
+        ),
+        "terminal_status": terminal_status,
+        "fallback_reason": fallback_reason,
+        "source_shape": shape,
+        "accepted_reference_count": len(references),
+        "legacy_origin_source_card_count": len(legacy_cards),
+        "contract_present": contract_present,
+        "contract_valid": bool(classification.get("valid")),
+        "answer_policy": _normalized_text(classification.get("answer_policy")),
+        "boundary_violation": boundary_violation,
+    }
+    counter_key = "|".join(
+        [
+            runtime_mode,
+            terminal_status or "none",
+            fallback_reason or "none",
+            shape,
+            f"violation={int(boundary_violation)}",
+        ]
+    )
+    _SELECTED_SOURCE_TELEMETRY_COUNTERS[counter_key] = (
+        _SELECTED_SOURCE_TELEMETRY_COUNTERS.get(counter_key, 0) + 1
+    )
+    snapshot["counter_key"] = counter_key
+    snapshot["counter_value"] = _SELECTED_SOURCE_TELEMETRY_COUNTERS[counter_key]
+    return snapshot
+
+
+def selected_source_retrieval_telemetry_counters() -> dict[str, int]:
+    return dict(_SELECTED_SOURCE_TELEMETRY_COUNTERS)
+
+
+def reset_selected_source_retrieval_telemetry() -> None:
+    _SELECTED_SOURCE_TELEMETRY_COUNTERS.clear()
 
 
 def _retrieval_engine_authority_state(result: Any) -> str:

@@ -89,6 +89,8 @@ from open_webui.retrieval.engine_contract import (
     build_engine_error_contract,
     classify_engine_attempt,
     persist_engine_attempt,
+    record_selected_source_retrieval_telemetry,
+    selected_source_engine_operator_disabled,
     _retrieval_engine_authority_state,
     _retrieval_engine_bypass_reason,
     _retrieval_engine_observe_safe_mapping,
@@ -11094,6 +11096,30 @@ async def chat_completion_files_handler(
                     item for item in inventory_sources if isinstance(item, dict)
                 )
                 retrieval_returned_candidates = True
+            selected_source_retrieval_telemetry = (
+                record_selected_source_retrieval_telemetry(
+                    classification=retrieval_engine_attempt_classification,
+                    active_sources=active_sources,
+                    source_shape=(
+                        "unsupported_selected_source"
+                        if retrieval_engine_attempt_classification.get(
+                            "fallback_reason"
+                        )
+                        == "unsupported_source_shape"
+                        else "local_file_text"
+                    ),
+                )
+            )
+            metadata["selected_source_retrieval_telemetry"] = (
+                selected_source_retrieval_telemetry
+            )
+            if selected_source_retrieval_telemetry.get("boundary_violation"):
+                log.error(
+                    "selected_source_retrieval boundary violation: engine contract "
+                    "coexists with legacy-origin source cards (turn=%s message=%s)",
+                    metadata.get("turn_id"),
+                    metadata.get("message_id"),
+                )
             sources.extend(active_sources)
 
             request_prior_attachments = _prompt_requests_prior_attachments(prompt)
@@ -11659,6 +11685,16 @@ def _retrieval_engine_selected_source_lane_package(
 
     if not selected_files:
         return None
+
+    if selected_source_engine_operator_disabled():
+        return {
+            "authority": {"state": "fallback", "reason": "operator_disabled"},
+            "attempt": {
+                "engine_invoked": False,
+                "fallback_reason": "operator_disabled",
+                "failure_class": "operator_disabled",
+            },
+        }
 
     try:
         from open_webui.retrieval.engine_adapter import (

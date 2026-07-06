@@ -10,8 +10,16 @@ from open_webui.retrieval.engine_adapter import (
     build_selected_source_retrieval_engine_package,
 )
 from open_webui.retrieval.engine_contract import (
+    ENGINE_ANSWER_POLICIES,
+    ENGINE_FALLBACK_REASONS,
     ENGINE_INVOCATION_TIMEOUT_SECONDS,
+    ENGINE_TERMINAL_STATUSES,
     build_engine_error_contract,
+    classify_engine_attempt,
+    record_selected_source_retrieval_telemetry,
+    reset_selected_source_retrieval_telemetry,
+    selected_source_engine_operator_disabled,
+    selected_source_retrieval_telemetry_counters,
     _retrieval_engine_authority_state,
     _retrieval_engine_reference_dicts,
     _retrieval_engine_result_first_pass_contract,
@@ -12120,3 +12128,259 @@ def test_pre_invocation_fallback_reasons_still_bypass_engine(monkeypatch):
     assert package["authority"]["reason"] == "request_construction_error"
     assert package["attempt"]["engine_invoked"] is False
     assert package["attempt"]["fallback_reason"] == "request_construction_error"
+
+
+def test_engine_fallback_reasons_remain_closed_enum():
+    assert ENGINE_FALLBACK_REASONS == {
+        "adapter_unavailable",
+        "request_construction_error",
+        "unsupported_source_shape",
+        "operator_disabled",
+    }
+
+
+def test_engine_answer_policy_covers_all_terminal_statuses():
+    assert set(ENGINE_ANSWER_POLICIES) == set(ENGINE_TERMINAL_STATUSES)
+
+
+def test_selected_source_engine_operator_disabled_is_marked_fallback(monkeypatch):
+    monkeypatch.setenv("RETRIEVAL_ENGINE_SELECTED_SOURCE_DISABLED", "1")
+    assert selected_source_engine_operator_disabled() is True
+
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is transformer grounding",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "data": {
+                    "content": "Transformer grounding aligns model outputs with source text."
+                },
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[],
+        legacy_references=[],
+        legacy_accepted_outputs=[],
+    )
+
+    assert package["authority"] == {
+        "state": "fallback",
+        "reason": "operator_disabled",
+    }
+    assert package["attempt"]["engine_invoked"] is False
+    assert package["attempt"]["fallback_reason"] == "operator_disabled"
+    assert "contract" not in package
+
+    classification = classify_engine_attempt(
+        package=package,
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+    )
+    assert classification["engine_owned"] is False
+    assert classification["fallback_eligible"] is True
+    assert classification["fallback_reason"] == "operator_disabled"
+    assert classification["retrieval_runtime_mode"] == "legacy_fallback"
+    assert classification["contract_present"] is False
+
+
+def test_selected_source_engine_operator_switch_defaults_enabled(monkeypatch):
+    monkeypatch.delenv("RETRIEVAL_ENGINE_SELECTED_SOURCE_DISABLED", raising=False)
+    assert selected_source_engine_operator_disabled() is False
+    monkeypatch.setenv("RETRIEVAL_ENGINE_SELECTED_SOURCE_DISABLED", "0")
+    assert selected_source_engine_operator_disabled() is False
+
+
+def test_selected_source_all_files_textless_is_engine_owned_no_evidence():
+    active_source_scope = {
+        "status": "resolved",
+        "source_ids": ["alpha-file", "beta-file"],
+    }
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is the allowed tolerance",
+        selected_files=[
+            {"id": "alpha-file", "name": "alpha-policy.txt", "data": {"content": ""}},
+            {"id": "beta-file", "name": "beta-policy.txt", "data": {"content": "   "}},
+        ],
+        active_source_scope=active_source_scope,
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[],
+        legacy_references=[],
+        legacy_accepted_outputs=[],
+    )
+
+    assert package["authority"]["state"] != "fallback"
+    assert package["attempt"]["engine_invoked"] is True
+    contract = package["contract"]
+    assert contract["status"] == "no_evidence"
+    assert contract["references"] == []
+    assert contract["accepted_outputs"] == []
+    assert contract["sources"] == []
+
+    classification = classify_engine_attempt(
+        package=package,
+        active_source_scope=active_source_scope,
+    )
+    assert classification["engine_owned"] is True
+    assert classification["valid"] is True
+    assert classification["fallback_eligible"] is False
+    assert classification["terminal_status"] == "no_evidence"
+    assert classification["answer_policy"] == "report_no_evidence"
+    assert classification["attempt_metadata"]["engine_invoked"] is True
+    assert classification["attempt_metadata"]["contract_present"] is True
+
+
+def test_selected_source_collection_shape_without_host_text_still_falls_back():
+    package = _retrieval_engine_selected_source_lane_package(
+        prompt="what is the allowed tolerance",
+        selected_files=[
+            {
+                "id": "alpha-file",
+                "name": "alpha-policy.txt",
+                "type": "text",
+                "collection_name": "alpha-file",
+                "meta": {"content_type": "text/plain"},
+            }
+        ],
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        legacy_status="success",
+        legacy_terminal_reason="success",
+        legacy_sources=[],
+        legacy_references=[],
+        legacy_accepted_outputs=[],
+    )
+
+    assert package["authority"]["state"] == "fallback"
+    assert package["authority"]["reason"] == "unsupported_source_shape"
+    assert package["attempt"]["engine_invoked"] is False
+    assert package["attempt"]["fallback_reason"] == "unsupported_source_shape"
+
+
+def test_selected_source_retrieval_telemetry_counts_modes():
+    reset_selected_source_retrieval_telemetry()
+    scope = {"status": "resolved", "source_ids": ["alpha-file"]}
+
+    success = classify_engine_attempt(
+        contract=_engine_authority_tool_contract(
+            status="success", terminal_reason="success", include_evidence=True
+        ),
+        active_source_scope=scope,
+    )
+    snapshot = record_selected_source_retrieval_telemetry(
+        classification=success,
+        active_sources=[{"source": {"id": "alpha-file"}}],
+    )
+    assert snapshot["runtime_mode"] == "engine_owned"
+    assert snapshot["terminal_status"] == "success"
+    assert snapshot["accepted_reference_count"] == 1
+    assert snapshot["legacy_origin_source_card_count"] == 0
+    assert snapshot["boundary_violation"] is False
+    assert snapshot["answer_policy"] == "answer_from_accepted_evidence"
+    assert snapshot["source_shape"] == "local_file_text"
+
+    no_evidence = classify_engine_attempt(
+        contract=_engine_authority_tool_contract(
+            status="no_evidence",
+            terminal_reason="rejected_candidates_only",
+            include_evidence=False,
+        ),
+        active_source_scope=scope,
+    )
+    snapshot = record_selected_source_retrieval_telemetry(
+        classification=no_evidence, active_sources=[]
+    )
+    assert snapshot["terminal_status"] == "no_evidence"
+    assert snapshot["accepted_reference_count"] == 0
+    assert snapshot["answer_policy"] == "report_no_evidence"
+    assert snapshot["boundary_violation"] is False
+
+    timeout = classify_engine_attempt(
+        contract=_engine_authority_tool_contract(
+            status="timeout",
+            terminal_reason="post_invocation_timeout",
+            include_evidence=False,
+        ),
+        active_source_scope=scope,
+    )
+    snapshot = record_selected_source_retrieval_telemetry(
+        classification=timeout, active_sources=[]
+    )
+    assert snapshot["terminal_status"] == "timeout"
+    assert snapshot["answer_policy"] == "report_retrieval_error"
+
+    tampered = _engine_authority_tool_contract(
+        status="success", terminal_reason="success", include_evidence=True
+    )
+    tampered["contract_version"] = "tampered"
+    fail_closed = classify_engine_attempt(
+        contract=tampered, active_source_scope=scope
+    )
+    snapshot = record_selected_source_retrieval_telemetry(
+        classification=fail_closed, active_sources=[]
+    )
+    assert snapshot["contract_valid"] is False
+    assert snapshot["terminal_status"] == "error"
+    assert snapshot["selected_source_runtime_mode"] == "retrieval_engine_fail_closed"
+    assert snapshot["boundary_violation"] is False
+
+    fallback = classify_engine_attempt(
+        package={
+            "authority": {"state": "fallback", "reason": "operator_disabled"},
+            "attempt": {
+                "engine_invoked": False,
+                "fallback_reason": "operator_disabled",
+            },
+        }
+    )
+    legacy_card = {
+        "origin": "legacy_fallback",
+        "source": {"id": "alpha-file", "origin": "legacy_fallback"},
+    }
+    snapshot = record_selected_source_retrieval_telemetry(
+        classification=fallback, active_sources=[legacy_card]
+    )
+    assert snapshot["runtime_mode"] == "legacy_fallback"
+    assert snapshot["fallback_reason"] == "operator_disabled"
+    assert snapshot["legacy_origin_source_card_count"] == 1
+    assert snapshot["boundary_violation"] is False
+
+    counters = selected_source_retrieval_telemetry_counters()
+    assert sum(counters.values()) == 5
+    assert all("|" in key for key in counters)
+
+
+def test_selected_source_retrieval_telemetry_flags_contract_with_legacy_cards():
+    reset_selected_source_retrieval_telemetry()
+    scope = {"status": "resolved", "source_ids": ["alpha-file"]}
+    legacy_card = {"source": {"id": "stale-file", "origin": "legacy_fallback"}}
+
+    valid_contract = classify_engine_attempt(
+        contract=_engine_authority_tool_contract(
+            status="no_evidence",
+            terminal_reason="rejected_candidates_only",
+            include_evidence=False,
+        ),
+        active_source_scope=scope,
+    )
+    snapshot = record_selected_source_retrieval_telemetry(
+        classification=valid_contract, active_sources=[legacy_card]
+    )
+    assert snapshot["boundary_violation"] is True
+    assert "violation=1" in snapshot["counter_key"]
+
+    tampered = _engine_authority_tool_contract(
+        status="success", terminal_reason="success", include_evidence=True
+    )
+    tampered["engine_version"] = "tampered"
+    invalid_contract = classify_engine_attempt(
+        contract=tampered, active_source_scope=scope
+    )
+    snapshot = record_selected_source_retrieval_telemetry(
+        classification=invalid_contract, active_sources=[legacy_card]
+    )
+    assert snapshot["boundary_violation"] is True
+
+    counters = selected_source_retrieval_telemetry_counters()
+    assert sum(value for key, value in counters.items() if "violation=1" in key) == 2

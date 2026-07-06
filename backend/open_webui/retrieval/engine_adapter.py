@@ -483,7 +483,9 @@ def build_selected_source_retrieval_engine_package(
         for file_item in observed_files
         if str((file_item.get("data") or {}).get("content") or "").strip()
     )
-    if not documents:
+    if not documents and not any(
+        file_item.get("host_text_representation") for file_item in observed_files
+    ):
         return OpenWebUISelectedSourceLanePackage(
             observed_files=observed_files,
             unsupported_reason="unsupported_source_shape",
@@ -596,8 +598,33 @@ def _selected_source_observed_files(selected_files: Sequence[Any]) -> tuple[dict
         text_content = _selected_source_observed_file_text(item)
         if text_content:
             descriptor["data"] = {"content": text_content}
+        descriptor["host_text_representation"] = (
+            _selected_source_file_has_host_text_representation(item)
+        )
         observed.append(descriptor)
     return tuple(observed)
+
+
+def _selected_source_file_has_host_text_representation(
+    file_item: Mapping[str, Any],
+) -> bool:
+    """True when the host holds a canonical-text representation for the file.
+
+    Distinguishes uploaded/local files whose text the host carries (possibly
+    empty -> engine-owned no_evidence) from collection/provider-backed shapes
+    whose text lives outside the host (-> unsupported source shape for this
+    lane)."""
+    data = file_item.get("data")
+    if isinstance(data, Mapping) and "content" in data:
+        return True
+    nested_file = file_item.get("file")
+    if isinstance(nested_file, Mapping):
+        nested_data = nested_file.get("data")
+        if isinstance(nested_data, Mapping) and "content" in nested_data:
+            return True
+    return isinstance(file_item.get("content"), str) or isinstance(
+        file_item.get("text"), str
+    )
 
 
 def _selected_source_observed_file_text(file_item: Mapping[str, Any]) -> str:
