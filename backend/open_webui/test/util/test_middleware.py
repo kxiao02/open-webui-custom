@@ -12384,3 +12384,299 @@ def test_selected_source_retrieval_telemetry_flags_contract_with_legacy_cards():
 
     counters = selected_source_retrieval_telemetry_counters()
     assert sum(value for key, value in counters.items() if "violation=1" in key) == 2
+
+
+# ---------------------------------------------------------------------------
+# Answer calibration: structured policy states
+# ---------------------------------------------------------------------------
+
+
+def test_answer_policy_normal_when_accepted_evidence_and_no_gaps():
+    """Normal policy only when accepted evidence exists AND no material diagnostic gaps."""
+    from open_webui.utils.middleware import _build_answer_policy
+
+    policy = _build_answer_policy(
+        status="success",
+        terminal_reason="success",
+        has_accepted_evidence=True,
+        source_scoped=True,
+        diagnostics=[],
+        unsupported_claim_reasons=[],
+    )
+    assert policy["policy"] == "normal"
+    assert policy["calibration"] == "full_citation_allowed"
+    assert policy["source_scoped"] is True
+
+
+def test_answer_policy_calibrate_when_accepted_evidence_but_gaps_exist():
+    """Calibrate when accepted evidence exists but diagnostic gaps are present."""
+    from open_webui.utils.middleware import _build_answer_policy
+
+    policy = _build_answer_policy(
+        status="success",
+        terminal_reason="success",
+        has_accepted_evidence=True,
+        source_scoped=True,
+        diagnostics=[
+            {"classification": "weak_evidence", "outcome": "weak_evidence",
+             "reason": "weak_or_indirect_evidence"}
+        ],
+        unsupported_claim_reasons=["weak_or_indirect_evidence"],
+    )
+    assert policy["policy"] == "calibrate"
+    assert policy["calibration"] == "labeled_assumptions_allowed"
+
+
+def test_answer_policy_calibrate_when_partial_status_with_evidence():
+    """Calibrate when status is partial even with accepted evidence."""
+    from open_webui.utils.middleware import _build_answer_policy
+
+    policy = _build_answer_policy(
+        status="partial",
+        terminal_reason="budget_limited",
+        has_accepted_evidence=True,
+        source_scoped=False,
+        diagnostics=[],
+        unsupported_claim_reasons=[],
+    )
+    assert policy["policy"] == "calibrate"
+
+
+def test_answer_policy_refuse_only_for_blocked_denied():
+    """Refuse policy reserved for blocked/denied only."""
+    from open_webui.utils.middleware import _build_answer_policy
+
+    for status in ("blocked", "denied"):
+        policy = _build_answer_policy(
+            status=status,
+            terminal_reason="ambiguous_retrieval_scope",
+            has_accepted_evidence=False,
+            source_scoped=True,
+            diagnostics=[],
+        )
+        assert policy["policy"] == "refuse", f"status={status}"
+        assert policy["calibration"] == "blanket_refusal"
+
+
+def test_answer_policy_report_retrieval_error_for_timeout():
+    """Timeout uses report_retrieval_error, not refuse."""
+    from open_webui.utils.middleware import _build_answer_policy
+
+    policy = _build_answer_policy(
+        status="timeout",
+        terminal_reason="retrieval_timeout",
+        has_accepted_evidence=False,
+        source_scoped=True,
+        diagnostics=[],
+    )
+    assert policy["policy"] == "report_retrieval_error"
+    assert policy["calibration"] == "error_without_guess"
+    assert policy["reason"] == "retrieval_timeout"
+
+
+def test_answer_policy_report_retrieval_error_for_error():
+    """Error status uses report_retrieval_error, not refuse."""
+    from open_webui.utils.middleware import _build_answer_policy
+
+    policy = _build_answer_policy(
+        status="error",
+        terminal_reason="engine_observe_error",
+        has_accepted_evidence=False,
+        source_scoped=False,
+        diagnostics=[],
+    )
+    assert policy["policy"] == "report_retrieval_error"
+    assert policy["calibration"] == "error_without_guess"
+
+
+def test_answer_policy_fail_clean_for_source_scoped_no_evidence():
+    """Fail-clean policy when source-scoped and no accepted evidence."""
+    from open_webui.utils.middleware import _build_answer_policy
+
+    policy = _build_answer_policy(
+        status="no_evidence",
+        terminal_reason="no_accepted_evidence",
+        has_accepted_evidence=False,
+        source_scoped=True,
+        diagnostics=[],
+    )
+    assert policy["policy"] == "fail_clean"
+    assert policy["calibration"] == "no_source_scoped_guess"
+    assert policy["source_scoped"] is True
+
+
+def test_answer_policy_calibrate_for_non_source_scoped_no_evidence():
+    """Calibrate policy when not source-scoped and no evidence."""
+    from open_webui.utils.middleware import _build_answer_policy
+
+    policy = _build_answer_policy(
+        status="no_evidence",
+        terminal_reason="no_retrieval_candidates",
+        has_accepted_evidence=False,
+        source_scoped=False,
+        diagnostics=[],
+    )
+    assert policy["policy"] == "calibrate"
+    assert policy["calibration"] == "labeled_assumptions_allowed"
+    assert policy["source_scoped"] is False
+
+
+def test_answer_policy_calibrate_when_conflict_diagnostics_with_evidence():
+    """Calibrate when conflict diagnostics exist even with accepted evidence."""
+    from open_webui.utils.middleware import _build_answer_policy
+
+    policy = _build_answer_policy(
+        status="success",
+        terminal_reason="success",
+        has_accepted_evidence=True,
+        source_scoped=False,
+        diagnostics=[
+            {"classification": "conflict", "reason": "explicit_conflict_marker"}
+        ],
+        unsupported_claim_reasons=["explicit_conflict_marker"],
+    )
+    assert policy["policy"] == "calibrate"
+
+
+def test_synthesis_calibration_context_carries_structured_signals():
+    """Calibration context carries all structured signals without prompt analysis."""
+    from open_webui.utils.middleware import _build_synthesis_calibration_context
+
+    ctx = _build_synthesis_calibration_context(
+        answer_policy={
+            "policy": "fail_clean",
+            "source_scoped": True,
+            "calibration": "no_source_scoped_guess",
+            "reason": "no_accepted_evidence",
+        },
+        terminal_reason="no_accepted_evidence",
+        terminal_status="no_evidence",
+        accepted_output_count=0,
+        reference_count=0,
+        diagnostic_count=1,
+        active_source_scope={"status": "resolved", "source_ids": ["alpha-file"]},
+        unsupported_claim_reasons=["weak_or_indirect_evidence"],
+    )
+    assert ctx["answer_policy"]["policy"] == "fail_clean"
+    assert ctx["terminal_status"] == "no_evidence"
+    assert ctx["terminal_reason"] == "no_accepted_evidence"
+    assert ctx["accepted_output_count"] == 0
+    assert ctx["reference_count"] == 0
+    assert ctx["source_scoped"] is True
+    assert ctx["active_source_scope_state"] == "resolved"
+    assert "weak_or_indirect_evidence" in ctx["unsupported_claim_reasons"]
+
+
+def test_calibrated_guard_fail_clean_source_scoped():
+    """Fail-clean guard for source-scoped no-evidence says sources don't support the fact."""
+    from open_webui.utils.middleware import _append_calibrated_synthesis_guard
+
+    messages = [{"role": "user", "content": "What is the value in cell B2?"}]
+    policy = {
+        "policy": "fail_clean",
+        "source_scoped": True,
+        "calibration": "no_source_scoped_guess",
+        "reason": "no_accepted_evidence",
+    }
+    updated = _append_calibrated_synthesis_guard(messages, answer_policy=policy)
+    guard_msg = updated[0]
+    assert guard_msg["role"] == "system"
+    assert "selected sources" in guard_msg["content"].lower()
+    assert "general-knowledge guess" in guard_msg["content"].lower()
+
+
+def test_calibrated_guard_calibrate_non_scoped():
+    """Calibrate guard for non-scoped no-evidence allows labeled assumptions."""
+    from open_webui.utils.middleware import _append_calibrated_synthesis_guard
+
+    messages = [{"role": "user", "content": "What are the tradeoffs?"}]
+    policy = {
+        "policy": "calibrate",
+        "source_scoped": False,
+        "calibration": "labeled_assumptions_allowed",
+        "reason": "incomplete_retrieval",
+    }
+    updated = _append_calibrated_synthesis_guard(messages, answer_policy=policy)
+    guard_msg = updated[0]
+    assert guard_msg["role"] == "system"
+    assert "assumptions" in guard_msg["content"].lower() or "labeled" in guard_msg["content"].lower()
+    # Guard says "do not render a blanket refusal" — it mentions the phrase as prohibition, not policy
+    assert "do not render a blanket refusal" in guard_msg["content"].lower()
+
+
+def test_calibrated_guard_refuse_uses_no_evidence_guard():
+    """Refuse policy falls back to the standard no-evidence guard."""
+    from open_webui.utils.middleware import _append_calibrated_synthesis_guard
+
+    messages = [{"role": "user", "content": "Continue"}]
+    policy = {
+        "policy": "refuse",
+        "source_scoped": True,
+        "calibration": "blanket_refusal",
+        "reason": "ambiguous_retrieval_scope",
+    }
+    updated = _append_calibrated_synthesis_guard(messages, answer_policy=policy)
+    guard_msg = updated[0]
+    assert guard_msg["role"] == "system"
+    assert "no usable source evidence" in guard_msg["content"].lower()
+
+
+def test_calibrated_guard_report_retrieval_error():
+    """report_retrieval_error guard states limitation without refusal."""
+    from open_webui.utils.middleware import _append_calibrated_synthesis_guard
+
+    messages = [{"role": "user", "content": "What is the policy?"}]
+    policy = {
+        "policy": "report_retrieval_error",
+        "source_scoped": True,
+        "calibration": "error_without_guess",
+        "reason": "retrieval_timeout",
+    }
+    updated = _append_calibrated_synthesis_guard(messages, answer_policy=policy)
+    guard_msg = updated[0]
+    assert guard_msg["role"] == "system"
+    content = guard_msg["content"].lower()
+    assert "retrieval" in content
+    assert "limitation" in content or "error" in content
+    # Must not be a blanket refusal
+    assert "no usable source evidence" not in content
+
+
+def test_calibrated_guard_preserves_supported_claims():
+    """Calibrate guard instructs to keep supported claims and label unsupported ones."""
+    from open_webui.utils.middleware import _append_calibrated_synthesis_guard
+
+    messages = [{"role": "user", "content": "Analyze the policy"}]
+    policy = {
+        "policy": "calibrate",
+        "source_scoped": False,
+        "calibration": "labeled_assumptions_allowed",
+        "reason": "partial_evidence",
+    }
+    updated = _append_calibrated_synthesis_guard(messages, answer_policy=policy)
+    guard_msg = updated[0]
+    content = guard_msg["content"].lower()
+    assert "supported claims" in content or "keep supported" in content
+    assert "label" in content or "limit" in content
+
+
+def test_structural_guard_rejects_regex_intent_classifiers_in_middleware():
+    """Middleware must not contain regex-based intent classifiers."""
+    import ast
+    import inspect
+
+    source = inspect.getsource(middleware)
+
+    forbidden_patterns = [
+        "_EXACT_FACT_PATTERNS",
+        "_OPEN_ENDED_PATTERNS",
+        "_classify_answer_intent",
+        "exact_fact_pattern",
+        "open_ended_pattern",
+        "intent_classifier",
+    ]
+    for pattern in forbidden_patterns:
+        assert pattern not in source, (
+            f"Middleware source contains forbidden regex intent classifier: {pattern}. "
+            "Answer calibration must use structured signals only."
+        )

@@ -7252,6 +7252,196 @@ def _append_no_evidence_guard(messages: list) -> list:
     return add_or_update_system_message(guard, messages, append=True)
 
 
+def _diagnostics_have_material_gaps(
+    diagnostics: list[dict[str, Any]],
+) -> bool:
+    """Check whether diagnostics indicate material gaps using existing schema fields.
+
+    Consumes the existing diagnostic shape: classification, outcome, reason.
+    Does not invent a parallel taxonomy.
+    """
+    # Classifications that indicate the source could not satisfy the evidence gate.
+    gap_classifications = {"no_evidence", "weak_evidence", "conflict"}
+    # Outcomes from _NO_EVIDENCE_DIAGNOSTIC_OUTCOMES that indicate failure.
+    gap_outcomes = {"blocked", "denied", "error", "low_relevance", "malformed",
+                    "no_evidence", "permission_denied", "timeout", "unauthorized",
+                    "weak_evidence"}
+    for diag in diagnostics:
+        if not isinstance(diag, dict):
+            continue
+        classification = str(diag.get("classification") or "").strip().lower()
+        outcome = str(diag.get("outcome") or "").strip().lower()
+        if classification in gap_classifications:
+            return True
+        if outcome in gap_outcomes:
+            return True
+    return False
+
+
+def _build_answer_policy(
+    *,
+    status: str,
+    terminal_reason: str,
+    has_accepted_evidence: bool,
+    source_scoped: bool,
+    diagnostics: list[dict[str, Any]],
+    unsupported_claim_reasons: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build answer policy from structured retrieval signals only.
+
+    No prompt/keyword analysis. Policy is determined entirely by:
+    - retrieval status and terminal_reason
+    - whether accepted evidence exists
+    - whether scope is source-scoped (resolved/authorized active_source_scope)
+    - diagnostic classification signals
+    - unsupported claim reasons
+
+    Policy rules:
+    - denied/blocked → refuse (blanket refusal)
+    - timeout/error → report_retrieval_error (not refusal, not synthesis)
+    - accepted evidence + no material gaps → normal
+    - accepted evidence + material gaps → calibrate
+    - no evidence + source-scoped → fail_clean
+    - no evidence + not source-scoped → calibrate
+    """
+    has_gaps = (
+        bool(unsupported_claim_reasons)
+        or status == "partial"
+        or _diagnostics_have_material_gaps(diagnostics)
+    )
+
+    if status in {"blocked", "denied"}:
+        return {
+            "policy": "refuse",
+            "source_scoped": source_scoped,
+            "calibration": "blanket_refusal",
+            "reason": terminal_reason,
+        }
+
+    if status in {"timeout", "error"}:
+        return {
+            "policy": "report_retrieval_error",
+            "source_scoped": source_scoped,
+            "calibration": "error_without_guess",
+            "reason": terminal_reason or status,
+        }
+
+    if has_accepted_evidence and not has_gaps:
+        return {
+            "policy": "normal",
+            "source_scoped": source_scoped,
+            "calibration": "full_citation_allowed",
+        }
+
+    if has_accepted_evidence and has_gaps:
+        return {
+            "policy": "calibrate",
+            "source_scoped": source_scoped,
+            "calibration": "labeled_assumptions_allowed",
+            "reason": terminal_reason or "material_diagnostic_gaps",
+        }
+
+    # no accepted evidence
+    if source_scoped:
+        return {
+            "policy": "fail_clean",
+            "source_scoped": True,
+            "calibration": "no_source_scoped_guess",
+            "reason": terminal_reason or "no_accepted_evidence",
+        }
+
+    return {
+        "policy": "calibrate",
+        "source_scoped": source_scoped,
+        "calibration": "labeled_assumptions_allowed",
+        "reason": terminal_reason or "incomplete_retrieval",
+    }
+
+
+def _build_synthesis_calibration_context(
+    *,
+    answer_policy: dict[str, Any],
+    terminal_reason: str,
+    terminal_status: str,
+    accepted_output_count: int,
+    reference_count: int,
+    diagnostic_count: int,
+    active_source_scope: dict | None,
+    unsupported_claim_reasons: list[str],
+) -> dict[str, Any]:
+    """Build structured synthesis calibration context from retrieval signals.
+
+    This is passed to final synthesis as structured data — no regex, no
+    keyword matching, no prompt analysis.
+    """
+    scope = active_source_scope if isinstance(active_source_scope, dict) else {}
+    return {
+        "answer_policy": answer_policy,
+        "terminal_status": terminal_status,
+        "terminal_reason": terminal_reason,
+        "accepted_output_count": accepted_output_count,
+        "reference_count": reference_count,
+        "diagnostic_count": diagnostic_count,
+        "source_scoped": bool(answer_policy.get("source_scoped")),
+        "unsupported_claim_reasons": list(unsupported_claim_reasons),
+        "active_source_scope_state": str(scope.get("status") or "none"),
+    }
+
+
+def _append_calibrated_synthesis_guard(
+    messages: list,
+    *,
+    answer_policy: dict[str, Any],
+) -> list:
+    """Append synthesis guard driven by structured answer policy only.
+
+    This is a transitional carrier — the long-term owner of calibration
+    behavior is the synthesis layer / final-answer assembly, not this
+    middleware function.
+    """
+    policy = str(answer_policy.get("policy") or "calibrate")
+    source_scoped = bool(answer_policy.get("source_scoped"))
+
+    if policy == "refuse":
+        return _append_no_evidence_guard(messages)
+
+    if policy == "report_retrieval_error":
+        guard = (
+            "Retrieval encountered an error or timeout. State the retrieval "
+            "limitation clearly. Do not present claims as supported by "
+            "retrieved sources. If useful context exists outside retrieval, "
+            "answer from that context with explicit separation from the "
+            "retrieval limitation."
+        )
+        return add_or_update_system_message(guard, messages, append=True)
+
+    if policy == "fail_clean" and source_scoped:
+        guard = (
+            "The selected sources do not provide enough evidence for the "
+            "requested specific fact. State this clearly. Do not fill the "
+            "answer with a general-knowledge guess presented as if it came "
+            "from the selected sources. Any optional outside-source or "
+            "general-knowledge supplement must be visibly separated and must "
+            "not carry selected-source citations."
+        )
+        return add_or_update_system_message(guard, messages, append=True)
+
+    if policy == "calibrate":
+        guard = (
+            "Retrieval returned incomplete, partial, or conflicting evidence "
+            "for this turn. Provide the useful answer available from the "
+            "conversation and accepted context. Material assumptions, "
+            "inferences, unsupported areas, and evidence gaps must be labeled "
+            "as such. Do not render a blanket refusal solely because "
+            "retrieval was incomplete. If some claims are supported and "
+            "others are inferred, conflicting, or unsupported, keep "
+            "supported claims and label or limit the rest."
+        )
+        return add_or_update_system_message(guard, messages, append=True)
+
+    return _append_no_evidence_guard(messages)
+
+
 def _is_selected_source_metadata_first_diagnostics_only(metadata: object) -> bool:
     if not isinstance(metadata, dict):
         return False
@@ -11629,6 +11819,36 @@ async def chat_completion_files_handler(
     if engine_has_valid_contract:
         metadata["retrieval_engine_first_pass_contract"] = engine_contract
 
+    active_scope = metadata.get("active_source_scope")
+    active_scope_status = (
+        str(active_scope.get("status") or "").strip().lower()
+        if isinstance(active_scope, dict)
+        else ""
+    )
+    # Use existing diagnostic classifications from the retrieval schema.
+    _gap_classifications = {"no_evidence", "weak_evidence", "conflict"}
+    _gap_outcomes = {"blocked", "denied", "error", "low_relevance", "malformed",
+                     "no_evidence", "permission_denied", "timeout", "unauthorized",
+                     "weak_evidence"}
+    unsupported_claim_reasons = [
+        str(item.get("reason") or "").strip()
+        for item in retrieval_diagnostics
+        if isinstance(item, dict)
+        and (
+            str(item.get("classification") or "").strip().lower() in _gap_classifications
+            or str(item.get("outcome") or "").strip().lower() in _gap_outcomes
+        )
+    ]
+    answer_policy = _build_answer_policy(
+        status=status,
+        terminal_reason=terminal_reason,
+        has_accepted_evidence=bool(accepted_outputs),
+        source_scoped=active_scope_status in {"resolved", "authorized"},
+        diagnostics=retrieval_diagnostics,
+        unsupported_claim_reasons=unsupported_claim_reasons,
+    )
+    metadata["answer_policy"] = answer_policy
+
     return body, {
         "sources": sources,
         "retrieval_diagnostics": retrieval_diagnostics,
@@ -11637,6 +11857,7 @@ async def chat_completion_files_handler(
         "first_pass_profile_lock": metadata.get("first_pass_profile_lock"),
         "retrieval_attempted": performed_retrieval,
         "no_evidence": performed_retrieval and not sources,
+        "answer_policy": answer_policy,
         "retrieval_engine_observe": metadata.get("retrieval_engine_observe"),
         "retrieval_engine_plan_summary": metadata.get("retrieval_engine_plan_summary"),
         "retrieval_engine_attempt": metadata.get("retrieval_engine_attempt"),
@@ -14005,7 +14226,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             request, form_data["messages"], sources, prompt
         )
     elif retrieval_no_evidence:
-        form_data["messages"] = _append_no_evidence_guard(form_data["messages"])
+        answer_policy = metadata.get("answer_policy")
+        if isinstance(answer_policy, dict):
+            form_data["messages"] = _append_calibrated_synthesis_guard(
+                form_data["messages"],
+                answer_policy=answer_policy,
+            )
+        else:
+            form_data["messages"] = _append_no_evidence_guard(form_data["messages"])
         if _selected_source_requires_stable_limitation_response(metadata):
             form_data["messages"] = _append_selected_source_limitation_guard(
                 form_data["messages"],
