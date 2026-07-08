@@ -95,3 +95,28 @@ def test_s3_tag_sanitization():
         provider.S3StorageProvider.sanitize_tag_value("a/b+c@x:y z!*")
         == "a/b+c@x:y z"
     )
+
+
+def test_storage_file_not_found_error_is_file_not_found():
+    assert issubclass(provider.StorageFileNotFoundError, FileNotFoundError)
+
+
+def test_storage_provider_has_get_file_metadata():
+    assert hasattr(provider.StorageProvider, "get_file_metadata")
+
+
+def test_local_get_file_metadata_raises_for_missing_file(monkeypatch, tmp_path):
+    mock_upload_dir(monkeypatch, tmp_path)
+    storage = provider.LocalStorageProvider()
+    with pytest.raises(provider.StorageFileNotFoundError):
+        storage.get_file_metadata(str(tmp_path / "uploads" / "nonexistent.dat"))
+
+
+def test_local_get_file_metadata_returns_size_and_type(monkeypatch, tmp_path):
+    upload_dir = mock_upload_dir(monkeypatch, tmp_path)
+    storage = provider.LocalStorageProvider()
+    path = upload_dir / "hello.txt"
+    path.write_bytes(b"hello world")
+    meta = storage.get_file_metadata(str(path))
+    assert meta["size_bytes"] == 11
+    assert "content_type" in meta

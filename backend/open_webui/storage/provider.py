@@ -1,4 +1,5 @@
 import io
+import mimetypes
 import os
 import shutil
 import json
@@ -6,7 +7,7 @@ import logging
 import re
 import tempfile
 from abc import ABC, abstractmethod
-from typing import BinaryIO, Tuple, Dict
+from typing import Any, BinaryIO, Tuple, Dict
 
 try:
     import boto3
@@ -86,9 +87,21 @@ def cleanup_ephemeral_storage_file(file_path: str | os.PathLike | None) -> None:
         log.warning("Failed to remove ephemeral storage file %s: %s", resolved_path, e)
 
 
+class StorageFileNotFoundError(FileNotFoundError):
+    """Raised when a storage object does not exist at the given path."""
+
+
 class StorageProvider(ABC):
     @abstractmethod
     def get_file(self, file_path: str) -> str:
+        pass
+
+    @abstractmethod
+    def get_file_metadata(self, file_path: str) -> Dict[str, Any]:
+        """Return metadata dict with at least 'size_bytes' and 'content_type'.
+
+        Raises StorageFileNotFoundError when the object does not exist.
+        """
         pass
 
     @abstractmethod
@@ -123,6 +136,19 @@ class LocalStorageProvider(StorageProvider):
     def get_file(file_path: str) -> str:
         """Handles downloading of the file from local storage."""
         return file_path
+
+    @staticmethod
+    def get_file_metadata(file_path: str) -> Dict[str, Any]:
+        filename = file_path.split("/")[-1]
+        resolved = os.path.join(UPLOAD_DIR, filename)
+        if not os.path.isfile(resolved):
+            raise StorageFileNotFoundError(f"Local file not found: {resolved}")
+        stat = os.stat(resolved)
+        content_type, _ = mimetypes.guess_type(resolved)
+        return {
+            "size_bytes": stat.st_size,
+            "content_type": content_type or "application/octet-stream",
+        }
 
     @staticmethod
     def delete_file(file_path: str) -> None:
@@ -234,6 +260,21 @@ class S3StorageProvider(StorageProvider):
         except ClientError as e:
             raise RuntimeError(f"Error downloading file from S3: {e}")
 
+    def get_file_metadata(self, file_path: str) -> Dict[str, Any]:
+        s3_key = self._extract_s3_key(file_path)
+        try:
+            response = self.s3_client.head_object(
+                Bucket=self.bucket_name, Key=s3_key
+            )
+            return {
+                "size_bytes": response.get("ContentLength"),
+                "content_type": response.get("ContentType"),
+            }
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "404":
+                raise StorageFileNotFoundError(f"S3 object not found: {file_path}")
+            raise RuntimeError(f"Error getting S3 object metadata: {e}")
+
     def delete_file(self, file_path: str) -> None:
         """Handles deletion of the file from S3 storage."""
         try:
@@ -313,6 +354,17 @@ class GCSStorageProvider(StorageProvider):
         except NotFound as e:
             raise RuntimeError(f"Error downloading file from GCS: {e}")
 
+    def get_file_metadata(self, file_path: str) -> Dict[str, Any]:
+        filename = file_path.removeprefix("gs://").split("/")[1]
+        blob = self.bucket.get_blob(filename)
+        if blob is None:
+            raise StorageFileNotFoundError(f"GCS object not found: {file_path}")
+        blob.reload()
+        return {
+            "size_bytes": blob.size,
+            "content_type": blob.content_type,
+        }
+
     def delete_file(self, file_path: str) -> None:
         """Handles deletion of the file from GCS storage."""
         try:
@@ -388,6 +440,18 @@ class AzureStorageProvider(StorageProvider):
             return local_file_path
         except ResourceNotFoundError as e:
             raise RuntimeError(f"Error downloading file from Azure Blob Storage: {e}")
+
+    def get_file_metadata(self, file_path: str) -> Dict[str, Any]:
+        filename = file_path.split("/")[-1]
+        blob_client = self.container_client.get_blob_client(filename)
+        try:
+            props = blob_client.get_blob_properties()
+            return {
+                "size_bytes": props.size,
+                "content_type": props.content_settings.content_type,
+            }
+        except ResourceNotFoundError:
+            raise StorageFileNotFoundError(f"Azure blob not found: {file_path}")
 
     def delete_file(self, file_path: str) -> None:
         """Handles deletion of the file from Azure Blob Storage."""
