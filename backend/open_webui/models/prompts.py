@@ -4,9 +4,9 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
-from open_webui.models.groups import Groups
 from open_webui.models.users import Users, UserResponse
 from open_webui.models.prompt_history import PromptHistories
+from open_webui.models.groups import Groups
 from open_webui.models.access_grants import AccessGrantModel, AccessGrants
 
 

@@ -5,13 +5,13 @@
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
 	import Check from '$lib/components/icons/Check.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
+	type ViewItem = { value: string; label: string };
 
 	export let value = '';
 	export let placeholder = $i18n.t('Select view');
 	export let onChange: (value: string) => void = () => {};
-
-	const items = [
+	export let items: ViewItem[] = [
 		{ value: '', label: $i18n.t('All') },
 		{ value: 'created', label: $i18n.t('Created by you') },
 		{ value: 'shared', label: $i18n.t('Shared with you') }
@@ -22,7 +22,11 @@
 	selected={items.find((item) => item.value === value)}
 	{items}
 	onSelectedChange={(selectedItem) => {
-		value = selectedItem.value;
+		if (!selectedItem) {
+			return;
+		}
+
+		value = String(selectedItem.value ?? '');
 		onChange(value);
 	}}
 >

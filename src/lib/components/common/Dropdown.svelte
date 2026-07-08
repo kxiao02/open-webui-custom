@@ -2,13 +2,13 @@
 	import { DropdownMenu } from 'bits-ui';
 	import { createEventDispatcher, getContext } from 'svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { flyAndScale } from '$lib/utils/transitions';
 
 	export let show = false;
-	export let side = 'bottom';
-	export let align = 'start';
+	export let side: 'left' | 'right' | 'top' | 'bottom' = 'bottom';
+	export let align: 'start' | 'center' | 'end' = 'start';
 	export let closeOnOutsideClick = true;
 
 	const dispatch = createEventDispatcher();

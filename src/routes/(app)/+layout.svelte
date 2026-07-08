@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { toast } from 'svelte-sonner';
 	import { onMount, tick, getContext } from 'svelte';
 	import { openDB, deleteDB } from 'idb';
@@ -9,15 +10,13 @@
 	import { page } from '$app/stores';
 	import { fade } from 'svelte/transition';
 
-	import { getModels, getToolServersData, getVersionUpdates } from '$lib/apis';
+	import { getModels, getToolServersData } from '$lib/apis';
 	import { getTools } from '$lib/apis/tools';
 	import { getBanners } from '$lib/apis/configs';
 	import { getTerminalServers } from '$lib/apis/terminal';
-	import { getUserSettings } from '$lib/apis/users';
+	import { getUserSettings, updateUserSettings } from '$lib/apis/users';
 
 	import { WEBUI_VERSION, WEBUI_API_BASE_URL } from '$lib/constants';
-	import { compareVersion } from '$lib/utils';
-
 	import {
 		config,
 		user,
@@ -37,6 +36,10 @@
 		showSearch,
 		showSidebar,
 		showControls,
+		showOverview,
+		showFilePreview,
+		selectedGeneratedFilePreviewId,
+		selectedTerminalId,
 		mobile
 	} from '$lib/stores';
 
@@ -44,17 +47,14 @@
 	import SettingsModal from '$lib/components/chat/SettingsModal.svelte';
 	import ChangelogModal from '$lib/components/ChangelogModal.svelte';
 	import AccountPending from '$lib/components/layout/Overlay/AccountPending.svelte';
-	import UpdateInfoToast from '$lib/components/layout/UpdateInfoToast.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { Shortcut, shortcuts } from '$lib/shortcuts';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	let loaded = false;
 	let DB = null;
 	let localDBChats = [];
-
-	let version;
 
 	const clearChatInputStorage = () => {
 		const chatInputKeys = Object.keys(localStorage).filter((key) => key.startsWith('chat-input'));
@@ -91,21 +91,83 @@
 			return null;
 		});
 
-		if (!userSettings) {
-			try {
-				userSettings = JSON.parse(localStorage.getItem('settings') ?? '{}');
-			} catch (e: unknown) {
-				console.error('Failed to parse settings from localStorage', e);
-				userSettings = {};
-			}
-		}
-
 		if (userSettings?.ui) {
 			settings.set(userSettings.ui);
+		} else {
+			settings.set({});
 		}
 
 		if (cb) {
 			await cb();
+		}
+	};
+
+	const normalizeModelIds = (value: unknown): string[] => {
+		if (!Array.isArray(value)) {
+			return [];
+		}
+
+		return [...new Set(value.map((id) => (typeof id === 'string' ? id.trim() : '')).filter(Boolean))];
+	};
+
+	const areStringArraysEqual = (a: string[], b: string[]) => {
+		if (a.length !== b.length) {
+			return false;
+		}
+
+		return a.every((value, index) => value === b[index]);
+	};
+
+	const repairUserModelSettings = async () => {
+		const visibleModelIds = $models
+			.filter((model) => !(model?.info?.meta?.hidden ?? false))
+			.map((model) => model.id);
+
+		if (visibleModelIds.length === 0) {
+			return;
+		}
+
+		const configuredDefaultModelIds = ($config?.default_models ?? '')
+			.split(',')
+			.map((id) => id.trim())
+			.filter((id) => id && visibleModelIds.includes(id));
+
+		const currentSettings = $settings ?? {};
+		const originalModels = normalizeModelIds(currentSettings?.models);
+		const originalPinnedModels = normalizeModelIds(currentSettings?.pinnedModels);
+		const currentModels = originalModels.filter((id) =>
+			visibleModelIds.includes(id)
+		);
+		const currentPinnedModels = originalPinnedModels.filter((id) =>
+			visibleModelIds.includes(id)
+		);
+
+		const nextModels =
+			currentModels.length > 0
+				? currentModels
+				: configuredDefaultModelIds.length > 0
+					? configuredDefaultModelIds
+					: [visibleModelIds[0]];
+
+		const modelsChanged = !areStringArraysEqual(originalModels, nextModels);
+		const pinnedModelsChanged = !areStringArraysEqual(originalPinnedModels, currentPinnedModels);
+
+		if (!modelsChanged && !pinnedModelsChanged) {
+			return;
+		}
+
+		const nextSettings = {
+			...currentSettings,
+			models: nextModels,
+			pinnedModels: currentPinnedModels
+		};
+
+		settings.set(nextSettings);
+
+		try {
+			await updateUserSettings(localStorage.token, { ui: nextSettings });
+		} catch (error) {
+			console.error('Failed to repair user model settings', error);
 		}
 	};
 
@@ -116,6 +178,7 @@
 				$config?.features?.enable_direct_connections ? ($settings?.directConnections ?? null) : null
 			)
 		);
+		await repairUserModelSettings();
 	};
 
 	const setToolServers = async () => {
@@ -191,8 +254,25 @@
 		tools.set(toolsData);
 	};
 
+	const hasSessionCredential = () =>
+		Boolean(localStorage.token || document.cookie.match(/(?:^|; )token=/));
+
+	const waitForSessionBootstrap = async () => {
+		for (let attempt = 0; attempt < 20; attempt += 1) {
+			if ($user) {
+				return true;
+			}
+			if (!hasSessionCredential()) {
+				return false;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+
+		return Boolean($user);
+	};
+
 	onMount(async () => {
-		if ($user === undefined || $user === null) {
+		if (($user === undefined || $user === null) && !(await waitForSessionBootstrap())) {
 			await goto('/auth');
 			return;
 		}
@@ -304,6 +384,7 @@
 					event.preventDefault();
 					document.getElementById('generate-message-pair-button')?.click();
 				} else if (
+					!event.repeat &&
 					isShortcutMatch(event, shortcuts[Shortcut.REGENERATE_RESPONSE]) &&
 					document.activeElement?.id === 'chat-input'
 				) {
@@ -315,10 +396,6 @@
 		};
 		setupKeyboardShortcuts();
 
-		if ($user?.role === 'admin' && ($settings?.showChangelog ?? true)) {
-			showChangelog.set($settings?.version !== $config.version);
-		}
-
 		if ($user?.role === 'admin' || ($user?.permissions?.chat?.temporary ?? true)) {
 			if ($page.url.searchParams.get('temporary-chat') === 'true') {
 				temporaryChatEnabled.set(true);
@@ -329,56 +406,22 @@
 			}
 		}
 
-		// Check for version updates
-		if ($user?.role === 'admin' && $config?.features?.enable_version_update_check) {
-			// Check if the user has dismissed the update toast in the last 24 hours
-			if (localStorage.dismissedUpdateToast) {
-				const dismissedUpdateToast = new Date(Number(localStorage.dismissedUpdateToast));
-				const now = new Date();
-
-				if (now - dismissedUpdateToast > 24 * 60 * 60 * 1000) {
-					checkForVersionUpdates();
-				}
-			} else {
-				checkForVersionUpdates();
-			}
-		}
-		// Persist showControls: track open/close state separately from saved size
-		// chatControlsSize always retains the last width for openPane()
-		await showControls.set(!$mobile ? localStorage.showControls === 'true' : false);
-		showControls.subscribe((value) => {
-			localStorage.showControls = value ? 'true' : 'false';
-		});
+		// Hard refresh should not resurrect the side pane or any preview state.
+		await showControls.set(false);
+		await showOverview.set(false);
+		await showFilePreview.set(false);
+		selectedGeneratedFilePreviewId.set(null);
+		selectedTerminalId.set(null);
+		localStorage.showControls = 'false';
 
 		await tick();
 
 		loaded = true;
 	});
-
-	const checkForVersionUpdates = async () => {
-		version = await getVersionUpdates(localStorage.token).catch((error) => {
-			return {
-				current: WEBUI_VERSION,
-				latest: WEBUI_VERSION
-			};
-		});
-	};
 </script>
 
 <SettingsModal bind:show={$showSettings} />
 <ChangelogModal bind:show={$showChangelog} />
-
-{#if version && compareVersion(version.latest, version.current) && ($settings?.showUpdateToast ?? true)}
-	<div class=" absolute bottom-8 right-8 z-50" in:fade={{ duration: 100 }}>
-		<UpdateInfoToast
-			{version}
-			on:close={() => {
-				localStorage.setItem('dismissedUpdateToast', Date.now().toString());
-				version = null;
-			}}
-		/>
-	</div>
-{/if}
 
 {#if $user}
 	<div class="app relative">

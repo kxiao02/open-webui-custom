@@ -1,14 +1,23 @@
+import io
+import mimetypes
 import os
 import shutil
 import json
 import logging
 import re
+import tempfile
 from abc import ABC, abstractmethod
-from typing import BinaryIO, Tuple, Dict
+from typing import Any, BinaryIO, Tuple, Dict
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
+try:
+    import boto3
+    from botocore.config import Config
+    from botocore.exceptions import ClientError
+except ImportError:
+    boto3 = None
+    Config = None
+    ClientError = Exception
+
 from open_webui.config import (
     S3_ACCESS_KEY_ID,
     S3_BUCKET_NAME,
@@ -27,19 +36,72 @@ from open_webui.config import (
     STORAGE_PROVIDER,
     UPLOAD_DIR,
 )
-from google.cloud import storage
-from google.cloud.exceptions import GoogleCloudError, NotFound
 from open_webui.constants import ERROR_MESSAGES
-from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobServiceClient
-from azure.core.exceptions import ResourceNotFoundError
+
+try:
+    from google.cloud import storage
+    from google.cloud.exceptions import GoogleCloudError, NotFound
+except ImportError:
+    storage = None
+    GoogleCloudError = Exception
+    NotFound = Exception
+
+try:
+    from azure.identity import DefaultAzureCredential
+    from azure.storage.blob import BlobServiceClient
+    from azure.core.exceptions import ResourceNotFoundError
+except ImportError:
+    DefaultAzureCredential = None
+    BlobServiceClient = None
+    ResourceNotFoundError = Exception
 
 log = logging.getLogger(__name__)
+TEMP_DOWNLOAD_PREFIX = "open-webui-s3-"
+
+
+def _require_dependency(name: str, value):
+    if value is None:
+        raise RuntimeError(
+            f"{name} is required for the configured storage provider. "
+            "Install the full backend requirements or the provider-specific SDK."
+        )
+    return value
+
+
+def is_ephemeral_storage_file(file_path: str | os.PathLike | None) -> bool:
+    if not file_path:
+        return False
+    return os.path.basename(os.fspath(file_path)).startswith(TEMP_DOWNLOAD_PREFIX)
+
+
+def cleanup_ephemeral_storage_file(file_path: str | os.PathLike | None) -> None:
+    if not is_ephemeral_storage_file(file_path):
+        return
+
+    resolved_path = os.fspath(file_path)
+    try:
+        os.remove(resolved_path)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("Failed to remove ephemeral storage file %s: %s", resolved_path, e)
+
+
+class StorageFileNotFoundError(FileNotFoundError):
+    """Raised when a storage object does not exist at the given path."""
 
 
 class StorageProvider(ABC):
     @abstractmethod
     def get_file(self, file_path: str) -> str:
+        pass
+
+    @abstractmethod
+    def get_file_metadata(self, file_path: str) -> Dict[str, Any]:
+        """Return metadata dict with at least 'size_bytes' and 'content_type'.
+
+        Raises StorageFileNotFoundError when the object does not exist.
+        """
         pass
 
     @abstractmethod
@@ -76,6 +138,19 @@ class LocalStorageProvider(StorageProvider):
         return file_path
 
     @staticmethod
+    def get_file_metadata(file_path: str) -> Dict[str, Any]:
+        filename = file_path.split("/")[-1]
+        resolved = os.path.join(UPLOAD_DIR, filename)
+        if not os.path.isfile(resolved):
+            raise StorageFileNotFoundError(f"Local file not found: {resolved}")
+        stat = os.stat(resolved)
+        content_type, _ = mimetypes.guess_type(resolved)
+        return {
+            "size_bytes": stat.st_size,
+            "content_type": content_type or "application/octet-stream",
+        }
+
+    @staticmethod
     def delete_file(file_path: str) -> None:
         """Handles deletion of the file from local storage."""
         filename = file_path.split("/")[-1]
@@ -104,7 +179,9 @@ class LocalStorageProvider(StorageProvider):
 
 class S3StorageProvider(StorageProvider):
     def __init__(self):
-        config = Config(
+        _require_dependency("boto3", boto3)
+        config_cls = _require_dependency("botocore", Config)
+        config = config_cls(
             s3={
                 "use_accelerate_endpoint": S3_USE_ACCELERATE_ENDPOINT,
                 "addressing_style": S3_ADDRESSING_STYLE,
@@ -146,10 +223,14 @@ class S3StorageProvider(StorageProvider):
         self, file: BinaryIO, filename: str, tags: Dict[str, str]
     ) -> Tuple[bytes, str]:
         """Handles uploading of the file to S3 storage."""
-        _, file_path = LocalStorageProvider.upload_file(file, filename, tags)
+        contents = file.read()
+        if not contents:
+            raise ValueError(ERROR_MESSAGES.EMPTY_CONTENT)
         s3_key = os.path.join(self.key_prefix, filename)
         try:
-            self.s3_client.upload_file(file_path, self.bucket_name, s3_key)
+            self.s3_client.upload_fileobj(
+                io.BytesIO(contents), self.bucket_name, s3_key
+            )
             if S3_ENABLE_TAGGING and tags:
                 sanitized_tags = {
                     self.sanitize_tag_value(k): self.sanitize_tag_value(v)
@@ -165,10 +246,7 @@ class S3StorageProvider(StorageProvider):
                     Key=s3_key,
                     Tagging=tagging,
                 )
-            return (
-                open(file_path, "rb").read(),
-                f"s3://{self.bucket_name}/{s3_key}",
-            )
+            return (contents, f"s3://{self.bucket_name}/{s3_key}")
         except ClientError as e:
             raise RuntimeError(f"Error uploading file to S3: {e}")
 
@@ -176,11 +254,26 @@ class S3StorageProvider(StorageProvider):
         """Handles downloading of the file from S3 storage."""
         try:
             s3_key = self._extract_s3_key(file_path)
-            local_file_path = self._get_local_file_path(s3_key)
+            local_file_path = self._get_temp_file_path(s3_key)
             self.s3_client.download_file(self.bucket_name, s3_key, local_file_path)
             return local_file_path
         except ClientError as e:
             raise RuntimeError(f"Error downloading file from S3: {e}")
+
+    def get_file_metadata(self, file_path: str) -> Dict[str, Any]:
+        s3_key = self._extract_s3_key(file_path)
+        try:
+            response = self.s3_client.head_object(
+                Bucket=self.bucket_name, Key=s3_key
+            )
+            return {
+                "size_bytes": response.get("ContentLength"),
+                "content_type": response.get("ContentType"),
+            }
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "404":
+                raise StorageFileNotFoundError(f"S3 object not found: {file_path}")
+            raise RuntimeError(f"Error getting S3 object metadata: {e}")
 
     def delete_file(self, file_path: str) -> None:
         """Handles deletion of the file from S3 storage."""
@@ -189,9 +282,6 @@ class S3StorageProvider(StorageProvider):
             self.s3_client.delete_object(Bucket=self.bucket_name, Key=s3_key)
         except ClientError as e:
             raise RuntimeError(f"Error deleting file from S3: {e}")
-
-        # Always delete from local storage
-        LocalStorageProvider.delete_file(file_path)
 
     def delete_all_files(self) -> None:
         """Handles deletion of all files from S3 storage."""
@@ -209,30 +299,35 @@ class S3StorageProvider(StorageProvider):
         except ClientError as e:
             raise RuntimeError(f"Error deleting all files from S3: {e}")
 
-        # Always delete from local storage
-        LocalStorageProvider.delete_all_files()
-
     # The s3 key is the name assigned to an object. It excludes the bucket name, but includes the internal path and the file name.
     def _extract_s3_key(self, full_file_path: str) -> str:
         return "/".join(full_file_path.split("//")[1].split("/")[1:])
 
-    def _get_local_file_path(self, s3_key: str) -> str:
-        return f"{UPLOAD_DIR}/{s3_key.split('/')[-1]}"
+    def _get_temp_file_path(self, s3_key: str) -> str:
+        suffix = os.path.splitext(s3_key)[1]
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix=TEMP_DOWNLOAD_PREFIX,
+            suffix=suffix,
+            delete=False,
+        )
+        temp_file.close()
+        return temp_file.name
 
 
 class GCSStorageProvider(StorageProvider):
     def __init__(self):
+        storage_client = _require_dependency("google-cloud-storage", storage)
         self.bucket_name = GCS_BUCKET_NAME
 
         if GOOGLE_APPLICATION_CREDENTIALS_JSON:
-            self.gcs_client = storage.Client.from_service_account_info(
+            self.gcs_client = storage_client.Client.from_service_account_info(
                 info=json.loads(GOOGLE_APPLICATION_CREDENTIALS_JSON)
             )
         else:
             # if no credentials json is provided, credentials will be picked up from the environment
             # if running on local environment, credentials would be user credentials
             # if running on a Compute Engine instance, credentials would be from Google Metadata server
-            self.gcs_client = storage.Client()
+            self.gcs_client = storage_client.Client()
         self.bucket = self.gcs_client.bucket(GCS_BUCKET_NAME)
 
     def upload_file(
@@ -258,6 +353,17 @@ class GCSStorageProvider(StorageProvider):
             return local_file_path
         except NotFound as e:
             raise RuntimeError(f"Error downloading file from GCS: {e}")
+
+    def get_file_metadata(self, file_path: str) -> Dict[str, Any]:
+        filename = file_path.removeprefix("gs://").split("/")[1]
+        blob = self.bucket.get_blob(filename)
+        if blob is None:
+            raise StorageFileNotFoundError(f"GCS object not found: {file_path}")
+        blob.reload()
+        return {
+            "size_bytes": blob.size,
+            "content_type": blob.content_type,
+        }
 
     def delete_file(self, file_path: str) -> None:
         """Handles deletion of the file from GCS storage."""
@@ -288,20 +394,24 @@ class GCSStorageProvider(StorageProvider):
 
 class AzureStorageProvider(StorageProvider):
     def __init__(self):
+        blob_service_client = _require_dependency(
+            "azure-storage-blob", BlobServiceClient
+        )
         self.endpoint = AZURE_STORAGE_ENDPOINT
         self.container_name = AZURE_STORAGE_CONTAINER_NAME
         storage_key = AZURE_STORAGE_KEY
 
         if storage_key:
             # Configure using the Azure Storage Account Endpoint and Key
-            self.blob_service_client = BlobServiceClient(
+            self.blob_service_client = blob_service_client(
                 account_url=self.endpoint, credential=storage_key
             )
         else:
             # Configure using the Azure Storage Account Endpoint and DefaultAzureCredential
             # If the key is not configured, then the DefaultAzureCredential will be used to support Managed Identity authentication
-            self.blob_service_client = BlobServiceClient(
-                account_url=self.endpoint, credential=DefaultAzureCredential()
+            credential = _require_dependency("azure-identity", DefaultAzureCredential)
+            self.blob_service_client = blob_service_client(
+                account_url=self.endpoint, credential=credential()
             )
         self.container_client = self.blob_service_client.get_container_client(
             self.container_name
@@ -330,6 +440,18 @@ class AzureStorageProvider(StorageProvider):
             return local_file_path
         except ResourceNotFoundError as e:
             raise RuntimeError(f"Error downloading file from Azure Blob Storage: {e}")
+
+    def get_file_metadata(self, file_path: str) -> Dict[str, Any]:
+        filename = file_path.split("/")[-1]
+        blob_client = self.container_client.get_blob_client(filename)
+        try:
+            props = blob_client.get_blob_properties()
+            return {
+                "size_bytes": props.size,
+                "content_type": props.content_settings.content_type,
+            }
+        except ResourceNotFoundError:
+            raise StorageFileNotFoundError(f"Azure blob not found: {file_path}")
 
     def delete_file(self, file_path: str) -> None:
         """Handles deletion of the file from Azure Blob Storage."""

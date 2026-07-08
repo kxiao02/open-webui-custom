@@ -7,22 +7,26 @@ import type { AudioQueue } from '$lib/utils/audio';
 
 import emojiShortCodes from '$lib/emoji-shortcodes.json';
 
+type LooseRecord = Record<string, any>;
+
 // Backend
 export const WEBUI_NAME = writable(APP_NAME);
 
-export const WEBUI_VERSION = writable(null);
-export const WEBUI_DEPLOYMENT_ID = writable(null);
+export const WEBUI_VERSION: Writable<string | null> = writable(null);
+export const WEBUI_DEPLOYMENT_ID: Writable<string | null> = writable(null);
 
 export const config: Writable<Config | undefined> = writable(undefined);
+export const configStatus: Writable<'idle' | 'loading' | 'ready' | 'error'> = writable('idle');
+export const configError: Writable<string | null> = writable(null);
 export const user: Writable<SessionUser | undefined> = writable(undefined);
 
 // Electron App
 export const isApp = writable(false);
-export const appInfo = writable(null);
-export const appData = writable(null);
+export const appInfo: Writable<LooseRecord | null> = writable(null);
+export const appData: Writable<LooseRecord | null> = writable(null);
 
 // Frontend
-export const MODEL_DOWNLOAD_POOL = writable({});
+export const MODEL_DOWNLOAD_POOL: Writable<LooseRecord> = writable({});
 
 export const mobile = writable(false);
 
@@ -34,7 +38,7 @@ export const USAGE_POOL: Writable<null | string[]> = writable(null);
 export const theme = writable('system');
 
 export const shortCodesToEmojis = writable(
-	Object.entries(emojiShortCodes).reduce((acc, [key, value]) => {
+	Object.entries(emojiShortCodes).reduce<Record<string, string>>((acc, [key, value]) => {
 		if (typeof value === 'string') {
 			acc[value] = key;
 		} else {
@@ -47,30 +51,30 @@ export const shortCodesToEmojis = writable(
 	}, {})
 );
 
-export const TTSWorker = writable(null);
+export const TTSWorker: Writable<any> = writable(null);
 
 export const chatId = writable('');
 export const chatTitle = writable('');
 
-export const channels = writable([]);
-export const channelId = writable(null);
+export const channels: Writable<LooseRecord[]> = writable([]);
+export const channelId: Writable<string | null> = writable(null);
 
-export const chats = writable(null);
-export const pinnedChats = writable([]);
-export const tags = writable([]);
-export const folders = writable([]);
+export const chats: Writable<LooseRecord | null> = writable(null);
+export const pinnedChats: Writable<LooseRecord[]> = writable([]);
+export const tags: Writable<LooseRecord[]> = writable([]);
+export const folders: Writable<LooseRecord[]> = writable([]);
 
-export const selectedFolder = writable(null);
+export const selectedFolder: Writable<LooseRecord | null> = writable(null);
 
 export const models: Writable<Model[]> = writable([]);
 
 export const knowledge: Writable<null | Document[]> = writable(null);
-export const tools = writable(null);
-export const skills = writable(null);
-export const functions = writable(null);
+export const tools: Writable<LooseRecord[] | null> = writable(null);
+export const skills: Writable<LooseRecord[] | null> = writable(null);
+export const functions: Writable<LooseRecord[] | null> = writable(null);
 
-export const toolServers = writable([]);
-export const terminalServers = writable([]);
+export const toolServers: Writable<LooseRecord[]> = writable([]);
+export const terminalServers: Writable<LooseRecord[]> = writable([]);
 
 // Persistent Pyodide worker for code interpreter FS
 export const pyodideWorker: Writable<Worker | null> = writable(null);
@@ -94,16 +98,18 @@ export const showControls = writable(false);
 export const showEmbeds = writable(false);
 export const showOverview = writable(false);
 export const showArtifacts = writable(false);
+export const showFilePreview = writable(false);
 export const showCallOverlay = writable(false);
 export const showFileNav = writable(false);
 export const showFileNavPath: Writable<string | null> = writable(null);
 export const showFileNavDir: Writable<string | null> = writable(null);
+export const selectedGeneratedFilePreviewId: Writable<string | null> = writable(null);
 export const selectedTerminalId: Writable<string | null> = writable(null);
 
-export const artifactCode = writable(null);
-export const artifactContents = writable(null);
+export const artifactCode: Writable<any> = writable(null);
+export const artifactContents: Writable<any> = writable(null);
 
-export const embed = writable(null);
+export const embed: Writable<LooseRecord | null> = writable(null);
 
 export const temporaryChatEnabled = writable(false);
 export const scrollPaginationEnabled = writable(false);
@@ -119,6 +125,7 @@ type BaseModel = {
 	name: string;
 	info?: ModelConfig;
 	owned_by: 'ollama' | 'openai' | 'arena';
+	filters?: any[];
 };
 
 export interface OpenAIModel extends BaseModel {
@@ -163,8 +170,9 @@ type OllamaModelDetails = {
 };
 
 type Settings = {
-	pinnedModels?: never[];
-	toolServers?: never[];
+	[key: string]: any;
+	pinnedModels?: string[];
+	toolServers?: string[];
 	detectArtifacts?: boolean;
 	showUpdateToast?: boolean;
 	showChangelog?: boolean;
@@ -201,6 +209,10 @@ type Settings = {
 	chatBubble?: boolean;
 	copyFormatted?: boolean;
 	models?: string[];
+	tools?: string[];
+	terminalServers?: any[];
+	insertSuggestionPrompt?: string;
+	temporaryChatByDefault?: boolean;
 	conversationMode?: boolean;
 	speechAutoSend?: boolean;
 	responseAutoPlayback?: boolean;
@@ -256,6 +268,7 @@ type Document = {
 };
 
 type Config = {
+	[key: string]: any;
 	license_metadata: any;
 	status: boolean;
 	name: string;
@@ -264,6 +277,7 @@ type Config = {
 	default_models: string;
 	default_prompt_suggestions: PromptSuggestion[];
 	features: {
+		[key: string]: any;
 		auth: boolean;
 		auth_trusted_header: boolean;
 		enable_api_keys: boolean;
@@ -276,7 +290,6 @@ type Config = {
 		enable_admin_export: boolean;
 		enable_admin_chat_access: boolean;
 		enable_admin_analytics: boolean;
-		enable_community_sharing: boolean;
 		enable_memories: boolean;
 		enable_autocomplete_generation: boolean;
 		enable_direct_connections: boolean;

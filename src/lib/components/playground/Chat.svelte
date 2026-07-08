@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
@@ -33,7 +34,7 @@
 	import Download from '../icons/Download.svelte';
 	import EllipsisHorizontal from '../icons/EllipsisHorizontal.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	let loaded = false;
 

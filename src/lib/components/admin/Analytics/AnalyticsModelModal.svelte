@@ -14,7 +14,7 @@
 	export let endDate: number | null = null;
 	export let onClose: () => void = () => {};
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	type Tab = 'overview' | 'chats';
 	let selectedTab: Tab = 'overview';

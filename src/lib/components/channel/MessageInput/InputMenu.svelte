@@ -12,13 +12,10 @@
 	import Switch from '$lib/components/common/Switch.svelte';
 	import GlobeAltSolid from '$lib/components/icons/GlobeAltSolid.svelte';
 	import WrenchSolid from '$lib/components/icons/WrenchSolid.svelte';
-	import CameraSolid from '$lib/components/icons/CameraSolid.svelte';
-	import Camera from '$lib/components/icons/Camera.svelte';
 	import Clip from '$lib/components/icons/Clip.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
-	export let screenCaptureHandler: Function;
 	export let uploadFilesHandler: Function;
 
 	export let onClose: Function = () => {};
@@ -52,26 +49,16 @@
 			side="bottom"
 			align="start"
 			transition={flyAndScale}
-		>
-			<DropdownMenu.Item
-				class="select-none flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 rounded-xl"
-				on:click={() => {
-					uploadFilesHandler();
-				}}
 			>
-				<Clip />
-				<div class="line-clamp-1">{$i18n.t('Upload Files')}</div>
-			</DropdownMenu.Item>
-
-			<DropdownMenu.Item
-				class="select-none flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50  rounded-xl"
-				on:click={() => {
-					screenCaptureHandler();
-				}}
-			>
-				<Camera />
-				<div class=" line-clamp-1">{$i18n.t('Capture')}</div>
-			</DropdownMenu.Item>
-		</DropdownMenu.Content>
+				<DropdownMenu.Item
+					class="select-none flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 rounded-xl"
+					on:click={() => {
+						uploadFilesHandler();
+					}}
+				>
+					<Clip />
+					<div class="line-clamp-1">{$i18n.t('Upload Files')}</div>
+				</DropdownMenu.Item>
+			</DropdownMenu.Content>
 	</div>
 </Dropdown>

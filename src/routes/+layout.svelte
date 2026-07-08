@@ -1,4 +1,5 @@
 <script>
+	// @ts-nocheck
 	import { io } from 'socket.io-client';
 	import { spring } from 'svelte/motion';
 	import PyodideWorker from '$lib/workers/pyodide.worker?worker';
@@ -11,6 +12,8 @@
 	import { onMount, tick, setContext, onDestroy } from 'svelte';
 	import {
 		config,
+		configStatus,
+		configError,
 		user,
 		settings,
 		theme,
@@ -54,13 +57,17 @@
 	import { getAllTags, getChatList } from '$lib/apis/chats';
 	import { chatCompletion } from '$lib/apis/openai';
 
-	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME } from '$lib/constants';
-	import { bestMatchingLanguage, displayFileHandler } from '$lib/utils';
+	import {
+		WEBUI_API_BASE_URL,
+		WEBUI_BASE_URL,
+		WEBUI_BUILD_HASH,
+		WEBUI_HOSTNAME
+	} from '$lib/constants';
+	import { bestMatchingLanguage, displayFileHandler, toPlainNotificationText } from '$lib/utils';
 	import { setTextScale } from '$lib/utils/text-scale';
 
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
 	import AppSidebar from '$lib/components/app/AppSidebar.svelte';
-	import SyncStatsModal from '$lib/components/chat/Settings/SyncStatsModal.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { getUserSettings } from '$lib/apis/users';
 	import dayjs from 'dayjs';
@@ -80,11 +87,70 @@
 		return false;
 	};
 
+	const getPreloadReloadKey = () => {
+		const appEntryHref = document
+			.querySelector('link[rel="modulepreload"][href*="/_app/immutable/entry/app."]')
+			?.getAttribute('href');
+
+		return `vite-preload-reload:${appEntryHref ?? window.location.pathname}`;
+	};
+
+	const CLIENT_SYNC_RELOAD_PREFIX = 'client-sync-reload:';
+
+	const clearClientSyncReloadGuards = () => {
+		for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
+			const key = sessionStorage.key(index);
+			if (key?.startsWith(CLIENT_SYNC_RELOAD_PREFIX)) {
+				sessionStorage.removeItem(key);
+			}
+		}
+	};
+
+	const requestConvergentReload = async (reason, signature, targetHref = location.href) => {
+		const reloadKey = `${CLIENT_SYNC_RELOAD_PREFIX}${reason}:${signature}`;
+
+		if (sessionStorage.getItem(reloadKey)) {
+			console.error('Skipping repeated forced reload after persistent sync mismatch:', {
+				reason,
+				signature,
+				targetHref
+			});
+			return false;
+		}
+
+		console.warn('Forcing one-time reload to resync client state:', {
+			reason,
+			signature,
+			targetHref
+		});
+		sessionStorage.setItem(reloadKey, '1');
+
+		await unregisterServiceWorkers();
+		location.href = targetHref;
+		return true;
+	};
+
+	const preloadErrorHandler = async (event) => {
+		const reloadKey = getPreloadReloadKey();
+
+		if (sessionStorage.getItem(reloadKey)) {
+			console.error('Vite preload error persisted after reload:', event?.payload);
+			sessionStorage.removeItem(reloadKey);
+			return;
+		}
+
+		console.error('Vite preload error detected, forcing reload:', event?.payload);
+		event.preventDefault();
+		sessionStorage.setItem(reloadKey, '1');
+
+		await unregisterServiceWorkers();
+		location.reload();
+	};
+
 	// handle frontend updates (https://svelte.dev/docs/kit/configuration#version)
 	beforeNavigate(async ({ willUnload, to }) => {
 		if (updated.current && !willUnload && to?.url) {
-			await unregisterServiceWorkers();
-			location.href = to.url.href;
+			await requestConvergentReload('svelte-updated', to.url.href, to.url.href);
 		}
 	});
 
@@ -97,12 +163,88 @@
 
 	let showRefresh = false;
 
-	let showSyncStatsModal = false;
-	let syncStatsEventData = null;
-
 	let heartbeatInterval = null;
 
 	const BREAKPOINT = 768;
+	const MASCOT_NOTIFICATION_EVENT = 'cpecc:mascot-notification';
+	const MASCOT_WIDGET_STATE_EVENT = 'cpecc:widget-state';
+	const MASCOT_WIDGET_READY_EVENT = 'cpecc:widget-ready';
+	let mascotWidgetState = {
+		avatarPresent: false,
+		widgetActive: true,
+		lastSeenAt: 0
+	};
+
+	const truncateMascotNotificationText = (value, limit) => {
+		const text = toPlainNotificationText(`${value ?? ''}`)
+			.replace(/\s+/g, ' ')
+			.trim();
+		return text.length > limit ? `${text.slice(0, Math.max(0, limit - 3))}...` : text;
+	};
+
+	const emitMascotNotificationBubble = ({ title, content, path, status, duration, clear }) => {
+		if (typeof window === 'undefined') {
+			return false;
+		}
+
+		const payload = {
+			source: 'cpecc',
+			title: truncateMascotNotificationText(title, 80),
+			content: truncateMascotNotificationText(content, 180),
+			path: typeof path === 'string' ? path : '',
+			status: typeof status === 'string' ? status : '',
+			duration: Number.isFinite(Number(duration)) ? Math.max(0, Number(duration)) : undefined,
+			clear: clear === true
+		};
+
+		if (!payload.title && !payload.content && !payload.clear) {
+			return false;
+		}
+
+		window.dispatchEvent(new CustomEvent(MASCOT_NOTIFICATION_EVENT, { detail: payload }));
+
+		if (window.parent && window.parent !== window) {
+			window.parent.postMessage({ type: MASCOT_NOTIFICATION_EVENT, payload }, '*');
+		}
+
+		return true;
+	};
+
+	const shouldRouteNotificationToMascot = () => {
+		return (
+			typeof window !== 'undefined' &&
+			window.parent &&
+			window.parent !== window &&
+			mascotWidgetState.avatarPresent === true &&
+			mascotWidgetState.widgetActive === false
+		);
+	};
+
+	const announceMascotWidgetReady = () => {
+		if (typeof window === 'undefined' || !window.parent || window.parent === window) {
+			return;
+		}
+
+		window.parent.postMessage({ type: MASCOT_WIDGET_READY_EVENT }, '*');
+	};
+
+	const handleMascotWidgetStateMessage = (event) => {
+		if (!window.parent || window.parent === window || event.source !== window.parent) {
+			return;
+		}
+
+		const data = event.data;
+		if (!data || typeof data !== 'object' || data.type !== MASCOT_WIDGET_STATE_EVENT) {
+			return;
+		}
+
+		const payload = data.payload ?? {};
+		mascotWidgetState = {
+			avatarPresent: payload.avatarPresent === true || payload.launcherVisible === true,
+			widgetActive: payload.widgetActive === true || payload.active === true,
+			lastSeenAt: Date.now()
+		};
+	};
 
 	const setupSocket = async (enableWebsocket) => {
 		const _socket = io(`${WEBUI_BASE_URL}` || undefined, {
@@ -122,21 +264,53 @@
 
 		_socket.on('connect', async () => {
 			console.log('connected', _socket.id);
+			if (await updated.check()) {
+				if (await requestConvergentReload('svelte-updated', location.href)) {
+					return;
+				}
+			}
+
 			const res = await getVersion(localStorage.token);
 
 			const deploymentId = res?.deployment_id ?? null;
 			const version = res?.version ?? null;
+			const buildHash = res?.build_hash ?? null;
+			const expectsBuildHashMatch =
+				typeof WEBUI_BUILD_HASH === 'string' &&
+				WEBUI_BUILD_HASH.trim() !== '' &&
+				WEBUI_BUILD_HASH !== 'dev-build';
 
-			if (version !== null || deploymentId !== null) {
-				if (
-					($WEBUI_VERSION !== null && version !== $WEBUI_VERSION) ||
-					($WEBUI_DEPLOYMENT_ID !== null && deploymentId !== $WEBUI_DEPLOYMENT_ID)
-				) {
-					await unregisterServiceWorkers();
-					location.href = location.href;
+			const mismatchReasons = [];
+			if ($WEBUI_VERSION !== null && version !== $WEBUI_VERSION) {
+				mismatchReasons.push(`version:${$WEBUI_VERSION}->${version ?? 'null'}`);
+			}
+			if ($WEBUI_DEPLOYMENT_ID !== null && deploymentId !== $WEBUI_DEPLOYMENT_ID) {
+				mismatchReasons.push(`deployment:${$WEBUI_DEPLOYMENT_ID}->${deploymentId ?? 'null'}`);
+			}
+			if (expectsBuildHashMatch && buildHash !== null && buildHash !== WEBUI_BUILD_HASH) {
+				mismatchReasons.push(`build_hash:${WEBUI_BUILD_HASH}->${buildHash}`);
+			}
+
+			if (mismatchReasons.length > 0) {
+				if (await requestConvergentReload('socket-sync', mismatchReasons.join('|'))) {
 					return;
 				}
+
+				console.error(
+					'Persistent frontend/backend sync mismatch remained after reload; continuing without another forced reload.',
+					{
+						mismatchReasons,
+						server: { version, deploymentId, buildHash },
+						client: {
+							version: $WEBUI_VERSION,
+							deploymentId: $WEBUI_DEPLOYMENT_ID,
+							buildHash: WEBUI_BUILD_HASH
+						}
+					}
+				);
 			}
+
+			clearClientSyncReloadGuards();
 
 			// Send heartbeat every 30 seconds
 			heartbeatInterval = setInterval(() => {
@@ -406,7 +580,7 @@
 	};
 
 	const chatEventHandler = async (event, cb) => {
-		const chat = $page.url.pathname.includes(`/c/${event.chat_id}`);
+		const isCurrentChat = event.chat_id === $chatId || $temporaryChatEnabled;
 
 		// Skip events from temporary chats that are not the current chat.
 		// This prevents notifications from being sent to other tabs/devices
@@ -416,58 +590,73 @@
 			return;
 		}
 
-		let isFocused = document.visibilityState !== 'visible';
+		let isWindowFocused = document.visibilityState === 'visible';
 		if (window.electronAPI) {
 			const res = await window.electronAPI.send({
 				type: 'window:isFocused'
 			});
 			if (res) {
-				isFocused = res.isFocused;
+				isWindowFocused = !!res.isFocused;
 			}
 		}
 
 		await tick();
 		const type = event?.data?.type ?? null;
 		const data = event?.data?.data ?? null;
+		const routeNotificationToMascot = shouldRouteNotificationToMascot();
 
-		if ((event.chat_id !== $chatId && !$temporaryChatEnabled) || isFocused) {
-			if (type === 'chat:completion') {
-				const { done, content, title } = data;
-				const displayTitle = title || $i18n.t('New Chat');
+		if (
+			type === 'chat:completion' &&
+			(!isCurrentChat || !isWindowFocused || routeNotificationToMascot)
+		) {
+			const { done, content, title } = data;
 
-				if (done) {
-					if ($settings?.notificationSoundAlways ?? false) {
-						playingNotificationSound.set(true);
+			if (done) {
+				const notificationContent = toPlainNotificationText(content);
 
-						const audio = new Audio(`/audio/notification.mp3`);
-						audio.play().finally(() => {
-							// Ensure the global state is reset after the sound finishes
-							playingNotificationSound.set(false);
+				if ($settings?.notificationSoundAlways ?? false) {
+					playingNotificationSound.set(true);
+
+					const audio = new Audio(`/audio/notification.mp3`);
+					audio.play().finally(() => {
+						// Ensure the global state is reset after the sound finishes
+						playingNotificationSound.set(false);
+					});
+				}
+
+				if ($isLastActiveTab) {
+					if ($settings?.notificationEnabled ?? false) {
+						new Notification(`${title} • ${$WEBUI_NAME}`, {
+							body: notificationContent,
+							icon: `${WEBUI_BASE_URL}/static/favicon.png`
 						});
 					}
+				}
 
-					if ($isLastActiveTab) {
-						if ($settings?.notificationEnabled ?? false) {
-							new Notification(`${displayTitle} • Open WebUI`, {
-								body: content,
-								icon: `${WEBUI_BASE_URL}/static/favicon.png`
-							});
-						}
-					}
+				emitMascotNotificationBubble({
+					title,
+					content: notificationContent,
+					path: `/c/${event.chat_id}`
+				});
 
+				if (!routeNotificationToMascot) {
 					toast.custom(NotificationToast, {
 						componentProps: {
 							onClick: () => {
 								goto(`/c/${event.chat_id}`);
 							},
-							content: content,
-							title: displayTitle
+							content: notificationContent,
+							title: title
 						},
 						duration: 15000,
 						unstyled: true
 					});
 				}
-			} else if (type === 'chat:title') {
+			}
+		}
+
+		if (!isCurrentChat) {
+			if (type === 'chat:title') {
 				currentChatPage.set(1);
 				await chats.set(await getChatList(localStorage.token, $currentChatPage));
 			} else if (type === 'chat:tags') {
@@ -608,7 +797,9 @@
 			}
 		}
 
-		if ((!channel || isFocused) && event?.user?.id !== $user?.id) {
+		const routeNotificationToMascot = shouldRouteNotificationToMascot();
+
+		if ((!channel || isFocused || routeNotificationToMascot) && event?.user?.id !== $user?.id) {
 			await tick();
 			const type = event?.data?.type ?? null;
 			const data = event?.data?.data ?? null;
@@ -648,27 +839,36 @@
 
 			if (type === 'message') {
 				const title = `${data?.user?.name}${event?.channel?.type !== 'dm' ? ` (#${event?.channel?.name})` : ''}`;
+				const notificationContent = toPlainNotificationText(data?.content ?? '');
 
 				if ($isLastActiveTab) {
 					if ($settings?.notificationEnabled ?? false) {
-						new Notification(`${title} • Open WebUI`, {
-							body: data?.content,
+						new Notification(`${title} • ${$WEBUI_NAME}`, {
+							body: notificationContent,
 							icon: `${WEBUI_API_BASE_URL}/users/${data?.user?.id}/profile/image`
 						});
 					}
 				}
 
-				toast.custom(NotificationToast, {
-					componentProps: {
-						onClick: () => {
-							goto(`/channels/${event.channel_id}`);
-						},
-						content: data?.content,
-						title: `${title}`
-					},
-					duration: 15000,
-					unstyled: true
+				emitMascotNotificationBubble({
+					title,
+					content: notificationContent,
+					path: `/channels/${event.channel_id}`
 				});
+
+				if (!routeNotificationToMascot) {
+					toast.custom(NotificationToast, {
+						componentProps: {
+							onClick: () => {
+								goto(`/channels/${event.channel_id}`);
+							},
+							content: notificationContent,
+							title: `${title}`
+						},
+						duration: 15000,
+						unstyled: true
+					});
+				}
 			}
 		}
 	};
@@ -687,28 +887,18 @@
 			const res = await userSignOut();
 			user.set(null);
 			localStorage.removeItem('token');
+			localStorage.removeItem('settings');
+			settings.set({});
 
 			location.href = res?.redirect_url ?? '/auth';
 		}
 	};
 
-	const windowMessageEventHandler = async (event) => {
-		if (
-			!['https://openwebui.com', 'https://www.openwebui.com', 'http://localhost:9999'].includes(
-				event.origin
-			)
-		) {
-			return;
-		}
-
-		if (event.data === 'export:stats' || event.data?.type === 'export:stats') {
-			syncStatsEventData = event.data;
-			showSyncStatsModal = true;
-		}
-	};
-
 	onMount(async () => {
-		window.addEventListener('message', windowMessageEventHandler);
+		window.addEventListener('vite:preloadError', preloadErrorHandler);
+		window.addEventListener('message', handleMascotWidgetStateMessage);
+		announceMascotWidgetReady();
+		window.setTimeout(announceMascotWidgetReady, 250);
 
 		let touchstartY = 0;
 
@@ -818,7 +1008,7 @@
 				if (userSettings) {
 					settings.set(userSettings.ui);
 				} else {
-					settings.set(JSON.parse(localStorage.getItem('settings') ?? '{}'));
+					settings.set({});
 				}
 				setTextScale($settings?.textScale ?? 1);
 
@@ -830,8 +1020,12 @@
 			} else {
 				$socket?.off('events', chatEventHandler);
 				$socket?.off('events:channel', channelEventHandler);
+				settings.set({});
 			}
 		});
+
+		configStatus.set('loading');
+		configError.set(null);
 
 		let backendConfig = null;
 		try {
@@ -839,6 +1033,8 @@
 			console.log('Backend config:', backendConfig);
 		} catch (error) {
 			console.error('Error loading backend config:', error);
+			configError.set(error?.message ?? 'Failed to load backend config');
+			configStatus.set('error');
 		}
 		// Initialize i18n even if we didn't get a backend config,
 		// so `/error` can show something that's not `undefined`.
@@ -860,6 +1056,7 @@
 			// Save Backend Status to Store
 			await config.set(backendConfig);
 			await WEBUI_NAME.set(backendConfig.name);
+			configStatus.set('ready');
 
 			if ($config) {
 				await setupSocket($config.features?.enable_websocket ?? true);
@@ -877,13 +1074,19 @@
 					if (sessionUser) {
 						await user.set(sessionUser);
 						try {
+							configStatus.set('loading');
 							await config.set(await getBackendConfig());
+							configStatus.set('ready');
 						} catch (error) {
 							console.error('Error refreshing backend config:', error);
+							configError.set(error?.message ?? 'Failed to refresh backend config');
+							configStatus.set('error');
 						}
 					} else {
 						// Redirect Invalid Session User to /auth Page
 						localStorage.removeItem('token');
+						localStorage.removeItem('settings');
+						settings.set({});
 						await goto(`/auth?redirect=${encodedUrl}`);
 					}
 				} else {
@@ -896,6 +1099,9 @@
 			}
 		} else {
 			// Redirect to /error when Backend Not Detected
+			if ($configStatus !== 'error') {
+				configStatus.set('error');
+			}
 			await goto(`/error`);
 		}
 
@@ -931,18 +1137,10 @@
 			loaded = true;
 		}
 
-		// Auto-show SyncStatsModal when opened with ?sync=true (from community)
-		if (
-			(window.opener ?? false) &&
-			$page.url.searchParams.get('sync') === 'true' &&
-			($config?.features?.enable_community_sharing ?? false)
-		) {
-			showSyncStatsModal = true;
-		}
-
 		return () => {
 			window.removeEventListener('resize', onResize);
-			window.removeEventListener('message', windowMessageEventHandler);
+			window.removeEventListener('vite:preloadError', preloadErrorHandler);
+			window.removeEventListener('message', handleMascotWidgetStateMessage);
 			document.removeEventListener('touchstart', touchstartHandler);
 			document.removeEventListener('touchmove', touchmoveHandler);
 			document.removeEventListener('touchend', touchendHandler);
@@ -957,7 +1155,18 @@
 
 <svelte:head>
 	<title>{$WEBUI_NAME}</title>
-	<link crossorigin="anonymous" rel="icon" href="{WEBUI_BASE_URL}/static/favicon.png" />
+	<link
+		crossorigin="anonymous"
+		rel="icon"
+		href="{WEBUI_BASE_URL}/static/favicon.png"
+		media="(prefers-color-scheme: light)"
+	/>
+	<link
+		crossorigin="anonymous"
+		rel="icon"
+		href="{WEBUI_BASE_URL}/static/favicon-dark.png"
+		media="(prefers-color-scheme: dark)"
+	/>
 
 	<meta name="apple-mobile-web-app-title" content={$WEBUI_NAME} />
 	<meta name="description" content={$WEBUI_NAME} />
@@ -988,10 +1197,6 @@
 	{:else}
 		<slot />
 	{/if}
-{/if}
-
-{#if $config?.features.enable_community_sharing}
-	<SyncStatsModal bind:show={showSyncStatsModal} eventData={syncStatsEventData} />
 {/if}
 
 <Toaster

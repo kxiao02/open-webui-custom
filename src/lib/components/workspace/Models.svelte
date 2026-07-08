@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { marked } from 'marked';
 
 	import { toast } from 'svelte-sonner';
@@ -9,7 +10,7 @@
 
 	import { onMount, getContext, tick } from 'svelte';
 	import { goto } from '$app/navigation';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { WEBUI_NAME, config, mobile, models as _models, settings, user } from '$lib/stores';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
@@ -35,7 +36,6 @@
 	import GarbageBin from '../icons/GarbageBin.svelte';
 	import Search from '../icons/Search.svelte';
 	import Plus from '../icons/Plus.svelte';
-	import ChevronRight from '../icons/ChevronRight.svelte';
 	import Switch from '../common/Switch.svelte';
 	import Spinner from '../common/Spinner.svelte';
 	import XMark from '../icons/XMark.svelte';
@@ -138,24 +138,6 @@
 		goto('/workspace/models/create');
 	};
 
-	const shareModelHandler = async (model) => {
-		toast.success($i18n.t('Redirecting you to Open WebUI Community'));
-
-		const url = 'https://openwebui.com';
-
-		const tab = await window.open(`${url}/models/create`, '_blank');
-
-		const messageHandler = (event) => {
-			if (event.origin !== url) return;
-			if (event.data === 'loaded') {
-				tab.postMessage(JSON.stringify(model), '*');
-				window.removeEventListener('message', messageHandler);
-			}
-		};
-
-		window.addEventListener('message', messageHandler, false);
-	};
-
 	const hideModelHandler = async (model) => {
 		model.meta = {
 			...model.meta,
@@ -228,11 +210,17 @@
 		viewOption = localStorage.workspaceViewOption ?? '';
 		page = 1;
 
-		let groups = await getGroups(localStorage.token);
-		groupIds = groups.map((group) => group.id);
-
-		await tick();
-		loaded = true;
+		try {
+			const groups =
+				(await getGroups(localStorage.token).catch((error) => {
+					toast.error(`${error}`);
+					return [];
+				})) ?? [];
+			groupIds = groups.map((group) => group.id);
+		} finally {
+			await tick();
+			loaded = true;
+		}
 
 		const onKeyDown = (event) => {
 			if (event.key === 'Shift') {
@@ -557,9 +545,6 @@
 																			`/workspace/models/edit?id=${encodeURIComponent(model.id)}`
 																		);
 																	}}
-																	shareHandler={() => {
-																		shareModelHandler(model);
-																	}}
 																	cloneHandler={() => {
 																		cloneModelHandler(model);
 																	}}
@@ -666,7 +651,6 @@
 			{:else}
 				<div class=" w-full h-full flex flex-col justify-center items-center my-16 mb-24">
 					<div class="max-w-md text-center">
-						<div class=" text-3xl mb-3">😕</div>
 						<div class=" text-lg font-medium mb-1">{$i18n.t('No models found')}</div>
 						<div class=" text-gray-500 text-center text-xs">
 							{$i18n.t('Try adjusting your search or filter to find what you are looking for.')}
@@ -680,33 +664,6 @@
 			</div>
 		{/if}
 	</div>
-
-	{#if $config?.features.enable_community_sharing}
-		<div class=" my-16">
-			<div class=" text-xl font-medium mb-1 line-clamp-1">
-				{$i18n.t('Made by Open WebUI Community')}
-			</div>
-
-			<a
-				class=" flex cursor-pointer items-center justify-between hover:bg-gray-50 dark:hover:bg-gray-850 w-full mb-2 px-3.5 py-1.5 rounded-xl transition"
-				href="https://openwebui.com/models"
-				target="_blank"
-			>
-				<div class=" self-center">
-					<div class=" font-medium line-clamp-1">{$i18n.t('Discover a model')}</div>
-					<div class=" text-sm line-clamp-1">
-						{$i18n.t('Discover, download, and explore model presets')}
-					</div>
-				</div>
-
-				<div>
-					<div>
-						<ChevronRight />
-					</div>
-				</div>
-			</a>
-		</div>
-	{/if}
 {:else}
 	<div class="w-full h-full flex justify-center items-center">
 		<Spinner className="size-5" />

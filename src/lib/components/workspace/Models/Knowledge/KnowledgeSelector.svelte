@@ -17,7 +17,7 @@
 	import PageEdit from '$lib/components/icons/PageEdit.svelte';
 	import DocumentPage from '$lib/components/icons/DocumentPage.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 	const dispatch = createEventDispatcher();
 
 	export let onClose: Function = () => {};

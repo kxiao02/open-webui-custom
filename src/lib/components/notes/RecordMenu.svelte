@@ -10,7 +10,7 @@
 	import DocumentArrowUp from '../icons/DocumentArrowUp.svelte';
 	import CloudArrowUp from '../icons/CloudArrowUp.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let show = false;
 	export let className = 'max-w-[170px]';

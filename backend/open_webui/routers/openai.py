@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -9,7 +10,11 @@ import aiohttp
 from aiocache import cached
 import requests
 
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+try:
+    from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+except ModuleNotFoundError:
+    DefaultAzureCredential = None
+    get_bearer_token_provider = None
 
 from fastapi import Depends, HTTPException, Request, APIRouter
 from fastapi.responses import (
@@ -17,6 +22,7 @@ from fastapi.responses import (
     StreamingResponse,
     JSONResponse,
     PlainTextResponse,
+    Response,
 )
 from pydantic import BaseModel, ConfigDict
 
@@ -51,15 +57,72 @@ from open_webui.utils.payload import (
 from open_webui.utils.misc import (
     cleanup_response,
     convert_logit_bias_input_to_json,
+    openai_chat_completion_message_template,
     stream_chunks_handler,
     stream_wrapper,
 )
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import include_user_info_headers
+from open_webui.utils.model_access import is_model_always_allowed
 from open_webui.utils.anthropic import is_anthropic_url, get_anthropic_models
 
 log = logging.getLogger(__name__)
+
+OPENWEBUI_FILE_LINK_RE = re.compile(r"(?<!/openai)/v1/files/")
+OPENWEBUI_GENERATED_FILE_LINK_RE = re.compile(
+    r"(?<!/openai)/v1/generated-files/"
+)
+THINKING_MODEL_SUFFIX = "-thinking"
+FORWARD_SESSION_INFO_HEADER_TASK = "X-OpenWebUI-Task"
+DEEPSEEK_REASONING_TAGS = (
+    ("<think>", "</think>"),
+    ("<thinking>", "</thinking>"),
+    ("<reason>", "</reason>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<thought>", "</thought>"),
+    ("<Thought>", "</Thought>"),
+    ("<|begin_of_thought|>", "<|end_of_thought|>"),
+    ("◁think▷", "◁/think▷"),
+)
+
+
+def _is_deepagent_bridge_url(url: str) -> bool:
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").strip().lower()
+    path = (parsed.path or "").rstrip("/")
+    return host in {"agent-bridge", "deepagent-project-agent-bridge-1"} or (
+        path.endswith("/v1") and "agent-bridge" in host
+    )
+
+
+def _metadata_for_deepagent_bridge(metadata: Optional[dict]) -> Optional[dict]:
+    if not isinstance(metadata, dict):
+        return None
+
+    allowed_keys = {
+        "active_source_scope",
+        "bridge_execution_profile",
+        "client_capabilities",
+        "deepagent_execution_profile",
+        "deepagent_runtime_tools",
+        "executionProfile",
+        "execution_profile",
+        "files",
+        "provider_thinking",
+        "resolved_execution_profile",
+        "task",
+        "thinking",
+        "thinkingMode",
+        "thinking_mode",
+        "tool_ids",
+    }
+    bridge_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if key in allowed_keys and value is not None
+    }
+    return bridge_metadata or None
 
 
 ##########################################
@@ -67,6 +130,124 @@ log = logging.getLogger(__name__)
 # Utility functions
 #
 ##########################################
+
+
+def _coerce_booleanish(value) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"false", "0", "no", "off", "disabled"}:
+            return False
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return None
+
+
+def _is_deepseek_model_name(model_id: Optional[str]) -> bool:
+    if not isinstance(model_id, str):
+        return False
+
+    normalized = model_id.strip().lower()
+    return normalized.startswith("deepseek-")
+
+
+def _is_deepseek_provider(url: Optional[str], model_id: Optional[str]) -> bool:
+    if _is_deepseek_model_name(model_id):
+        return True
+    if not isinstance(url, str) or not url:
+        return False
+
+    try:
+        hostname = urlparse(url).hostname or ""
+    except Exception:
+        hostname = ""
+
+    return hostname.endswith("deepseek.com")
+
+
+def _extract_reasoning_content_from_text(content: str) -> tuple[str, str]:
+    if not isinstance(content, str) or not content:
+        return "", content
+
+    reasoning_parts: list[str] = []
+    remaining = content
+
+    for start_tag, end_tag in DEEPSEEK_REASONING_TAGS:
+        pattern = re.compile(
+            rf"{re.escape(start_tag)}(.*?){re.escape(end_tag)}",
+            flags=re.DOTALL,
+        )
+
+        while True:
+            match = pattern.search(remaining)
+            if not match:
+                break
+
+            reasoning_text = match.group(1).strip()
+            if reasoning_text:
+                reasoning_parts.append(reasoning_text)
+
+            remaining = f"{remaining[: match.start()]}{remaining[match.end() :]}"
+
+    remaining = re.sub(r"\n{3,}", "\n\n", remaining).strip()
+    return "\n\n".join(reasoning_parts).strip(), remaining
+
+
+def _adapt_messages_for_deepseek(messages: list[dict]) -> list[dict]:
+    if not isinstance(messages, list):
+        return messages
+
+    last_user_index = -1
+    for index, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_user_index = index
+
+    normalized_messages = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            normalized_messages.append(message)
+            continue
+
+        normalized_message = {**message}
+        if normalized_message.get("role") != "assistant":
+            normalized_message.pop("reasoning_content", None)
+            normalized_messages.append(normalized_message)
+            continue
+
+        content = normalized_message.get("content")
+        if isinstance(content, str) and content:
+            reasoning_content, stripped_content = _extract_reasoning_content_from_text(
+                content
+            )
+            normalized_message["content"] = stripped_content
+            if reasoning_content and index > last_user_index:
+                normalized_message["reasoning_content"] = reasoning_content
+            else:
+                normalized_message.pop("reasoning_content", None)
+        else:
+            normalized_message.pop("reasoning_content", None)
+
+        normalized_messages.append(normalized_message)
+
+    return normalized_messages
+
+
+def _apply_deepseek_thinking_config(payload: dict, thinking_mode_enabled: bool) -> dict:
+    existing_thinking = payload.get("thinking")
+    if isinstance(existing_thinking, dict):
+        return payload
+
+    model_name = str(payload.get("model", "") or "").strip().lower()
+    if thinking_mode_enabled and model_name and model_name != "deepseek-reasoner":
+        payload["thinking"] = {"type": "enabled"}
+
+    return payload
 
 
 async def send_get_request(url, key=None, user: UserModel = None):
@@ -98,7 +279,128 @@ async def get_models_request(url, key=None, user: UserModel = None):
     return await send_get_request(f"{url}/models", key, user=user)
 
 
-def openai_reasoning_model_handler(payload):
+def _rewrite_openwebui_file_links_in_text(value: str) -> str:
+    if "/v1/files/" not in value and "/v1/generated-files/" not in value:
+        return value
+    rewritten = OPENWEBUI_FILE_LINK_RE.sub("/openai/v1/files/", value)
+    return OPENWEBUI_GENERATED_FILE_LINK_RE.sub(
+        "/openai/v1/generated-files/", rewritten
+    )
+
+
+def _rewrite_openwebui_file_links(value):
+    if isinstance(value, dict):
+        for key, item in list(value.items()):
+            value[key] = _rewrite_openwebui_file_links(item)
+        return value
+    if isinstance(value, list):
+        for idx, item in enumerate(value):
+            value[idx] = _rewrite_openwebui_file_links(item)
+        return value
+    if isinstance(value, str):
+        return _rewrite_openwebui_file_links_in_text(value)
+    return value
+
+
+def _rewrite_openwebui_sse_line(line: str) -> str:
+    if not line.startswith("data: "):
+        return _rewrite_openwebui_file_links_in_text(line)
+
+    payload = line[6:].strip()
+    if not payload or payload == "[DONE]":
+        return line
+
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        return _rewrite_openwebui_file_links_in_text(line)
+
+    rewritten = _rewrite_openwebui_file_links(parsed)
+    return f"data: {json.dumps(rewritten, ensure_ascii=False)}"
+
+
+async def _rewrite_openwebui_sse_stream(stream):
+    buffer = ""
+    async for chunk in stream:
+        if isinstance(chunk, bytes):
+            text = chunk.decode("utf-8", errors="replace")
+        else:
+            text = str(chunk)
+        buffer += text
+
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            rewritten_line = _rewrite_openwebui_sse_line(line)
+            yield rewritten_line.encode("utf-8")
+            yield b"\n"
+
+    if buffer:
+        rewritten_line = _rewrite_openwebui_sse_line(buffer)
+        yield rewritten_line.encode("utf-8")
+
+
+def _normalize_proxy_path_for_base_url(base_url: str, raw_path: str) -> str:
+    """
+    Avoid duplicating `/v1` when the upstream base URL already includes it.
+    """
+    normalized_path = (raw_path or "").lstrip("/")
+    if not normalized_path:
+        return ""
+
+    base = (base_url or "").rstrip("/")
+    if base.endswith("/v1"):
+        if normalized_path == "v1":
+            return ""
+        if normalized_path.startswith("v1/"):
+            return normalized_path[len("v1/") :]
+
+    return normalized_path
+
+
+def _is_json_content_type(content_type: str) -> bool:
+    return content_type == "application/json" or content_type.endswith("+json")
+
+
+def _is_text_content_type(content_type: str) -> bool:
+    return content_type.startswith("text/")
+
+
+def _get_proxy_passthrough_headers(response: aiohttp.ClientResponse) -> dict:
+    allowed_headers = {
+        "content-disposition",
+        "content-language",
+        "cache-control",
+        "etag",
+        "last-modified",
+        "expires",
+    }
+    return {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() in allowed_headers
+    }
+
+
+async def _read_proxy_response_data(response: aiohttp.ClientResponse):
+    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+    encoding = response.charset or "utf-8"
+    raw = await response.read()
+
+    if _is_json_content_type(content_type):
+        try:
+            return "json", json.loads(raw.decode(encoding))
+        except Exception:
+            return "text", raw.decode(encoding, errors="replace")
+
+    if _is_text_content_type(content_type):
+        return "text", raw.decode(encoding, errors="replace")
+
+    return "bytes", raw
+
+
+def openai_reasoning_model_handler(
+    payload: dict, model_id_override: Optional[str] = None
+):
     """
     Handle reasoning model specific parameters
     """
@@ -108,8 +410,8 @@ def openai_reasoning_model_handler(payload):
         del payload["max_tokens"]
 
     # Handle system role conversion based on model type
-    if payload["messages"][0]["role"] == "system":
-        model_lower = payload["model"].lower()
+    if payload.get("messages") and payload["messages"][0].get("role") == "system":
+        model_lower = str(model_id_override or payload.get("model", "")).lower()
         # Legacy models use "user" role instead of "system"
         if model_lower.startswith("o1-mini") or model_lower.startswith("o1-preview"):
             payload["messages"][0]["role"] = "user"
@@ -142,8 +444,11 @@ async def get_headers_and_cookies(
 
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
         headers = include_user_info_headers(headers, user)
-        if metadata and metadata.get("chat_id"):
-            headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata.get("chat_id")
+
+    if isinstance(metadata, dict) and metadata.get("chat_id"):
+        headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = str(metadata.get("chat_id"))
+    if isinstance(metadata, dict) and metadata.get("task"):
+        headers[FORWARD_SESSION_INFO_HEADER_TASK] = str(metadata.get("task"))
 
     token = None
     auth_type = config.get("auth_type")
@@ -189,6 +494,9 @@ def get_microsoft_entra_id_access_token():
     Get Microsoft Entra ID access token using DefaultAzureCredential for Azure OpenAI.
     Returns the token string or None if authentication fails.
     """
+    if DefaultAzureCredential is None or get_bearer_token_provider is None:
+        log.error("azure-identity is not installed")
+        return None
     try:
         token_provider = get_bearer_token_provider(
             DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
@@ -472,6 +780,10 @@ async def get_filtered_models(models, user, db=None):
 
     filtered_models = []
     for model in models.get("data", []):
+        if is_model_always_allowed(model.get("id")):
+            filtered_models.append(model)
+            continue
+
         model_info = model_infos.get(model["id"])
         if model_info:
             if user.id == model_info.user_id or model_info.id in accessible_model_ids:
@@ -924,13 +1236,92 @@ def convert_to_responses_payload(payload: dict) -> dict:
     return responses_payload
 
 
+def _extract_responses_output_text(response: dict) -> str:
+    if not isinstance(response, dict):
+        return ""
+
+    output_text = response.get("output_text") or response.get("outputText")
+    if isinstance(output_text, str):
+        return output_text
+    if isinstance(output_text, list):
+        parts = [str(part) for part in output_text if part]
+        if parts:
+            return "\n".join(parts)
+
+    output = response.get("output")
+    if not isinstance(output, list):
+        return ""
+
+    text_parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        role = item.get("role")
+        if role and role != "assistant":
+            continue
+        content = item.get("content", [])
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = str(part.get("type") or "").strip()
+                if part_type in {"output_text", "text"}:
+                    text = part.get("text")
+                    if text:
+                        text_parts.append(str(text))
+        elif isinstance(content, str) and content:
+            text_parts.append(content)
+
+    return "\n".join(text_parts).strip()
+
+
 def convert_responses_result(response: dict) -> dict:
     """
-    Convert non-streaming Responses API result.
-    Just add done flag - pass through raw response, frontend handles output.
+    Convert non-streaming Responses API result to Chat Completions format.
+    Preserves structured output for Open WebUI persistence.
     """
+    if not isinstance(response, dict):
+        return response
+
     response["done"] = True
-    return response
+    if "choices" in response:
+        return response
+
+    model_name = str(response.get("model", "") or "")
+    content = _extract_responses_output_text(response)
+    chat_response = openai_chat_completion_message_template(
+        model_name, message=content or ""
+    )
+
+    chat_response["done"] = True
+
+    usage = response.get("usage")
+    if usage is not None:
+        chat_response["usage"] = usage
+
+    output = response.get("output")
+    if output is not None:
+        chat_response["output"] = output
+
+    if "id" in response:
+        chat_response["id"] = response["id"]
+
+    created = response.get("created")
+    if created is None:
+        created = response.get("created_at") or response.get("createdAt")
+    if created is not None:
+        try:
+            chat_response["created"] = int(created)
+        except Exception:
+            pass
+
+    for key in ("error", "status", "incomplete_details", "metadata", "system_fingerprint"):
+        if key in response:
+            chat_response[key] = response[key]
+
+    return chat_response
 
 
 @router.post("/chat/completions")
@@ -952,9 +1343,85 @@ async def generate_chat_completion(
 
     payload = {**form_data}
     metadata = payload.pop("metadata", None)
+    if isinstance(metadata, dict):
+        task_value = metadata.get("task")
+        if task_value is not None:
+            task_text = str(task_value).strip()
+            if task_text:
+                payload.setdefault("task", task_text)
+    payload.pop("thinking_mode_enabled", None)
+    payload.pop("thinkingModeEnabled", None)
 
-    model_id = form_data.get("model")
-    model_info = Models.get_model_by_id(model_id)
+    raw_requested_model_id = form_data.get("model")
+    base_requested_model_id = raw_requested_model_id
+    requested_model_info = None
+    legacy_thinking_suffix_requested = (
+        isinstance(raw_requested_model_id, str)
+        and raw_requested_model_id.endswith(THINKING_MODEL_SUFFIX)
+    )
+    if isinstance(raw_requested_model_id, str):
+        requested_model_info = Models.get_model_by_id(raw_requested_model_id)
+        if legacy_thinking_suffix_requested:
+            base_requested_model_id = raw_requested_model_id[: -len(THINKING_MODEL_SUFFIX)]
+            if not requested_model_info:
+                requested_model_info = Models.get_model_by_id(base_requested_model_id)
+
+    requested_base_model_id = (
+        request.base_model_id
+        if hasattr(request, "base_model_id")
+        else (
+            requested_model_info.base_model_id
+            if requested_model_info and requested_model_info.base_model_id
+            else base_requested_model_id
+        )
+    )
+    deepseek_requested_model = _is_deepseek_model_name(requested_base_model_id)
+    requested_model_id = (
+        base_requested_model_id
+        if deepseek_requested_model and legacy_thinking_suffix_requested
+        else raw_requested_model_id
+    )
+
+    explicit_thinking_mode = _coerce_booleanish(form_data.get("thinking_mode_enabled"))
+    if explicit_thinking_mode is None:
+        explicit_thinking_mode = _coerce_booleanish(form_data.get("thinkingModeEnabled"))
+
+    explicit_thinking_payload = form_data.get("thinking")
+    if isinstance(explicit_thinking_payload, dict):
+        thinking_type = str(explicit_thinking_payload.get("type", "") or "").strip().lower()
+        if thinking_type == "enabled":
+            explicit_thinking_mode = True
+        elif thinking_type == "disabled":
+            explicit_thinking_mode = False
+
+    thinking_mode_enabled = (
+        explicit_thinking_mode
+        if explicit_thinking_mode is not None
+        else bool(deepseek_requested_model and legacy_thinking_suffix_requested)
+    )
+
+    model_id = requested_model_id
+    if (
+        thinking_mode_enabled
+        and isinstance(model_id, str)
+        and model_id
+        and not model_id.endswith(THINKING_MODEL_SUFFIX)
+        and not deepseek_requested_model
+    ):
+        model_id = f"{model_id}{THINKING_MODEL_SUFFIX}"
+    payload["model"] = model_id
+    reasoning_requested = False
+    if isinstance(requested_model_id, str) and requested_model_id:
+        reasoning_requested = is_openai_reasoning_model(
+            requested_model_id
+        ) or requested_model_id.endswith(THINKING_MODEL_SUFFIX)
+    if isinstance(model_id, str) and model_id.endswith(THINKING_MODEL_SUFFIX):
+        reasoning_requested = True
+    model_is_always_allowed = is_model_always_allowed(requested_model_id)
+    model_lookup_id = model_id
+    if isinstance(model_lookup_id, str) and model_lookup_id.endswith(THINKING_MODEL_SUFFIX):
+        model_lookup_id = model_lookup_id[: -len(THINKING_MODEL_SUFFIX)]
+    model_info = requested_model_info or Models.get_model_by_id(model_lookup_id)
 
     # Check model info and override the payload
     if model_info:
@@ -964,8 +1431,18 @@ async def generate_chat_completion(
                 if hasattr(request, "base_model_id")
                 else model_info.base_model_id
             )  # Use request's base_model_id if available
-            payload["model"] = base_model_id
-            model_id = base_model_id
+            resolved_model_id = base_model_id
+            if (
+                isinstance(model_id, str)
+                and model_id.endswith(THINKING_MODEL_SUFFIX)
+                and isinstance(base_model_id, str)
+                and not base_model_id.endswith(THINKING_MODEL_SUFFIX)
+                and not _is_deepseek_model_name(base_model_id)
+            ):
+                resolved_model_id = f"{base_model_id}{THINKING_MODEL_SUFFIX}"
+
+            payload["model"] = resolved_model_id
+            model_id = resolved_model_id
 
         params = model_info.params.model_dump()
 
@@ -976,8 +1453,14 @@ async def generate_chat_completion(
             if not bypass_system_prompt:
                 payload = apply_system_prompt_to_body(system, payload, metadata, user)
 
+            if not reasoning_requested:
+                if payload.get("reasoning") is not None or payload.get(
+                    "reasoning_effort"
+                ) is not None:
+                    reasoning_requested = True
+
         # Check if user has access to the model
-        if not bypass_filter and user.role == "user":
+        if not bypass_filter and user.role == "user" and not model_is_always_allowed:
             user_group_ids = {
                 group.id for group in Groups.get_groups_by_member_id(user.id)
             }
@@ -995,19 +1478,25 @@ async def generate_chat_completion(
                     status_code=403,
                     detail="Model not found",
                 )
-    elif not bypass_filter:
-        if user.role != "admin":
-            raise HTTPException(
-                status_code=403,
-                detail="Model not found",
-            )
+    # Base/provider models without a custom DB record are validated later against
+    # the live provider model registry, so they stay readable for verified users.
+    if not reasoning_requested:
+        if payload.get("reasoning") is not None or payload.get("reasoning_effort") is not None:
+            reasoning_requested = True
 
     # Check if model is already in app state cache to avoid expensive get_all_models() call
     models = request.app.state.OPENAI_MODELS
-    if not models or model_id not in models:
+    model_lookup_candidates = {model_id}
+    if isinstance(model_id, str) and model_id.endswith(THINKING_MODEL_SUFFIX):
+        model_lookup_candidates.add(model_id[: -len(THINKING_MODEL_SUFFIX)])
+
+    if not models or not any(candidate in models for candidate in model_lookup_candidates):
         await get_all_models(request, user=user)
         models = request.app.state.OPENAI_MODELS
     model = models.get(model_id)
+    if not model and isinstance(model_id, str) and model_id.endswith(THINKING_MODEL_SUFFIX):
+        base_model_id = model_id[: -len(THINKING_MODEL_SUFFIX)]
+        model = models.get(base_model_id)
 
     if model:
         idx = model["urlIdx"]
@@ -1041,9 +1530,18 @@ async def generate_chat_completion(
     url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
     key = request.app.state.config.OPENAI_API_KEYS[idx]
 
+    if _is_deepseek_provider(url, payload.get("model")):
+        payload = _apply_deepseek_thinking_config(payload, thinking_mode_enabled)
+        payload["messages"] = _adapt_messages_for_deepseek(payload.get("messages", []))
+
+    if is_openai_reasoning_model(payload.get("model", "")):
+        reasoning_requested = True
+
     # Check if model is a reasoning model that needs special handling
-    if is_openai_reasoning_model(payload["model"]):
-        payload = openai_reasoning_model_handler(payload)
+    if reasoning_requested:
+        payload = openai_reasoning_model_handler(
+            payload, model_id_override=requested_model_id
+        )
     elif "api.openai.com" not in url:
         # Remove "max_completion_tokens" from the payload for backward compatibility
         if "max_completion_tokens" in payload:
@@ -1089,6 +1587,76 @@ async def generate_chat_completion(
         else:
             request_url = f"{url}/chat/completions"
 
+    bridge_metadata = (
+        _metadata_for_deepagent_bridge(metadata)
+        if _is_deepagent_bridge_url(url)
+        else None
+    )
+
+    # Server-mint scoped artifact publication context for agent use.
+    # This is independent of client metadata filtering — the scope token is
+    # always minted server-side when the target is a DeepAgent bridge, even
+    # if no other client metadata survives the allowlist.
+    if _is_deepagent_bridge_url(url) and user:
+        try:
+            from open_webui.models.chats import Chats
+            from open_webui.internal.db import get_db_context
+            from open_webui.utils.artifact_publication_scope import (
+                mint_artifact_publication_scope,
+            )
+
+            # Resolve chat_id: prefer metadata, fallback to top-level payload
+            # only after verifying the current user owns/can access that chat.
+            raw_chat_id = (
+                (metadata.get("chat_id") if isinstance(metadata, dict) else None)
+                or payload.get("chat_id")
+            )
+            chat_id = None
+            if isinstance(raw_chat_id, str) and raw_chat_id.strip():
+                candidate = raw_chat_id.strip()
+                # Reject synthetic/local chat IDs that don't map to persisted chats.
+                if candidate.startswith("local:"):
+                    chat_id = None
+                else:
+                    with get_db_context() as db:
+                        if user.role == "admin":
+                            chat = Chats.get_chat_by_id(candidate, db=db)
+                        else:
+                            chat = Chats.get_chat_by_id_and_user_id(
+                                candidate, user.id, db=db
+                            )
+                        if chat:
+                            chat_id = candidate
+
+            owner_message_id = (
+                (metadata.get("message_id") if isinstance(metadata, dict) else None)
+                or payload.get("message_id")
+            )
+            if owner_message_id:
+                owner_message_id = str(owner_message_id).strip() or None
+
+            # Require verified chat_id to bind scope to a verified chat context.
+            if chat_id:
+                scope_token = mint_artifact_publication_scope(
+                    user_id=user.id,
+                    chat_id=chat_id,
+                    owner_message_id=owner_message_id,
+                )
+                # Ensure bridge_metadata exists before injecting scope.
+                if bridge_metadata is None:
+                    bridge_metadata = {}
+                bridge_metadata["artifact_publication_scope"] = scope_token
+        except Exception as exc:
+            log.warning(
+                "Failed to mint artifact publication scope; omitting scope for this request: %s",
+                exc,
+            )
+
+    if bridge_metadata:
+        payload["metadata"] = json.loads(
+            json.dumps(bridge_metadata, ensure_ascii=False, default=str)
+        )
+
     payload = json.dumps(payload)
 
     r = None
@@ -1114,7 +1682,7 @@ async def generate_chat_completion(
         if "text/event-stream" in r.headers.get("Content-Type", ""):
             streaming = True
             return StreamingResponse(
-                stream_wrapper(r, session, stream_chunks_handler),
+                _rewrite_openwebui_sse_stream(stream_wrapper(r, session, stream_chunks_handler)),
                 status_code=r.status,
                 headers=dict(r.headers),
             )
@@ -1135,7 +1703,7 @@ async def generate_chat_completion(
             if is_responses and isinstance(response, dict):
                 response = convert_responses_result(response)
 
-            return response
+            return _rewrite_openwebui_file_links(response)
     except Exception as e:
         log.exception(e)
 
@@ -1208,20 +1776,40 @@ async def embeddings(request: Request, form_data: dict, user):
                 headers=dict(r.headers),
             )
         else:
-            try:
-                response_data = await r.json()
-            except Exception:
-                response_data = await r.text()
+            response_type, response_data = await _read_proxy_response_data(r)
+
+            if response_type == "json":
+                response_data = _rewrite_openwebui_file_links(response_data)
+            elif response_type == "text":
+                response_data = _rewrite_openwebui_file_links_in_text(response_data)
 
             if r.status >= 400:
-                if isinstance(response_data, (dict, list)):
+                if response_type == "json" and isinstance(response_data, (dict, list)):
                     return JSONResponse(status_code=r.status, content=response_data)
-                else:
+                if response_type == "text":
                     return PlainTextResponse(
                         status_code=r.status, content=response_data
                     )
+                binary_headers = _get_proxy_passthrough_headers(r)
+                content_type = r.headers.get("Content-Type")
+                if content_type:
+                    binary_headers["Content-Type"] = content_type
+                return Response(
+                    status_code=r.status, content=response_data, headers=binary_headers
+                )
 
-            return response_data
+            if response_type == "json":
+                return response_data
+            if response_type == "text":
+                return PlainTextResponse(status_code=r.status, content=response_data)
+
+            binary_headers = _get_proxy_passthrough_headers(r)
+            content_type = r.headers.get("Content-Type")
+            if content_type:
+                binary_headers["Content-Type"] = content_type
+            return Response(
+                status_code=r.status, content=response_data, headers=binary_headers
+            )
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -1416,7 +2004,10 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
 
             request_url = f"{url}/{path}?api-version={api_version}"
         else:
-            request_url = f"{url}/{path}"
+            normalized_path = _normalize_proxy_path_for_base_url(url, path)
+            request_url = (
+                f"{url.rstrip('/')}/{normalized_path}" if normalized_path else url.rstrip("/")
+            )
 
         session = aiohttp.ClientSession(
             trust_env=True,
@@ -1440,20 +2031,40 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
                 headers=dict(r.headers),
             )
         else:
-            try:
-                response_data = await r.json()
-            except Exception:
-                response_data = await r.text()
+            response_type, response_data = await _read_proxy_response_data(r)
+
+            if response_type == "json":
+                response_data = _rewrite_openwebui_file_links(response_data)
+            elif response_type == "text":
+                response_data = _rewrite_openwebui_file_links_in_text(response_data)
 
             if r.status >= 400:
-                if isinstance(response_data, (dict, list)):
+                if response_type == "json" and isinstance(response_data, (dict, list)):
                     return JSONResponse(status_code=r.status, content=response_data)
-                else:
+                if response_type == "text":
                     return PlainTextResponse(
                         status_code=r.status, content=response_data
                     )
+                binary_headers = _get_proxy_passthrough_headers(r)
+                content_type = r.headers.get("Content-Type")
+                if content_type:
+                    binary_headers["Content-Type"] = content_type
+                return Response(
+                    status_code=r.status, content=response_data, headers=binary_headers
+                )
 
-            return response_data
+            if response_type == "json":
+                return response_data
+            if response_type == "text":
+                return PlainTextResponse(status_code=r.status, content=response_data)
+
+            binary_headers = _get_proxy_passthrough_headers(r)
+            content_type = r.headers.get("Content-Type")
+            if content_type:
+                binary_headers["Content-Type"] = content_type
+            return Response(
+                status_code=r.status, content=response_data, headers=binary_headers
+            )
 
     except Exception as e:
         log.exception(e)

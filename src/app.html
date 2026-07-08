@@ -2,7 +2,13 @@
 <html lang="en">
 	<head>
 		<meta charset="utf-8" />
-		<link rel="icon" type="image/png" href="/static/favicon.png" crossorigin="use-credentials" />
+		<link
+			rel="icon"
+			type="image/png"
+			href="/static/favicon.png"
+			media="(prefers-color-scheme: light)"
+			crossorigin="use-credentials"
+		/>
 		<link
 			rel="icon"
 			type="image/png"
@@ -12,11 +18,12 @@
 		/>
 		<link
 			rel="icon"
-			type="image/svg+xml"
-			href="/static/favicon.svg"
+			type="image/png"
+			href="/static/favicon-dark.png"
+			media="(prefers-color-scheme: dark)"
 			crossorigin="use-credentials"
 		/>
-		<link rel="shortcut icon" href="/static/favicon.ico" crossorigin="use-credentials" />
+		<link rel="shortcut icon" href="/static/favicon.png" crossorigin="use-credentials" />
 		<link
 			rel="apple-touch-icon"
 			sizes="180x180"
@@ -30,6 +37,14 @@
 		/>
 		<meta name="theme-color" content="#171717" />
 		<meta name="robots" content="noindex,nofollow" />
+		<meta name="application-name" content="中电慧语" />
+		<meta name="apple-mobile-web-app-title" content="中电慧语" />
+		<meta name="description" content="中电慧语" />
+		<meta property="og:site_name" content="中电慧语" />
+		<meta property="og:title" content="中电慧语" />
+		<meta property="og:description" content="中电慧语" />
+		<meta name="twitter:title" content="中电慧语" />
+		<meta name="twitter:description" content="中电慧语" />
 
 		<script src="/static/loader.js" defer crossorigin="use-credentials"></script>
 		<link rel="stylesheet" href="/static/custom.css" crossorigin="use-credentials" />
@@ -45,6 +60,19 @@
 			(() => {
 				const metaThemeColorTag = document.querySelector('meta[name="theme-color"]');
 				const prefersDarkTheme = window.matchMedia('(prefers-color-scheme: dark)').matches;
+				const root = document.documentElement;
+				const withoutThemeTransitions = (callback) => {
+					root.classList.add('theme-switching');
+					callback();
+
+					requestAnimationFrame(() => {
+						requestAnimationFrame(() => {
+							root.classList.remove('theme-switching');
+						});
+					});
+				};
+
+				window.__withoutThemeTransitions = withoutThemeTransitions;
 
 				if (!localStorage?.theme) {
 					localStorage.theme = 'system';
@@ -73,15 +101,17 @@
 
 				window.matchMedia('(prefers-color-scheme: dark)').addListener((e) => {
 					if (localStorage.theme === 'system') {
-						if (e.matches) {
-							document.documentElement.classList.add('dark');
-							document.documentElement.classList.remove('light');
-							metaThemeColorTag.setAttribute('content', '#171717');
-						} else {
-							document.documentElement.classList.add('light');
-							document.documentElement.classList.remove('dark');
-							metaThemeColorTag.setAttribute('content', '#ffffff');
-						}
+						withoutThemeTransitions(() => {
+							if (e.matches) {
+								document.documentElement.classList.add('dark');
+								document.documentElement.classList.remove('light');
+								metaThemeColorTag.setAttribute('content', '#171717');
+							} else {
+								document.documentElement.classList.add('light');
+								document.documentElement.classList.remove('dark');
+								metaThemeColorTag.setAttribute('content', '#ffffff');
+							}
+						});
 					}
 				});
 				const isDarkMode = document.documentElement.classList.contains('dark');
@@ -103,7 +133,7 @@
 			})();
 		</script>
 
-		<title>Open WebUI</title>
+		<title>中电慧语</title>
 
 		%sveltekit.head%
 	</head>

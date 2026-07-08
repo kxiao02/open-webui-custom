@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { createEventDispatcher, getContext } from 'svelte';
-	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
 	import { formatFileSize } from '$lib/utils';
+	import { normalizeOpenWebUiFileUrl } from '$lib/utils/generated-files';
 	import { settings } from '$lib/stores';
 
 	import FileItemModal from './FileItemModal.svelte';
@@ -11,7 +11,7 @@
 	import Tooltip from './Tooltip.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 	const dispatch = createEventDispatcher();
 
 	export let className = 'w-60';
@@ -60,15 +60,14 @@
 		if (item?.file?.data?.content || item?.type === 'file' || item?.content || modal) {
 			showModal = !showModal;
 		} else {
-			if (url) {
+			const normalizedUrl = typeof url === 'string' ? url.trim() : '';
+			if (normalizedUrl && normalizedUrl !== 'null' && normalizedUrl !== 'undefined') {
 				if (type === 'file') {
-					if (url.startsWith('http')) {
-						window.open(`${url}/content`, '_blank').focus();
-					} else {
-						window.open(`${WEBUI_API_BASE_URL}/files/${url}/content`, '_blank').focus();
-					}
+					const popup = window.open(normalizeOpenWebUiFileUrl(normalizedUrl), '_blank');
+					popup?.focus();
 				} else {
-					window.open(`${url}`, '_blank').focus();
+					const popup = window.open(`${normalizedUrl}`, '_blank');
+					popup?.focus();
 				}
 			}
 		}
@@ -166,7 +165,11 @@
 			<div class="flex flex-col justify-center -space-y-0.5 px-1 w-full">
 				<div class=" dark:text-gray-100 text-sm flex justify-between items-center">
 					<div class="font-medium line-clamp-1 flex-1 pr-1">{decodeString(name)}</div>
-					{#if size}
+					{#if loading}
+						<div class="text-gray-500 text-xs capitalize shrink-0">
+							{$i18n.t('Uploading...')}
+						</div>
+					{:else if size}
 						<div class="text-gray-500 text-xs capitalize shrink-0">{formatFileSize(size)}</div>
 					{:else}
 						<div class="text-gray-500 text-xs capitalize shrink-0">{type}</div>

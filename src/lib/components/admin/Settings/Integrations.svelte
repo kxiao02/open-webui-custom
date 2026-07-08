@@ -5,7 +5,7 @@
 	import { getModels as _getModels } from '$lib/apis';
 
 	const dispatch = createEventDispatcher();
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { models, settings, user, terminalServers } from '$lib/stores';
 	import { getTerminalServers } from '$lib/apis/terminal';
@@ -18,13 +18,12 @@
 	import Cog6 from '$lib/components/icons/Cog6.svelte';
 	import Cloud from '$lib/components/icons/Cloud.svelte';
 	import Connection from '$lib/components/chat/Settings/Tools/Connection.svelte';
-	import SensitiveInput from '$lib/components/common/SensitiveInput.svelte';
-
 	import AddToolServerModal from '$lib/components/AddToolServerModal.svelte';
 	import AddTerminalServerModal from '$lib/components/AddTerminalServerModal.svelte';
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 
 	import {
+		getEnterpriseOAuthConfig,
 		getToolServerConnections,
 		setToolServerConnections,
 		getTerminalServerConnections,
@@ -42,6 +41,29 @@
 	let editTerminalIdx: number | null = null;
 	let showDeleteTerminalConfirm = false;
 	let deleteTerminalIdx: number | null = null;
+	let enterpriseOAuthForm = {
+		ENTERPRISE_OAUTH_ENABLED: false,
+		ENTERPRISE_OAUTH_PROVIDER_NAME: '',
+		ENTERPRISE_OAUTH_CLIENT_ID: '',
+		ENTERPRISE_OAUTH_CLIENT_SECRET: '',
+		ENTERPRISE_OAUTH_AUTHORIZE_URL: '',
+		ENTERPRISE_OAUTH_TOKEN_URL: '',
+		ENTERPRISE_OAUTH_PROFILE_URL: '',
+		ENTERPRISE_OAUTH_CHECK_TOKEN_URL: '',
+		ENTERPRISE_OAUTH_LOGOUT_URL: '',
+		ENTERPRISE_OAUTH_REDIRECT_URI: '',
+		ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM: 'redirect_uri',
+		ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM: 'redirect_uri',
+		ENTERPRISE_OAUTH_ID_CLAIM: 'id',
+		ENTERPRISE_OAUTH_ACCOUNT_NO_PATH: 'attributes.account_no',
+		ENTERPRISE_OAUTH_EMAIL_CLAIM: '',
+		ENTERPRISE_OAUTH_EMAIL_DOMAIN: 'local'
+	};
+	let enterpriseOAuthLoading = true;
+	let enterpriseOAuthError: string | null = null;
+	let enterpriseOAuthDeploymentManaged = false;
+	let enterpriseOAuthMissingRequiredEnv: string[] = [];
+	let enterpriseOAuthEffectiveRedirectUri = '';
 
 	const addConnectionHandler = async (server) => {
 		servers = [...servers, server];
@@ -103,6 +125,142 @@
 		saveTerminalServers();
 	};
 
+	const coerceBoolean = (value) => {
+		if (typeof value === 'boolean') {
+			return value;
+		}
+		if (typeof value === 'string') {
+			const normalized = value.trim().toLowerCase();
+			if (['true', '1', 'yes', 'on'].includes(normalized)) {
+				return true;
+			}
+			if (['false', '0', 'no', 'off', ''].includes(normalized)) {
+				return false;
+			}
+		}
+		return Boolean(value);
+	};
+
+	const pickValue = (payload, keys, fallback = '') => {
+		if (!payload) {
+			return fallback;
+		}
+		for (const key of keys) {
+			if (payload[key] !== undefined && payload[key] !== null) {
+				return payload[key];
+			}
+		}
+		return fallback;
+	};
+
+	const normalizeEnterpriseOAuthForm = (payload) => {
+		if (!payload) {
+			return {
+				ENTERPRISE_OAUTH_ENABLED: false,
+				ENTERPRISE_OAUTH_PROVIDER_NAME: '',
+				ENTERPRISE_OAUTH_CLIENT_ID: '',
+				ENTERPRISE_OAUTH_CLIENT_SECRET: '',
+				ENTERPRISE_OAUTH_AUTHORIZE_URL: '',
+				ENTERPRISE_OAUTH_TOKEN_URL: '',
+				ENTERPRISE_OAUTH_PROFILE_URL: '',
+				ENTERPRISE_OAUTH_CHECK_TOKEN_URL: '',
+				ENTERPRISE_OAUTH_LOGOUT_URL: '',
+				ENTERPRISE_OAUTH_REDIRECT_URI: '',
+				ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM: 'redirect_uri',
+				ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM: 'redirect_uri',
+				ENTERPRISE_OAUTH_ID_CLAIM: 'id',
+				ENTERPRISE_OAUTH_ACCOUNT_NO_PATH: 'attributes.account_no',
+				ENTERPRISE_OAUTH_EMAIL_CLAIM: '',
+				ENTERPRISE_OAUTH_EMAIL_DOMAIN: 'local'
+			};
+		}
+
+		return {
+			ENTERPRISE_OAUTH_ENABLED: coerceBoolean(
+				pickValue(payload, ['ENTERPRISE_OAUTH_ENABLED', 'ENABLE_ENTERPRISE_OAUTH'], false)
+			),
+			ENTERPRISE_OAUTH_PROVIDER_NAME: pickValue(
+				payload,
+				['ENTERPRISE_OAUTH_PROVIDER_NAME', 'PROVIDER_NAME'],
+				''
+			),
+			ENTERPRISE_OAUTH_CLIENT_ID: pickValue(
+				payload,
+				['ENTERPRISE_OAUTH_CLIENT_ID', 'CLIENT_ID'],
+				''
+			),
+			ENTERPRISE_OAUTH_CLIENT_SECRET: pickValue(
+				payload,
+				['ENTERPRISE_OAUTH_CLIENT_SECRET', 'CLIENT_SECRET'],
+				''
+			),
+			ENTERPRISE_OAUTH_AUTHORIZE_URL: pickValue(
+				payload,
+				['ENTERPRISE_OAUTH_AUTHORIZE_URL', 'AUTHORIZE_REQUEST_URL'],
+				''
+			),
+			ENTERPRISE_OAUTH_TOKEN_URL: pickValue(
+				payload,
+				['ENTERPRISE_OAUTH_TOKEN_URL', 'TOKEN_REQUEST_URL'],
+				''
+			),
+			ENTERPRISE_OAUTH_PROFILE_URL: pickValue(
+				payload,
+				['ENTERPRISE_OAUTH_PROFILE_URL', 'USERINFO_REQUEST_URL'],
+				''
+			),
+			ENTERPRISE_OAUTH_CHECK_TOKEN_URL: pickValue(
+				payload,
+				['ENTERPRISE_OAUTH_CHECK_TOKEN_URL', 'TOKEN_VALIDATE_URL'],
+				''
+			),
+			ENTERPRISE_OAUTH_LOGOUT_URL: pickValue(
+				payload,
+				['ENTERPRISE_OAUTH_LOGOUT_URL', 'TOKEN_LOGOUT_URL'],
+				''
+			),
+			ENTERPRISE_OAUTH_REDIRECT_URI: pickValue(
+				payload,
+				['ENTERPRISE_OAUTH_REDIRECT_URI', 'REDIRECT_URI'],
+				''
+			),
+			ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM:
+				payload.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM ?? 'redirect_uri',
+			ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM:
+				payload.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM ?? 'redirect_uri',
+			ENTERPRISE_OAUTH_ID_CLAIM: payload.ENTERPRISE_OAUTH_ID_CLAIM ?? 'id',
+			ENTERPRISE_OAUTH_ACCOUNT_NO_PATH:
+				payload.ENTERPRISE_OAUTH_ACCOUNT_NO_PATH ?? 'attributes.account_no',
+			ENTERPRISE_OAUTH_EMAIL_CLAIM: payload.ENTERPRISE_OAUTH_EMAIL_CLAIM ?? '',
+			ENTERPRISE_OAUTH_EMAIL_DOMAIN: payload.ENTERPRISE_OAUTH_EMAIL_DOMAIN ?? 'local'
+		};
+	};
+
+	const normalizeEnterpriseOAuthDiagnostics = (payload) => {
+		const deploymentManaged = coerceBoolean(
+			pickValue(payload, ['ENTERPRISE_OAUTH_DEPLOYMENT_MANAGED', 'DEPLOYMENT_MANAGED'], false)
+		);
+		const missingRaw = pickValue(
+			payload,
+			['ENTERPRISE_OAUTH_MISSING_REQUIRED_ENV', 'MISSING_REQUIRED_ENV'],
+			[]
+		);
+		const missingRequiredEnv = Array.isArray(missingRaw)
+			? missingRaw.filter((entry) => Boolean(entry))
+			: [];
+		const effectiveRedirectUri = pickValue(
+			payload,
+			['ENTERPRISE_OAUTH_EFFECTIVE_REDIRECT_URI', 'EFFECTIVE_REDIRECT_URI'],
+			''
+		);
+
+		return {
+			deploymentManaged,
+			missingRequiredEnv,
+			effectiveRedirectUri
+		};
+	};
+
 	onMount(async () => {
 		const res = await getToolServerConnections(localStorage.token);
 		servers = res.TOOL_SERVER_CONNECTIONS;
@@ -115,6 +273,24 @@
 			}
 		} catch {
 			// Not configured yet
+		}
+
+		enterpriseOAuthLoading = true;
+		enterpriseOAuthError = null;
+		try {
+			const enterpriseRes = await getEnterpriseOAuthConfig(localStorage.token);
+			enterpriseOAuthForm = normalizeEnterpriseOAuthForm(enterpriseRes);
+			const diagnostics = normalizeEnterpriseOAuthDiagnostics(enterpriseRes);
+			enterpriseOAuthDeploymentManaged = diagnostics.deploymentManaged;
+			enterpriseOAuthMissingRequiredEnv = diagnostics.missingRequiredEnv;
+			enterpriseOAuthEffectiveRedirectUri = diagnostics.effectiveRedirectUri;
+		} catch (err) {
+			enterpriseOAuthError = err?.message ?? 'Failed to load enterprise OAuth config';
+			enterpriseOAuthDeploymentManaged = false;
+			enterpriseOAuthMissingRequiredEnv = [];
+			enterpriseOAuthEffectiveRedirectUri = '';
+		} finally {
+			enterpriseOAuthLoading = false;
 		}
 	});
 </script>
@@ -208,6 +384,191 @@
 						<div class="my-1.5">
 							<div class="text-xs text-gray-500">
 								{$i18n.t('Connect to your own OpenAPI compatible external tool servers.')}
+							</div>
+						</div>
+					</div>
+
+					<hr class=" border-gray-100/30 dark:border-gray-850/30 my-4" />
+
+					<div class="mb-2.5 flex flex-col w-full">
+						<div class="flex items-center gap-2 mb-1">
+							<div class="font-medium">{$i18n.t('Enterprise OAuth (Code Mode)')}</div>
+							<span
+								class="text-[0.65rem] font-medium uppercase px-1.5 py-0.5 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400"
+								>{$i18n.t('Read-only')}</span
+							>
+						</div>
+
+						<div class="text-xs text-gray-500 mb-2">
+							{#if enterpriseOAuthDeploymentManaged}
+								{$i18n.t('Deployment-managed configuration detected. This screen is read-only.')}
+							{:else}
+								{$i18n.t(
+									'Deployment-managed configuration not detected. This screen remains read-only during rollout.'
+								)}
+							{/if}
+						</div>
+						{#if enterpriseOAuthLoading}
+							<div class="text-xs text-gray-500 mb-2 flex items-center gap-2">
+								<Spinner className="size-3" />
+								{$i18n.t('Loading deployment configuration...')}
+							</div>
+						{:else if enterpriseOAuthError}
+							<div class="text-xs text-amber-600 dark:text-amber-400 mb-2">
+								{$i18n.t('Failed to load deployment configuration. Showing defaults.')}
+							</div>
+						{/if}
+						<div
+							class="text-xs text-gray-500 mb-3 rounded-lg border border-gray-100/60 dark:border-gray-800/60 bg-gray-50/60 dark:bg-gray-900/40 px-3 py-2"
+						>
+							{$i18n.t(
+								'To change Enterprise OAuth, update ENTERPRISE_OAUTH_* in your deployment environment (compose/.env/secret manager) and restart Open WebUI. Runtime edits are not supported.'
+							)}
+						</div>
+						{#if !enterpriseOAuthLoading}
+							{#if enterpriseOAuthDeploymentManaged && enterpriseOAuthMissingRequiredEnv.length > 0}
+								<div
+									class="text-xs text-amber-600 dark:text-amber-400 mb-2 rounded-lg border border-amber-200/60 dark:border-amber-900/40 bg-amber-50/60 dark:bg-amber-950/20 px-3 py-2"
+								>
+									{$i18n.t('Missing required Enterprise OAuth environment variables:')}
+									{' '}
+									<span class="font-mono break-all">
+										{enterpriseOAuthMissingRequiredEnv.join(', ')}
+									</span>
+								</div>
+							{/if}
+							<div
+								class="text-xs text-gray-500 mb-3 rounded-lg border border-gray-100/60 dark:border-gray-800/60 bg-gray-50/60 dark:bg-gray-900/40 px-3 py-2"
+							>
+								{#if enterpriseOAuthEffectiveRedirectUri}
+									{$i18n.t('Effective redirect URI:')}
+									{' '}
+									<span class="font-mono break-all">
+										{enterpriseOAuthEffectiveRedirectUri}
+									</span>
+								{:else}
+									{$i18n.t(
+										'Effective redirect URI unavailable. Set ENTERPRISE_OAUTH_REDIRECT_URI or WEBUI_URL.'
+									)}
+								{/if}
+							</div>
+						{/if}
+
+						<div class="flex items-center justify-between mb-3">
+							<div class="text-xs text-gray-500">
+								{$i18n.t('Current runtime value from deployment config.')}
+							</div>
+							<Switch bind:state={enterpriseOAuthForm.ENTERPRISE_OAUTH_ENABLED} disabled={true} />
+						</div>
+
+						<div class="grid grid-cols-1 gap-3">
+							<div>
+								<div class="text-xs font-medium mb-1">Provider Name</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									placeholder="SSO"
+									bind:value={enterpriseOAuthForm.ENTERPRISE_OAUTH_PROVIDER_NAME}
+									readonly
+								/>
+							</div>
+
+							<div>
+								<div class="text-xs font-medium mb-1">Client ID</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									placeholder="CLIENT_ID"
+									bind:value={enterpriseOAuthForm.ENTERPRISE_OAUTH_CLIENT_ID}
+									readonly
+								/>
+							</div>
+
+							<div>
+								<div class="text-xs font-medium mb-1">Client Secret</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									type="password"
+									placeholder="CLIENT_SECRET"
+									value={enterpriseOAuthForm.ENTERPRISE_OAUTH_CLIENT_SECRET}
+									readonly
+								/>
+							</div>
+
+							<div>
+								<div class="text-xs font-medium mb-1">Authorize Request URL</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									placeholder="http://host/esc-sso/oauth2.0/authorize"
+									bind:value={enterpriseOAuthForm.ENTERPRISE_OAUTH_AUTHORIZE_URL}
+									readonly
+								/>
+							</div>
+
+							<div>
+								<div class="text-xs font-medium mb-1">Token Request URL</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									placeholder="http://host/esc-sso/oauth2.0/accessToken"
+									bind:value={enterpriseOAuthForm.ENTERPRISE_OAUTH_TOKEN_URL}
+									readonly
+								/>
+							</div>
+
+							<div>
+								<div class="text-xs font-medium mb-1">Userinfo Request URL</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									placeholder="http://host/esc-sso/oauth2.0/profile"
+									bind:value={enterpriseOAuthForm.ENTERPRISE_OAUTH_PROFILE_URL}
+									readonly
+								/>
+							</div>
+
+							<div>
+								<div class="text-xs font-medium mb-1">Token Validate URL</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									placeholder="http://host/esc-sso/api/v1/loginLog/checkAccessToken"
+									bind:value={enterpriseOAuthForm.ENTERPRISE_OAUTH_CHECK_TOKEN_URL}
+									readonly
+								/>
+							</div>
+
+							<div>
+								<div class="text-xs font-medium mb-1">Token Logout URL</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									placeholder="http://host/esc-sso/cxf/api/v1/ssoSession/remove"
+									bind:value={enterpriseOAuthForm.ENTERPRISE_OAUTH_LOGOUT_URL}
+									readonly
+								/>
+							</div>
+
+							<div>
+								<div class="text-xs font-medium mb-1">Redirect URI</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									placeholder="http://host/oauth/enterprise/callback"
+									bind:value={enterpriseOAuthForm.ENTERPRISE_OAUTH_REDIRECT_URI}
+									readonly
+								/>
+							</div>
+
+							<div>
+								<div class="text-xs font-medium mb-1">Authorize Redirect Param</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									bind:value={enterpriseOAuthForm.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM}
+									readonly
+								/>
+							</div>
+
+							<div>
+								<div class="text-xs font-medium mb-1">Token Redirect Param</div>
+								<input
+									class="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-transparent px-3 py-2 text-xs"
+									bind:value={enterpriseOAuthForm.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM}
+									readonly
+								/>
 							</div>
 						</div>
 					</div>

@@ -1,0 +1,48 @@
+services:
+  openai-adapter:
+    build:
+      context: ./openai-adapter
+      dockerfile: Dockerfile
+    container_name: openai-adapter
+    ports:
+      - ${OPENAI_ADAPTER_PORT-8000}:8000
+    environment:
+      - ADAPTER_UPSTREAM_BASE_URL=${ADAPTER_UPSTREAM_BASE_URL-http://host.docker.internal:8081/v1}
+      - ADAPTER_UPSTREAM_API_KEY=${ADAPTER_UPSTREAM_API_KEY-}
+      - ADAPTER_UI_MODEL_ID=${ADAPTER_UI_MODEL_ID-miniagent-chat}
+      - ADAPTER_UPSTREAM_MODEL_ID=${ADAPTER_UPSTREAM_MODEL_ID-deepagent}
+      - ADAPTER_TIMEOUT_SECONDS=${ADAPTER_TIMEOUT_SECONDS-120}
+      - ADAPTER_MODELS_TIMEOUT_SECONDS=${ADAPTER_MODELS_TIMEOUT_SECONDS-2}
+      - ADAPTER_API_KEY=${ADAPTER_API_KEY-}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  open-webui:
+    depends_on:
+      openai-adapter:
+        condition: service_healthy
+    environment:
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL-http://openai-adapter:8000/v1}
+      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URLS-http://openai-adapter:8000/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY-}
+      OPENAI_API_KEYS: ${OPENAI_API_KEYS-}
+      ENABLE_OPENAI_API: ${ENABLE_OPENAI_API-true}
+      ENABLE_OLLAMA_API: ${ENABLE_OLLAMA_API-false}
+      PUBLIC_WEBUI_BASE_URL: ${PUBLIC_WEBUI_BASE_URL-}
+      CORS_ALLOW_ORIGIN: ${CORS_ALLOW_ORIGIN-*}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS-*}
+      CONTENT_SECURITY_POLICY: ${CONTENT_SECURITY_POLICY-}
+      XFRAME_OPTIONS: ${XFRAME_OPTIONS-}
+      WEBUI_SESSION_COOKIE_SAME_SITE: ${WEBUI_SESSION_COOKIE_SAME_SITE-lax}
+      WEBUI_SESSION_COOKIE_SECURE: ${WEBUI_SESSION_COOKIE_SECURE-false}
+      WEBUI_AUTH_COOKIE_SAME_SITE: ${WEBUI_AUTH_COOKIE_SAME_SITE-lax}
+      WEBUI_AUTH_COOKIE_SECURE: ${WEBUI_AUTH_COOKIE_SECURE-false}
+      VECTOR_DB: ${VECTOR_DB-chroma}
+      SKIP_PLUGIN_DEPENDENCY_INSTALL: ${SKIP_PLUGIN_DEPENDENCY_INSTALL-false}

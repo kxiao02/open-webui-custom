@@ -58,6 +58,10 @@ from open_webui.utils.payload import (
     apply_system_prompt_to_body,
 )
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.access_control import has_access
+from open_webui.utils.model_access import is_model_always_allowed
+
+
 from open_webui.config import (
     UPLOAD_DIR,
 )
@@ -438,6 +442,10 @@ async def get_filtered_models(models, user, db=None):
 
     filtered_models = []
     for model in models.get("models", []):
+        if is_model_always_allowed(model.get("model")):
+            filtered_models.append(model)
+            continue
+
         model_info = model_infos.get(model["model"])
         if model_info:
             if user.id == model_info.user_id or model_info.id in accessible_model_ids:
@@ -1315,6 +1323,7 @@ async def generate_chat_completion(
         del payload["metadata"]
 
     model_id = payload["model"]
+    model_is_always_allowed = is_model_always_allowed(model_id)
     model_info = Models.get_model_by_id(model_id)
 
     if model_info:
@@ -1336,7 +1345,7 @@ async def generate_chat_completion(
                 payload = apply_system_prompt_to_body(system, payload, metadata, user)
 
         # Check if user has access to the model
-        if not bypass_filter and user.role == "user":
+        if not bypass_filter and user.role == "user" and not model_is_always_allowed:
             user_group_ids = {
                 group.id for group in Groups.get_groups_by_member_id(user.id)
             }
@@ -1354,12 +1363,8 @@ async def generate_chat_completion(
                     status_code=403,
                     detail="Model not found",
                 )
-    elif not bypass_filter:
-        if user.role != "admin":
-            raise HTTPException(
-                status_code=403,
-                detail="Model not found",
-            )
+    # Base/provider models without a custom DB record are validated against the
+    # live Ollama registry below, so verified users may still use them.
 
     url, url_idx = await get_ollama_url(request, payload["model"], url_idx)
     api_config = request.app.state.config.OLLAMA_API_CONFIGS.get(
@@ -1437,6 +1442,10 @@ async def generate_openai_completion(
         del payload["metadata"]
 
     model_id = form_data.model
+    if ":" not in model_id:
+        model_id = f"{model_id}:latest"
+
+    model_is_always_allowed = is_model_always_allowed(model_id)
     model_info = Models.get_model_by_id(model_id)
     if model_info:
         if model_info.base_model_id:
@@ -1447,7 +1456,7 @@ async def generate_openai_completion(
             payload = apply_model_params_to_body_openai(params, payload)
 
         # Check if user has access to the model
-        if user.role == "user":
+        if user.role == "user" and not model_is_always_allowed:
             user_group_ids = {
                 group.id for group in Groups.get_groups_by_member_id(user.id)
             }
@@ -1465,12 +1474,8 @@ async def generate_openai_completion(
                     status_code=403,
                     detail="Model not found",
                 )
-    else:
-        if user.role != "admin":
-            raise HTTPException(
-                status_code=403,
-                detail="Model not found",
-            )
+    # Base/provider models without a custom DB record are validated against the
+    # live Ollama registry below, so verified users may still use them.
 
     url, url_idx = await get_ollama_url(request, payload["model"], url_idx)
     api_config = request.app.state.config.OLLAMA_API_CONFIGS.get(
@@ -1521,6 +1526,10 @@ async def generate_openai_chat_completion(
         del payload["metadata"]
 
     model_id = completion_form.model
+    if ":" not in model_id:
+        model_id = f"{model_id}:latest"
+
+    model_is_always_allowed = is_model_always_allowed(model_id)
     model_info = Models.get_model_by_id(model_id)
     if model_info:
         if model_info.base_model_id:
@@ -1535,7 +1544,7 @@ async def generate_openai_chat_completion(
             payload = apply_system_prompt_to_body(system, payload, metadata, user)
 
         # Check if user has access to the model
-        if user.role == "user":
+        if user.role == "user" and not model_is_always_allowed:
             user_group_ids = {
                 group.id for group in Groups.get_groups_by_member_id(user.id)
             }
@@ -1553,12 +1562,8 @@ async def generate_openai_chat_completion(
                     status_code=403,
                     detail="Model not found",
                 )
-    else:
-        if user.role != "admin":
-            raise HTTPException(
-                status_code=403,
-                detail="Model not found",
-            )
+    # Base/provider models without a custom DB record are validated against the
+    # live Ollama registry below, so verified users may still use them.
 
     url, url_idx = await get_ollama_url(request, payload["model"], url_idx)
     api_config = request.app.state.config.OLLAMA_API_CONFIGS.get(
@@ -1658,6 +1663,10 @@ async def get_openai_models(
 
         filtered_models = []
         for model in models:
+            if is_model_always_allowed(model.get("id")):
+                filtered_models.append(model)
+                continue
+
             model_info = model_infos.get(model["id"])
             if model_info:
                 if (

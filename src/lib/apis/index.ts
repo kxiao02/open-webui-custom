@@ -1,10 +1,11 @@
+// @ts-nocheck
 import { WEBUI_BASE_URL } from '$lib/constants';
 import { convertOpenApiToToolPayload } from '$lib/utils';
 import { getOpenAIModelsDirect } from './openai';
 
 export const getModels = async (
 	token: string = '',
-	connections: object | null = null,
+	connections: Record<string, any> | false | null = null,
 	base: boolean = false,
 	refresh: boolean = false
 ) => {
@@ -155,11 +156,16 @@ export const getModels = async (
 	return models;
 };
 
+type ChatMessagePayload = Record<string, unknown>;
+
 type ChatCompletedForm = {
 	model: string;
-	messages: string[];
+	messages: ChatMessagePayload[];
 	chat_id: string;
-	session_id: string;
+	session_id?: string;
+	filter_ids?: string[];
+	model_item?: unknown;
+	id?: string;
 };
 
 export const chatCompleted = async (token: string, body: ChatCompletedForm) => {
@@ -197,8 +203,12 @@ export const chatCompleted = async (token: string, body: ChatCompletedForm) => {
 
 type ChatActionForm = {
 	model: string;
-	messages: string[];
+	messages: ChatMessagePayload[];
 	chat_id: string;
+	session_id?: string;
+	model_item?: unknown;
+	id?: string;
+	event?: unknown;
 };
 
 export const chatAction = async (token: string, action_id: string, body: ChatActionForm) => {
@@ -670,12 +680,12 @@ export const generateTitle = async (
 export const generateFollowUps = async (
 	token: string = '',
 	model: string,
-	messages: string,
+	messages: object[],
 	chat_id?: string
 ) => {
 	let error = null;
 
-	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/tasks/follow_ups/completions`, {
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/tasks/follow_up/completions`, {
 		method: 'POST',
 		headers: {
 			Accept: 'application/json',
@@ -1415,6 +1425,7 @@ export const getVersion = async (token: string) => {
 
 	const res = await fetch(`${WEBUI_BASE_URL}/api/version`, {
 		method: 'GET',
+		cache: 'no-store',
 		headers: {
 			'Content-Type': 'application/json',
 			Authorization: `Bearer ${token}`
@@ -1583,60 +1594,6 @@ export const updateWebhookUrl = async (token: string, url: string) => {
 	return res.url;
 };
 
-export const getCommunitySharingEnabledStatus = async (token: string) => {
-	let error = null;
-
-	const res = await fetch(`${WEBUI_BASE_URL}/api/community_sharing`, {
-		method: 'GET',
-		headers: {
-			'Content-Type': 'application/json',
-			Authorization: `Bearer ${token}`
-		}
-	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
-		.catch((err) => {
-			console.error(err);
-			error = err;
-			return null;
-		});
-
-	if (error) {
-		throw error;
-	}
-
-	return res;
-};
-
-export const toggleCommunitySharingEnabledStatus = async (token: string) => {
-	let error = null;
-
-	const res = await fetch(`${WEBUI_BASE_URL}/api/community_sharing/toggle`, {
-		method: 'GET',
-		headers: {
-			'Content-Type': 'application/json',
-			Authorization: `Bearer ${token}`
-		}
-	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return res.json();
-		})
-		.catch((err) => {
-			console.error(err);
-			error = err.detail;
-			return null;
-		});
-
-	if (error) {
-		throw error;
-	}
-
-	return res;
-};
-
 export const getModelConfig = async (token: string): Promise<GlobalModelConfig> => {
 	let error = null;
 
@@ -1673,10 +1630,14 @@ export interface ModelConfig {
 }
 
 export interface ModelMeta {
-	toolIds: never[];
+	toolIds: string[];
 	description?: string;
 	capabilities?: object;
 	profile_image_url?: string;
+	hidden?: boolean;
+	defaultFeatureIds?: string[];
+	defaultFilterIds?: string[];
+	[key: string]: any;
 }
 
 export interface ModelParams {}

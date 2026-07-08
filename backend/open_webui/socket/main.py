@@ -38,6 +38,7 @@ from open_webui.env import (
     WEBSOCKET_SERVER_LOGGING,
     WEBSOCKET_SERVER_ENGINEIO_LOGGING,
     WEBSOCKET_EVENT_CALLER_TIMEOUT,
+    INSTANCE_ID,
 )
 from open_webui.utils.auth import decode_token
 from open_webui.socket.utils import RedisDict, RedisLock, YdocManager
@@ -101,6 +102,9 @@ else:
 # Timeout duration in seconds
 TIMEOUT_DURATION = 3
 SESSION_POOL_TIMEOUT = 120  # seconds without heartbeat before session is reaped
+SESSION_CLEANUP_RENEW_INTERVAL = max(
+    1, min(SESSION_POOL_TIMEOUT, WEBSOCKET_REDIS_LOCK_TIMEOUT // 2)
+)
 
 # Dictionary to maintain the user pool
 
@@ -183,20 +187,27 @@ async def periodic_session_pool_cleanup():
         return
 
     try:
+        last_cleanup_at = 0
         while True:
             if not session_renew_func():
                 log.error("Unable to renew session cleanup lock. Exiting.")
                 return
 
             now = int(time.time())
-            for sid in list(SESSION_POOL.keys()):
-                entry = SESSION_POOL.get(sid)
-                if entry and now - entry.get("last_seen_at", 0) > SESSION_POOL_TIMEOUT:
-                    log.warning(
-                        f"Reaping orphaned session {sid} (user {entry.get('id')})"
-                    )
-                    del SESSION_POOL[sid]
-            await asyncio.sleep(SESSION_POOL_TIMEOUT)
+            if now - last_cleanup_at >= SESSION_POOL_TIMEOUT:
+                for sid in list(SESSION_POOL.keys()):
+                    entry = SESSION_POOL.get(sid)
+                    if (
+                        entry
+                        and now - entry.get("last_seen_at", 0) > SESSION_POOL_TIMEOUT
+                    ):
+                        log.warning(
+                            f"Reaping orphaned session {sid} (user {entry.get('id')})"
+                        )
+                        del SESSION_POOL[sid]
+                last_cleanup_at = now
+
+            await asyncio.sleep(SESSION_CLEANUP_RENEW_INTERVAL)
     finally:
         session_release_func()
 
@@ -695,7 +706,7 @@ async def yjs_document_update(sid, data):
             await document_save_handler(document_id, data.get("data", {}), user)
 
         if data.get("data"):
-            await create_task(REDIS, debounced_save(), document_id)
+            await create_task(REDIS, debounced_save(), document_id, INSTANCE_ID)
 
     except Exception as e:
         log.error(f"Error in yjs_document_update: {e}")
@@ -776,6 +787,28 @@ async def disconnect(sid):
         # print(f"Unknown session ID {sid} disconnected")
 
 
+def _merge_embed_entries(*groups):
+    merged = []
+    seen = set()
+
+    for group in groups:
+        if isinstance(group, str):
+            items = [group]
+        elif isinstance(group, (list, tuple)):
+            items = group
+        else:
+            continue
+
+        for item in items:
+            normalized = str(item or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append(normalized)
+
+    return merged
+
+
 def get_event_emitter(request_info, update_db=True):
     async def __event_emitter__(event_data):
         user_id = request_info["user_id"]
@@ -847,8 +880,10 @@ def get_event_emitter(request_info, update_db=True):
                     request_info["message_id"],
                 )
 
-                embeds = event_data.get("data", {}).get("embeds", [])
-                embeds.extend(message.get("embeds", []))
+                embeds = _merge_embed_entries(
+                    message.get("embeds", []) if isinstance(message, dict) else [],
+                    event_data.get("data", {}).get("embeds", []),
+                )
 
                 await asyncio.to_thread(
                     Chats.upsert_message_to_chat_by_id_and_message_id,

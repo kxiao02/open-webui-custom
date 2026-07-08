@@ -7,6 +7,7 @@
 
 	const dispatch = createEventDispatcher();
 
+	import { generateFollowUps } from '$lib/apis';
 	import { getChatList } from '$lib/apis/chats';
 	import { updateFolderById } from '$lib/apis/folders';
 
@@ -20,6 +21,10 @@
 		currentChatPage
 	} from '$lib/stores';
 	import { sanitizeResponseContent, extractCurlyBraceWords } from '$lib/utils';
+	import {
+		buildHistoryTitleSuggestions,
+		getHardcodedSuggestionPrompts
+	} from '$lib/utils/historySuggestions';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 
 	import Suggestions from './Suggestions.svelte';
@@ -29,10 +34,11 @@
 	import FolderPlaceholder from './Placeholder/FolderPlaceholder.svelte';
 	import FolderTitle from './Placeholder/FolderTitle.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let createMessagePair: Function;
 	export let stopResponse: Function;
+	export let answerNowResponse: Function = stopResponse;
 
 	export let autoScroll = false;
 
@@ -46,6 +52,7 @@
 	export let messageInput = null;
 
 	export let selectedToolIds = [];
+	export let lockedToolIds = [];
 	export let selectedFilterIds = [];
 
 	export let showCommands = false;
@@ -53,6 +60,8 @@
 	export let imageGenerationEnabled = false;
 	export let codeInterpreterEnabled = false;
 	export let webSearchEnabled = false;
+	export let thinkingModeEnabled = false;
+	export let thinkingModelId: string | null = null;
 
 	export let onUpload: Function = (e) => {};
 	export let onSelect = (e) => {};
@@ -64,12 +73,136 @@
 
 	let models = [];
 	let selectedModelIdx = 0;
+	let historySuggestionPrompts = [];
+	let suggestionPrompts = [];
+
+	const buildHistorySummaryPrompt = (titles: string[]): string => {
+		const items = titles
+			.slice(0, 50)
+			.map((title, index) => `${index + 1}. ${title}`)
+			.join('\n');
+
+		return `以下是我全部历史会话标题。请基于这些标题，生成5条新的、可直接发送给助手的问题建议，优先覆盖近期主题。只输出问题本身。\n\n历史标题：\n${items}`;
+	};
+
+	const toSuggestionPrompts = (
+		items: string[],
+		sourceLabel: string
+	): Array<{ id: string; content: string; title: [string, string] }> => {
+		const seen = new Set<string>();
+		const prompts: Array<{ id: string; content: string; title: [string, string] }> = [];
+
+		for (const item of items) {
+			const text = (item ?? '').trim();
+			const key = text.toLowerCase();
+			if (!text || seen.has(key)) continue;
+			seen.add(key);
+			prompts.push({
+				id: `${sourceLabel}-${prompts.length + 1}-${key.slice(0, 24)}`,
+				content: text,
+				title: [text, sourceLabel]
+			});
+			if (prompts.length >= 8) break;
+		}
+
+		return prompts;
+	};
+
+	const resolveTaskModelIds = (): { thinking: string; fallback: string } => {
+		const availableIds = new Set(($_models ?? []).map((m) => m.id));
+		const preferredThinkingId = (thinkingModelId ?? '').trim();
+
+		if (preferredThinkingId && availableIds.has(preferredThinkingId)) {
+			const fallbackId = preferredThinkingId.endsWith('-thinking')
+				? preferredThinkingId.slice(0, -'-thinking'.length)
+				: preferredThinkingId;
+			return { thinking: preferredThinkingId, fallback: fallbackId || preferredThinkingId };
+		}
+
+		const currentModelId =
+			(atSelectedModel?.id ??
+				models[selectedModelIdx]?.id ??
+				models[0]?.id ??
+				selectedModels[selectedModelIdx] ??
+				selectedModels[0] ??
+				'') || '';
+
+		const normalizedModelId = currentModelId.trim();
+		if (!normalizedModelId) return { thinking: '', fallback: '' };
+
+		if (normalizedModelId.endsWith('-thinking')) {
+			const fallbackId = normalizedModelId.slice(0, -'-thinking'.length);
+			return { thinking: normalizedModelId, fallback: fallbackId || normalizedModelId };
+		}
+
+		const thinkingCandidate = `${normalizedModelId}-thinking`;
+		if (availableIds.has(thinkingCandidate) || !availableIds.size) {
+			return { thinking: thinkingCandidate, fallback: normalizedModelId };
+		}
+
+		return { thinking: thinkingCandidate, fallback: normalizedModelId };
+	};
+
+	const loadHistorySuggestions = async () => {
+		if (!localStorage.token) {
+			historySuggestionPrompts = [];
+			return;
+		}
+
+		try {
+			const allChatTitles = await getChatList(localStorage.token);
+			const baseTitlePrompts = buildHistoryTitleSuggestions(allChatTitles ?? [], 8);
+			historySuggestionPrompts =
+				baseTitlePrompts.length > 0 ? baseTitlePrompts : getHardcodedSuggestionPrompts();
+
+			const historyTitleTexts = buildHistoryTitleSuggestions(allChatTitles ?? [], 50).map(
+				(prompt) => prompt.content
+			);
+			if (historyTitleTexts.length === 0) return;
+
+			const { thinking: thinkingTaskModelId, fallback: fallbackTaskModelId } = resolveTaskModelIds();
+			if (!thinkingTaskModelId) return;
+
+			let generated = await generateFollowUps(localStorage.token, thinkingTaskModelId, [
+				{ role: 'user', content: buildHistorySummaryPrompt(historyTitleTexts) }
+			]).catch(() => []);
+			if (
+				(!Array.isArray(generated) || generated.length === 0) &&
+				fallbackTaskModelId &&
+				fallbackTaskModelId !== thinkingTaskModelId
+			) {
+				generated = await generateFollowUps(localStorage.token, fallbackTaskModelId, [
+					{ role: 'user', content: buildHistorySummaryPrompt(historyTitleTexts) }
+				]).catch(() => []);
+			}
+
+			const generatedPrompts = toSuggestionPrompts(generated ?? [], '历史推荐');
+			if (generatedPrompts.length > 0) {
+				historySuggestionPrompts = generatedPrompts;
+			}
+		} catch (error) {
+			console.error('Failed to load history title suggestions', error);
+			historySuggestionPrompts = getHardcodedSuggestionPrompts();
+		}
+	};
 
 	$: if (selectedModels.length > 0) {
 		selectedModelIdx = models.length - 1;
 	}
 
 	$: models = selectedModels.map((id) => $_models.find((m) => m.id === id));
+
+	onMount(async () => {
+		await loadHistorySuggestions();
+	});
+
+	$: suggestionPrompts =
+		historySuggestionPrompts.length > 0
+			? historySuggestionPrompts
+			: (atSelectedModel?.info?.meta?.suggestion_prompts ??
+				models[selectedModelIdx]?.info?.meta?.suggestion_prompts ??
+				$config?.default_prompt_suggestions ??
+				[]);
 </script>
 
 <div class="m-auto w-full max-w-6xl px-2 @2xl:px-20 translate-y-6 py-24 text-center">
@@ -124,8 +257,14 @@
 										}}
 									>
 										<img
-											src={`${WEBUI_API_BASE_URL}/models/model/profile/image?id=${model?.id}&lang=${$i18n.language}`}
-											class=" size-9 @sm:size-10 rounded-full border-[1px] border-gray-100 dark:border-none"
+											src={`${WEBUI_API_BASE_URL}/models/model/profile/image?id=${model?.id}&lang=${$i18n.language}&theme=light`}
+											class="h-[55px] w-[71px] @sm:h-[59px] @sm:w-[79px] rounded-md object-contain dark:hidden"
+											aria-hidden="true"
+											draggable="false"
+										/>
+										<img
+											src={`${WEBUI_API_BASE_URL}/models/model/profile/image?id=${model?.id}&lang=${$i18n.language}&theme=dark`}
+											class="h-[55px] w-[71px] @sm:h-[59px] @sm:w-[79px] rounded-md object-contain hidden dark:block"
 											aria-hidden="true"
 											draggable="false"
 										/>
@@ -181,17 +320,8 @@
 							{#if models[selectedModelIdx]?.info?.meta?.user}
 								<div class="mt-0.5 text-sm font-normal text-gray-400 dark:text-gray-500">
 									By
-									{#if models[selectedModelIdx]?.info?.meta?.user.community}
-										<a
-											href="https://openwebui.com/m/{models[selectedModelIdx]?.info?.meta?.user
-												.username}"
-											>{models[selectedModelIdx]?.info?.meta?.user.name
-												? models[selectedModelIdx]?.info?.meta?.user.name
-												: `@${models[selectedModelIdx]?.info?.meta?.user.username}`}</a
-										>
-									{:else}
-										{models[selectedModelIdx]?.info?.meta?.user.name}
-									{/if}
+									{models[selectedModelIdx]?.info?.meta?.user.name ??
+										`@${models[selectedModelIdx]?.info?.meta?.user.username}`}
 								</div>
 							{/if}
 						{/if}
@@ -204,19 +334,23 @@
 					bind:this={messageInput}
 					{history}
 					{selectedModels}
+					{thinkingModelId}
 					bind:files
 					bind:prompt
 					bind:autoScroll
 					bind:selectedToolIds
+					{lockedToolIds}
 					bind:selectedFilterIds
 					bind:imageGenerationEnabled
 					bind:codeInterpreterEnabled
 					bind:webSearchEnabled
+					bind:thinkingModeEnabled
 					bind:atSelectedModel
 					bind:showCommands
 					bind:dragged
 					{toolServers}
 					{stopResponse}
+					{answerNowResponse}
 					{createMessagePair}
 					placeholder={$i18n.t('How can I help you today?')}
 					{onChange}
@@ -240,10 +374,7 @@
 		<div class="mx-auto max-w-2xl font-primary mt-2" in:fade={{ duration: 200, delay: 200 }}>
 			<div class="mx-5">
 				<Suggestions
-					suggestionPrompts={atSelectedModel?.info?.meta?.suggestion_prompts ??
-						models[selectedModelIdx]?.info?.meta?.suggestion_prompts ??
-						$config?.default_prompt_suggestions ??
-						[]}
+					{suggestionPrompts}
 					inputValue={prompt}
 					{onSelect}
 				/>

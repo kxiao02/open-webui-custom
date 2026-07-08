@@ -1,8 +1,9 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { onMount, getContext } from 'svelte';
 	import Message from './Message.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let messages = [];
 </script>

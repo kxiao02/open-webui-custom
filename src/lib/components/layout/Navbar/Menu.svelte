@@ -35,7 +35,7 @@
 	import Messages from '$lib/components/chat/Messages.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let shareEnabled: boolean = false;
 
@@ -310,6 +310,21 @@
 				</svg>
 				<div class="flex items-center">{$i18n.t('Settings')}</div>
 			</DropdownMenu.Item> -->
+
+			{#if $mobile && $user?.role === 'admin'}
+				<DropdownMenu.Item
+					class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl select-none w-full"
+					id="chat-controls-button"
+					on:click={async () => {
+						await showControls.set(true);
+						await showArtifacts.set(false);
+						await showEmbeds.set(false);
+					}}
+				>
+					<AdjustmentsHorizontal className=" size-4" strokeWidth="1.5" />
+					<div class="flex items-center">{$i18n.t('Controls')}</div>
+				</DropdownMenu.Item>
+			{/if}
 
 			{#if ($artifactContents ?? []).length > 0}
 				<DropdownMenu.Item

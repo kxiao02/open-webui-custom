@@ -1,3 +1,4 @@
+// @ts-nocheck
 import type { Writable } from 'svelte/store';
 import { v4 as uuidv4 } from 'uuid';
 import sha256 from 'js-sha256';
@@ -49,6 +50,140 @@ export const replaceOutsideCode = (content: string, replacer: (str: string) => s
 		.join('');
 };
 
+// Keep older markdown helpers working after the shared splitter was renamed.
+const processOutsideCodeBlocks = (content: string, replacer: (str: string) => string) => {
+	return replaceOutsideCode(content, replacer);
+};
+
+const PIPE_TABLE_SEPARATOR_CELL_RE = /^:?-{3,}:?$/;
+
+function looksLikePipeTableLine(line: string): boolean {
+	const trimmed = line.trim();
+	return trimmed.startsWith('|') && trimmed.lastIndexOf('|') > 0;
+}
+
+function getPipeTableIndent(line: string): string {
+	return line.match(/^(\s*)\|/)?.[1] ?? '';
+}
+
+function splitPipeTableCells(line: string): string[] {
+	let trimmed = line.trim();
+	if (trimmed.startsWith('|')) {
+		trimmed = trimmed.slice(1);
+	}
+	if (trimmed.endsWith('|')) {
+		trimmed = trimmed.slice(0, -1);
+	}
+
+	const cells: string[] = [];
+	let current = '';
+	let escaped = false;
+
+	for (const char of trimmed) {
+		if (char === '|' && !escaped) {
+			cells.push(current.trim());
+			current = '';
+			continue;
+		}
+
+		current += char;
+		escaped = char === '\\' && !escaped;
+	}
+
+	cells.push(current.trim());
+	return cells;
+}
+
+function isPipeTableSeparatorLine(line: string): boolean {
+	if (!looksLikePipeTableLine(line)) {
+		return false;
+	}
+
+	const cells = splitPipeTableCells(line);
+	return cells.length > 0 && cells.every((cell) => PIPE_TABLE_SEPARATOR_CELL_RE.test(cell));
+}
+
+function formatPipeTableRow(line: string, targetColumnCount: number): string {
+	const cells = splitPipeTableCells(line);
+	while (cells.length < targetColumnCount) {
+		cells.push('');
+	}
+
+	return `${getPipeTableIndent(line)}| ${cells.join(' | ')} |`;
+}
+
+function formatPipeTableSeparator(line: string, targetColumnCount: number): string {
+	const cells = splitPipeTableCells(line).map((cell) => cell.replace(/\s+/g, '') || '---');
+	while (cells.length < targetColumnCount) {
+		cells.push('---');
+	}
+
+	return `${getPipeTableIndent(line)}|${cells.join('|')}|`;
+}
+
+function normalizePipeTableBlocks(content: string): string {
+	return processOutsideCodeBlocks(content, (segment) => {
+		const lines = segment.split('\n');
+		const normalizedLines: string[] = [];
+
+		for (let index = 0; index < lines.length; ) {
+			const headerLine = lines[index];
+			const separatorLine = lines[index + 1];
+
+			if (
+				!headerLine ||
+				!separatorLine ||
+				!looksLikePipeTableLine(headerLine) ||
+				!isPipeTableSeparatorLine(separatorLine)
+			) {
+				normalizedLines.push(headerLine);
+				index += 1;
+				continue;
+			}
+
+			const headerCells = splitPipeTableCells(headerLine);
+			if (headerCells.length < 2) {
+				normalizedLines.push(headerLine);
+				index += 1;
+				continue;
+			}
+
+			normalizedLines.push(formatPipeTableRow(headerLine, headerCells.length));
+			normalizedLines.push(formatPipeTableSeparator(separatorLine, headerCells.length));
+			index += 2;
+
+			while (index < lines.length && looksLikePipeTableLine(lines[index])) {
+				normalizedLines.push(formatPipeTableRow(lines[index], headerCells.length));
+				index += 1;
+			}
+		}
+
+		return normalizedLines.join('\n');
+	});
+}
+
+function normalizeMermaidCodeBlocks(content: string): string {
+	return content
+		.split(/(```[\s\S]*?```|`[\s\S]*?`)/)
+		.map((segment) => {
+			if (!segment.startsWith('```')) {
+				return segment;
+			}
+
+			const match = segment.match(/^```(\s*mermaid[^\n]*)\n([\s\S]*?)```$/i);
+			if (!match) {
+				return segment;
+			}
+
+			const [, fence, body] = match;
+			const hasTrailingNewline = body.endsWith('\n');
+			const diagramBody = hasTrailingNewline ? body.slice(0, -1) : body;
+			const normalizedBody = normalizeMermaidDiagramSource(diagramBody);
+			return `\`\`\`${fence}\n${normalizedBody}${hasTrailingNewline ? '\n' : ''}\`\`\``;
+		})
+		.join('');
+}
+
 export const replaceTokens = (content, char, user) => {
 	const tokens = [
 		{ regex: /{{char}}/gi, replacement: char },
@@ -91,8 +226,155 @@ export const sanitizeResponseContent = (content: string) => {
 
 export const processResponseContent = (content: string) => {
 	content = processChineseContent(content);
+	content = processBareMathContent(content);
+	content = normalizeDetailsTags(content);
+	content = normalizePipeTableBlocks(content);
+	content = normalizeMermaidCodeBlocks(content);
+	content = linkifyRelativeFileDownloadPaths(content);
 	return content.trim();
 };
+
+const RELATIVE_FILE_DOWNLOAD_PATH_RE =
+	/\/(?:api\/)?v1\/files\/[A-Za-z0-9][A-Za-z0-9._-]*\/content(?:\/[^\s)\]]*)?/g;
+
+function collectMarkdownLinkRanges(segment: string): Array<[number, number]> {
+	const ranges: Array<[number, number]> = [];
+	const markdownLinkRe = /!?\[[^\]]*?\]\((?:[^()\\]|\\.)*?\)/g;
+	let match: RegExpExecArray | null = null;
+	while ((match = markdownLinkRe.exec(segment)) !== null) {
+		ranges.push([match.index, match.index + match[0].length]);
+	}
+	return ranges;
+}
+
+function isInsideRanges(index: number, ranges: Array<[number, number]>): boolean {
+	for (const [start, end] of ranges) {
+		if (index >= start && index < end) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function linkifyRelativeFileDownloadPaths(content: string): string {
+	return processOutsideCodeBlocks(content, (segment) => {
+		if (!segment.includes('/v1/files/') && !segment.includes('/api/v1/files/')) {
+			return segment;
+		}
+
+		const linkRanges = collectMarkdownLinkRanges(segment);
+		return segment.replace(
+			RELATIVE_FILE_DOWNLOAD_PATH_RE,
+			(match: string, ...args: Array<string | number>) => {
+				const index = Number(args[args.length - 2] ?? -1);
+				if (index < 0 || isInsideRanges(index, linkRanges)) {
+					return match;
+				}
+				return `[${match}](${match})`;
+			}
+		);
+	});
+}
+
+const BARE_MATH_ALLOWED_RE =
+	/^[A-Za-z0-9_\\{}()[\]\s+\-*/^×÷=<>≤≥≠≈∏∑√∞.,:;'"%|&\p{Script=Greek}]+$/u;
+
+function looksLikeBareMathBody(body: string): boolean {
+	const trimmed = body.trim();
+	if (!trimmed || trimmed.includes('$')) {
+		return false;
+	}
+	if (/https?:\/\//i.test(trimmed)) {
+		return false;
+	}
+	// Avoid wrapping markup/metadata-like lines such as details attributes.
+	if (
+		/[<>]/.test(trimmed) ||
+		/&(?:lt|gt|quot|amp);/i.test(trimmed) ||
+		/\b(?:details|summary|reasoning|tool_calls|code_interpreter|duration|done)\b/i.test(trimmed)
+	) {
+		return false;
+	}
+	if (!trimmed.includes('=')) {
+		return false;
+	}
+
+	const assignmentMatch = trimmed.match(/^([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(\S+)$/);
+	if (assignmentMatch) {
+		const [, lhs, rhs] = assignmentMatch;
+		const looksLikeConfigKey = lhs === lhs.toUpperCase() || lhs.includes('_') || lhs.includes('.');
+		const looksLikePathValue =
+			rhs.startsWith('/') || rhs.startsWith('~/') || rhs.includes('\\') || rhs.includes(':/');
+		if (looksLikeConfigKey && looksLikePathValue) {
+			return false;
+		}
+	}
+
+	// Require at least one math-ish operator/structure to avoid `key=value` false positives.
+	if (!/[+\-*/^×÷∑∏√()]/.test(trimmed)) {
+		return false;
+	}
+
+	const normalized = trimmed.replace(/[。！？!?;；,:：.]$/, '').trim();
+	if (normalized.length < 3 || normalized.length > 180) {
+		return false;
+	}
+	if (!/[A-Za-z_\p{Script=Greek}]/u.test(normalized)) {
+		return false;
+	}
+	if (!BARE_MATH_ALLOWED_RE.test(normalized)) {
+		return false;
+	}
+	// Avoid wrapping regular sentence-like English prose.
+	if (/[A-Za-z]{3,}\s+[A-Za-z]{3,}\s+[A-Za-z]{3,}/.test(normalized)) {
+		return false;
+	}
+	return true;
+}
+
+function wrapBareMathLine(line: string): string {
+	let prefix = '';
+	let body = line;
+
+	const prefixMatch = line.match(/^(\s*(?:[-*+]\s+|\d+\.\s+|>\s+))(.*)$/);
+	if (prefixMatch) {
+		prefix = prefixMatch[1];
+		body = prefixMatch[2];
+	}
+
+	let trailing = '';
+	const trailingMatch = body.match(/^(.*?)([。！？!?;；,:：.])$/);
+	if (trailingMatch) {
+		body = trailingMatch[1];
+		trailing = trailingMatch[2];
+	}
+
+	if (!looksLikeBareMathBody(body)) {
+		return line;
+	}
+
+	return `${prefix}$${body.trim()}$${trailing}`;
+}
+
+function processBareMathContent(content: string): string {
+	return processOutsideCodeBlocks(content, (segment) => {
+		return segment
+			.split('\n')
+			.map((line) => wrapBareMathLine(line))
+			.join('\n');
+	});
+}
+
+function normalizeDetailsTags(content: string): string {
+	return processOutsideCodeBlocks(content, (segment) => {
+		return (
+			segment
+				// Normalize compact/malformed opening tags from streamed chunks.
+				.replace(/<details(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)/gi, '<details ')
+				.replace(/<summary(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)/gi, '<summary ')
+		);
+	});
+}
 
 function isChineseChar(char: string): boolean {
 	return /\p{Script=Han}/u.test(char);
@@ -881,17 +1163,78 @@ export const removeDetails = (content, types) => {
 		for (const type of types) {
 			segment = segment.replace(
 				new RegExp(`<details\\s+type="${type}"[^>]*>.*?<\\/details>`, 'gis'),
-				''
+				'\n\n'
 			);
 		}
-		return segment;
+		return segment.replace(/\n{3,}/g, '\n\n');
 	});
 };
 
 export const removeAllDetails = (content) => {
 	return replaceOutsideCode(content, (segment) => {
-		return segment.replace(/<details[^>]*>.*?<\/details>/gis, '');
+		return segment.replace(/<details[^>]*>.*?<\/details>/gis, '\n\n').replace(/\n{3,}/g, '\n\n');
 	});
+};
+
+const AGENT_CONTROL_BLOCK_REGEX =
+	/<(?:tool_execution|tool_call|analysis|reasoning)\b[^>]*>[\s\S]*?<\/(?:tool_execution|tool_call|analysis|reasoning)>/gi;
+const AGENT_CONTROL_TAG_REGEX = /<\/?(?:tool_execution|tool_call|analysis|reasoning)\b[^>]*\/?>/gi;
+const LEAKED_TOOL_ATTR_LINE_REGEX =
+	/(^|\n)\s*(?:type="tool_calls"|name="[^"\n]*"|tool_id="[^"\n]*"|tool_name="[^"\n]*"|arguments="[^"\n]*"|result="[^"\n]*"|done="(?:true|false)"\s+status="[^"\n]*")[^\n]*(?=\n|$)/gi;
+const LEAKED_TOOL_ATTR_TAIL_REGEX =
+	/\s+(?:name|tool_id|tool_name|arguments|result|done|status)="[^"\n>]*"(?:\s+(?:name|tool_id|tool_name|arguments|result|done|status)="[^"\n>]*")*\s*>/gi;
+const SUMMARY_TAG_REGEX = /<\/?summary\b[^>]*>/gi;
+const MALFORMED_HEADING_REGEX = /(^|\n)(\s*)#{1,6}(?=\S)/g;
+const INLINE_HEADING_MARKER_REGEX = /([。！？!?：:]\s*)#{1,6}(?=\S)/g;
+const STANDALONE_BOLD_LABEL_REGEX =
+	/(^|[\n。！？!?：:]\s*)\*{2,3}([^*\n]{1,120}?[：:])\*{2,3}(?=\s|$)/g;
+const EMPTY_MARKER_LINE_REGEX = /(^|\n)\s*(?:#{1,6}|\*{1,3}|_{1,3})\s*$/g;
+
+export const stripAgentControlMarkup = (content: string) => {
+	if (!content) return '';
+
+	return replaceOutsideCode(content, (segment) => {
+		return segment
+			.replace(AGENT_CONTROL_BLOCK_REGEX, '\n\n')
+			.replace(AGENT_CONTROL_TAG_REGEX, '\n')
+			.replace(SUMMARY_TAG_REGEX, '\n')
+			.replace(/\n{3,}/g, '\n\n');
+	}).trim();
+};
+
+export const normalizeLeakedFormatting = (content: string) => {
+	if (!content) return '';
+
+	return replaceOutsideCode(stripAgentControlMarkup(content), (segment) => {
+		return (
+			segment
+				.replace(STANDALONE_BOLD_LABEL_REGEX, '$1$2')
+				// Remove malformed heading markers such as `##总结` while leaving valid markdown headings intact.
+				.replace(MALFORMED_HEADING_REGEX, '$1$2')
+				.replace(INLINE_HEADING_MARKER_REGEX, '$1')
+				.replace(EMPTY_MARKER_LINE_REGEX, '$1')
+				.replace(/\n{3,}/g, '\n\n')
+		);
+	}).trim();
+};
+
+export const toPlainNotificationText = (content: string) => {
+	if (!content) return '';
+
+	const normalized = normalizeLeakedFormatting(removeAllDetails(content))
+		.replace(LEAKED_TOOL_ATTR_LINE_REGEX, '$1')
+		.replace(LEAKED_TOOL_ATTR_TAIL_REGEX, '')
+		.replace(/<[^>]+>/g, ' ')
+		.replace(/&nbsp;/gi, ' ');
+
+	const plainText = removeFormattings(unescapeHtml(normalized) || normalized);
+
+	return plainText
+		.replace(/[ \t]+\n/g, '\n')
+		.replace(/\n[ \t]+/g, '\n')
+		.replace(/[ \t]{2,}/g, ' ')
+		.replace(/\n{3,}/g, '\n\n')
+		.trim();
 };
 
 export const processDetails = (content) => {
@@ -1146,8 +1489,8 @@ export const getTimeRange = (timestamp) => {
  * @param content {string} - The content string with potential frontmatter.
  * @returns {Object} - The extracted frontmatter as a dictionary.
  */
-export const extractFrontmatter = (content) => {
-	const frontmatter = {};
+export const extractFrontmatter = (content: string): Record<string, string> => {
+	const frontmatter: Record<string, string> = {};
 	let frontmatterStarted = false;
 	let frontmatterEnded = false;
 	const frontmatterPattern = /^\s*([a-z_]+):\s*(.*)\s*$/i;
@@ -1662,23 +2005,181 @@ export const decodeString = (str: string) => {
 	}
 };
 
+const MERMAID_XYCHART_UNQUOTED_LABEL_RE = /^[A-Za-z0-9&+=*._-]+$/;
+
+function isMermaidXYChartDiagram(source: string): boolean {
+	for (const line of source.split('\n')) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith('%%')) {
+			continue;
+		}
+		return /^xychart(?:-beta)?\b/i.test(trimmed);
+	}
+
+	return false;
+}
+
+function splitMermaidXYChartAxisLabels(labels: string): string[] {
+	const parts: string[] = [];
+	let current = '';
+	let quoteChar = '';
+	let escaped = false;
+
+	for (const char of labels) {
+		if (escaped) {
+			current += char;
+			escaped = false;
+			continue;
+		}
+
+		if (quoteChar) {
+			current += char;
+			if (char === '\\') {
+				escaped = true;
+				continue;
+			}
+			if (char === quoteChar) {
+				quoteChar = '';
+			}
+			continue;
+		}
+
+		if (char === '"' || char === "'") {
+			quoteChar = char;
+			current += char;
+			continue;
+		}
+
+		if (char === ',') {
+			parts.push(current);
+			current = '';
+			continue;
+		}
+
+		current += char;
+	}
+
+	parts.push(current);
+	return parts;
+}
+
+function normalizeMermaidXYChartLabel(label: string): string {
+	const trimmed = label.trim();
+	if (!trimmed) {
+		return trimmed;
+	}
+
+	if (
+		(trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+		(trimmed.startsWith("'") && trimmed.endsWith("'"))
+	) {
+		return trimmed;
+	}
+
+	if (MERMAID_XYCHART_UNQUOTED_LABEL_RE.test(trimmed)) {
+		return trimmed;
+	}
+
+	return JSON.stringify(trimmed);
+}
+
+function normalizeMermaidXYChartAxisLine(line: string): string {
+	const match = line.match(/^(\s*x-axis\b[^[]*\[)(.*)(\]\s*(?:%%.*)?)$/i);
+	if (!match) {
+		return line;
+	}
+
+	const [, prefix, rawLabels, suffix] = match;
+	const labels = splitMermaidXYChartAxisLabels(rawLabels);
+	if (!labels.length) {
+		return line;
+	}
+
+	const normalizedLabels = labels.map((label) => normalizeMermaidXYChartLabel(label));
+	const needsNormalization = normalizedLabels.some((label, index) => label !== labels[index].trim());
+
+	return needsNormalization ? `${prefix}${normalizedLabels.join(', ')}${suffix}` : line;
+}
+
+function normalizeMermaidDiagramSource(source: string): string {
+	if (!source.includes('x-axis') || !isMermaidXYChartDiagram(source)) {
+		return source;
+	}
+
+	let changed = false;
+	const normalized = source
+		.split('\n')
+		.map((line) => {
+			const nextLine = normalizeMermaidXYChartAxisLine(line);
+			if (nextLine !== line) {
+				changed = true;
+			}
+			return nextLine;
+		})
+		.join('\n');
+
+	return changed ? normalized : source;
+}
+
+let mermaidInitPromise = null;
+let mermaidInitTheme = null;
+let mermaidRenderQueue = Promise.resolve();
+
 export const initMermaid = async () => {
-	const { default: mermaid } = await import('mermaid');
-	mermaid.initialize({
-		startOnLoad: false, // Should be false when using render API
-		theme: document.documentElement.classList.contains('dark') ? 'dark' : 'default',
-		securityLevel: 'loose'
-	});
-	return mermaid;
+	const theme =
+		typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
+			? 'dark'
+			: 'default';
+
+	if (!mermaidInitPromise || mermaidInitTheme !== theme) {
+		mermaidInitTheme = theme;
+		mermaidInitPromise = import('mermaid').then(({ default: mermaid }) => {
+			mermaid.initialize({
+				startOnLoad: false, // Should be false when using render API
+				theme,
+				securityLevel: 'loose'
+			});
+			return mermaid;
+		});
+	}
+
+	return mermaidInitPromise;
 };
 
 export const renderMermaidDiagram = async (mermaid, code: string) => {
-	const parseResult = await mermaid.parse(code, { suppressErrors: false });
-	if (parseResult) {
-		const { svg } = await mermaid.render(`mermaid-${uuidv4()}`, code);
-		return svg;
+	const source = code?.trim?.() ?? '';
+	if (!source) {
+		return '';
 	}
-	return '';
+
+	const normalizedSource = normalizeMermaidDiagramSource(source);
+
+	const renderSource = async (diagramSource: string) => {
+		const parseResult = await mermaid.parse(diagramSource, { suppressErrors: false });
+		if (parseResult) {
+			const { svg } = await mermaid.render(`mermaid-${uuidv4()}`, diagramSource);
+			return svg;
+		}
+		return '';
+	};
+
+	const renderTask = async () => {
+		try {
+			return await renderSource(source);
+		} catch (error) {
+			if (normalizedSource !== source) {
+				return await renderSource(normalizedSource);
+			}
+			throw error;
+		}
+	};
+
+	const queuedTask = mermaidRenderQueue.then(renderTask, renderTask);
+	mermaidRenderQueue = queuedTask.then(
+		() => undefined,
+		() => undefined
+	);
+	return queuedTask;
 };
 
 export const renderVegaVisualization = async (spec: string, i18n?: any) => {

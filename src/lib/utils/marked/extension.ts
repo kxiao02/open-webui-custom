@@ -1,18 +1,35 @@
 // Helper function to find matching closing tag
 function findMatchingClosingTag(src: string, openTag: string, closeTag: string): number {
+	const lowerSrc = src.toLowerCase();
+	const lowerOpenTag = openTag.toLowerCase();
+	const lowerCloseTag = closeTag.toLowerCase();
+
+	const firstOpenIndex = lowerSrc.indexOf(lowerOpenTag);
+	if (firstOpenIndex === -1) {
+		return -1;
+	}
+
 	let depth = 1;
-	let index = openTag.length;
-	while (depth > 0 && index < src.length) {
-		if (src.startsWith(openTag, index)) {
-			depth++;
-		} else if (src.startsWith(closeTag, index)) {
-			depth--;
+	let index = firstOpenIndex + lowerOpenTag.length;
+
+	while (depth > 0 && index < lowerSrc.length) {
+		const nextOpenIndex = lowerSrc.indexOf(lowerOpenTag, index);
+		const nextCloseIndex = lowerSrc.indexOf(lowerCloseTag, index);
+
+		if (nextCloseIndex === -1) {
+			return -1;
 		}
-		if (depth > 0) {
-			index++;
+
+		if (nextOpenIndex !== -1 && nextOpenIndex < nextCloseIndex) {
+			depth++;
+			index = nextOpenIndex + lowerOpenTag.length;
+		} else {
+			depth--;
+			index = nextCloseIndex + lowerCloseTag.length;
 		}
 	}
-	return depth === 0 ? index + closeTag.length : -1;
+
+	return depth === 0 ? index : -1;
 }
 
 // Function to parse attributes from tag
@@ -27,9 +44,13 @@ function parseAttributes(tag: string): { [key: string]: string } {
 }
 
 function detailsTokenizer(src: string) {
-	// Updated regex to capture attributes inside <details>
-	const detailsRegex = /^<details(\s+[^>]*)?>\n/;
-	const summaryRegex = /^<summary>(.*?)<\/summary>\n/;
+	// Accept common variants:
+	// - `<details ...>\n`
+	// - `<details ...>` (no trailing newline)
+	// - compact malformed tag like `<detailstype="reasoning"...>`
+	const detailsRegex =
+		/^\s*<details(?:(\s+[^>]*)|(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=)([^>]*))?>\s*/i;
+	const summaryRegex = /^<summary>([\s\S]*?)<\/summary>\s*/i;
 
 	const detailsMatch = detailsRegex.exec(src);
 	if (detailsMatch) {
@@ -60,7 +81,7 @@ function detailsTokenizer(src: string) {
 }
 
 function detailsStart(src: string) {
-	return src.match(/^<details>/) ? 0 : -1;
+	return src.match(/^\s*<details(?:\b|(?=[a-zA-Z_:][-a-zA-Z0-9_:.]*=))/i) ? 0 : -1;
 }
 
 function detailsRenderer(token: any) {
@@ -87,8 +108,8 @@ function detailsExtension() {
 	};
 }
 
-export default function (options = {}) {
+export default function () {
 	return {
-		extensions: [detailsExtension(options)]
+		extensions: [detailsExtension()]
 	};
 }

@@ -62,7 +62,7 @@ def migrate_modelfile_to_model(migrator: Migrator, database: pw.Database):
                 "ollama": {"modelfile": modelfile.modelfile.get("content")},
                 "suggestion_prompts": modelfile.modelfile.get("suggestionPrompts"),
                 "categories": modelfile.modelfile.get("categories"),
-                "user": {**modelfile.modelfile.get("user", {}), "community": True},
+                "user": modelfile.modelfile.get("user", {}),
             }
         )
 
@@ -118,7 +118,7 @@ def move_data_back_to_modelfile(migrator: Migrator, database: pw.Database):
             "content": meta.get("ollama", {}).get("modelfile"),
             "suggestionPrompts": meta.get("suggestion_prompts"),
             "categories": meta.get("categories"),
-            "user": {k: v for k, v in meta.get("user", {}).items() if k != "community"},
+            "user": meta.get("user", {}),
         }
 
         # Insert the processed data back into the 'modelfile' table

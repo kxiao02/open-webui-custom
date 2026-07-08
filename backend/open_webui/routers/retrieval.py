@@ -39,7 +39,7 @@ from langchain_core.documents import Document
 from open_webui.models.files import FileModel, FileUpdateForm, Files
 from open_webui.utils.access_control.files import has_access_to_file
 from open_webui.models.knowledge import Knowledges
-from open_webui.storage.provider import Storage
+from open_webui.storage.provider import Storage, cleanup_ephemeral_storage_file
 from open_webui.internal.db import get_session, get_db
 from sqlalchemy.orm import Session
 
@@ -138,9 +138,9 @@ def get_ef(
 ):
     ef = None
     if embedding_model and engine == "":
-        from sentence_transformers import SentenceTransformer
-
         try:
+            from sentence_transformers import SentenceTransformer
+
             ef = SentenceTransformer(
                 get_model_path(embedding_model, auto_update),
                 device=DEVICE_TYPE,
@@ -195,10 +195,10 @@ def get_rf(
                     log.error(f"ExternalReranking: {e}")
                     raise Exception(ERROR_MESSAGES.DEFAULT(e))
             else:
-                import sentence_transformers
-                import torch
-
                 try:
+                    import sentence_transformers
+                    import torch
+
                     rf = sentence_transformers.CrossEncoder(
                         get_model_path(reranking_model, auto_update),
                         device=DEVICE_TYPE,
@@ -236,6 +236,109 @@ def get_rf(
                     log.warning(f"Failed to adjust pad_token_id on CrossEncoder: {e2}")
 
     return rf
+
+
+def _get_retrieval_runtime_signature(app) -> tuple:
+    return (
+        app.state.config.RAG_EMBEDDING_ENGINE,
+        app.state.config.RAG_EMBEDDING_MODEL,
+        app.state.config.RAG_EMBEDDING_FALLBACK_MODEL,
+        app.state.config.RAG_OPENAI_API_BASE_URL,
+        app.state.config.RAG_OPENAI_API_KEY,
+        app.state.config.RAG_OLLAMA_BASE_URL,
+        app.state.config.RAG_OLLAMA_API_KEY,
+        app.state.config.RAG_AZURE_OPENAI_BASE_URL,
+        app.state.config.RAG_AZURE_OPENAI_API_KEY,
+        app.state.config.RAG_AZURE_OPENAI_API_VERSION,
+        app.state.config.RAG_EMBEDDING_BATCH_SIZE,
+        app.state.config.ENABLE_ASYNC_EMBEDDING,
+        app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
+        app.state.config.RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL,
+        app.state.config.ENABLE_RAG_HYBRID_SEARCH,
+        app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL,
+        app.state.config.RAG_RERANKING_ENGINE,
+        app.state.config.RAG_RERANKING_MODEL,
+        app.state.config.RAG_EXTERNAL_RERANKER_URL,
+        app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
+        app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
+    )
+
+
+def initialize_retrieval_runtime(app, force: bool = False):
+    signature = _get_retrieval_runtime_signature(app)
+
+    if (
+        not force
+        and getattr(app.state, "_retrieval_runtime_signature", None) == signature
+        and app.state.EMBEDDING_FUNCTION is not None
+    ):
+        return
+
+    app.state.ef = None
+    app.state.rf = None
+
+    try:
+        app.state.ef = get_ef(
+            app.state.config.RAG_EMBEDDING_ENGINE,
+            app.state.config.RAG_EMBEDDING_MODEL,
+        )
+        if (
+            app.state.config.ENABLE_RAG_HYBRID_SEARCH
+            and not app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
+        ):
+            app.state.rf = get_rf(
+                app.state.config.RAG_RERANKING_ENGINE,
+                app.state.config.RAG_RERANKING_MODEL,
+                app.state.config.RAG_EXTERNAL_RERANKER_URL,
+                app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
+                app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
+            )
+    except Exception as e:
+        log.error(f"Error updating retrieval runtime: {e}")
+
+    app.state.EMBEDDING_FUNCTION = get_embedding_function(
+        app.state.config.RAG_EMBEDDING_ENGINE,
+        app.state.config.RAG_EMBEDDING_MODEL,
+        app.state.ef,
+        (
+            app.state.config.RAG_OPENAI_API_BASE_URL
+            if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else (
+                app.state.config.RAG_OLLAMA_BASE_URL
+                if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
+                else app.state.config.RAG_AZURE_OPENAI_BASE_URL
+            )
+        ),
+        (
+            app.state.config.RAG_OPENAI_API_KEY
+            if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else (
+                app.state.config.RAG_OLLAMA_API_KEY
+                if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
+                else app.state.config.RAG_AZURE_OPENAI_API_KEY
+            )
+        ),
+        app.state.config.RAG_EMBEDDING_BATCH_SIZE,
+        azure_api_version=(
+            app.state.config.RAG_AZURE_OPENAI_API_VERSION
+            if app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
+            else None
+        ),
+        enable_async=app.state.config.ENABLE_ASYNC_EMBEDDING,
+        concurrent_requests=app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
+        fallback_to_local=app.state.config.RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL,
+        fallback_embedding_model=app.state.config.RAG_EMBEDDING_FALLBACK_MODEL,
+    )
+    app.state.RERANKING_FUNCTION = get_reranking_function(
+        app.state.config.RAG_RERANKING_ENGINE,
+        app.state.config.RAG_RERANKING_MODEL,
+        app.state.rf,
+    )
+    app.state._retrieval_runtime_signature = signature
+
+
+def ensure_retrieval_runtime(app):
+    initialize_retrieval_runtime(app)
 
 
 ##########################################
@@ -330,9 +433,8 @@ class EmbeddingModelUpdateForm(BaseModel):
 
 def unload_embedding_model(request: Request):
     if request.app.state.config.RAG_EMBEDDING_ENGINE == "":
-        # unloads current internal embedding model and clears VRAM cache
+        # Unload the currently cached internal embedding model.
         request.app.state.ef = None
-        request.app.state.EMBEDDING_FUNCTION = None
         import gc
 
         gc.collect()
@@ -341,6 +443,9 @@ def unload_embedding_model(request: Request):
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    request.app.state.EMBEDDING_FUNCTION = None
+    request.app.state._retrieval_runtime_signature = None
 
 
 @router.post("/embedding/update")
@@ -396,42 +501,7 @@ async def update_embedding_config(
                     form_data.azure_openai_config.version
                 )
 
-        request.app.state.ef = get_ef(
-            request.app.state.config.RAG_EMBEDDING_ENGINE,
-            request.app.state.config.RAG_EMBEDDING_MODEL,
-        )
-
-        request.app.state.EMBEDDING_FUNCTION = get_embedding_function(
-            request.app.state.config.RAG_EMBEDDING_ENGINE,
-            request.app.state.config.RAG_EMBEDDING_MODEL,
-            request.app.state.ef,
-            (
-                request.app.state.config.RAG_OPENAI_API_BASE_URL
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else (
-                    request.app.state.config.RAG_OLLAMA_BASE_URL
-                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-                    else request.app.state.config.RAG_AZURE_OPENAI_BASE_URL
-                )
-            ),
-            (
-                request.app.state.config.RAG_OPENAI_API_KEY
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else (
-                    request.app.state.config.RAG_OLLAMA_API_KEY
-                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-                    else request.app.state.config.RAG_AZURE_OPENAI_API_KEY
-                )
-            ),
-            request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
-            azure_api_version=(
-                request.app.state.config.RAG_AZURE_OPENAI_API_VERSION
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
-                else None
-            ),
-            enable_async=request.app.state.config.ENABLE_ASYNC_EMBEDDING,
-            concurrent_requests=request.app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
-        )
+        initialize_retrieval_runtime(request.app, force=True)
 
         return {
             "status": True,
@@ -965,6 +1035,7 @@ async def update_rag_config(
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+    request.app.state._retrieval_runtime_signature = None
     request.app.state.config.RAG_RERANKING_ENGINE = (
         form_data.RAG_RERANKING_ENGINE
         if form_data.RAG_RERANKING_ENGINE is not None
@@ -1004,19 +1075,7 @@ async def update_rag_config(
                 request.app.state.config.ENABLE_RAG_HYBRID_SEARCH
                 and not request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
             ):
-                request.app.state.rf = get_rf(
-                    request.app.state.config.RAG_RERANKING_ENGINE,
-                    request.app.state.config.RAG_RERANKING_MODEL,
-                    request.app.state.config.RAG_EXTERNAL_RERANKER_URL,
-                    request.app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
-                    request.app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
-                )
-
-                request.app.state.RERANKING_FUNCTION = get_reranking_function(
-                    request.app.state.config.RAG_RERANKING_ENGINE,
-                    request.app.state.config.RAG_RERANKING_MODEL,
-                    request.app.state.rf,
-                )
+                initialize_retrieval_runtime(request.app, force=True)
         except Exception as e:
             log.error(f"Error loading reranking model: {e}")
             request.app.state.config.ENABLE_RAG_HYBRID_SEARCH = False
@@ -1449,6 +1508,19 @@ def save_docs_to_vector_db(
     add: bool = False,
     user=None,
 ) -> bool:
+    def _run_embedding_generation(awaitable, timeout: Optional[float] = None):
+        main_loop = getattr(request.app.state, "main_loop", None)
+        if isinstance(main_loop, asyncio.AbstractEventLoop) and main_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(awaitable, main_loop)
+            return future.result(timeout=timeout)
+
+        async def _await_with_optional_timeout():
+            if timeout is None:
+                return await awaitable
+            return await asyncio.wait_for(awaitable, timeout=timeout)
+
+        return asyncio.run(_await_with_optional_timeout())
+
     def _get_docs_info(docs: list[Document]) -> str:
         docs_info = set()
 
@@ -1564,6 +1636,7 @@ def save_docs_to_vector_db(
     ]
 
     try:
+        ensure_retrieval_runtime(request.app)
         if VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
             log.info(f"collection {collection_name} already exists")
 
@@ -1577,51 +1650,35 @@ def save_docs_to_vector_db(
                 return True
 
         log.info(f"generating embeddings for {collection_name}")
-        embedding_function = get_embedding_function(
-            request.app.state.config.RAG_EMBEDDING_ENGINE,
-            request.app.state.config.RAG_EMBEDDING_MODEL,
-            request.app.state.ef,
-            (
-                request.app.state.config.RAG_OPENAI_API_BASE_URL
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else (
-                    request.app.state.config.RAG_OLLAMA_BASE_URL
-                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-                    else request.app.state.config.RAG_AZURE_OPENAI_BASE_URL
-                )
-            ),
-            (
-                request.app.state.config.RAG_OPENAI_API_KEY
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else (
-                    request.app.state.config.RAG_OLLAMA_API_KEY
-                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-                    else request.app.state.config.RAG_AZURE_OPENAI_API_KEY
-                )
-            ),
-            request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
-            azure_api_version=(
-                request.app.state.config.RAG_AZURE_OPENAI_API_VERSION
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
-                else None
-            ),
-            enable_async=request.app.state.config.ENABLE_ASYNC_EMBEDDING,
-            concurrent_requests=request.app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
-        )
+        embedding_function = request.app.state.EMBEDDING_FUNCTION
 
-        # Run async embedding in sync context using the main event loop
-        # This allows the main loop to stay responsive to health checks during long operations
+        # Bridge sync file-processing paths into async embedding generation.
+        # Prefer the shared app loop when available, but fall back to a local
+        # event loop for valid runtime paths where the app state has no main_loop.
         embedding_timeout = RAG_EMBEDDING_TIMEOUT
 
-        future = asyncio.run_coroutine_threadsafe(
+        embeddings = _run_embedding_generation(
             embedding_function(
                 list(map(lambda x: x.replace("\n", " "), texts)),
                 prefix=RAG_EMBEDDING_CONTENT_PREFIX,
                 user=user,
             ),
-            request.app.state.main_loop,
+            timeout=embedding_timeout,
         )
-        embeddings = future.result(timeout=embedding_timeout)
+        embedding_engine = (
+            str(request.app.state.config.RAG_EMBEDDING_ENGINE or "").strip() or "local"
+        )
+        embedding_model = str(request.app.state.config.RAG_EMBEDDING_MODEL or "").strip()
+
+        if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+            actual_count = len(embeddings) if isinstance(embeddings, list) else 0
+            raise RuntimeError(
+                f"{embedding_engine} embedding generation failed for model "
+                f"{embedding_model}: provider returned {actual_count} embeddings "
+                f"for {len(texts)} inputs. Check upstream embedding authorization "
+                "and provider configuration."
+            )
+
         log.info(f"embeddings generated {len(embeddings)} for {len(texts)} items")
 
         items = [
@@ -1672,7 +1729,19 @@ def process_file(
         file = Files.get_file_by_id_and_user_id(form_data.file_id, user.id, db=db)
 
     if file:
+        text_content = ""
+        content_hash = None
         try:
+            Files.update_file_data_by_id(
+                file.id,
+                {
+                    "status": "processing",
+                    "error": None,
+                    "retrieval_status": "processing",
+                    "retrieval_error": None,
+                },
+                db=db,
+            )
 
             collection_name = form_data.collection_name
 
@@ -1743,42 +1812,45 @@ def process_file(
                 file_path = file.path
                 if file_path:
                     file_path = Storage.get_file(file_path)
-                    loader = Loader(
-                        engine=request.app.state.config.CONTENT_EXTRACTION_ENGINE,
-                        user=user,
-                        DATALAB_MARKER_API_KEY=request.app.state.config.DATALAB_MARKER_API_KEY,
-                        DATALAB_MARKER_API_BASE_URL=request.app.state.config.DATALAB_MARKER_API_BASE_URL,
-                        DATALAB_MARKER_ADDITIONAL_CONFIG=request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
-                        DATALAB_MARKER_SKIP_CACHE=request.app.state.config.DATALAB_MARKER_SKIP_CACHE,
-                        DATALAB_MARKER_FORCE_OCR=request.app.state.config.DATALAB_MARKER_FORCE_OCR,
-                        DATALAB_MARKER_PAGINATE=request.app.state.config.DATALAB_MARKER_PAGINATE,
-                        DATALAB_MARKER_STRIP_EXISTING_OCR=request.app.state.config.DATALAB_MARKER_STRIP_EXISTING_OCR,
-                        DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION=request.app.state.config.DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION,
-                        DATALAB_MARKER_FORMAT_LINES=request.app.state.config.DATALAB_MARKER_FORMAT_LINES,
-                        DATALAB_MARKER_USE_LLM=request.app.state.config.DATALAB_MARKER_USE_LLM,
-                        DATALAB_MARKER_OUTPUT_FORMAT=request.app.state.config.DATALAB_MARKER_OUTPUT_FORMAT,
-                        EXTERNAL_DOCUMENT_LOADER_URL=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_URL,
-                        EXTERNAL_DOCUMENT_LOADER_API_KEY=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_API_KEY,
-                        TIKA_SERVER_URL=request.app.state.config.TIKA_SERVER_URL,
-                        DOCLING_SERVER_URL=request.app.state.config.DOCLING_SERVER_URL,
-                        DOCLING_API_KEY=request.app.state.config.DOCLING_API_KEY,
-                        DOCLING_PARAMS=request.app.state.config.DOCLING_PARAMS,
-                        PDF_EXTRACT_IMAGES=request.app.state.config.PDF_EXTRACT_IMAGES,
-                        PDF_LOADER_MODE=request.app.state.config.PDF_LOADER_MODE,
-                        DOCUMENT_INTELLIGENCE_ENDPOINT=request.app.state.config.DOCUMENT_INTELLIGENCE_ENDPOINT,
-                        DOCUMENT_INTELLIGENCE_KEY=request.app.state.config.DOCUMENT_INTELLIGENCE_KEY,
-                        DOCUMENT_INTELLIGENCE_MODEL=request.app.state.config.DOCUMENT_INTELLIGENCE_MODEL,
-                        MISTRAL_OCR_API_BASE_URL=request.app.state.config.MISTRAL_OCR_API_BASE_URL,
-                        MISTRAL_OCR_API_KEY=request.app.state.config.MISTRAL_OCR_API_KEY,
-                        MINERU_API_MODE=request.app.state.config.MINERU_API_MODE,
-                        MINERU_API_URL=request.app.state.config.MINERU_API_URL,
-                        MINERU_API_KEY=request.app.state.config.MINERU_API_KEY,
-                        MINERU_API_TIMEOUT=request.app.state.config.MINERU_API_TIMEOUT,
-                        MINERU_PARAMS=request.app.state.config.MINERU_PARAMS,
-                    )
-                    docs = loader.load(
-                        file.filename, file.meta.get("content_type"), file_path
-                    )
+                    try:
+                        loader = Loader(
+                            engine=request.app.state.config.CONTENT_EXTRACTION_ENGINE,
+                            user=user,
+                            DATALAB_MARKER_API_KEY=request.app.state.config.DATALAB_MARKER_API_KEY,
+                            DATALAB_MARKER_API_BASE_URL=request.app.state.config.DATALAB_MARKER_API_BASE_URL,
+                            DATALAB_MARKER_ADDITIONAL_CONFIG=request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
+                            DATALAB_MARKER_SKIP_CACHE=request.app.state.config.DATALAB_MARKER_SKIP_CACHE,
+                            DATALAB_MARKER_FORCE_OCR=request.app.state.config.DATALAB_MARKER_FORCE_OCR,
+                            DATALAB_MARKER_PAGINATE=request.app.state.config.DATALAB_MARKER_PAGINATE,
+                            DATALAB_MARKER_STRIP_EXISTING_OCR=request.app.state.config.DATALAB_MARKER_STRIP_EXISTING_OCR,
+                            DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION=request.app.state.config.DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION,
+                            DATALAB_MARKER_FORMAT_LINES=request.app.state.config.DATALAB_MARKER_FORMAT_LINES,
+                            DATALAB_MARKER_USE_LLM=request.app.state.config.DATALAB_MARKER_USE_LLM,
+                            DATALAB_MARKER_OUTPUT_FORMAT=request.app.state.config.DATALAB_MARKER_OUTPUT_FORMAT,
+                            EXTERNAL_DOCUMENT_LOADER_URL=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_URL,
+                            EXTERNAL_DOCUMENT_LOADER_API_KEY=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_API_KEY,
+                            TIKA_SERVER_URL=request.app.state.config.TIKA_SERVER_URL,
+                            DOCLING_SERVER_URL=request.app.state.config.DOCLING_SERVER_URL,
+                            DOCLING_API_KEY=request.app.state.config.DOCLING_API_KEY,
+                            DOCLING_PARAMS=request.app.state.config.DOCLING_PARAMS,
+                            PDF_EXTRACT_IMAGES=request.app.state.config.PDF_EXTRACT_IMAGES,
+                            PDF_LOADER_MODE=request.app.state.config.PDF_LOADER_MODE,
+                            DOCUMENT_INTELLIGENCE_ENDPOINT=request.app.state.config.DOCUMENT_INTELLIGENCE_ENDPOINT,
+                            DOCUMENT_INTELLIGENCE_KEY=request.app.state.config.DOCUMENT_INTELLIGENCE_KEY,
+                            DOCUMENT_INTELLIGENCE_MODEL=request.app.state.config.DOCUMENT_INTELLIGENCE_MODEL,
+                            MISTRAL_OCR_API_BASE_URL=request.app.state.config.MISTRAL_OCR_API_BASE_URL,
+                            MISTRAL_OCR_API_KEY=request.app.state.config.MISTRAL_OCR_API_KEY,
+                            MINERU_API_MODE=request.app.state.config.MINERU_API_MODE,
+                            MINERU_API_URL=request.app.state.config.MINERU_API_URL,
+                            MINERU_API_KEY=request.app.state.config.MINERU_API_KEY,
+                            MINERU_API_TIMEOUT=request.app.state.config.MINERU_API_TIMEOUT,
+                            MINERU_PARAMS=request.app.state.config.MINERU_PARAMS,
+                        )
+                        docs = loader.load(
+                            file.filename, file.meta.get("content_type"), file_path
+                        )
+                    finally:
+                        cleanup_ephemeral_storage_file(file_path)
 
                     docs = [
                         Document(
@@ -1814,11 +1886,20 @@ def process_file(
                 {"content": text_content},
                 db=db,
             )
-            hash = calculate_sha256_string(text_content)
+            content_hash = calculate_sha256_string(text_content)
 
             if request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL:
-                Files.update_file_data_by_id(file.id, {"status": "completed"}, db=db)
-                Files.update_file_hash_by_id(file.id, hash, db=db)
+                Files.update_file_data_by_id(
+                    file.id,
+                    {
+                        "status": "completed",
+                        "error": None,
+                        "retrieval_status": "skipped",
+                        "retrieval_error": None,
+                    },
+                    db=db,
+                )
+                Files.update_file_hash_by_id(file.id, content_hash, db=db)
                 return {
                     "status": True,
                     "collection_name": None,
@@ -1840,7 +1921,7 @@ def process_file(
                         metadata={
                             "file_id": file.id,
                             "name": file.filename,
-                            "hash": hash,
+                            "hash": content_hash,
                         },
                         add=(True if form_data.collection_name else False),
                         user=user,
@@ -1860,10 +1941,17 @@ def process_file(
 
                             Files.update_file_data_by_id(
                                 file.id,
-                                {"status": "completed"},
+                                {
+                                    "status": "completed",
+                                    "error": None,
+                                    "retrieval_status": "completed",
+                                    "retrieval_error": None,
+                                },
                                 db=session,
                             )
-                            Files.update_file_hash_by_id(file.id, hash, db=session)
+                            Files.update_file_hash_by_id(
+                                file.id, content_hash, db=session
+                            )
 
                             return {
                                 "status": True,
@@ -1879,14 +1967,38 @@ def process_file(
         except Exception as e:
             log.exception(e)
             # Fresh session for error status update.
+            error_detail = str(e.detail) if hasattr(e, "detail") else str(e)
+            content_extracted = bool(str(text_content or "").strip())
+            preserve_completed_status = content_extracted and not form_data.collection_name
             with get_db() as session:
-                Files.update_file_data_by_id(
-                    file.id,
-                    {"status": "failed"},
-                    db=session,
-                )
-                # Clear the hash so the file can be re-uploaded after fixing the issue
-                Files.update_file_hash_by_id(file.id, None, db=session)
+                if preserve_completed_status:
+                    Files.update_file_data_by_id(
+                        file.id,
+                        {
+                            "status": "completed",
+                            "error": None,
+                            "retrieval_status": "failed",
+                            "retrieval_error": error_detail,
+                        },
+                        db=session,
+                    )
+                    if content_hash:
+                        Files.update_file_hash_by_id(
+                            file.id, content_hash, db=session
+                        )
+                else:
+                    Files.update_file_data_by_id(
+                        file.id,
+                        {
+                            "status": "failed",
+                            "error": error_detail,
+                            "retrieval_status": "failed",
+                            "retrieval_error": error_detail,
+                        },
+                        db=session,
+                    )
+                    # Clear the hash so the file can be re-uploaded after fixing the issue
+                    Files.update_file_hash_by_id(file.id, None, db=session)
 
             if "No pandoc was found" in str(e):
                 raise HTTPException(
@@ -2540,6 +2652,7 @@ async def query_doc_handler(
     _validate_collection_access([form_data.collection_name], user)
 
     try:
+        ensure_retrieval_runtime(request.app)
         if request.app.state.config.ENABLE_RAG_HYBRID_SEARCH and (
             form_data.hybrid is None or form_data.hybrid
         ):
@@ -2616,6 +2729,7 @@ async def query_collection_handler(
     _validate_collection_access(form_data.collection_names, user)
 
     try:
+        ensure_retrieval_runtime(request.app)
         if request.app.state.config.ENABLE_RAG_HYBRID_SEARCH and (
             form_data.hybrid is None or form_data.hybrid
         ):
@@ -2744,6 +2858,7 @@ if ENV == "dev":
 
     @router.get("/ef/{text}")
     async def get_embeddings(request: Request, text: Optional[str] = "Hello World!"):
+        ensure_retrieval_runtime(request.app)
         return {
             "result": await request.app.state.EMBEDDING_FUNCTION(
                 text, prefix=RAG_EMBEDDING_QUERY_PREFIX

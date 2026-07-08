@@ -27,6 +27,7 @@
 		type FileEntry
 	} from '$lib/apis/terminal';
 	import { isCodeFile } from '$lib/utils/codeHighlight';
+	import { isMarkdownPreviewPath } from '$lib/utils/markdownPreview';
 	import Folder from '../icons/Folder.svelte';
 	import Document from '../icons/Document.svelte';
 	import PenAlt from '../icons/PenAlt.svelte';
@@ -41,7 +42,7 @@
 	import PortList from './FileNav/PortList.svelte';
 	import XTerminal from './XTerminal.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let onAttach: ((blob: Blob, name: string, contentType: string) => void) | null = null;
 	export let overlay = false;
@@ -111,13 +112,12 @@
 	let showRaw = false;
 	let saving = false;
 
-	const MD_EXTS = new Set(['md', 'markdown', 'mdx']);
 	const CSV_EXTS = new Set(['csv', 'tsv']);
 	const HTML_EXTS = new Set(['html', 'htm']);
 	const OFFICE_EXTS = new Set(['docx', 'xlsx', 'pptx']);
 	const getFileExt = (path: string | null) => path?.split('.').pop()?.toLowerCase() ?? '';
 
-	$: isMarkdown = MD_EXTS.has(getFileExt(selectedFile));
+	$: isMarkdown = isMarkdownPreviewPath(selectedFile);
 	$: isCsv = CSV_EXTS.has(getFileExt(selectedFile));
 	$: isHtml = HTML_EXTS.has(getFileExt(selectedFile));
 	$: isJson = ['json', 'jsonc', 'jsonl', 'json5'].includes(getFileExt(selectedFile));

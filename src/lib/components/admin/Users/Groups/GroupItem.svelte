@@ -3,7 +3,7 @@
 	import { onMount, getContext } from 'svelte';
 	import { page } from '$app/stores';
 
-	const i18n = getContext('i18n');
+	const i18n = /** @type {import('$lib/i18n').I18nStore} */ (getContext('i18n'));
 
 	import { deleteGroupById, updateGroupById } from '$lib/apis/groups';
 

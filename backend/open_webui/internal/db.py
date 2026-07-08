@@ -2,6 +2,7 @@ import os
 import json
 import logging
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Optional
 
 from open_webui.internal.wrappers import register_connection
@@ -14,7 +15,6 @@ from open_webui.env import (
     DATABASE_POOL_SIZE,
     DATABASE_POOL_TIMEOUT,
     DATABASE_ENABLE_SQLITE_WAL,
-    DATABASE_ENABLE_SESSION_SHARING,
     ENABLE_DB_MIGRATIONS,
 )
 from peewee_migrate import Router
@@ -53,11 +53,41 @@ class JSONField(types.TypeDecorator):
 # Workaround to handle the peewee migration
 # This is required to ensure the peewee migration is handled before the alembic migration
 def handle_peewee_migration(DATABASE_URL):
-    # db = None
+    db = None
     try:
         # Replace the postgresql:// with postgres:// to handle the peewee migration
         db = register_connection(DATABASE_URL.replace("postgresql://", "postgres://"))
         migrate_dir = OPEN_WEBUI_DIR / "internal" / "migrations"
+
+        # This fork already uses Alembic for the current PostgreSQL schema. If the
+        # legacy peewee migration history is only partially populated, rerunning the
+        # remaining peewee migrations collides with columns/indexes that Alembic has
+        # already created. In that case, mark the legacy migrations as applied and
+        # let Alembic remain the source of truth.
+        tables = set(db.get_tables())
+        if "alembic_version" in tables and "migratehistory" in tables:
+            applied_rows = db.execute_sql("SELECT name FROM migratehistory").fetchall()
+            applied = {row[0] for row in applied_rows}
+            migration_names = sorted(
+                path.stem
+                for path in Path(migrate_dir).glob("*.py")
+                if path.is_file() and path.name != "__init__.py"
+            )
+            pending = [name for name in migration_names if name not in applied]
+            if pending:
+                log.warning(
+                    "Alembic-managed schema detected with incomplete peewee migration "
+                    f"history; marking legacy migrations as applied: {pending}"
+                )
+                for name in pending:
+                    db.execute_sql(
+                        "INSERT INTO migratehistory (name, migrated_at) VALUES (%s, NOW())",
+                        (name,),
+                    )
+                db.commit()
+                db.close()
+                return
+
         router = Router(db, logger=log, migrate_dir=migrate_dir)
         router.run()
         db.close()
@@ -74,7 +104,8 @@ def handle_peewee_migration(DATABASE_URL):
             db.close()
 
         # Assert if db connection has been closed
-        assert db.is_closed(), "Database connection is still open."
+        if db is not None:
+            assert db.is_closed(), "Database connection is still open."
 
 
 if ENABLE_DB_MIGRATIONS:
@@ -184,7 +215,7 @@ get_db = contextmanager(get_session)
 
 @contextmanager
 def get_db_context(db: Optional[Session] = None):
-    if isinstance(db, Session) and DATABASE_ENABLE_SESSION_SHARING:
+    if isinstance(db, Session):
         yield db
     else:
         with get_db() as session:

@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import json
 import logging
+import hashlib
+import datetime
 from typing import Optional
+from email.utils import formatdate, parsedate_to_datetime
 from sqlalchemy.orm import Session
-import asyncio
-from fastapi.responses import StreamingResponse
 
 
 from open_webui.utils.misc import get_message_list
@@ -17,11 +20,6 @@ from open_webui.models.chats import (
     Chats,
     ChatTitleIdResponse,
     SharedChatResponse,
-    ChatStatsExport,
-    AggregateChatStats,
-    ChatBody,
-    ChatHistoryStats,
-    MessageStats,
 )
 from open_webui.models.tags import TagModel, Tags
 from open_webui.models.folders import Folders
@@ -29,7 +27,7 @@ from open_webui.internal.db import get_session
 
 from open_webui.config import ENABLE_ADMIN_CHAT_ACCESS, ENABLE_ADMIN_EXPORT
 from open_webui.constants import ERROR_MESSAGES
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 
 
@@ -40,6 +38,127 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+DEFAULT_CHAT_TAIL_MESSAGES = 50
+
+
+def _normalize_etag(tag: str) -> str:
+    tag = (tag or "").strip()
+    if tag.startswith("W/"):
+        tag = tag[2:].strip()
+    return tag
+
+
+def _if_none_match_matches(request: Request, etag: str) -> bool:
+    inm = request.headers.get("if-none-match")
+    if not inm:
+        return False
+    inm = inm.strip()
+    if inm == "*":
+        return True
+    normalized_target = _normalize_etag(etag)
+    for candidate in inm.split(","):
+        if _normalize_etag(candidate) == normalized_target:
+            return True
+    return False
+
+
+def _is_not_modified(
+    request: Request, etag: Optional[str], last_modified_ts: Optional[int]
+) -> bool:
+    if etag and request.headers.get("if-none-match"):
+        return _if_none_match_matches(request, etag)
+    return _if_modified_since_matches(request, last_modified_ts)
+
+
+def _if_modified_since_matches(request: Request, last_modified_ts: Optional[int]) -> bool:
+    if not last_modified_ts:
+        return False
+    ims = request.headers.get("if-modified-since")
+    if not ims:
+        return False
+    try:
+        ims_dt = parsedate_to_datetime(ims)
+    except (TypeError, ValueError):
+        return False
+    if ims_dt.tzinfo is None:
+        ims_dt = ims_dt.replace(tzinfo=datetime.timezone.utc)
+    last_dt = datetime.datetime.fromtimestamp(
+        last_modified_ts, tz=datetime.timezone.utc
+    )
+    return last_dt <= ims_dt
+
+
+def _apply_private_cache_headers(
+    response: Response,
+    etag: Optional[str],
+    last_modified_ts: Optional[int],
+) -> None:
+    response.headers["Cache-Control"] = "private, must-revalidate"
+    existing_vary = response.headers.get("Vary")
+    if existing_vary:
+        if "Authorization" not in existing_vary:
+            response.headers["Vary"] = f"{existing_vary}, Authorization"
+    else:
+        response.headers["Vary"] = "Authorization"
+    if etag:
+        response.headers["ETag"] = etag
+    if last_modified_ts:
+        response.headers["Last-Modified"] = formatdate(
+            last_modified_ts, usegmt=True
+        )
+
+
+def _build_chat_list_etag(
+    user_id: str,
+    page: Optional[int],
+    include_pinned: bool,
+    include_folders: bool,
+    items: list,
+) -> str:
+    normalized_items = []
+    for item in items:
+        if isinstance(item, dict):
+            normalized_items.append(
+                {
+                    "id": item.get("id"),
+                    "updated_at": item.get("updated_at"),
+                    "title": item.get("title"),
+                }
+            )
+        else:
+            normalized_items.append(
+                {
+                    "id": getattr(item, "id", None),
+                    "updated_at": getattr(item, "updated_at", None),
+                    "title": getattr(item, "title", None),
+                }
+            )
+    payload = {
+        "user_id": user_id,
+        "page": page,
+        "include_pinned": include_pinned,
+        "include_folders": include_folders,
+        "items": normalized_items,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f'W/"{digest}"'
+
+
+def _max_updated_at(items: list) -> Optional[int]:
+    max_ts: Optional[int] = None
+    for item in items:
+        if isinstance(item, dict):
+            ts = item.get("updated_at")
+        else:
+            ts = getattr(item, "updated_at", None)
+        if isinstance(ts, (int, float)):
+            ts_int = int(ts)
+            if max_ts is None or ts_int > max_ts:
+                max_ts = ts_int
+    return max_ts
+
 ############################
 # GetChatList
 ############################
@@ -48,6 +167,8 @@ router = APIRouter()
 @router.get("/", response_model=list[ChatTitleIdResponse])
 @router.get("/list", response_model=list[ChatTitleIdResponse])
 def get_session_user_chat_list(
+    request: Request,
+    response: Response,
     user=Depends(get_verified_user),
     page: Optional[int] = None,
     include_pinned: Optional[bool] = False,
@@ -59,7 +180,7 @@ def get_session_user_chat_list(
             limit = 60
             skip = (page - 1) * limit
 
-            return Chats.get_chat_title_id_list_by_user_id(
+            chats = Chats.get_chat_title_id_list_by_user_id(
                 user.id,
                 include_folders=include_folders,
                 include_pinned=include_pinned,
@@ -68,12 +189,29 @@ def get_session_user_chat_list(
                 db=db,
             )
         else:
-            return Chats.get_chat_title_id_list_by_user_id(
+            chats = Chats.get_chat_title_id_list_by_user_id(
                 user.id,
                 include_folders=include_folders,
                 include_pinned=include_pinned,
                 db=db,
             )
+
+        etag = _build_chat_list_etag(
+            user_id=str(user.id),
+            page=page,
+            include_pinned=bool(include_pinned),
+            include_folders=bool(include_folders),
+            items=chats,
+        )
+        last_modified = _max_updated_at(chats)
+
+        if _is_not_modified(request, etag, last_modified):
+            response_304 = Response(status_code=status.HTTP_304_NOT_MODIFIED)
+            _apply_private_cache_headers(response_304, etag, last_modified)
+            return response_304
+
+        _apply_private_cache_headers(response, etag, last_modified)
+        return chats
     except Exception as e:
         log.exception(e)
         raise HTTPException(
@@ -203,325 +341,6 @@ def get_session_user_chat_usage_stats(
 
     except Exception as e:
         log.exception(e)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT()
-        )
-
-
-############################
-# GetChatStatsExport
-############################
-
-
-CHAT_EXPORT_PAGE_ITEM_COUNT = 10
-
-
-class ChatStatsExportList(BaseModel):
-    type: str = "chats"
-    items: list[ChatStatsExport]
-    total: int
-    page: int
-
-
-def _process_chat_for_export(chat) -> Optional[ChatStatsExport]:
-    try:
-
-        def get_message_content_length(message):
-            content = message.get("content", "")
-            if isinstance(content, str):
-                return len(content)
-            elif isinstance(content, list):
-                return sum(
-                    len(item.get("text", ""))
-                    for item in content
-                    if item.get("type") == "text"
-                )
-            return 0
-
-        messages_map = chat.chat.get("history", {}).get("messages", {})
-        message_id = chat.chat.get("history", {}).get("currentId")
-
-        history_models = {}
-        history_message_count = len(messages_map)
-        history_user_messages = []
-        history_assistant_messages = []
-
-        export_messages = {}
-        for key, message in messages_map.items():
-            try:
-                content_length = get_message_content_length(message)
-
-                # Extract rating safely
-                rating = message.get("annotation", {}).get("rating")
-                tags = message.get("annotation", {}).get("tags")
-
-                message_stat = MessageStats(
-                    id=message.get("id"),
-                    role=message.get("role"),
-                    model=message.get("model"),
-                    timestamp=message.get("timestamp"),
-                    content_length=content_length,
-                    token_count=None,  # Populate if available, e.g. message.get("info", {}).get("token_count")
-                    rating=rating,
-                    tags=tags,
-                )
-
-                export_messages[key] = message_stat
-
-                # --- Aggregation Logic (copied/adapted from usage stats) ---
-                role = message.get("role", "")
-                if role == "user":
-                    history_user_messages.append(message)
-                elif role == "assistant":
-                    history_assistant_messages.append(message)
-                    model = message.get("model")
-                    if model:
-                        if model not in history_models:
-                            history_models[model] = 0
-                        history_models[model] += 1
-            except Exception as e:
-                log.debug(f"Error processing message {key}: {e}")
-                continue
-
-        # Calculate Averages
-        average_user_message_content_length = (
-            sum(get_message_content_length(m) for m in history_user_messages)
-            / len(history_user_messages)
-            if history_user_messages
-            else 0
-        )
-
-        average_assistant_message_content_length = (
-            sum(get_message_content_length(m) for m in history_assistant_messages)
-            / len(history_assistant_messages)
-            if history_assistant_messages
-            else 0
-        )
-
-        # Response Times
-        response_times = []
-        for message in history_assistant_messages:
-            user_message_id = message.get("parentId", None)
-            if user_message_id and user_message_id in messages_map:
-                user_message = messages_map[user_message_id]
-                # Ensure timestamps exist
-                t1 = message.get("timestamp")
-                t0 = user_message.get("timestamp")
-                if t1 and t0:
-                    response_times.append(t1 - t0)
-
-        average_response_time = (
-            sum(response_times) / len(response_times) if response_times else 0
-        )
-
-        # Current Message List Logic (Main path)
-        message_list = get_message_list(messages_map, message_id)
-        message_count = len(message_list)
-        models = {}
-        for message in reversed(message_list):
-            if message.get("role") == "assistant":
-                model = message.get("model")
-                if model:
-                    if model not in models:
-                        models[model] = 0
-                    models[model] += 1
-
-        # Construct Aggregate Stats
-        stats = AggregateChatStats(
-            average_response_time=average_response_time,
-            average_user_message_content_length=average_user_message_content_length,
-            average_assistant_message_content_length=average_assistant_message_content_length,
-            models=models,
-            message_count=message_count,
-            history_models=history_models,
-            history_message_count=history_message_count,
-            history_user_message_count=len(history_user_messages),
-            history_assistant_message_count=len(history_assistant_messages),
-        )
-
-        # Construct Chat Body
-        chat_body = ChatBody(
-            history=ChatHistoryStats(messages=export_messages, currentId=message_id)
-        )
-
-        return ChatStatsExport(
-            id=chat.id,
-            user_id=chat.user_id,
-            created_at=chat.created_at,
-            updated_at=chat.updated_at,
-            tags=chat.meta.get("tags", []),
-            stats=stats,
-            chat=chat_body,
-        )
-    except Exception as e:
-        log.exception(f"Error exporting stats for chat {chat.id}: {e}")
-        return None
-
-
-def calculate_chat_stats(user_id, skip=0, limit=10, filter=None):
-    if filter is None:
-        filter = {}
-
-    result = Chats.get_chats_by_user_id(
-        user_id,
-        skip=skip,
-        limit=limit,
-        filter=filter,
-    )
-
-    chat_stats_export_list = []
-    for chat in result.items:
-        chat_stat = _process_chat_for_export(chat)
-        if chat_stat:
-            chat_stats_export_list.append(chat_stat)
-
-    return chat_stats_export_list, result.total
-
-
-def generate_chat_stats_jsonl_generator(user_id, filter):
-    """
-    Synchronous generator for streaming chat stats export.
-
-    NOTE: We intentionally do NOT pass a shared db session here. Instead, we let
-    each batch create its own short-lived session via get_db_context(None).
-    This is critical for SQLite in low-resource environments because:
-    1. SQLite uses file-level locking
-    2. Holding a session open for the entire streaming duration blocks other requests
-    3. Short-lived sessions release locks between batches, allowing other operations
-    """
-    skip = 0
-    limit = CHAT_EXPORT_PAGE_ITEM_COUNT
-
-    while True:
-        # Each batch gets its own session that closes after the query
-        result = Chats.get_chats_by_user_id(
-            user_id,
-            filter=filter,
-            skip=skip,
-            limit=limit,
-            db=None,  # Let get_db_context create a fresh session per batch
-        )
-        if not result.items:
-            break
-
-        for chat in result.items:
-            try:
-                chat_stat = _process_chat_for_export(chat)
-                if chat_stat:
-                    yield chat_stat.model_dump_json() + "\n"
-            except Exception as e:
-                log.exception(f"Error processing chat {chat.id}: {e}")
-
-        skip += limit
-
-
-@router.get("/stats/export", response_model=ChatStatsExportList)
-async def export_chat_stats(
-    request: Request,
-    updated_at: Optional[int] = None,
-    page: Optional[int] = 1,
-    stream: bool = False,
-    user=Depends(get_verified_user),
-):
-    # Check if the user has permission to share/export chats
-    if (user.role != "admin") and (
-        not request.app.state.config.ENABLE_COMMUNITY_SHARING
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-        )
-
-    try:
-        # Fetch chats with date filtering
-        filter = {"order_by": "updated_at", "direction": "asc"}
-
-        if updated_at:
-            filter["updated_at"] = updated_at
-
-        if stream:
-            return StreamingResponse(
-                generate_chat_stats_jsonl_generator(user.id, filter),
-                media_type="application/x-ndjson",
-                headers={
-                    "Content-Disposition": f"attachment; filename=chat-stats-export-{user.id}.jsonl"
-                },
-            )
-        else:
-            limit = CHAT_EXPORT_PAGE_ITEM_COUNT
-            skip = (page - 1) * limit
-
-            chat_stats_export_list, total = await asyncio.to_thread(
-                calculate_chat_stats, user.id, skip, limit, filter
-            )
-
-            return ChatStatsExportList(
-                items=chat_stats_export_list, total=total, page=page
-            )
-
-    except Exception as e:
-        log.debug(f"Error exporting chat stats: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT()
-        )
-
-
-############################
-# GetSingleChatStatsExport
-############################
-
-
-@router.get("/stats/export/{chat_id}", response_model=Optional[ChatStatsExport])
-async def export_single_chat_stats(
-    request: Request,
-    chat_id: str,
-    user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
-):
-    """
-    Export stats for exactly one chat by ID.
-    Returns ChatStatsExport for the specified chat.
-    """
-    # Check if the user has permission to share/export chats
-    if (user.role != "admin") and (
-        not request.app.state.config.ENABLE_COMMUNITY_SHARING
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-        )
-
-    try:
-        chat = Chats.get_chat_by_id(chat_id, db=db)
-
-        if not chat:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=ERROR_MESSAGES.NOT_FOUND,
-            )
-
-        # Verify the chat belongs to the user (unless admin)
-        if chat.user_id != user.id and user.role != "admin":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-            )
-
-        # Process the chat for export
-        chat_stats = await asyncio.to_thread(_process_chat_for_export, chat)
-
-        if not chat_stats:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to process chat stats",
-            )
-
-        return chat_stats
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.debug(f"Error exporting single chat stats: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT()
         )
@@ -952,17 +771,74 @@ async def get_user_chat_list_by_tag_name(
 
 @router.get("/{id}", response_model=Optional[ChatResponse])
 async def get_chat_by_id(
-    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+    request: Request,
+    response: Response,
+    id: str,
+    recent_only: bool = False,
+    tail: Optional[int] = None,
+    include_full_history: bool = True,
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
 ):
-    chat = Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
+    include_history_meta = recent_only or tail is not None or not include_full_history
+
+    effective_tail: Optional[int] = None
+    if tail is not None and tail > 0:
+        effective_tail = tail
+    elif recent_only or not include_full_history:
+        effective_tail = DEFAULT_CHAT_TAIL_MESSAGES
+
+    if effective_tail is not None:
+        chat = Chats.get_chat_by_id_and_user_id(
+            id, user.id, history_tail=effective_tail, db=db
+        )
+    else:
+        chat = Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
 
     if chat:
-        return ChatResponse(**chat.model_dump())
+        last_modified = chat.updated_at if isinstance(chat.updated_at, int) else None
+        etag_payload = {
+            "user_id": str(user.id),
+            "chat_id": str(chat.id),
+            "updated_at": chat.updated_at,
+            "recent_only": bool(recent_only),
+            "include_full_history": bool(include_full_history),
+            "tail": effective_tail,
+            "include_history_meta": bool(include_history_meta),
+        }
+        etag = f'W/"{hashlib.sha256(json.dumps(etag_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()}"'
 
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND
-        )
+        if _is_not_modified(request, etag, last_modified):
+            response_304 = Response(status_code=status.HTTP_304_NOT_MODIFIED)
+            _apply_private_cache_headers(response_304, etag, last_modified)
+            return response_304
+
+        payload = chat.model_dump()
+
+        if include_history_meta and effective_tail is None:
+            history_meta: dict = {}
+            chat_payload = payload.get("chat")
+            if isinstance(chat_payload, dict):
+                history = chat_payload.get("history")
+                if isinstance(history, dict):
+                    messages = history.get("messages")
+                    total_messages = len(messages) if isinstance(messages, dict) else 0
+                    history_meta = {
+                        "total": total_messages,
+                        "truncated": False,
+                        "can_load_more": False,
+                    }
+
+            if history_meta:
+                payload_meta = payload.get("meta") or {}
+                payload["meta"] = {**payload_meta, "history": history_meta}
+
+        _apply_private_cache_headers(response, etag, last_modified)
+        return ChatResponse(**payload)
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND
+    )
 
 
 ############################
@@ -989,11 +865,40 @@ async def update_chat_by_id(
         )
 
 
+@router.post("/{id}/session/capabilities", response_model=Optional[ChatResponse])
+async def update_chat_session_capabilities_by_id(
+    id: str,
+    form_data: ChatSessionCapabilitiesForm,
+    user=Depends(get_verified_user),
+    db: Session = Depends(get_session),
+):
+    chat = Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
+    if not chat:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    meta_updates = {}
+    if form_data.tool_ids is not None:
+        meta_updates["session_tool_ids"] = list(dict.fromkeys(form_data.tool_ids))
+    if form_data.skill_ids is not None:
+        meta_updates["session_skill_ids"] = list(dict.fromkeys(form_data.skill_ids))
+
+    chat = Chats.update_chat_meta_by_id(id, meta_updates, db=db)
+    return ChatResponse(**chat.model_dump())
+
+
 ############################
 # UpdateChatMessageById
 ############################
 class MessageForm(BaseModel):
     content: str
+
+
+class ChatSessionCapabilitiesForm(BaseModel):
+    tool_ids: Optional[list[str]] = None
+    skill_ids: Optional[list[str]] = None
 
 
 @router.post("/{id}/messages/{message_id}", response_model=Optional[ChatResponse])

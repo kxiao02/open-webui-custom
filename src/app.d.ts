@@ -1,6 +1,9 @@
 // See https://kit.svelte.dev/docs/types#app
 // for information about these interfaces
 declare global {
+	const APP_VERSION: string;
+	const APP_BUILD_HASH: string;
+
 	namespace App {
 		// interface Error {}
 		// interface Locals {}
@@ -8,5 +11,8 @@ declare global {
 		// interface Platform {}
 	}
 }
+
+declare module 'file-saver';
+declare module 'uuid';
 
 export {};

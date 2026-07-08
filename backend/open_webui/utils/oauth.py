@@ -33,6 +33,7 @@ from open_webui.models.users import Users
 
 
 from open_webui.models.groups import Groups, GroupModel, GroupUpdateForm, GroupForm
+from open_webui.internal.db import get_db_context
 from open_webui.config import (
     DEFAULT_USER_ROLE,
     ENABLE_OAUTH_SIGNUP,
@@ -86,6 +87,28 @@ from mcp.shared.auth import (
 )
 
 from authlib.oauth2.rfc6749.errors import OAuth2Error
+
+
+def _get_nested_value(data: dict, path: str):
+    if not data or not path:
+        return None
+    current = data
+    for key in path.split("."):
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+        else:
+            return None
+    return current
+
+
+def _get_first_nested_value(data: dict, paths: list[str]):
+    for path in paths:
+        value = _get_nested_value(data, path) or data.get(path)
+        if isinstance(value, str):
+            value = value.strip()
+        if value:
+            return value
+    return None
 
 
 class OAuthClientMetadata(MCPOAuthClientMetadata):
@@ -958,6 +981,111 @@ class OAuthManager:
             client = provider_config["register"](self.oauth)
             self._clients[name] = client
 
+    def _get_enterprise_config(self, provider_name: str) -> Optional[dict]:
+        provider_cfg = OAUTH_PROVIDERS.get(provider_name, {})
+        enterprise_cfg = provider_cfg.get("enterprise")
+        return enterprise_cfg if enterprise_cfg else None
+
+    def _build_enterprise_authorize_url(
+        self, enterprise_cfg: dict, state: Optional[str] = None
+    ) -> str:
+        params = {
+            "client_id": enterprise_cfg.get("client_id"),
+            "response_type": "code",
+            enterprise_cfg.get("authorize_redirect_param", "redirect_uri"): enterprise_cfg.get(
+                "redirect_uri"
+            ),
+        }
+        if state:
+            params["state"] = state
+
+        authorize_url = enterprise_cfg.get("authorize_url", "")
+        parsed = urllib.parse.urlparse(authorize_url)
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        query.update({k: v for k, v in params.items() if v})
+        new_query = urllib.parse.urlencode(query)
+        return urllib.parse.urlunparse(
+            parsed._replace(query=new_query)
+        )
+
+    async def _enterprise_request_token(self, enterprise_cfg: dict, params: dict) -> dict:
+        token_url = enterprise_cfg.get("token_url")
+        if not token_url:
+            raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            async with session.post(
+                token_url,
+                params=params,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    log.warning(
+                        f"Enterprise token exchange failed: {resp.status} - {error_text}"
+                    )
+                    raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+                return await resp.json(content_type=None)
+
+    async def _enterprise_fetch_profile(self, enterprise_cfg: dict, access_token: str):
+        profile_url = enterprise_cfg.get("profile_url")
+        if not profile_url:
+            raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            async with session.get(
+                profile_url,
+                params={"access_token": access_token},
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    log.warning(
+                        f"Enterprise profile request failed: {resp.status} - {error_text}"
+                    )
+                    raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+                return await resp.json(content_type=None)
+
+    async def enterprise_check_token(self, provider: str, access_token: str) -> bool:
+        enterprise_cfg = self._get_enterprise_config(provider)
+        if not enterprise_cfg:
+            return False
+
+        check_url = enterprise_cfg.get("check_token_url")
+        if not check_url:
+            return False
+
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            async with session.get(
+                check_url,
+                headers={"accesstoken": access_token},
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json(content_type=None)
+                return str(data.get("errorCode", "")) == "0"
+
+    async def enterprise_revoke_token(self, provider: str, access_token: str) -> bool:
+        enterprise_cfg = self._get_enterprise_config(provider)
+        if not enterprise_cfg:
+            return False
+
+        logout_url = enterprise_cfg.get("logout_url")
+        if not logout_url:
+            return False
+
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            async with session.post(
+                logout_url,
+                params={"accessToken": access_token},
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json(content_type=None)
+                return str(data.get("errorCode", "")) == "0"
+
     def get_client(self, provider_name):
         if provider_name not in self._clients:
             self._clients[provider_name] = self.oauth.create_client(provider_name)
@@ -995,6 +1123,17 @@ class OAuthManager:
                     f"No OAuth session found for user {user_id}, session {session_id}"
                 )
                 return None
+
+            if (
+                not force_refresh
+                and self._get_enterprise_config(session.provider)
+                and session.token.get("access_token")
+            ):
+                token_valid = await self.enterprise_check_token(
+                    session.provider, session.token.get("access_token")
+                )
+                if not token_valid:
+                    force_refresh = True
 
             if force_refresh or datetime.now() + timedelta(
                 minutes=5
@@ -1065,6 +1204,63 @@ class OAuthManager:
             return None
 
         try:
+            enterprise_cfg = self._get_enterprise_config(provider)
+            if enterprise_cfg:
+                refresh_params = {
+                    "grant_type": "refresh_token",
+                    "client_id": enterprise_cfg.get("client_id"),
+                    "client_secret": enterprise_cfg.get("client_secret"),
+                    "refresh_token": token_data["refresh_token"],
+                }
+                redirect_param = enterprise_cfg.get(
+                    "token_redirect_param", "redirect_uri"
+                )
+                if enterprise_cfg.get("redirect_uri"):
+                    refresh_params[redirect_param] = enterprise_cfg.get("redirect_uri")
+
+                new_token_data = await self._enterprise_request_token(
+                    enterprise_cfg, refresh_params
+                )
+                if "refresh_token" not in new_token_data:
+                    new_token_data["refresh_token"] = token_data["refresh_token"]
+
+                new_token_data["issued_at"] = datetime.now().timestamp()
+
+                if "expires_in" in new_token_data and "expires_at" not in new_token_data:
+                    new_token_data["expires_at"] = int(
+                        datetime.now().timestamp() + new_token_data["expires_in"]
+                    )
+
+                if "expires_at" not in new_token_data:
+                    # Best effort: refresh profile to get token_expire if available
+                    try:
+                        profile = await self._enterprise_fetch_profile(
+                            enterprise_cfg, new_token_data.get("access_token", "")
+                        )
+                        token_expire = _get_nested_value(
+                            profile, "attributes.token_expire"
+                        )
+                        token_gtime = _get_nested_value(
+                            profile, "attributes.token_gtime"
+                        )
+                        if token_expire:
+                            expire_seconds = int(token_expire)
+                            if token_gtime:
+                                new_token_data["expires_at"] = int(
+                                    int(token_gtime) / 1000 + expire_seconds
+                                )
+                            else:
+                                new_token_data["expires_at"] = int(
+                                    time.time() + expire_seconds
+                                )
+                    except Exception:
+                        pass
+
+                if "expires_at" not in new_token_data:
+                    new_token_data["expires_at"] = int(time.time()) + 3600
+
+                return new_token_data
+
             client = self.get_client(provider)
             if not client:
                 log.error(f"No OAuth client found for provider {provider}")
@@ -1220,7 +1416,9 @@ class OAuthManager:
 
         return role
 
-    def update_user_groups(self, user, user_data, default_permissions, db=None):
+    def update_user_groups(
+        self, user, user_data, default_permissions, db=None, commit: bool = True
+    ):
         log.debug("Running OAUTH Group management")
         oauth_claim = auth_manager_config.OAUTH_GROUPS_CLAIM
 
@@ -1260,7 +1458,7 @@ class OAuthManager:
             all_group_names = {g.name for g in all_available_groups}
             groups_created = False
             # Determine creator ID: Prefer admin, fallback to current user if no admin exists
-            admin_user = Users.get_super_admin_user()
+            admin_user = Users.get_primary_admin_user(db=db)
             creator_id = admin_user.id if admin_user else user.id
             log.debug(f"Using creator ID {creator_id} for potential group creation.")
 
@@ -1282,21 +1480,21 @@ class OAuthManager:
                         )
                         # Use determined creator ID (admin or fallback to current user)
                         created_group = Groups.insert_new_group(
-                            creator_id, new_group_form, db=db
+                            creator_id, new_group_form, db=db, commit=commit
                         )
-                        if created_group:
-                            log.info(
-                                f"Successfully created group '{group_name}' with ID {created_group.id} using creator ID {creator_id}"
-                            )
-                            groups_created = True
-                            # Add to local set to prevent duplicate creation attempts in this run
-                            all_group_names.add(group_name)
-                        else:
-                            log.error(
+                        if not created_group:
+                            raise RuntimeError(
                                 f"Failed to create group '{group_name}' via OAuth."
                             )
+                        log.info(
+                            f"Successfully created group '{group_name}' with ID {created_group.id} using creator ID {creator_id}"
+                        )
+                        groups_created = True
+                        # Add to local set to prevent duplicate creation attempts in this run
+                        all_group_names.add(group_name)
                     except Exception as e:
                         log.error(f"Error creating group '{group_name}' via OAuth: {e}")
+                        raise
 
             # Refresh the list of all available groups if any were created
             if groups_created:
@@ -1321,14 +1519,20 @@ class OAuthManager:
                 log.debug(
                     f"Removing user from group {group_model.name} as it is no longer in their oauth groups"
                 )
-                Groups.remove_users_from_group(group_model.id, [user.id], db=db)
+                removed_group = Groups.remove_users_from_group(
+                    group_model.id, [user.id], db=db, commit=commit
+                )
+                if removed_group is None:
+                    raise RuntimeError(
+                        f"Failed to remove user {user.id} from group {group_model.id}"
+                    )
 
                 # In case a group is created, but perms are never assigned to the group by hitting "save"
                 group_permissions = group_model.permissions
                 if not group_permissions:
                     group_permissions = default_permissions
 
-                Groups.update_group_by_id(
+                updated_group = Groups.update_group_by_id(
                     id=group_model.id,
                     form_data=GroupUpdateForm(
                         name=group_model.name,
@@ -1337,7 +1541,12 @@ class OAuthManager:
                     ),
                     overwrite=False,
                     db=db,
+                    commit=commit,
                 )
+                if updated_group is None:
+                    raise RuntimeError(
+                        f"Failed to update group permissions for {group_model.id}"
+                    )
 
         # Add user to new groups
         for group_model in all_available_groups:
@@ -1352,14 +1561,20 @@ class OAuthManager:
                     f"Adding user to group {group_model.name} as it was found in their oauth groups"
                 )
 
-                Groups.add_users_to_group(group_model.id, [user.id], db=db)
+                added_group = Groups.add_users_to_group(
+                    group_model.id, [user.id], db=db, commit=commit
+                )
+                if added_group is None:
+                    raise RuntimeError(
+                        f"Failed to add user {user.id} to group {group_model.id}"
+                    )
 
                 # In case a group is created, but perms are never assigned to the group by hitting "save"
                 group_permissions = group_model.permissions
                 if not group_permissions:
                     group_permissions = default_permissions
 
-                Groups.update_group_by_id(
+                updated_group = Groups.update_group_by_id(
                     id=group_model.id,
                     form_data=GroupUpdateForm(
                         name=group_model.name,
@@ -1368,7 +1583,12 @@ class OAuthManager:
                     ),
                     overwrite=False,
                     db=db,
+                    commit=commit,
                 )
+                if updated_group is None:
+                    raise RuntimeError(
+                        f"Failed to update group permissions for {group_model.id}"
+                    )
 
     async def _process_picture_url(
         self, picture_url: str, access_token: str = None
@@ -1418,6 +1638,14 @@ class OAuthManager:
     async def handle_login(self, request, provider):
         if provider not in OAUTH_PROVIDERS:
             raise HTTPException(404)
+        enterprise_cfg = self._get_enterprise_config(provider)
+        if enterprise_cfg:
+            state = request.query_params.get("state")
+            authorize_url = self._build_enterprise_authorize_url(
+                enterprise_cfg, state=state
+            )
+            return RedirectResponse(url=authorize_url)
+
         # If the provider has a custom redirect URL, use that, otherwise automatically generate one
         redirect_uri = OAUTH_PROVIDERS[provider].get("redirect_uri") or request.url_for(
             "oauth_login_callback", provider=provider
@@ -1437,7 +1665,297 @@ class OAuthManager:
             raise HTTPException(404)
 
         error_message = None
+        webhook_user = None
         try:
+            enterprise_cfg = self._get_enterprise_config(provider)
+            if enterprise_cfg:
+                code = request.query_params.get("code")
+                if not code:
+                    raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+
+                token_params = {
+                    "grant_type": "authorization_code",
+                    "client_id": enterprise_cfg.get("client_id"),
+                    "client_secret": enterprise_cfg.get("client_secret"),
+                    "code": code,
+                }
+                redirect_param = enterprise_cfg.get("token_redirect_param", "redirect_uri")
+                if enterprise_cfg.get("redirect_uri"):
+                    token_params[redirect_param] = enterprise_cfg.get("redirect_uri")
+
+                token = await self._enterprise_request_token(enterprise_cfg, token_params)
+                access_token = token.get("access_token")
+                if not access_token:
+                    raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+
+                user_data = await self._enterprise_fetch_profile(
+                    enterprise_cfg, access_token
+                )
+                if not user_data:
+                    raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+
+                account_no_path = enterprise_cfg.get("account_no_path") or ""
+                account_no = _get_nested_value(user_data, account_no_path)
+                id_claim = enterprise_cfg.get("id_claim") or "id"
+                main_account_id = _get_nested_value(user_data, id_claim) or user_data.get(
+                    id_claim
+                )
+                sub = account_no or main_account_id
+                if not sub:
+                    raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+
+                actual_name = _get_first_nested_value(
+                    user_data,
+                    [
+                        "attributes.account_name",
+                        "attributes.accountName",
+                        "account_name",
+                        "accountName",
+                        "attributes.nick_name",
+                        "attributes.nickName",
+                        "nick_name",
+                        "nickName",
+                    ],
+                )
+
+                oauth_payload = {"sub": sub}
+                if account_no:
+                    oauth_payload["account_no"] = account_no
+                if main_account_id:
+                    oauth_payload["main_account_id"] = main_account_id
+                if actual_name:
+                    oauth_payload["actual_name"] = actual_name
+
+                # Extract email
+                email = ""
+                email_claim = enterprise_cfg.get("email_claim") or ""
+                if email_claim:
+                    email = _get_nested_value(user_data, email_claim) or user_data.get(
+                        email_claim, ""
+                    )
+                if not email and account_no and "@" in account_no:
+                    email = account_no
+                if not email:
+                    local_source = str(account_no or sub)
+                    local_part = re.sub(r"[^a-zA-Z0-9._-]", "_", local_source).strip(
+                        "._-"
+                    )
+                    if not local_part:
+                        local_part = hashlib.sha256(
+                            local_source.encode()
+                        ).hexdigest()[:12]
+                    email_domain = enterprise_cfg.get("email_domain") or ""
+                    if email_domain:
+                        email = f"{local_part.lower()}@{email_domain}"
+                if not email and ENABLE_OAUTH_EMAIL_FALLBACK:
+                    email = f"{provider}@{sub}.local"
+                if not email:
+                    raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+
+                email = email.lower()
+                if (
+                    "*" not in auth_manager_config.OAUTH_ALLOWED_DOMAINS
+                    and email.split("@")[-1]
+                    not in auth_manager_config.OAUTH_ALLOWED_DOMAINS
+                ):
+                    raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+
+                # Use the actual person name when IAM exposes it, otherwise fall back to account_no.
+                name = actual_name or account_no or sub or email
+
+                # Compute expires_at using profile hints if present
+                token_expire = _get_nested_value(user_data, "attributes.token_expire")
+                token_gtime = _get_nested_value(user_data, "attributes.token_gtime")
+                if token_expire:
+                    try:
+                        expire_seconds = int(token_expire)
+                        if token_gtime:
+                            token["expires_at"] = int(int(token_gtime) / 1000 + expire_seconds)
+                        else:
+                            token["expires_at"] = int(time.time()) + expire_seconds
+                    except Exception:
+                        pass
+                if "expires_at" not in token and "expires_in" in token:
+                    try:
+                        token["expires_at"] = int(time.time()) + int(token["expires_in"])
+                    except Exception:
+                        pass
+                if "expires_at" not in token:
+                    token["expires_at"] = int(time.time()) + 3600
+
+                with get_db_context(db) as db_session:
+                    try:
+                        # Check if the user exists
+                        user = Users.get_user_by_oauth_sub(provider, sub, db=db_session)
+                        if (
+                            not user
+                            and main_account_id
+                            and main_account_id != sub
+                        ):
+                            user = Users.get_user_by_oauth_sub(
+                                provider, main_account_id, db=db_session
+                            )
+                        if not user and account_no:
+                            user = Users.get_user_by_oauth_provider_field(
+                                "portal", "account_no", account_no, db=db_session
+                            )
+                        if not user and auth_manager_config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL:
+                            user = Users.get_user_by_email(email, db=db_session)
+                            if user:
+                                Users.update_user_oauth_by_id(
+                                    user.id,
+                                    provider,
+                                    sub,
+                                    payload=oauth_payload,
+                                    db=db_session,
+                                    commit=False,
+                                )
+
+                        if user:
+                            Users.update_user_oauth_by_id(
+                                user.id,
+                                provider,
+                                sub,
+                                payload=oauth_payload,
+                                db=db_session,
+                                commit=False,
+                            )
+                            determined_role = self.get_user_role(user, user_data)
+                            if user.role != determined_role:
+                                Users.update_user_role_by_id(
+                                    user.id, determined_role, db=db_session, commit=False
+                                )
+                                user.role = determined_role
+                            if auth_manager_config.OAUTH_UPDATE_NAME_ON_LOGIN and name:
+                                if name != user.name:
+                                    Users.update_user_by_id(
+                                        user.id, {"name": name}, db=db_session, commit=False
+                                    )
+                                    user.name = name
+                            if auth_manager_config.OAUTH_UPDATE_EMAIL_ON_LOGIN and email:
+                                if email.lower() != user.email.lower():
+                                    existing_user = Users.get_user_by_email(
+                                        email, db=db_session
+                                    )
+                                    if not existing_user:
+                                        Auths.update_email_by_id(
+                                            user.id,
+                                            email.lower(),
+                                            db=db_session,
+                                            commit=False,
+                                        )
+                                        user.email = email.lower()
+                        else:
+                            if auth_manager_config.ENABLE_OAUTH_SIGNUP:
+                                existing_user = Users.get_user_by_email(
+                                    email, db=db_session
+                                )
+                                if existing_user:
+                                    raise HTTPException(
+                                        400, detail=ERROR_MESSAGES.EMAIL_TAKEN
+                                    )
+                                user = Auths.insert_new_auth(
+                                    email=email,
+                                    password=get_password_hash(str(uuid.uuid4())),
+                                    name=name,
+                                    profile_image_url="/user.png",
+                                    role=self.get_user_role(None, user_data),
+                                    oauth={provider: oauth_payload},
+                                    db=db_session,
+                                    commit=False,
+                                )
+                                webhook_user = user
+                                apply_default_group_assignment(
+                                    request.app.state.config.DEFAULT_GROUP_ID,
+                                    user.id,
+                                    db=db_session,
+                                    commit=False,
+                                )
+                            else:
+                                raise HTTPException(
+                                    status.HTTP_403_FORBIDDEN,
+                                    detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+                                )
+
+                        if (
+                            auth_manager_config.ENABLE_OAUTH_GROUP_MANAGEMENT
+                            and user.role != "admin"
+                        ):
+                            self.update_user_groups(
+                                user=user,
+                                user_data=user_data,
+                                default_permissions=request.app.state.config.USER_PERMISSIONS,
+                                db=db_session,
+                                commit=False,
+                            )
+
+                        db_session.commit()
+                    except HTTPException:
+                        db_session.rollback()
+                        raise
+                    except Exception:
+                        db_session.rollback()
+                        raise
+
+                if webhook_user and auth_manager_config.WEBHOOK_URL:
+                    await post_webhook(
+                        WEBUI_NAME,
+                        auth_manager_config.WEBHOOK_URL,
+                        WEBHOOK_MESSAGES.USER_SIGNUP(webhook_user.name),
+                        {
+                            "action": "signup",
+                            "message": WEBHOOK_MESSAGES.USER_SIGNUP(webhook_user.name),
+                            "user": webhook_user.model_dump_json(exclude_none=True),
+                        },
+                    )
+
+                jwt_token = create_token(
+                    data={"id": user.id},
+                    expires_delta=parse_duration(auth_manager_config.JWT_EXPIRES_IN),
+                )
+
+                response = RedirectResponse(
+                    url=f"{str(request.app.state.config.WEBUI_URL or request.base_url).rstrip('/')}/auth",
+                    headers=response.headers,
+                )
+                response.set_cookie(
+                    key="token",
+                    value=jwt_token,
+                    httponly=False,
+                    samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
+                    secure=WEBUI_AUTH_COOKIE_SECURE,
+                )
+
+                # Persist enterprise OAuth session server-side
+                token["issued_at"] = datetime.now().timestamp()
+                sessions = OAuthSessions.get_sessions_by_user_id(user.id, db=db)
+                provider_sessions = sorted(
+                    [session for session in sessions if session.provider == provider],
+                    key=lambda session: session.created_at,
+                    reverse=True,
+                )
+                if len(provider_sessions) >= OAUTH_MAX_SESSIONS_PER_USER:
+                    for old_session in provider_sessions[
+                        OAUTH_MAX_SESSIONS_PER_USER - 1 :
+                    ]:
+                        OAuthSessions.delete_session_by_id(old_session.id, db=db)
+
+                session = OAuthSessions.create_session(
+                    user_id=user.id,
+                    provider=provider,
+                    token=token,
+                    db=db,
+                )
+                if session:
+                    response.set_cookie(
+                        key="oauth_session_id",
+                        value=session.id,
+                        httponly=True,
+                        samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
+                        secure=WEBUI_AUTH_COOKIE_SECURE,
+                    )
+                return response
+
             client = self.get_client(provider)
 
             auth_params = {}
@@ -1556,141 +2074,191 @@ class OAuthManager:
                 )
                 raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
-            # Check if the user exists
-            user = Users.get_user_by_oauth_sub(provider, sub, db=db)
-            if not user:
-                # If the user does not exist, check if merging is enabled
-                if auth_manager_config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL:
-                    # Check if the user exists by email
-                    user = Users.get_user_by_email(email, db=db)
+            with get_db_context(db) as db_session:
+                try:
+                    # Check if the user exists
+                    user = Users.get_user_by_oauth_sub(provider, sub, db=db_session)
+                    if not user:
+                        # If the user does not exist, check if merging is enabled
+                        if auth_manager_config.OAUTH_MERGE_ACCOUNTS_BY_EMAIL:
+                            # Check if the user exists by email
+                            user = Users.get_user_by_email(email, db=db_session)
+                            if user:
+                                # Update the user with the new oauth sub
+                                Users.update_user_oauth_by_id(
+                                    user.id,
+                                    provider,
+                                    sub,
+                                    db=db_session,
+                                    commit=False,
+                                )
+
                     if user:
-                        # Update the user with the new oauth sub
-                        Users.update_user_oauth_by_id(user.id, provider, sub, db=db)
+                        determined_role = self.get_user_role(user, user_data)
+                        if user.role != determined_role:
+                            Users.update_user_role_by_id(
+                                user.id, determined_role, db=db_session, commit=False
+                            )
+                            # Update the user object in memory as well,
+                            # to avoid problems with the ENABLE_OAUTH_GROUP_MANAGEMENT check below
+                            user.role = determined_role
 
-            if user:
-                determined_role = self.get_user_role(user, user_data)
-                if user.role != determined_role:
-                    Users.update_user_role_by_id(user.id, determined_role, db=db)
-                    # Update the user object in memory as well,
-                    # to avoid problems with the ENABLE_OAUTH_GROUP_MANAGEMENT check below
-                    user.role = determined_role
+                        if auth_manager_config.OAUTH_UPDATE_NAME_ON_LOGIN:
+                            username_claim = auth_manager_config.OAUTH_USERNAME_CLAIM
+                            if username_claim:
+                                new_name = user_data.get(username_claim)
+                                if new_name and new_name != user.name:
+                                    Users.update_user_by_id(
+                                        user.id,
+                                        {"name": new_name},
+                                        db=db_session,
+                                        commit=False,
+                                    )
+                                    user.name = new_name
+                                    log.debug(f"Updated name for user {user.email}")
 
-                if auth_manager_config.OAUTH_UPDATE_NAME_ON_LOGIN:
-                    username_claim = auth_manager_config.OAUTH_USERNAME_CLAIM
-                    if username_claim:
-                        new_name = user_data.get(username_claim)
-                        if new_name and new_name != user.name:
-                            Users.update_user_by_id(user.id, {"name": new_name}, db=db)
-                            user.name = new_name
-                            log.debug(f"Updated name for user {user.email}")
+                        if auth_manager_config.OAUTH_UPDATE_EMAIL_ON_LOGIN:
+                            email_claim = auth_manager_config.OAUTH_EMAIL_CLAIM
+                            if email_claim:
+                                new_email = user_data.get(email_claim)
+                                if new_email and new_email.lower() != user.email.lower():
+                                    existing_user = Users.get_user_by_email(
+                                        new_email, db=db_session
+                                    )
+                                    if existing_user:
+                                        log.error(
+                                            f"Cannot update email to {new_email} for user {user.id} because it is already taken."
+                                        )
+                                    else:
+                                        Auths.update_email_by_id(
+                                            user.id,
+                                            new_email.lower(),
+                                            db=db_session,
+                                            commit=False,
+                                        )
+                                        user.email = new_email.lower()
+                                        log.debug(
+                                            f"Updated email for user {user.id}"
+                                        )
 
-                if auth_manager_config.OAUTH_UPDATE_EMAIL_ON_LOGIN:
-                    email_claim = auth_manager_config.OAUTH_EMAIL_CLAIM
-                    if email_claim:
-                        new_email = user_data.get(email_claim)
-                        if new_email and new_email.lower() != user.email.lower():
-                            existing_user = Users.get_user_by_email(new_email, db=db)
+                        # Update profile picture if enabled and different from current
+                        if auth_manager_config.OAUTH_UPDATE_PICTURE_ON_LOGIN:
+                            picture_claim = auth_manager_config.OAUTH_PICTURE_CLAIM
+                            if picture_claim:
+                                new_picture_url = user_data.get(
+                                    picture_claim,
+                                    OAUTH_PROVIDERS[provider].get("picture_url", ""),
+                                )
+                                processed_picture_url = (
+                                    await self._process_picture_url(
+                                        new_picture_url, token.get("access_token")
+                                    )
+                                )
+                                if processed_picture_url != user.profile_image_url:
+                                    Users.update_user_profile_image_url_by_id(
+                                        user.id,
+                                        processed_picture_url,
+                                        db=db_session,
+                                        commit=False,
+                                    )
+                                    log.debug(
+                                        f"Updated profile picture for user {user.email}"
+                                    )
+                    else:
+                        # If the user does not exist, check if signups are enabled
+                        if auth_manager_config.ENABLE_OAUTH_SIGNUP:
+                            # Check if an existing user with the same email already exists
+                            existing_user = Users.get_user_by_email(
+                                email, db=db_session
+                            )
                             if existing_user:
-                                log.error(
-                                    f"Cannot update email to {new_email} for user {user.id} because it is already taken."
+                                raise HTTPException(
+                                    400, detail=ERROR_MESSAGES.EMAIL_TAKEN
+                                )
+
+                            picture_claim = auth_manager_config.OAUTH_PICTURE_CLAIM
+                            if picture_claim:
+                                picture_url = user_data.get(
+                                    picture_claim,
+                                    OAUTH_PROVIDERS[provider].get("picture_url", ""),
+                                )
+                                picture_url = await self._process_picture_url(
+                                    picture_url, token.get("access_token")
                                 )
                             else:
-                                Auths.update_email_by_id(
-                                    user.id, new_email.lower(), db=db
+                                picture_url = "/user.png"
+                            username_claim = auth_manager_config.OAUTH_USERNAME_CLAIM
+
+                            name = user_data.get(username_claim)
+                            if not name:
+                                log.warning(
+                                    "Username claim is missing, using email as name"
                                 )
-                                user.email = new_email.lower()
-                                log.debug(f"Updated email for user {user.id}")
+                                name = email
 
-                # Update profile picture if enabled and different from current
-                if auth_manager_config.OAUTH_UPDATE_PICTURE_ON_LOGIN:
-                    picture_claim = auth_manager_config.OAUTH_PICTURE_CLAIM
-                    if picture_claim:
-                        new_picture_url = user_data.get(
-                            picture_claim,
-                            OAUTH_PROVIDERS[provider].get("picture_url", ""),
-                        )
-                        processed_picture_url = await self._process_picture_url(
-                            new_picture_url, token.get("access_token")
-                        )
-                        if processed_picture_url != user.profile_image_url:
-                            Users.update_user_profile_image_url_by_id(
-                                user.id, processed_picture_url, db=db
+                            user = Auths.insert_new_auth(
+                                email=email,
+                                password=get_password_hash(
+                                    str(uuid.uuid4())
+                                ),  # Random password, not used
+                                name=name,
+                                profile_image_url=picture_url,
+                                role=self.get_user_role(None, user_data),
+                                oauth=oauth_data,
+                                db=db_session,
+                                commit=False,
                             )
-                            log.debug(f"Updated profile picture for user {user.email}")
-            else:
-                # If the user does not exist, check if signups are enabled
-                if auth_manager_config.ENABLE_OAUTH_SIGNUP:
-                    # Check if an existing user with the same email already exists
-                    existing_user = Users.get_user_by_email(email, db=db)
-                    if existing_user:
-                        raise HTTPException(400, detail=ERROR_MESSAGES.EMAIL_TAKEN)
+                            webhook_user = user
 
-                    picture_claim = auth_manager_config.OAUTH_PICTURE_CLAIM
-                    if picture_claim:
-                        picture_url = user_data.get(
-                            picture_claim,
-                            OAUTH_PROVIDERS[provider].get("picture_url", ""),
-                        )
-                        picture_url = await self._process_picture_url(
-                            picture_url, token.get("access_token")
-                        )
-                    else:
-                        picture_url = "/user.png"
-                    username_claim = auth_manager_config.OAUTH_USERNAME_CLAIM
+                            apply_default_group_assignment(
+                                request.app.state.config.DEFAULT_GROUP_ID,
+                                user.id,
+                                db=db_session,
+                                commit=False,
+                            )
 
-                    name = user_data.get(username_claim)
-                    if not name:
-                        log.warning("Username claim is missing, using email as name")
-                        name = email
+                        else:
+                            raise HTTPException(
+                                status.HTTP_403_FORBIDDEN,
+                                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+                            )
 
-                    user = Auths.insert_new_auth(
-                        email=email,
-                        password=get_password_hash(
-                            str(uuid.uuid4())
-                        ),  # Random password, not used
-                        name=name,
-                        profile_image_url=picture_url,
-                        role=self.get_user_role(None, user_data),
-                        oauth=oauth_data,
-                        db=db,
-                    )
-
-                    if auth_manager_config.WEBHOOK_URL:
-                        await post_webhook(
-                            WEBUI_NAME,
-                            auth_manager_config.WEBHOOK_URL,
-                            WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
-                            {
-                                "action": "signup",
-                                "message": WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
-                                "user": user.model_dump_json(exclude_none=True),
-                            },
+                    if (
+                        auth_manager_config.ENABLE_OAUTH_GROUP_MANAGEMENT
+                        and user.role != "admin"
+                    ):
+                        self.update_user_groups(
+                            user=user,
+                            user_data=user_data,
+                            default_permissions=request.app.state.config.USER_PERMISSIONS,
+                            db=db_session,
+                            commit=False,
                         )
 
-                    apply_default_group_assignment(
-                        request.app.state.config.DEFAULT_GROUP_ID, user.id, db=db
-                    )
+                    db_session.commit()
+                except HTTPException:
+                    db_session.rollback()
+                    raise
+                except Exception:
+                    db_session.rollback()
+                    raise
 
-                else:
-                    raise HTTPException(
-                        status.HTTP_403_FORBIDDEN,
-                        detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-                    )
+            if webhook_user and auth_manager_config.WEBHOOK_URL:
+                await post_webhook(
+                    WEBUI_NAME,
+                    auth_manager_config.WEBHOOK_URL,
+                    WEBHOOK_MESSAGES.USER_SIGNUP(webhook_user.name),
+                    {
+                        "action": "signup",
+                        "message": WEBHOOK_MESSAGES.USER_SIGNUP(webhook_user.name),
+                        "user": webhook_user.model_dump_json(exclude_none=True),
+                    },
+                )
 
             jwt_token = create_token(
                 data={"id": user.id},
                 expires_delta=parse_duration(auth_manager_config.JWT_EXPIRES_IN),
             )
-            if (
-                auth_manager_config.ENABLE_OAUTH_GROUP_MANAGEMENT
-                and user.role != "admin"
-            ):
-                self.update_user_groups(
-                    user=user,
-                    user_data=user_data,
-                    default_permissions=request.app.state.config.USER_PERMISSIONS,
-                    db=db,
-                )
 
         except Exception as e:
             log.error(f"Error during OAuth process: {e}")

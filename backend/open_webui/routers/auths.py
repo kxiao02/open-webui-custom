@@ -26,7 +26,7 @@ from open_webui.models.users import (
     UpdateProfileForm,
     UserStatus,
 )
-from open_webui.models.groups import Groups
+from open_webui.models.groups import Groups, Group, GroupMember
 from open_webui.models.oauth_sessions import OAuthSessions
 
 from open_webui.constants import ERROR_MESSAGES, WEBHOOK_MESSAGES
@@ -73,7 +73,6 @@ from open_webui.internal.db import get_session
 from sqlalchemy.orm import Session
 from open_webui.utils.webhook import post_webhook
 from open_webui.utils.access_control import get_permissions, has_permission
-from open_webui.utils.groups import apply_default_group_assignment
 
 from open_webui.utils.redis import get_redis_client
 from open_webui.utils.rate_limit import RateLimiter
@@ -83,8 +82,13 @@ from typing import Optional, List
 
 from ssl import CERT_NONE, CERT_REQUIRED, PROTOCOL_TLS
 
-from ldap3 import Server, Connection, NONE, Tls
-from ldap3.utils.conv import escape_filter_chars
+try:
+    from ldap3 import Server, Connection, NONE, Tls
+    from ldap3.utils.conv import escape_filter_chars
+except ImportError:
+    Server = Connection = Tls = None
+    NONE = None
+    escape_filter_chars = None
 
 router = APIRouter()
 
@@ -326,6 +330,12 @@ async def ldap_auth(
     if not request.app.state.config.ENABLE_LDAP:
         raise HTTPException(400, detail="LDAP authentication is not enabled")
 
+    if Server is None or Connection is None or Tls is None or escape_filter_chars is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ldap3 is required when LDAP authentication is enabled",
+        )
+
     if not ENABLE_PASSWORD_AUTH:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -523,6 +533,7 @@ async def ldap_auth(
                         name=cn,
                         role=role,
                         db=db,
+                        commit=False,
                     )
 
                     if not user:
@@ -530,16 +541,20 @@ async def ldap_auth(
                             500, detail=ERROR_MESSAGES.CREATE_USER_ERROR
                         )
 
-                    apply_default_group_assignment(
-                        request.app.state.config.DEFAULT_GROUP_ID,
-                        user.id,
+                    _assign_default_group_if_needed(
                         db=db,
+                        user_id=user.id,
+                        default_group_id=request.app.state.config.DEFAULT_GROUP_ID,
                     )
+                    db.commit()
+                    user = Users.get_user_by_id(user.id, db=db)
 
                 except HTTPException:
+                    db.rollback()
                     raise
                 except Exception as err:
                     log.error(f"LDAP user creation error: {str(err)}")
+                    db.rollback()
                     raise HTTPException(
                         500, detail="Internal error occurred during LDAP user creation."
                     )
@@ -592,10 +607,12 @@ async def signin(
             detail=ERROR_MESSAGES.ACTION_PROHIBITED,
         )
 
-    if WEBUI_AUTH_TRUSTED_EMAIL_HEADER:
-        if WEBUI_AUTH_TRUSTED_EMAIL_HEADER not in request.headers:
-            raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_TRUSTED_HEADER)
-
+    # Allow trusted-header SSO on selected routes without disabling
+    # password login for every other request path.
+    if (
+        WEBUI_AUTH_TRUSTED_EMAIL_HEADER
+        and WEBUI_AUTH_TRUSTED_EMAIL_HEADER in request.headers
+    ):
         email = request.headers[WEBUI_AUTH_TRUSTED_EMAIL_HEADER].lower()
         name = email
 
@@ -685,6 +702,45 @@ async def signin(
 ############################
 
 
+def _assign_default_group_if_needed(
+    *,
+    db: Session,
+    user_id: str,
+    default_group_id: str,
+) -> None:
+    if not default_group_id:
+        return
+
+    group = db.query(Group).filter_by(id=default_group_id).first()
+    if not group:
+        log.warning(
+            "Default group %s not found; skipping auto-assignment for user %s",
+            default_group_id,
+            user_id,
+        )
+        return
+
+    existing = (
+        db.query(GroupMember)
+        .filter_by(group_id=default_group_id, user_id=user_id)
+        .first()
+    )
+    if existing:
+        return
+
+    now = int(time.time())
+    db.add(
+        GroupMember(
+            id=str(uuid.uuid4()),
+            group_id=default_group_id,
+            user_id=user_id,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    group.updated_at = now
+
+
 async def signup_handler(
     request: Request,
     email: str,
@@ -706,23 +762,39 @@ async def signup_handler(
     # first-user registration can all see an empty table and each get admin.
     hashed = get_password_hash(password)
 
-    user = Auths.insert_new_auth(
-        email=email.lower(),
-        password=hashed,
-        name=name,
-        profile_image_url=profile_image_url,
-        role=request.app.state.config.DEFAULT_USER_ROLE,
-        db=db,
-    )
-    if not user:
-        raise HTTPException(500, detail=ERROR_MESSAGES.CREATE_USER_ERROR)
+    try:
+        user = Auths.insert_new_auth(
+            email=email.lower(),
+            password=hashed,
+            name=name,
+            profile_image_url=profile_image_url,
+            role=request.app.state.config.DEFAULT_USER_ROLE,
+            db=db,
+            commit=False,
+        )
+        if not user:
+            raise HTTPException(500, detail=ERROR_MESSAGES.CREATE_USER_ERROR)
 
-    # Atomically check if this is the only user *after* the insert.
-    # Only the single user present at this point should become admin.
-    if Users.get_num_users(db=db) == 1:
-        Users.update_user_role_by_id(user.id, "admin", db=db)
+        # Atomically check if this is the only user *after* the insert.
+        # Only the single user present at this point should become admin.
+        if Users.get_num_users(db=db) == 1:
+            Users.update_user_role_by_id(user.id, "admin", db=db, commit=False)
+            Users.ensure_primary_admin(user.id, db=db, commit=False)
+            request.app.state.config.ENABLE_SIGNUP = False
+
+        _assign_default_group_if_needed(
+            db=db,
+            user_id=user.id,
+            default_group_id=request.app.state.config.DEFAULT_GROUP_ID,
+        )
+        db.commit()
         user = Users.get_user_by_id(user.id, db=db)
-        request.app.state.config.ENABLE_SIGNUP = False
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
 
     if request.app.state.config.WEBHOOK_URL:
         await post_webhook(
@@ -735,12 +807,6 @@ async def signup_handler(
                 "user": user.model_dump_json(exclude_none=True),
             },
         )
-
-    apply_default_group_assignment(
-        request.app.state.config.DEFAULT_GROUP_ID,
-        user.id,
-        db=db,
-    )
 
     return user
 
@@ -825,6 +891,34 @@ async def signout(
         response.delete_cookie("oauth_session_id")
 
         session = OAuthSessions.get_session_by_id(oauth_session_id, db=db)
+        if session and session.provider == "enterprise":
+            try:
+                access_token = session.token.get("access_token") if session.token else None
+                if access_token:
+                    await request.app.state.oauth_manager.enterprise_revoke_token(
+                        session.provider, access_token
+                    )
+            except Exception as e:
+                log.warning(f"Enterprise signout error: {str(e)}")
+
+            OAuthSessions.delete_session_by_id(oauth_session_id, db=db)
+
+            if WEBUI_AUTH_SIGNOUT_REDIRECT_URL:
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "status": True,
+                        "redirect_url": WEBUI_AUTH_SIGNOUT_REDIRECT_URL,
+                    },
+                    headers=response.headers,
+                )
+
+            return JSONResponse(
+                status_code=200, content={"status": True}, headers=response.headers
+            )
+
+        if session:
+            OAuthSessions.delete_session_by_id(oauth_session_id, db=db)
 
         # If a custom end_session_endpoint is configured (e.g. AWS Cognito), redirect
         # there directly instead of attempting OIDC discovery.
@@ -927,31 +1021,36 @@ async def add_user(
             form_data.profile_image_url,
             form_data.role,
             db=db,
+            commit=False,
         )
 
-        if user:
-            apply_default_group_assignment(
-                request.app.state.config.DEFAULT_GROUP_ID,
-                user.id,
-                db=db,
-            )
-
-            token = create_token(data={"id": user.id})
-            return {
-                "token": token,
-                "token_type": "Bearer",
-                "id": user.id,
-                "email": user.email,
-                "name": user.name,
-                "role": user.role,
-                "profile_image_url": f"/api/v1/users/{user.id}/profile/image",
-            }
-        else:
+        if not user:
             raise HTTPException(500, detail=ERROR_MESSAGES.CREATE_USER_ERROR)
+
+        _assign_default_group_if_needed(
+            db=db,
+            user_id=user.id,
+            default_group_id=request.app.state.config.DEFAULT_GROUP_ID,
+        )
+        db.commit()
+        user = Users.get_user_by_id(user.id, db=db)
+
+        token = create_token(data={"id": user.id})
+        return {
+            "token": token,
+            "token_type": "Bearer",
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "role": user.role,
+            "profile_image_url": f"/api/v1/users/{user.id}/profile/image",
+        }
     except HTTPException:
+        db.rollback()
         raise
     except Exception as err:
         log.error(f"Add user error: {str(err)}")
+        db.rollback()
         raise HTTPException(
             500, detail="An internal error occurred while adding the user."
         )
@@ -977,7 +1076,7 @@ async def get_admin_details(
             if admin:
                 admin_name = admin.name
         else:
-            admin = Users.get_first_user(db=db)
+            admin = Users.ensure_primary_admin(db=db)
             if admin:
                 admin_email = admin.email
                 admin_name = admin.name
@@ -1008,7 +1107,6 @@ async def get_admin_config(request: Request, user=Depends(get_admin_user)):
         "DEFAULT_USER_ROLE": request.app.state.config.DEFAULT_USER_ROLE,
         "DEFAULT_GROUP_ID": request.app.state.config.DEFAULT_GROUP_ID,
         "JWT_EXPIRES_IN": request.app.state.config.JWT_EXPIRES_IN,
-        "ENABLE_COMMUNITY_SHARING": request.app.state.config.ENABLE_COMMUNITY_SHARING,
         "ENABLE_MESSAGE_RATING": request.app.state.config.ENABLE_MESSAGE_RATING,
         "ENABLE_FOLDERS": request.app.state.config.ENABLE_FOLDERS,
         "FOLDER_MAX_FILE_COUNT": request.app.state.config.FOLDER_MAX_FILE_COUNT,
@@ -1034,7 +1132,6 @@ class AdminConfig(BaseModel):
     DEFAULT_USER_ROLE: str
     DEFAULT_GROUP_ID: str
     JWT_EXPIRES_IN: str
-    ENABLE_COMMUNITY_SHARING: bool
     ENABLE_MESSAGE_RATING: bool
     ENABLE_FOLDERS: bool
     FOLDER_MAX_FILE_COUNT: Optional[int | str] = None
@@ -1073,7 +1170,7 @@ async def update_admin_config(
     request.app.state.config.ENABLE_MEMORIES = form_data.ENABLE_MEMORIES
     request.app.state.config.ENABLE_NOTES = form_data.ENABLE_NOTES
 
-    if form_data.DEFAULT_USER_ROLE in ["pending", "user", "admin"]:
+    if form_data.DEFAULT_USER_ROLE in ["pending", "user"]:
         request.app.state.config.DEFAULT_USER_ROLE = form_data.DEFAULT_USER_ROLE
 
     request.app.state.config.DEFAULT_GROUP_ID = form_data.DEFAULT_GROUP_ID
@@ -1084,9 +1181,6 @@ async def update_admin_config(
     if re.match(pattern, form_data.JWT_EXPIRES_IN):
         request.app.state.config.JWT_EXPIRES_IN = form_data.JWT_EXPIRES_IN
 
-    request.app.state.config.ENABLE_COMMUNITY_SHARING = (
-        form_data.ENABLE_COMMUNITY_SHARING
-    )
     request.app.state.config.ENABLE_MESSAGE_RATING = form_data.ENABLE_MESSAGE_RATING
 
     request.app.state.config.ENABLE_USER_WEBHOOKS = form_data.ENABLE_USER_WEBHOOKS
@@ -1112,7 +1206,6 @@ async def update_admin_config(
         "DEFAULT_USER_ROLE": request.app.state.config.DEFAULT_USER_ROLE,
         "DEFAULT_GROUP_ID": request.app.state.config.DEFAULT_GROUP_ID,
         "JWT_EXPIRES_IN": request.app.state.config.JWT_EXPIRES_IN,
-        "ENABLE_COMMUNITY_SHARING": request.app.state.config.ENABLE_COMMUNITY_SHARING,
         "ENABLE_MESSAGE_RATING": request.app.state.config.ENABLE_MESSAGE_RATING,
         "ENABLE_FOLDERS": request.app.state.config.ENABLE_FOLDERS,
         "FOLDER_MAX_FILE_COUNT": request.app.state.config.FOLDER_MAX_FILE_COUNT,

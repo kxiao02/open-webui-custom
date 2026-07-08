@@ -20,6 +20,8 @@ const createI18nStore = (i18n: i18nType) => {
 	return i18nWritable;
 };
 
+export type I18nStore = ReturnType<typeof createI18nStore>;
+
 const createIsLoadingStore = (i18n: i18nType) => {
 	const isLoading = writable(false);
 

@@ -24,7 +24,8 @@ from opentelemetry import trace
 
 from open_webui.utils.access_control import has_permission
 from open_webui.models.users import Users
-from open_webui.models.auths import Auths
+from open_webui.models.auths import Auth, Auths
+from open_webui.internal.db import get_db_context
 
 
 from open_webui.constants import ERROR_MESSAGES
@@ -440,23 +441,65 @@ def create_admin_user(email: str, password: str, name: str = "Admin"):
     if not email or not password:
         return None
 
-    if Users.has_users():
-        log.debug("Users already exist, skipping admin creation")
-        return None
+    email = email.lower()
 
-    log.info(f"Creating admin account from environment variables: {email}")
     try:
         hashed = get_password_hash(password)
-        user = Auths.insert_new_auth(
-            email=email.lower(),
-            password=hashed,
-            name=name,
-            role="admin",
-        )
-        if user:
-            log.info(f"Admin account created successfully: {email}")
-            return user
-        else:
+
+        with get_db_context() as db:
+            existing_user = Users.get_user_by_email(email, db=db)
+            if existing_user:
+                log.info(
+                    f"Repairing admin account from environment variables for existing user: {email}"
+                )
+                auth = db.query(Auth).filter_by(id=existing_user.id).first()
+                if auth:
+                    auth.email = email
+                    auth.password = hashed
+                    auth.active = True
+                else:
+                    db.add(
+                        Auth(
+                            id=existing_user.id,
+                            email=email,
+                            password=hashed,
+                            active=True,
+                        )
+                    )
+
+                if existing_user.role != "admin":
+                    Users.update_user_role_by_id(
+                        existing_user.id, "admin", db=db, commit=False
+                    )
+                if existing_user.name != name or existing_user.email.lower() != email:
+                    Users.update_user_by_id(
+                        existing_user.id,
+                        {"name": name, "email": email},
+                        db=db,
+                        commit=False,
+                    )
+
+                Users.ensure_primary_admin(existing_user.id, db=db, commit=False)
+                db.commit()
+
+                return Users.get_user_by_id(existing_user.id, db=db)
+
+            log.info(f"Creating admin account from environment variables: {email}")
+            user = Auths.insert_new_auth(
+                email=email,
+                password=hashed,
+                name=name,
+                role="admin",
+                db=db,
+                commit=False,
+            )
+            if user:
+                Users.ensure_primary_admin(user.id, db=db, commit=False)
+                db.commit()
+                log.info(f"Admin account created successfully: {email}")
+                return Users.get_user_by_id(user.id, db=db)
+
+            db.rollback()
             log.error("Failed to create admin account from environment variables")
             return None
     except Exception as e:

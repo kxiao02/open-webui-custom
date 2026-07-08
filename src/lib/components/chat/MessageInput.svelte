@@ -31,6 +31,7 @@
 		terminalServers,
 		user as _user,
 		showControls,
+		showFilePreview,
 		showSettings,
 		selectedTerminalId,
 		TTSWorker,
@@ -79,13 +80,13 @@
 	import Photo from '../icons/Photo.svelte';
 	import Wrench from '../icons/Wrench.svelte';
 	import Sparkles from '../icons/Sparkles.svelte';
+	import LightBulb from '../icons/LightBulb.svelte';
+	import Database from '../icons/Database.svelte';
 
 	import InputVariablesModal from './MessageInput/InputVariablesModal.svelte';
 	import Voice from '../icons/Voice.svelte';
 	import Cloud from '../icons/Cloud.svelte';
-	import IntegrationsMenu from './MessageInput/IntegrationsMenu.svelte';
 	import TerminalMenu from './MessageInput/TerminalMenu.svelte';
-	import Component from '../icons/Component.svelte';
 	import PlusAlt from '../icons/PlusAlt.svelte';
 	import Dropdown from '../common/Dropdown.svelte';
 
@@ -101,13 +102,14 @@
 	import Expand from '../icons/Expand.svelte';
 	import QueuedMessageItem from './MessageInput/QueuedMessageItem.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let onUpload: Function = (e) => {};
 	export let onChange: Function = () => {};
 
 	export let createMessagePair: Function;
 	export let stopResponse: Function;
+	export let answerNowResponse: Function = stopResponse;
 
 	export let autoScroll = false;
 	export let generating = false;
@@ -120,17 +122,20 @@
 	$: selectedModelIds = atSelectedModel !== undefined ? [atSelectedModel.id] : selectedModels;
 
 	export let history;
-	export let taskIds = null;
+	export let hasBlockingGeneration = false;
 
 	export let prompt = '';
-	export let files = [];
+	export let files: any[] = [];
 
-	export let selectedToolIds = [];
-	export let selectedFilterIds = [];
+	export let selectedToolIds: string[] = [];
+	export let lockedToolIds: string[] = [];
+	export let selectedFilterIds: string[] = [];
 
 	export let imageGenerationEnabled = false;
 	export let webSearchEnabled = false;
 	export let codeInterpreterEnabled = false;
+	export let thinkingModeEnabled = false;
+	export let thinkingModelId: string | null = null;
 
 	let showTerminalMenu = false;
 
@@ -149,11 +154,6 @@
 	let showValvesModal = false;
 	let selectedValvesType = 'tool'; // 'tool' or 'function'
 	let selectedValvesItemId = null;
-	let integrationsMenuCloseOnOutsideClick = true;
-
-	$: if (!showValvesModal) {
-		integrationsMenuCloseOnOutsideClick = true;
-	}
 
 	$: onChange({
 		prompt,
@@ -170,8 +170,47 @@
 		selectedFilterIds,
 		imageGenerationEnabled,
 		webSearchEnabled,
-		codeInterpreterEnabled
+		codeInterpreterEnabled,
+		thinkingModeEnabled
 	});
+
+	const normalizeUploadFingerprintPart = (value: unknown): string =>
+		typeof value === 'string'
+			? value.trim().toLowerCase()
+			: value === null || value === undefined
+				? ''
+				: String(value);
+
+	const buildUploadFingerprint = (
+		file: Pick<File, 'name' | 'type' | 'size' | 'lastModified'> | null | undefined
+	): string =>
+		[
+			normalizeUploadFingerprintPart(file?.name),
+			normalizeUploadFingerprintPart(file?.type),
+			normalizeUploadFingerprintPart(file?.size),
+			normalizeUploadFingerprintPart(file?.lastModified)
+		].join('::');
+
+	const hasUploadFingerprint = (uploadFingerprint: string): boolean =>
+		uploadFingerprint !== '' &&
+		files.some((item) => item?.uploadFingerprint === uploadFingerprint && item?.status !== 'error');
+
+	const dispatchSubmit = (promptOverride: string = prompt) => {
+		dispatch('submit', {
+			prompt: promptOverride,
+			requestContext: {
+				thinkingModeEnabled,
+				selectedToolIds: [...selectedToolIds],
+				selectedFilterIds: [...selectedFilterIds],
+				selectedTerminalId: $selectedTerminalId ?? null,
+				featureToggles: {
+					imageGenerationEnabled,
+					webSearchEnabled,
+					codeInterpreterEnabled
+				}
+			}
+		});
+	};
 
 	const inputVariableHandler = async (text: string): Promise<string> => {
 		inputVariables = extractInputVariables(text);
@@ -462,6 +501,8 @@
 	$: fileUploadCapableModels = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).filter(
 		(model) => $models.find((m) => m.id === model)?.info?.meta?.capabilities?.file_upload ?? true
 	);
+	let hasUploadingFiles = false;
+	$: hasUploadingFiles = files.some((file) => file?.status === 'uploading');
 
 	let webSearchCapableModels = [];
 	$: webSearchCapableModels = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).filter(
@@ -490,21 +531,23 @@
 		.reduce((acc, filters) => acc.filter((f1) => filters.some((f2) => f2.id === f1.id)));
 
 	let showToolsButton = false;
-	$: showToolsButton = ($tools ?? []).length > 0 || ($toolServers ?? []).length > 0;
+	$: showToolsButton =
+		(($tools ?? []).filter((tool) => !tool?.id?.startsWith('server:')).length > 0) ||
+		(selectedToolIds ?? []).length > 0;
 
 	let showWebSearchButton = false;
 	$: showWebSearchButton =
 		(atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).length ===
 			webSearchCapableModels.length &&
 		$config?.features?.enable_web_search &&
-		($_user.role === 'admin' || $_user?.permissions?.features?.web_search);
+		($_user?.permissions?.features?.web_search ?? true);
 
 	let showImageGenerationButton = false;
 	$: showImageGenerationButton =
 		(atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).length ===
 			imageGenerationCapableModels.length &&
 		$config?.features?.enable_image_generation &&
-		($_user.role === 'admin' || $_user?.permissions?.features?.image_generation);
+		($_user?.permissions?.features?.image_generation ?? true);
 
 	let showCodeInterpreterButton = false;
 	$: showCodeInterpreterButton =
@@ -527,45 +570,11 @@
 		});
 	};
 
-	const screenCaptureHandler = async () => {
-		try {
-			// Request screen media
-			const mediaStream = await navigator.mediaDevices.getDisplayMedia({
-				video: { cursor: 'never' },
-				audio: false
-			});
-			// Once the user selects a screen, temporarily create a video element
-			const video = document.createElement('video');
-			video.srcObject = mediaStream;
-			// Ensure the video loads without affecting user experience or tab switching
-			await video.play();
-			// Set up the canvas to match the video dimensions
-			const canvas = document.createElement('canvas');
-			canvas.width = video.videoWidth;
-			canvas.height = video.videoHeight;
-			// Grab a single frame from the video stream using the canvas
-			const context = canvas.getContext('2d');
-			context.drawImage(video, 0, 0, canvas.width, canvas.height);
-			// Stop all video tracks (stop screen sharing) after capturing the image
-			mediaStream.getTracks().forEach((track) => track.stop());
-
-			// bring back focus to this current tab, so that the user can see the screen capture
-			window.focus();
-
-			// Convert the canvas to a Base64 image URL
-			const imageUrl = canvas.toDataURL('image/png');
-			const blob = await (await fetch(imageUrl)).blob();
-			const file = new File([blob], `screen-capture-${Date.now()}.png`, { type: 'image/png' });
-			inputFilesHandler([file]);
-			// Clean memory: Clear video srcObject
-			video.srcObject = null;
-		} catch (error) {
-			// Handle any errors (e.g., user cancels screen sharing)
-			console.error('Error capturing screen:', error);
-		}
-	};
-
-	const uploadFileHandler = async (file, process = true, itemData = {}) => {
+	const uploadFileHandler = async (
+		file,
+		process = false,
+		itemData: { uploadFingerprint?: string; [key: string]: any } = {}
+	) => {
 		if ($_user?.role !== 'admin' && !($_user?.permissions?.chat?.file_upload ?? true)) {
 			toast.error($i18n.t('You do not have permission to upload files.'));
 			return null;
@@ -573,6 +582,12 @@
 
 		if (fileUploadCapableModels.length !== selectedModels.length) {
 			toast.error($i18n.t('Model(s) do not support file upload'));
+			return null;
+		}
+
+		const uploadFingerprint =
+			normalizeUploadFingerprintPart(itemData?.uploadFingerprint) || buildUploadFingerprint(file);
+		if (hasUploadFingerprint(uploadFingerprint)) {
 			return null;
 		}
 
@@ -588,6 +603,7 @@
 			size: file.size,
 			error: '',
 			itemId: tempItemId,
+			uploadFingerprint,
 			...itemData
 		};
 
@@ -762,25 +778,33 @@
 					// Compress the image if settings or config require it
 					imageUrl = await compressImageHandler(imageUrl, $settings, $config);
 
+					const uploadFingerprint = buildUploadFingerprint(file);
+					if (hasUploadFingerprint(uploadFingerprint)) {
+						return;
+					}
+
 					if ($temporaryChatEnabled) {
 						files = [
 							...files,
 							{
 								type: 'image',
-								url: imageUrl
+								url: imageUrl,
+								uploadFingerprint
 							}
 						];
 					} else {
 						const blob = await (await fetch(imageUrl)).blob();
 						const compressedFile = new File([blob], file.name, { type: file.type });
 
-						uploadFileHandler(compressedFile, false);
+						uploadFileHandler(compressedFile, false, { uploadFingerprint });
 					}
 				};
 
 				reader.readAsDataURL(file['type'] === 'image/heic' ? await convertHeicToJpeg(file) : file);
 			} else {
-				uploadFileHandler(file);
+				uploadFileHandler(file, false, {
+					uploadFingerprint: buildUploadFingerprint(file)
+				});
 			}
 		});
 	};
@@ -1058,7 +1082,6 @@
 		await tick();
 	}}
 	on:close={() => {
-		integrationsMenuCloseOnOutsideClick = true;
 	}}
 />
 
@@ -1160,18 +1183,21 @@
 								document.getElementById('chat-input')?.focus();
 
 								if ($settings?.speechAutoSend ?? false) {
-									dispatch('submit', prompt);
+									dispatchSubmit();
 								}
 							}}
 						/>
 					</div>
-					<form
-						class="w-full flex flex-col gap-1.5 {recording ? 'hidden' : ''}"
-						on:submit|preventDefault={() => {
-							// check if selectedModels support image input
-							dispatch('submit', prompt);
-						}}
-					>
+						<form
+							class="w-full flex flex-col gap-1.5 {recording ? 'hidden' : ''}"
+							on:submit|preventDefault={() => {
+								if (hasUploadingFiles) {
+									toast.error($i18n.t('Please wait until all files are uploaded.'));
+									return;
+								}
+								dispatchSubmit();
+							}}
+						>
 						<button
 							id="generate-message-pair-button"
 							class="hidden"
@@ -1236,12 +1262,17 @@
 									dir={$settings?.chatDirection ?? 'auto'}
 								>
 									{#each files as file, fileIdx}
-										{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
-											{@const fileUrl =
-												file.url.startsWith('data') || file.url.startsWith('http')
-													? file.url
-													: `${WEBUI_API_BASE_URL}/files/${file.url}${file?.content_type ? '/content' : ''}`}
-											<div class=" relative group">
+										{@const fileRef = (file?.url ?? file?.id ?? '').toString().trim()}
+										{@const hasFileRef =
+											fileRef !== '' && fileRef !== 'null' && fileRef !== 'undefined'}
+										{@const isUploading = file?.status === 'uploading'}
+										{#if isUploading || hasFileRef}
+											{#if hasFileRef && (file.type === 'image' || (file?.content_type ?? '').startsWith('image/'))}
+												{@const fileUrl =
+													fileRef.startsWith('data') || fileRef.startsWith('http')
+														? fileRef
+														: `${WEBUI_API_BASE_URL}/files/${fileRef}${file?.content_type ? '/content' : ''}`}
+												<div class=" relative group">
 												<div class="relative flex items-center">
 													<Image
 														src={fileUrl}
@@ -1299,27 +1330,28 @@
 														</svg>
 													</button>
 												</div>
-											</div>
-										{:else}
-											<FileItem
-												item={file}
-												name={file.name}
-												type={file.type}
-												size={file?.size}
-												loading={file.status === 'uploading'}
-												dismissible={true}
-												edit={true}
-												small={true}
-												modal={['file', 'collection'].includes(file?.type)}
-												on:dismiss={async () => {
-													// Remove from UI state
-													files.splice(fileIdx, 1);
-													files = files;
-												}}
-												on:click={() => {
-													console.log(file);
-												}}
-											/>
+												</div>
+											{:else}
+												<FileItem
+													item={{ ...file, url: hasFileRef ? fileRef : null }}
+													name={file.name}
+													type={file.type}
+													size={file?.size}
+													loading={isUploading}
+													dismissible={true}
+													edit={true}
+													small={true}
+													modal={['file', 'collection'].includes(file?.type)}
+													on:dismiss={async () => {
+														// Remove from UI state
+														files.splice(fileIdx, 1);
+														files = files;
+													}}
+													on:click={() => {
+														console.log(file);
+													}}
+												/>
+											{/if}
 										{/if}
 									{/each}
 								</div>
@@ -1416,7 +1448,9 @@
 															document.getElementById('suggestions-container');
 
 														if (e.key === 'Escape') {
-															stopResponse();
+															if (hasBlockingGeneration) {
+																stopResponse();
+															}
 														}
 
 														if (prompt === '' && e.key == 'ArrowUp') {
@@ -1458,12 +1492,18 @@
 																		? (e.key === 'Enter' || e.keyCode === 13) && isCtrlPressed
 																		: (e.key === 'Enter' || e.keyCode === 13) && !e.shiftKey;
 
-																if (enterPressed) {
-																	e.preventDefault();
-																	if (prompt !== '' || files.length > 0) {
-																		dispatch('submit', prompt);
+																	if (enterPressed) {
+																		e.preventDefault();
+																		if (hasUploadingFiles) {
+																			toast.error(
+																				$i18n.t('Please wait until all files are uploaded.')
+																			);
+																			return;
+																		}
+																		if (prompt !== '' || files.length > 0) {
+																			dispatchSubmit();
+																		}
 																	}
-																}
 															}
 														}
 
@@ -1522,59 +1562,90 @@
 							</div>
 
 							<div class=" flex justify-between mt-0.5 mb-2.5 mx-0.5 max-w-full" dir="ltr">
-								<div class="ml-1 self-end flex items-center flex-1 max-w-[80%]">
-									<InputMenu
-										bind:files
-										selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
-										{fileUploadCapableModels}
-										{screenCaptureHandler}
-										{inputFilesHandler}
-										uploadFilesHandler={() => {
-											filesInputElement.click();
-										}}
-										uploadGoogleDriveHandler={async () => {
-											try {
-												const fileData = await createPicker();
-												if (fileData) {
-													const file = new File([fileData.blob], fileData.name, {
-														type: fileData.blob.type
-													});
-													await uploadFileHandler(file);
-												} else {
-													console.log('No file was selected from Google Drive');
-												}
-											} catch (error) {
-												console.error('Google Drive Error:', error);
-												toast.error(
-													$i18n.t('Error accessing Google Drive: {{error}}', {
-														error: error.message
-													})
-												);
-											}
-										}}
-										uploadOneDriveHandler={async (authorityType) => {
-											try {
-												const fileData = await pickAndDownloadFile(authorityType);
-												if (fileData) {
-													const file = new File([fileData.blob], fileData.name, {
-														type: fileData.blob.type || 'application/octet-stream'
-													});
-													await uploadFileHandler(file);
-												} else {
-													console.log('No file was selected from OneDrive');
-												}
-											} catch (error) {
-												console.error('OneDrive Error:', error);
-											}
-										}}
-										{onUpload}
-										onClose={async () => {
-											await tick();
+									<div class="ml-1 self-end flex items-center flex-1 max-w-[80%]">
+										<Tooltip content={$i18n.t('Thinking Mode')} placement="top">
+											<button
+												id="thinking-mode-toggle"
+												aria-label={thinkingModeEnabled
+													? $i18n.t('Disable Thinking Mode')
+													: $i18n.t('Enable Thinking Mode')}
+												aria-pressed={thinkingModeEnabled}
+												on:mousedown|preventDefault
+												on:click|preventDefault={(event) => {
+													thinkingModeEnabled = !thinkingModeEnabled;
+													(event.currentTarget as HTMLButtonElement | null)?.blur();
+												}}
+												type="button"
+												class="mr-1 inline-flex size-8 items-center justify-center rounded-full border-0 px-0 text-xs font-medium outline-none ring-0 shadow-none transition-colors focus:outline-none focus-visible:outline-none focus:ring-0 focus-visible:ring-0 sm:h-8 sm:w-auto sm:justify-start sm:gap-1.5 sm:px-2.5 {thinkingModeEnabled
+													? 'bg-gradient-to-r from-[#ef5b6d]/20 to-[#4a87ff]/20 text-[#b53c4f] dark:from-[#ef5b6d]/25 dark:to-[#4a87ff]/25 dark:text-[#dbe8ff]'
+													: 'bg-transparent text-gray-600 hover:bg-gradient-to-r hover:from-[#ef5b6d]/10 hover:to-[#4a87ff]/10 hover:text-[#7b3b8d] dark:bg-transparent dark:text-gray-300 dark:hover:bg-gradient-to-r dark:hover:from-[#ef5b6d]/10 dark:hover:to-[#4a87ff]/15 dark:hover:text-gray-100'}"
+											>
+												<LightBulb className="size-3.5" strokeWidth="1.75" />
+												<span class="hidden sm:inline">{$i18n.t('Thinking')}</span>
+												<div
+													class="relative hidden h-4 w-7 rounded-full transition-colors sm:block {thinkingModeEnabled
+														? 'bg-gradient-to-r from-[#ef5b6d] to-[#4a87ff]'
+														: 'bg-gray-300 dark:bg-gray-600'}"
+												>
+													<span
+														class="absolute left-[2px] top-[2px] h-3 w-3 rounded-full bg-white transition-transform {thinkingModeEnabled
+															? 'translate-x-3'
+															: ''}"
+													></span>
+												</div>
+											</button>
+										</Tooltip>
 
-											const chatInput = document.getElementById('chat-input');
-											chatInput?.focus();
-										}}
-									>
+											<InputMenu
+												bind:files
+												selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
+												{fileUploadCapableModels}
+												uploadFilesHandler={() => {
+													filesInputElement.click();
+												}}
+												uploadGoogleDriveHandler={async () => {
+													try {
+														const fileData = await createPicker();
+														if (fileData) {
+															const file = new File([fileData.blob], fileData.name, {
+																type: fileData.blob.type
+															});
+															await uploadFileHandler(file);
+														} else {
+															console.log('No file was selected from Google Drive');
+														}
+													} catch (error) {
+														console.error('Google Drive Error:', error);
+														toast.error(
+															$i18n.t('Error accessing Google Drive: {{error}}', {
+																error: error.message
+															})
+														);
+													}
+												}}
+												uploadOneDriveHandler={async (authorityType) => {
+													try {
+														const fileData = await pickAndDownloadFile(authorityType);
+														if (fileData) {
+															const file = new File([fileData.blob], fileData.name, {
+																type: fileData.blob.type || 'application/octet-stream'
+															});
+															await uploadFileHandler(file);
+														} else {
+															console.log('No file was selected from OneDrive');
+														}
+													} catch (error) {
+														console.error('OneDrive Error:', error);
+													}
+												}}
+												{onUpload}
+												onClose={async () => {
+													await tick();
+
+													const chatInput = document.getElementById('chat-input');
+													chatInput?.focus();
+												}}
+											>
 										<div
 											id="input-menu-button"
 											class="bg-transparent hover:bg-gray-100 text-gray-700 dark:text-white dark:hover:bg-gray-800 rounded-full size-8 flex justify-center items-center outline-hidden focus:outline-hidden"
@@ -1583,30 +1654,57 @@
 										</div>
 									</InputMenu>
 
-									{#if showWebSearchButton || showImageGenerationButton || showCodeInterpreterButton || showToolsButton || (toggleFilters && toggleFilters.length > 0)}
+									{#if $config?.features?.enable_knowledge ?? true}
 										<div
 											class="flex self-center w-[1px] h-4 mx-1 bg-gray-200/50 dark:bg-gray-800/50"
 										/>
 
-										<IntegrationsMenu
+										<InputMenu
+											bind:files
 											selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
-											{toggleFilters}
-											{showWebSearchButton}
-											{showImageGenerationButton}
-											{showCodeInterpreterButton}
-											bind:selectedToolIds
-											bind:selectedFilterIds
-											bind:webSearchEnabled
-											bind:imageGenerationEnabled
-											bind:codeInterpreterEnabled
-											closeOnOutsideClick={integrationsMenuCloseOnOutsideClick}
-											onShowValves={(e) => {
-												const { type, id } = e;
-												selectedValvesType = type;
-												selectedValvesItemId = id;
-												showValvesModal = true;
-												integrationsMenuCloseOnOutsideClick = false;
+											{fileUploadCapableModels}
+											uploadFilesHandler={() => {
+												filesInputElement.click();
 											}}
+											uploadGoogleDriveHandler={async () => {
+												try {
+													const fileData = await createPicker();
+													if (fileData) {
+														const file = new File([fileData.blob], fileData.name, {
+															type: fileData.blob.type
+														});
+														await uploadFileHandler(file);
+													} else {
+														console.log('No file was selected from Google Drive');
+													}
+												} catch (error) {
+													console.error('Google Drive Error:', error);
+													toast.error(
+														$i18n.t('Error accessing Google Drive: {{error}}', {
+															error: error.message
+														})
+													);
+												}
+											}}
+											uploadOneDriveHandler={async (authorityType) => {
+												try {
+													const fileData = await pickAndDownloadFile(authorityType);
+													if (fileData) {
+														const file = new File([fileData.blob], fileData.name, {
+															type: fileData.blob.type || 'application/octet-stream'
+														});
+														await uploadFileHandler(file);
+													} else {
+														console.log('No file was selected from OneDrive');
+													}
+												} catch (error) {
+													console.error('OneDrive Error:', error);
+												}
+											}}
+											{onUpload}
+											initialTab="knowledge"
+											knowledgeOnly={true}
+											tooltipContent="引用知识库"
 											onClose={async () => {
 												await tick();
 
@@ -1615,12 +1713,12 @@
 											}}
 										>
 											<div
-												id="integration-menu-button"
+												id="knowledge-menu-button"
 												class="bg-transparent hover:bg-gray-100 text-gray-700 dark:text-white dark:hover:bg-gray-800 rounded-full size-8 flex justify-center items-center outline-hidden focus:outline-hidden"
 											>
-												<Component className="size-4.5" strokeWidth="1.5" />
+												<Database className="size-4.5" strokeWidth="1.5" />
 											</div>
-										</IntegrationsMenu>
+										</InputMenu>
 									{/if}
 
 									{#if selectedModelIds.length === 1 && $models.find((m) => m.id === selectedModelIds[0])?.has_user_valves}
@@ -1643,15 +1741,15 @@
 									{/if}
 
 									<div class="ml-1 flex gap-1.5">
-										{#if (selectedToolIds ?? []).length > 0}
+										{#if showToolsButton && (selectedToolIds ?? []).length > 0}
 											<Tooltip
-												content={$i18n.t('{{COUNT}} Available Tools', {
+												content={$i18n.t('{{COUNT}} Enabled Tools', {
 													COUNT: (selectedToolIds ?? []).length
 												})}
 											>
 												<button
 													class="translate-y-[0.5px] px-1 flex gap-1 items-center text-gray-600 dark:text-gray-300 hover:text-gray-700 dark:hover:text-gray-200 rounded-lg self-center transition"
-													aria-label="Available Tools"
+													aria-label={`${$i18n.t('Enabled')} ${$i18n.t('Tools')}`}
 													type="button"
 													on:click={() => {
 														showTools = !showTools;
@@ -1747,33 +1845,45 @@
 														: $i18n.t('Enable Code Interpreter')}
 													aria-pressed={codeInterpreterEnabled}
 													on:click|preventDefault={() =>
-														(codeInterpreterEnabled = !codeInterpreterEnabled)}
+													(codeInterpreterEnabled = !codeInterpreterEnabled)}
 													type="button"
 													class=" group p-[7px] flex gap-1.5 items-center text-sm transition-colors duration-300 max-w-full overflow-hidden {codeInterpreterEnabled
 														? ' text-sky-500 dark:text-sky-300 bg-sky-50 hover:bg-sky-100 dark:bg-sky-400/10 dark:hover:bg-sky-700/10 border border-sky-200/40 dark:border-sky-500/20'
-														: 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 '} {($settings?.highContrastMode ??
+													: 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 '} {($settings?.highContrastMode ??
 													false)
 														? 'm-1'
 														: 'focus:outline-hidden rounded-full'}"
 												>
 													<Cloud className="size-3.5" strokeWidth="2" />
 
-													<div class="hidden group-hover:block">
-														<XMark className="size-4" strokeWidth="1.75" />
-													</div>
-												</button>
-											</Tooltip>
+												<div class="hidden group-hover:block">
+													<XMark className="size-4" strokeWidth="1.75" />
+												</div>
+											</button>
+										</Tooltip>
 										{/if}
-									</div>
+				</div>
 								</div>
 
 								<div class="self-end flex space-x-1 mr-1 shrink-0 gap-[0.5px]">
-									{#if (taskIds && taskIds.length > 0) || (history.currentId && history.messages[history.currentId]?.done != true) || generating}
-										<div class=" flex items-center">
+									{#if hasBlockingGeneration}
+										<div class=" flex items-center gap-1">
+											<Tooltip content="立即回答">
+												<button
+													class="inline-flex h-8 items-center rounded-full border border-gray-200 bg-white px-2.5 text-xs font-medium text-gray-700 shadow-xs transition hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+													type="button"
+													on:click|preventDefault|stopPropagation={() => {
+														answerNowResponse();
+													}}
+												>
+													立即回答
+												</button>
+											</Tooltip>
 											<Tooltip content={$i18n.t('Stop')}>
 												<button
 													class="bg-white hover:bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-white dark:hover:bg-gray-800 transition rounded-full p-1.5"
-													on:click={() => {
+													type="button"
+													on:click|preventDefault|stopPropagation={() => {
 														stopResponse();
 													}}
 												>
@@ -1810,7 +1920,7 @@
 											</Tooltip>
 										{/if}
 
-										{#if !history?.currentId || history.messages[history.currentId]?.done == true}
+										{#if !hasBlockingGeneration}
 											<!-- Terminal Server Selector -->
 											{#if ($terminalServers ?? []).length > 0 || ($settings?.terminalServers ?? []).some((s) => s.url)}
 												<TerminalMenu bind:show={showTerminalMenu} />
@@ -1867,7 +1977,7 @@
 											{/if}
 										{/if}
 
-										{#if prompt === '' && files.length === 0 && ($_user?.role === 'admin' || ($_user?.permissions?.chat?.call ?? true))}
+									{#if prompt === '' && files.length === 0 && ($_user?.permissions?.chat?.call ?? true) && ($settings?.conversationMode ?? false)}
 											<div class=" flex items-center">
 												<!-- {$i18n.t('Call')} -->
 												<Tooltip content={$i18n.t('Voice mode')}>
@@ -1916,6 +2026,7 @@
 																}
 
 																showCallOverlay.set(true);
+																showFilePreview.set(false);
 																showControls.set(true);
 															} catch (err) {
 																// If the user denies the permission or an error occurs, show an error message

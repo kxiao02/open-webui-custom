@@ -3,7 +3,7 @@
 	import { Select, DropdownMenu } from 'bits-ui';
 
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let align = 'center';
 	export let className = '';

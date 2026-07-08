@@ -2,16 +2,14 @@
 	import { toast } from 'svelte-sonner';
 
 	import { onMount, getContext, tick } from 'svelte';
-	import { models, tools, functions, user } from '$lib/stores';
+	import { models, functions, user } from '$lib/stores';
 	import { WEBUI_BASE_URL, DEFAULT_CAPABILITIES } from '$lib/constants';
 
-	import { getTools } from '$lib/apis/tools';
 	import { getFunctions } from '$lib/apis/functions';
 
 	import AdvancedParams from '$lib/components/chat/Settings/Advanced/AdvancedParams.svelte';
 	import Tags from '$lib/components/common/Tags.svelte';
 	import Knowledge from '$lib/components/workspace/Models/Knowledge.svelte';
-	import ToolsSelector from '$lib/components/workspace/Models/ToolsSelector.svelte';
 	import SkillsSelector from '$lib/components/workspace/Models/SkillsSelector.svelte';
 	import FiltersSelector from '$lib/components/workspace/Models/FiltersSelector.svelte';
 	import ActionsSelector from '$lib/components/workspace/Models/ActionsSelector.svelte';
@@ -28,7 +26,7 @@
 	import LockClosed from '$lib/components/icons/LockClosed.svelte';
 	import { updateModelAccessGrants } from '$lib/apis/models';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let onSubmit: Function;
 	export let onBack: null | Function = null;
@@ -89,7 +87,6 @@
 	};
 
 	let knowledge = [];
-	let toolIds = [];
 	let skillIds = [];
 
 	let filterIds = [];
@@ -149,12 +146,8 @@
 			}
 		}
 
-		if (toolIds.length > 0) {
-			info.meta.toolIds = toolIds;
-		} else {
-			if (info.meta.toolIds) {
-				delete info.meta.toolIds;
-			}
+		if (info.meta.toolIds) {
+			delete info.meta.toolIds;
 		}
 
 		if (skillIds.length > 0) {
@@ -236,7 +229,6 @@
 	};
 
 	onMount(async () => {
-		await tools.set(await getTools(localStorage.token));
 		await functions.set(await getFunctions(localStorage.token));
 
 		// Scroll to top 'workspace-container' element
@@ -295,7 +287,6 @@
 				}
 			});
 
-			toolIds = model?.meta?.toolIds ?? [];
 			skillIds = model?.meta?.skillIds ?? [];
 			filterIds = model?.meta?.filterIds ?? [];
 			defaultFilterIds = model?.meta?.defaultFilterIds ?? [];
@@ -741,10 +732,6 @@
 
 					<div class="my-4">
 						<Knowledge bind:selectedItems={knowledge} />
-					</div>
-
-					<div class="my-4">
-						<ToolsSelector bind:selectedToolIds={toolIds} tools={$tools ?? []} />
 					</div>
 
 					<div class="my-4">

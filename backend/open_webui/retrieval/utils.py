@@ -44,14 +44,36 @@ from open_webui.env import (
     OFFLINE_MODE,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     AIOHTTP_CLIENT_SESSION_SSL,
+    DEVICE_TYPE,
+    SENTENCE_TRANSFORMERS_BACKEND,
+    SENTENCE_TRANSFORMERS_MODEL_KWARGS,
 )
 from open_webui.config import (
+    RAG_EMBEDDING_MODEL_AUTO_UPDATE,
+    RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
     RAG_EMBEDDING_QUERY_PREFIX,
     RAG_EMBEDDING_CONTENT_PREFIX,
     RAG_EMBEDDING_PREFIX_FIELD_NAME,
 )
+from open_webui.utils.knowflow import (
+    KnowflowError,
+    build_knowflow_markdown_image,
+    get_knowflow_chunk_content,
+    get_knowflow_chunk_file_id,
+    get_knowflow_chunk_render_metadata,
+    get_knowflow_chunk_similarity,
+    get_knowflow_chunk_source_name,
+    is_knowflow_enabled,
+    is_knowflow_image_ref,
+    knowflow_content_has_inline_visuals,
+    retrieve_from_knowledge,
+)
 
 log = logging.getLogger(__name__)
+
+_SQL_VECTOR_DB_TYPES = {"pgvector", "opengauss", "mariadb_vector"}
+_QUERY_COLLECTION_MAX_DB_WORKERS = 4
+_QUERY_COLLECTION_MAX_NON_DB_WORKERS = 8
 
 
 from typing import Any
@@ -86,6 +108,43 @@ def get_content_from_url(request, url: str) -> str:
     docs = loader.load()
     content = " ".join([doc.page_content for doc in docs])
     return content, docs
+
+
+def load_sentence_transformer_embedding_model(
+    embedding_model: str,
+    auto_update: bool = RAG_EMBEDDING_MODEL_AUTO_UPDATE,
+):
+    if not embedding_model:
+        raise ValueError("Embedding model is required for local fallback.")
+
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(
+        get_model_path(embedding_model, auto_update),
+        device=DEVICE_TYPE,
+        trust_remote_code=RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
+        backend=SENTENCE_TRANSFORMERS_BACKEND,
+        model_kwargs=SENTENCE_TRANSFORMERS_MODEL_KWARGS,
+    )
+
+
+async def _encode_with_sentence_transformer(
+    embedding_function,
+    query,
+    prefix=None,
+    embedding_batch_size=1,
+):
+    return await asyncio.to_thread(
+        (
+            lambda query, prefix=None: embedding_function.encode(
+                query,
+                batch_size=int(embedding_batch_size),
+                **({"prompt": prefix} if prefix else {}),
+            ).tolist()
+        ),
+        query,
+        prefix,
+    )
 
 
 CHUNK_HASH_KEY = "_chunk_hash"
@@ -407,6 +466,109 @@ def merge_and_sort_query_results(query_results: list[dict], k: int) -> dict:
     }
 
 
+class RetrievalSourceList(list):
+    """List result wrapper for compatibility-path provenance and diagnostics."""
+
+    def __init__(
+        self,
+        iterable=(),
+        *,
+        compatibility_provenance: dict[str, Any] | None = None,
+        compatibility_diagnostics: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(iterable)
+        self.compatibility_provenance = (
+            compatibility_provenance
+            if isinstance(compatibility_provenance, dict)
+            else {}
+        )
+        self.compatibility_diagnostics = (
+            compatibility_diagnostics
+            if isinstance(compatibility_diagnostics, list)
+            else []
+        )
+
+
+def _query_result_has_usable_documents(query_result: Any) -> bool:
+    if not isinstance(query_result, dict):
+        return False
+    documents = query_result.get("documents")
+    if not isinstance(documents, list) or not documents:
+        return False
+    rows = documents[0]
+    if not isinstance(rows, list) or not rows:
+        return False
+    return any(str(document or "").strip() for document in rows)
+
+
+def _compatibility_retrieval_detail(
+    *,
+    collection_names: list[str] | set[str] | tuple[str, ...],
+    queries: list[str] | tuple[str, ...],
+    reason: str = "",
+) -> dict[str, Any]:
+    return {
+        "collection_count": len(
+            [name for name in collection_names if str(name or "").strip()]
+        ),
+        "query_count": len([query for query in queries if str(query or "").strip()]),
+        "reason": str(reason or "").strip(),
+    }
+
+
+def _record_compatibility_retrieval_event(
+    compatibility_provenance: dict[str, Any],
+    event: str,
+    *,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    if not isinstance(compatibility_provenance, dict):
+        return
+
+    normalized_event = str(event or "").strip()
+    if not normalized_event:
+        return
+
+    events = compatibility_provenance.setdefault("events", [])
+    if normalized_event not in events:
+        events.append(normalized_event)
+
+    event_counts = compatibility_provenance.setdefault("event_counts", {})
+    event_counts[normalized_event] = int(event_counts.get(normalized_event) or 0) + 1
+
+    if isinstance(detail, dict) and detail:
+        transition_details = compatibility_provenance.setdefault(
+            "transition_details", []
+        )
+        transition_details.append({"event": normalized_event, **detail})
+
+
+def _compatibility_retrieval_diagnostic(
+    *,
+    reason: str,
+    outcome: str,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_reason = str(reason or "").strip()
+    normalized_outcome = str(outcome or "").strip() or "diagnostics"
+    diagnostic = {
+        "kind": "retrieval_provider",
+        "classification": (
+            "no_evidence" if normalized_reason == "non_hybrid_fallback_no_evidence" else "diagnostics"
+        ),
+        "reason": normalized_reason,
+        "outcome": normalized_outcome,
+    }
+    if isinstance(detail, dict) and detail:
+        diagnostic["detail"] = detail
+    return diagnostic
+
+
+def _compatibility_retrieval_error_kind(exc: Exception) -> str:
+    timeout_types = (TimeoutError, asyncio.TimeoutError)
+    return "timeout" if isinstance(exc, timeout_types) else "provider_error"
+
+
 def get_all_items_from_collections(collection_names: list[str]) -> dict:
     results = []
 
@@ -456,7 +618,15 @@ async def query_collection(
         f"query_collection: processing {len(queries)} queries across {len(collection_names)} collections"
     )
 
-    with ThreadPoolExecutor() as executor:
+    total_tasks = max(1, len(query_embeddings) * len(collection_names))
+    max_workers = (
+        _QUERY_COLLECTION_MAX_DB_WORKERS
+        if VECTOR_DB in _SQL_VECTOR_DB_TYPES
+        else _QUERY_COLLECTION_MAX_NON_DB_WORKERS
+    )
+    max_workers = max(1, min(total_tasks, max_workers))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_results = []
         for query_embedding in query_embeddings:
             for collection_name in collection_names:
@@ -830,25 +1000,31 @@ def get_embedding_function(
     azure_api_version=None,
     enable_async=True,
     concurrent_requests=0,
+    fallback_to_local=False,
+    fallback_embedding_model=None,
 ) -> Awaitable:
     if embedding_engine == "":
+        if embedding_function is None:
+            async def missing_embedding_function(query, prefix=None, user=None):
+                raise RuntimeError(
+                    "Local sentence-transformers embeddings are unavailable. "
+                    "Install sentence-transformers or configure an external embedding engine."
+                )
+
+            return missing_embedding_function
+
         # Sentence transformers: CPU-bound sync operation
         async def async_embedding_function(query, prefix=None, user=None):
-            return await asyncio.to_thread(
-                (
-                    lambda query, prefix=None: embedding_function.encode(
-                        query,
-                        batch_size=int(embedding_batch_size),
-                        **({"prompt": prefix} if prefix else {}),
-                    ).tolist()
-                ),
+            return await _encode_with_sentence_transformer(
+                embedding_function,
                 query,
                 prefix,
+                embedding_batch_size,
             )
 
         return async_embedding_function
     elif embedding_engine in ["ollama", "openai", "azure_openai"]:
-        embedding_function = lambda query, prefix=None, user=None: generate_embeddings(
+        external_embedding_function = lambda query, prefix=None, user=None: generate_embeddings(
             engine=embedding_engine,
             model=embedding_model,
             text=query,
@@ -858,61 +1034,116 @@ def get_embedding_function(
             user=user,
             azure_api_version=azure_api_version,
         )
+        local_embedding_function = embedding_function
+        fallback_model_name = str(fallback_embedding_model or "").strip()
+        fallback_lock = asyncio.Lock()
 
-        async def async_embedding_function(query, prefix=None, user=None):
-            if isinstance(query, list):
-                # Create batches
-                batches = [
-                    query[i : i + embedding_batch_size]
-                    for i in range(0, len(query), embedding_batch_size)
-                ]
+        async def encode_with_local_fallback(query, prefix=None):
+            nonlocal local_embedding_function
 
-                if enable_async:
-                    log.debug(
-                        f"generate_multiple_async: Processing {len(batches)} batches in parallel"
-                    )
-                    # Use semaphore to limit concurrent embedding API requests
-                    # 0 = unlimited (no semaphore)
-                    if concurrent_requests:
-                        semaphore = asyncio.Semaphore(concurrent_requests)
-
-                        async def generate_batch_with_semaphore(batch):
-                            async with semaphore:
-                                return await embedding_function(
-                                    batch, prefix=prefix, user=user
-                                )
-
-                        tasks = [
-                            generate_batch_with_semaphore(batch) for batch in batches
-                        ]
-                    else:
-                        tasks = [
-                            embedding_function(batch, prefix=prefix, user=user)
-                            for batch in batches
-                        ]
-                    batch_results = await asyncio.gather(*tasks)
-                else:
-                    log.debug(
-                        f"generate_multiple_async: Processing {len(batches)} batches sequentially"
-                    )
-                    batch_results = []
-                    for batch in batches:
-                        batch_results.append(
-                            await embedding_function(batch, prefix=prefix, user=user)
+            if local_embedding_function is None:
+                async with fallback_lock:
+                    if local_embedding_function is None:
+                        log.warning(
+                            "Loading local fallback embedding model %s after %s embedding failure.",
+                            fallback_model_name,
+                            embedding_engine,
+                        )
+                        local_embedding_function = await asyncio.to_thread(
+                            load_sentence_transformer_embedding_model,
+                            fallback_model_name,
                         )
 
-                # Flatten results
-                embeddings = []
-                for batch_embeddings in batch_results:
-                    if isinstance(batch_embeddings, list):
-                        embeddings.extend(batch_embeddings)
+            return await _encode_with_sentence_transformer(
+                local_embedding_function,
+                query,
+                prefix,
+                embedding_batch_size,
+            )
 
-                log.debug(
-                    f"generate_multiple_async: Generated {len(embeddings)} embeddings from {len(batches)} parallel batches"
+        async def async_embedding_function(query, prefix=None, user=None):
+            try:
+                if isinstance(query, list):
+                    # Create batches
+                    batches = [
+                        query[i : i + embedding_batch_size]
+                        for i in range(0, len(query), embedding_batch_size)
+                    ]
+
+                    if enable_async:
+                        log.debug(
+                            f"generate_multiple_async: Processing {len(batches)} batches in parallel"
+                        )
+                        # Use semaphore to limit concurrent embedding API requests
+                        # 0 = unlimited (no semaphore)
+                        if concurrent_requests:
+                            semaphore = asyncio.Semaphore(concurrent_requests)
+
+                            async def generate_batch_with_semaphore(batch):
+                                async with semaphore:
+                                    return await external_embedding_function(
+                                        batch, prefix=prefix, user=user
+                                    )
+
+                            tasks = [
+                                generate_batch_with_semaphore(batch) for batch in batches
+                            ]
+                        else:
+                            tasks = [
+                                external_embedding_function(
+                                    batch, prefix=prefix, user=user
+                                )
+                                for batch in batches
+                            ]
+                        batch_results = await asyncio.gather(*tasks)
+                    else:
+                        log.debug(
+                            f"generate_multiple_async: Processing {len(batches)} batches sequentially"
+                        )
+                        batch_results = []
+                        for batch in batches:
+                            batch_results.append(
+                                await external_embedding_function(
+                                    batch, prefix=prefix, user=user
+                                )
+                            )
+
+                    if fallback_to_local and any(
+                        batch_embeddings is None for batch_embeddings in batch_results
+                    ):
+                        raise RuntimeError(
+                            f"{embedding_engine} embeddings request returned no data."
+                        )
+
+                    # Flatten results
+                    embeddings = []
+                    for batch_embeddings in batch_results:
+                        if isinstance(batch_embeddings, list):
+                            embeddings.extend(batch_embeddings)
+
+                    log.debug(
+                        f"generate_multiple_async: Generated {len(embeddings)} embeddings from {len(batches)} parallel batches"
+                    )
+                    return embeddings
+
+                result = await external_embedding_function(query, prefix, user)
+                if result is None and fallback_to_local:
+                    raise RuntimeError(
+                        f"{embedding_engine} embeddings request returned no data."
+                    )
+                return result
+            except Exception as exc:
+                if not fallback_to_local or not fallback_model_name:
+                    raise
+
+                log.warning(
+                    "External embeddings via %s model %s failed; falling back to local model %s: %s",
+                    embedding_engine,
+                    embedding_model,
+                    fallback_model_name,
+                    exc,
                 )
-                return embeddings
-            else:
-                return await embedding_function(query, prefix, user)
+                return await encode_with_local_fallback(query, prefix)
 
         return async_embedding_function
     else:
@@ -980,6 +1211,134 @@ def get_reranking_function(reranking_engine, reranking_model, reranking_function
         )
 
 
+def _first_non_empty_query(queries: list[str]) -> str:
+    for query in queries or []:
+        normalized_query = str(query or "").strip()
+        if normalized_query:
+            return normalized_query
+    return ""
+
+
+def _knowflow_chunk_dedupe_key(chunk: dict) -> str:
+    document_id = str(chunk.get("document_id") or "").strip()
+    content = str(chunk.get("content") or chunk.get("text") or "").strip()
+    return (
+        str(chunk.get("id") or "").strip()
+        or str(chunk.get("chunk_id") or "").strip()
+        or (f"{document_id}:{content[:200]}" if document_id and content else "")
+    )
+
+
+async def _retrieve_knowflow_chunks_for_queries(
+    request,
+    user: Optional[UserModel],
+    queries: list[str],
+    *,
+    dataset_ids: Optional[list[str]] = None,
+    document_ids: Optional[list[str]] = None,
+    page_size: int = 5,
+) -> list[dict]:
+    chunks: list[dict] = []
+    seen: set[str] = set()
+
+    for query in queries or []:
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            continue
+
+        query_chunks = await retrieve_from_knowledge(
+            request.app.state.config,
+            user,
+            normalized_query,
+            dataset_ids=dataset_ids,
+            document_ids=document_ids,
+            page_size=page_size,
+        )
+        for chunk in query_chunks or []:
+            if not isinstance(chunk, dict):
+                continue
+            key = _knowflow_chunk_dedupe_key(chunk)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            chunks.append(chunk)
+
+    return chunks
+
+
+def _format_knowflow_document_content(content: str, metadata: dict[str, Any]) -> str:
+    normalized_content = str(content or "").strip()
+    has_inline_visuals = knowflow_content_has_inline_visuals(normalized_content)
+
+    render_markdown = str(metadata.get("render_markdown") or "").strip()
+    render_url = str(metadata.get("url") or "").strip()
+    if (
+        not render_markdown
+        and render_url
+        and is_knowflow_image_ref(render_url)
+        and not has_inline_visuals
+    ):
+        render_markdown = build_knowflow_markdown_image(
+            render_url,
+            str(metadata.get("name") or "Knowledge image"),
+        )
+
+    if render_markdown:
+        if not normalized_content:
+            return render_markdown
+        if render_markdown not in normalized_content:
+            return f"{normalized_content}\n\n{render_markdown}"
+
+    if not normalized_content:
+        return str(metadata.get("html_content") or "").strip()
+
+    return normalized_content
+
+
+def _to_knowflow_query_result(
+    chunks: list[dict],
+    *,
+    config=None,
+    fallback_file_id: str = "",
+    fallback_name: str = "",
+) -> Optional[dict]:
+    documents: list[str] = []
+    metadatas: list[dict] = []
+    distances: list[float] = []
+
+    for chunk in chunks or []:
+        content = get_knowflow_chunk_content(chunk)
+        file_id = get_knowflow_chunk_file_id(chunk, fallback_file_id=fallback_file_id)
+        source_name = get_knowflow_chunk_source_name(chunk, fallback_name=fallback_name)
+        metadata = {
+            "file_id": file_id,
+            "name": source_name,
+            "source": source_name,
+            **get_knowflow_chunk_render_metadata(chunk, config),
+        }
+        content = _format_knowflow_document_content(content, metadata)
+        if not content:
+            continue
+
+        similarity = get_knowflow_chunk_similarity(chunk)
+        if similarity is not None:
+            metadata["similarity"] = similarity
+
+        documents.append(content)
+        metadatas.append(metadata)
+        distances.append(float(similarity) if similarity is not None else 0.0)
+
+    if not documents:
+        return None
+
+    return {
+        "documents": [documents],
+        "metadatas": [metadatas],
+        "distances": [distances],
+    }
+
+
 async def get_sources_from_items(
     request,
     items,
@@ -1000,6 +1359,15 @@ async def get_sources_from_items(
 
     extracted_collections = []
     query_results = []
+    knowflow_enabled = is_knowflow_enabled(request.app.state.config)
+    primary_query = _first_non_empty_query(queries)
+
+    compatibility_provenance: dict[str, Any] = {
+        "hybrid_requested": bool(hybrid_search),
+        "events": [],
+        "event_counts": {},
+    }
+    compatibility_diagnostics: list[dict[str, Any]] = []
 
     for item in items:
         query_result = None
@@ -1132,15 +1500,68 @@ async def get_sources_from_items(
                             ],
                         }
             else:
-                # Fallback to collection names
-                if item.get("legacy"):
-                    collection_names.append(f"{item['id']}")
-                else:
-                    collection_names.append(f"file-{item['id']}")
+                if knowflow_enabled and not full_context and primary_query and item.get("id"):
+                    try:
+                        chunks = await _retrieve_knowflow_chunks_for_queries(
+                            request,
+                            user,
+                            queries,
+                            document_ids=[item["id"]],
+                            page_size=max(1, int(k)),
+                        )
+                        query_result = _to_knowflow_query_result(
+                            chunks,
+                            config=request.app.state.config,
+                            fallback_file_id=str(item.get("id") or ""),
+                            fallback_name=str(item.get("name") or ""),
+                        )
+                    except KnowflowError as exc:
+                        log.warning(f"Knowflow file retrieval failed: {exc}")
+                    except Exception as exc:
+                        log.warning(f"Knowflow file retrieval failed unexpectedly: {exc}")
+
+                if query_result is None:
+                    # Fallback to local collection names
+                    if item.get("legacy"):
+                        collection_names.append(f"{item['id']}")
+                    else:
+                        collection_names.append(f"file-{item['id']}")
 
         elif item.get("type") == "collection":
+            if (
+                knowflow_enabled
+                and not full_context
+                and item.get("context") != "full"
+                and not request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
+                and primary_query
+                and item.get("id")
+            ):
+                try:
+                    chunks = await _retrieve_knowflow_chunks_for_queries(
+                        request,
+                        user,
+                        queries,
+                        dataset_ids=[item["id"]],
+                        page_size=max(1, int(k)),
+                    )
+                    query_result = _to_knowflow_query_result(
+                        chunks,
+                        config=request.app.state.config,
+                        fallback_name=str(item.get("name") or ""),
+                    )
+                except KnowflowError as exc:
+                    log.warning(f"Knowflow collection retrieval failed: {exc}")
+                except Exception as exc:
+                    log.warning(
+                        f"Knowflow collection retrieval failed unexpectedly: {exc}"
+                    )
+
             # Manual Full Mode Toggle for Collection
-            knowledge_base = Knowledges.get_knowledge_by_id(item.get("id"))
+            knowledge_base = (
+                Knowledges.get_knowledge_by_id(item.get("id"))
+                if query_result is None
+                else None
+            )
 
             if knowledge_base and (
                 user.role == "admin"
@@ -1218,8 +1639,13 @@ async def get_sources_from_items(
                 else:
                     query_result = None  # Initialize to None
                     if hybrid_search:
+                        hybrid_transition_reason = ""
+                        hybrid_transition_detail = _compatibility_retrieval_detail(
+                            collection_names=collection_names,
+                            queries=queries,
+                        )
                         try:
-                            query_result = await query_collection_with_hybrid_search(
+                            hybrid_result = await query_collection_with_hybrid_search(
                                 collection_names=collection_names,
                                 queries=queries,
                                 embedding_function=embedding_function,
@@ -1231,9 +1657,147 @@ async def get_sources_from_items(
                                 enable_enriched_texts=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS,
                             )
                         except Exception as e:
+                            hybrid_transition_reason = (
+                                "hybrid_error_then_non_hybrid_fallback"
+                            )
+                            hybrid_transition_detail = {
+                                **hybrid_transition_detail,
+                                "error_kind": _compatibility_retrieval_error_kind(e),
+                            }
                             log.debug(
                                 "Error when using hybrid search, using non hybrid search as fallback."
                             )
+                        else:
+                            if _query_result_has_usable_documents(hybrid_result):
+                                query_result = hybrid_result
+                                _record_compatibility_retrieval_event(
+                                    compatibility_provenance,
+                                    "hybrid_success",
+                                    detail=hybrid_transition_detail,
+                                )
+                            else:
+                                hybrid_transition_reason = (
+                                    "hybrid_no_evidence_then_non_hybrid_fallback"
+                                )
+
+                        if query_result is None:
+                            if hybrid_transition_reason:
+                                _record_compatibility_retrieval_event(
+                                    compatibility_provenance,
+                                    hybrid_transition_reason,
+                                    detail=hybrid_transition_detail,
+                                )
+
+                            fallback_skip_reason = ""
+                            if not any(str(query or "").strip() for query in queries):
+                                fallback_skip_reason = "missing_queries"
+                            elif not callable(embedding_function):
+                                fallback_skip_reason = "embedding_function_unavailable"
+
+                            if fallback_skip_reason:
+                                fallback_detail = _compatibility_retrieval_detail(
+                                    collection_names=collection_names,
+                                    queries=queries,
+                                    reason=fallback_skip_reason,
+                                )
+                                _record_compatibility_retrieval_event(
+                                    compatibility_provenance,
+                                    "hybrid_fallback_skipped_with_reason",
+                                    detail=fallback_detail,
+                                )
+                                if hybrid_transition_reason:
+                                    compatibility_diagnostics.append(
+                                        _compatibility_retrieval_diagnostic(
+                                            reason=hybrid_transition_reason,
+                                            outcome="fallback",
+                                            detail=hybrid_transition_detail,
+                                        )
+                                    )
+                                compatibility_diagnostics.append(
+                                    _compatibility_retrieval_diagnostic(
+                                        reason="hybrid_fallback_skipped_with_reason",
+                                        outcome="blocked",
+                                        detail=fallback_detail,
+                                    )
+                                )
+                            else:
+                                try:
+                                    query_result = await query_collection(
+                                        collection_names=collection_names,
+                                        queries=queries,
+                                        embedding_function=embedding_function,
+                                        k=k,
+                                    )
+                                except Exception as e:
+                                    fallback_error_kind = (
+                                        _compatibility_retrieval_error_kind(e)
+                                    )
+                                    fallback_detail = {
+                                        **_compatibility_retrieval_detail(
+                                            collection_names=collection_names,
+                                            queries=queries,
+                                        ),
+                                        "error_kind": fallback_error_kind,
+                                    }
+                                    _record_compatibility_retrieval_event(
+                                        compatibility_provenance,
+                                        "non_hybrid_fallback_error",
+                                        detail=fallback_detail,
+                                    )
+                                    if hybrid_transition_reason:
+                                        compatibility_diagnostics.append(
+                                            _compatibility_retrieval_diagnostic(
+                                                reason=hybrid_transition_reason,
+                                                outcome="fallback",
+                                                detail=hybrid_transition_detail,
+                                            )
+                                        )
+                                    compatibility_diagnostics.append(
+                                        _compatibility_retrieval_diagnostic(
+                                            reason="non_hybrid_fallback_error",
+                                            outcome=(
+                                                "timeout"
+                                                if fallback_error_kind == "timeout"
+                                                else "malformed"
+                                            ),
+                                            detail=fallback_detail,
+                                        )
+                                    )
+                                else:
+                                    if _query_result_has_usable_documents(query_result):
+                                        _record_compatibility_retrieval_event(
+                                            compatibility_provenance,
+                                            "non_hybrid_fallback_success",
+                                            detail=_compatibility_retrieval_detail(
+                                                collection_names=collection_names,
+                                                queries=queries,
+                                            ),
+                                        )
+                                    else:
+                                        no_evidence_detail = _compatibility_retrieval_detail(
+                                            collection_names=collection_names,
+                                            queries=queries,
+                                        )
+                                        _record_compatibility_retrieval_event(
+                                            compatibility_provenance,
+                                            "non_hybrid_fallback_no_evidence",
+                                            detail=no_evidence_detail,
+                                        )
+                                        if hybrid_transition_reason:
+                                            compatibility_diagnostics.append(
+                                                _compatibility_retrieval_diagnostic(
+                                                    reason=hybrid_transition_reason,
+                                                    outcome="fallback",
+                                                    detail=hybrid_transition_detail,
+                                                )
+                                            )
+                                        compatibility_diagnostics.append(
+                                            _compatibility_retrieval_diagnostic(
+                                                reason="non_hybrid_fallback_no_evidence",
+                                                outcome="empty",
+                                                detail=no_evidence_detail,
+                                            )
+                                        )
 
                     # fallback to non-hybrid search
                     if not hybrid_search and query_result is None:
@@ -1248,7 +1812,7 @@ async def get_sources_from_items(
 
             extracted_collections.extend(collection_names)
 
-        if query_result:
+        if _query_result_has_usable_documents(query_result):
             if "data" in item:
                 del item["data"]
             query_results.append({**query_result, "file": item})
@@ -1269,7 +1833,11 @@ async def get_sources_from_items(
                     sources.append(source)
         except Exception as e:
             log.exception(e)
-    return sources
+    return RetrievalSourceList(
+        sources,
+        compatibility_provenance=compatibility_provenance,
+        compatibility_diagnostics=compatibility_diagnostics,
+    )
 
 
 def get_model_path(model: str, update_model: bool = False):

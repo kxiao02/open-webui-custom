@@ -9,7 +9,7 @@
 	import UserList from './Users/UserList.svelte';
 	import Groups from './Users/Groups.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n = /** @type {import('$lib/i18n').I18nStore} */ (getContext('i18n'));
 
 	let selectedTab;
 	$: {

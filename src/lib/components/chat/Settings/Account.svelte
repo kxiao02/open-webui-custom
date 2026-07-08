@@ -17,7 +17,7 @@
 	import User from '$lib/components/icons/User.svelte';
 	import UserProfileImage from './Account/UserProfileImage.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let saveHandler: Function;
 	export let saveSettings: Function;
@@ -109,16 +109,16 @@
 		webhookUrl = $settings?.notifications?.webhook_url ?? '';
 
 		// Only fetch API key if the feature is enabled and user has permission
-		if (
-			user &&
-			($config?.features?.enable_api_keys ?? true) &&
-			(user?.role === 'admin' || (user?.permissions?.features?.api_keys ?? false))
-		) {
-			APIKey = await getAPIKey(localStorage.token).catch((error) => {
-				console.log(error);
-				return '';
-			});
-		}
+			if (
+				user &&
+				($config?.features?.enable_api_keys ?? true) &&
+				(user?.role === 'admin' || (user?.permissions?.features?.api_keys ?? false))
+			) {
+				APIKey = await getAPIKey(localStorage.token).catch((error) => {
+					console.log(error);
+					return '';
+				});
+			}
 
 		loaded = true;
 	});
@@ -137,8 +137,8 @@
 
 			<!-- <div class=" text-sm font-medium">{$i18n.t('Account')}</div> -->
 
-			<div class="flex space-x-5 my-4">
-				<UserProfileImage bind:profileImageUrl user={$user} />
+				<div class="flex space-x-5 my-4">
+					<UserProfileImage bind:profileImageUrl user={$user} />
 
 				<div class="flex flex-1 flex-col">
 					<div class=" flex-1">
@@ -254,7 +254,7 @@
 			</div>
 		{/if}
 
-		{#if ($config?.features?.enable_api_keys ?? true) && ($user?.role === 'admin' || ($user?.permissions?.features?.api_keys ?? false))}
+			{#if ($config?.features?.enable_api_keys ?? true) && ($user?.role === 'admin' || ($user?.permissions?.features?.api_keys ?? false))}
 			<div class="flex justify-between items-center text-sm mt-2">
 				<div class="  font-medium">{$i18n.t('API keys')}</div>
 				<button
@@ -420,12 +420,12 @@
 							</div>
 						</div>
 					{/if}
-				</div>
-			{/if}
-		{/if}
-	</div>
+					</div>
+						{/if}
+					{/if}
+			</div>
 
-	<div class="flex justify-end pt-3 text-sm font-medium">
+		<div class="flex justify-end pt-3 text-sm font-medium">
 		<button
 			class="px-3.5 py-1.5 text-sm font-medium bg-black hover:bg-gray-900 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 transition rounded-full"
 			on:click={async () => {

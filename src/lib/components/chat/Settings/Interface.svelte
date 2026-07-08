@@ -15,7 +15,7 @@
 
 	const dispatch = createEventDispatcher();
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let saveSettings: Function;
 
@@ -86,8 +86,6 @@
 	// chat export
 	let stylizedPdfExport = true;
 
-	// Admin - Show Update Available Toast
-	let showUpdateToast = true;
 	let showChangelog = true;
 
 	let showEmojiInCall = false;
@@ -207,7 +205,6 @@
 		responseAutoCopy = $settings?.responseAutoCopy ?? false;
 
 		showUsername = $settings?.showUsername ?? false;
-		showUpdateToast = $settings?.showUpdateToast ?? true;
 		showChangelog = $settings?.showChangelog ?? true;
 
 		showEmojiInCall = $settings?.showEmojiInCall ?? false;
@@ -547,25 +544,6 @@
 			</div>
 
 			{#if $user?.role === 'admin'}
-				<div>
-					<div class=" py-0.5 flex w-full justify-between">
-						<div id="toast-notifications-label" class=" self-center text-xs">
-							{$i18n.t('Toast notifications for new updates')}
-						</div>
-
-						<div class="flex items-center gap-2 p-1">
-							<Switch
-								ariaLabelledbyId="toast-notifications-label"
-								tooltip={true}
-								bind:state={showUpdateToast}
-								on:change={() => {
-									saveSettings({ showUpdateToast });
-								}}
-							/>
-						</div>
-					</div>
-				</div>
-
 				<div>
 					<div class=" py-0.5 flex w-full justify-between">
 						<div id="whats-new-label" class=" self-center text-xs">

@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { toast } from 'svelte-sonner';
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
@@ -8,14 +9,13 @@
 	dayjs.extend(relativeTime);
 
 	import { onMount, getContext } from 'svelte';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { deleteFeedbackById, exportAllFeedbacks, getFeedbackItems } from '$lib/apis/evaluations';
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
 	import Badge from '$lib/components/common/Badge.svelte';
-	import CloudArrowUp from '$lib/components/icons/CloudArrowUp.svelte';
 	import Pagination from '$lib/components/common/Pagination.svelte';
 	import FeedbackMenu from './FeedbackMenu.svelte';
 	import FeedbackModal from './FeedbackModal.svelte';
@@ -23,8 +23,7 @@
 
 	import ChevronUp from '$lib/components/icons/ChevronUp.svelte';
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
-	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
-	import { config } from '$lib/stores';
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 
 	let page = 1;
@@ -94,33 +93,6 @@
 			page = 1;
 			getFeedbacks();
 		}
-	};
-
-	const shareHandler = async () => {
-		toast.success($i18n.t('Redirecting you to Open WebUI Community'));
-
-		// remove snapshot from feedbacks
-		const feedbacksToShare = feedbacks.map((f) => {
-			const { snapshot, user, ...rest } = f;
-			return rest;
-		});
-		console.log(feedbacksToShare);
-
-		const url = 'https://openwebui.com';
-		const tab = await window.open(`${url}/leaderboard`, '_blank');
-
-		// Define the event handler function
-		const messageHandler = (event) => {
-			if (event.origin !== url) return;
-			if (event.data === 'loaded') {
-				tab.postMessage(JSON.stringify(feedbacksToShare), '*');
-
-				// Remove the event listener after handling the message
-				window.removeEventListener('message', messageHandler);
-			}
-		};
-
-		window.addEventListener('message', messageHandler, false);
 	};
 
 	const exportHandler = async () => {

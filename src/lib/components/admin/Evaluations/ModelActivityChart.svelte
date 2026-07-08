@@ -3,9 +3,12 @@
 	import { getContext } from 'svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
-	export let history: Array<{ date: string; won: number; lost: number }> = [];
+	type DailyHistoryPoint = { date: string; won: number; lost: number };
+	type WeeklyHistoryPoint = { startDate: string; won: number; lost: number };
+
+	export let history: DailyHistoryPoint[] = [];
 	export let loading = false;
 	export let aggregateWeekly = false;
 
@@ -28,7 +31,7 @@
 		}
 
 		// For year/all views, aggregate by week
-		let chartData = history;
+		let chartData: Array<DailyHistoryPoint | WeeklyHistoryPoint> = history;
 
 		if (aggregateWeekly && history.length > 7) {
 			// Aggregate daily data into weekly buckets

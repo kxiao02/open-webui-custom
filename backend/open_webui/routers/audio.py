@@ -588,12 +588,12 @@ def transcription_handler(request, file_path, metadata, user=None):
 
     metadata = metadata or {}
 
-    languages = [
-        metadata.get("language", None) if not WHISPER_LANGUAGE else WHISPER_LANGUAGE,
-        None,  # Always fallback to None in case transcription fails
-    ]
+    def save_transcription_result(data):
+        transcript_file = f"{file_dir}/{id}.json"
+        with open(transcript_file, "w") as f:
+            json.dump(data, f)
 
-    if request.app.state.config.STT_ENGINE == "":
+    def transcribe_with_local_whisper():
         if request.app.state.faster_whisper_model is None:
             request.app.state.faster_whisper_model = set_faster_whisper_model(
                 request.app.state.config.WHISPER_MODEL
@@ -614,14 +614,40 @@ def transcription_handler(request, file_path, metadata, user=None):
 
         transcript = "".join([segment.text for segment in list(segments)])
         data = {"text": transcript.strip()}
-
-        # save the transcript to a json file
-        transcript_file = f"{file_dir}/{id}.json"
-        with open(transcript_file, "w") as f:
-            json.dump(data, f)
-
+        save_transcription_result(data)
         log.debug(data)
         return data
+
+    def fallback_to_local(provider: str, error):
+        if not getattr(
+            request.app.state.config, "AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL", False
+        ):
+            return None
+
+        whisper_model = str(getattr(request.app.state.config, "WHISPER_MODEL", "")).strip()
+        if not whisper_model:
+            log.warning(
+                "External STT via %s failed, but no local Whisper fallback model is configured: %s",
+                provider,
+                error,
+            )
+            return None
+
+        log.warning(
+            "External STT via %s failed; falling back to local Whisper model %s: %s",
+            provider,
+            whisper_model,
+            error,
+        )
+        return transcribe_with_local_whisper()
+
+    languages = [
+        metadata.get("language", None) if not WHISPER_LANGUAGE else WHISPER_LANGUAGE,
+        None,  # Always fallback to None in case transcription fails
+    ]
+
+    if request.app.state.config.STT_ENGINE == "":
+        return transcribe_with_local_whisper()
     elif request.app.state.config.STT_ENGINE == "openai":
         r = None
         try:
@@ -655,11 +681,7 @@ def transcription_handler(request, file_path, metadata, user=None):
             r.raise_for_status()
             data = r.json()
 
-            # save the transcript to a json file
-            transcript_file = f"{file_dir}/{id}.json"
-            with open(transcript_file, "w") as f:
-                json.dump(data, f)
-
+            save_transcription_result(data)
             return data
         except Exception as e:
             log.exception(e)
@@ -673,9 +695,14 @@ def transcription_handler(request, file_path, metadata, user=None):
                 except Exception:
                     detail = f"External: {e}"
 
+            fallback_data = fallback_to_local("openai", detail if detail else e)
+            if fallback_data is not None:
+                return fallback_data
+
             raise Exception(detail if detail else "Open WebUI: Server Connection Error")
 
     elif request.app.state.config.STT_ENGINE == "deepgram":
+        r = None
         try:
             # Determine the MIME type of the file
             mime, _ = mimetypes.guess_type(file_path)
@@ -729,10 +756,7 @@ def transcription_handler(request, file_path, metadata, user=None):
             data = {"text": transcript.strip()}
 
             # Save transcript
-            transcript_file = f"{file_dir}/{id}.json"
-            with open(transcript_file, "w") as f:
-                json.dump(data, f)
-
+            save_transcription_result(data)
             return data
 
         except Exception as e:
@@ -745,6 +769,10 @@ def transcription_handler(request, file_path, metadata, user=None):
                         detail = f"External: {res['error'].get('message', '')}"
                 except Exception:
                     detail = f"External: {e}"
+
+            fallback_data = fallback_to_local("deepgram", detail if detail else e)
+            if fallback_data is not None:
+                return fallback_data
             raise Exception(detail if detail else "Open WebUI: Server Connection Error")
 
     elif request.app.state.config.STT_ENGINE == "azure":
@@ -835,16 +863,15 @@ def transcription_handler(request, file_path, metadata, user=None):
 
             data = {"text": transcript}
 
-            # Save transcript to json file (consistent with other providers)
-            transcript_file = f"{file_dir}/{id}.json"
-            with open(transcript_file, "w") as f:
-                json.dump(data, f)
-
+            save_transcription_result(data)
             log.debug(data)
             return data
 
         except (KeyError, IndexError, ValueError) as e:
             log.exception("Error parsing Azure response")
+            fallback_data = fallback_to_local("azure", e)
+            if fallback_data is not None:
+                return fallback_data
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to parse Azure response: {str(e)}",
@@ -877,6 +904,10 @@ def transcription_handler(request, file_path, metadata, user=None):
                         detail = f"External: {res['error'].get('message', '')}"
             except Exception:
                 detail = f"External: {e}"
+
+            fallback_data = fallback_to_local("azure", detail if detail else e)
+            if fallback_data is not None:
+                return fallback_data
 
             raise HTTPException(
                 status_code=status_code,
@@ -1030,18 +1061,17 @@ def transcription_handler(request, file_path, metadata, user=None):
                 if not transcript:
                     raise ValueError("Empty transcript in response")
 
-                data = {"text": transcript}
+            data = {"text": transcript}
 
-            # Save transcript to json file (consistent with other providers)
-            transcript_file = f"{file_dir}/{id}.json"
-            with open(transcript_file, "w") as f:
-                json.dump(data, f)
-
+            save_transcription_result(data)
             log.debug(data)
             return data
 
         except ValueError as e:
             log.exception("Error parsing Mistral response")
+            fallback_data = fallback_to_local("mistral", e)
+            if fallback_data is not None:
+                return fallback_data
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to parse Mistral response: {str(e)}",
@@ -1059,6 +1089,10 @@ def transcription_handler(request, file_path, metadata, user=None):
                         detail = f"External: {r.text}"
             except Exception:
                 detail = f"External: {e}"
+
+            fallback_data = fallback_to_local("mistral", detail if detail else e)
+            if fallback_data is not None:
+                return fallback_data
 
             raise HTTPException(
                 status_code=getattr(r, "status_code", 500) if r else 500,

@@ -3,6 +3,7 @@
 	import ChevronUp from '$lib/components/icons/ChevronUp.svelte';
 	import Search from '$lib/components/icons/Search.svelte';
 	import Collapsible from '$lib/components/common/Collapsible.svelte';
+	import WebSourceAvatar from '$lib/components/chat/Messages/WebSourceAvatar.svelte';
 
 	export let status = { urls: [], query: '' };
 	let state = false;
@@ -65,10 +66,10 @@
 				>
 					<div class=" flex justify-center items-center gap-3">
 						<div class="w-fit">
-							<img
-								src="https://www.google.com/s2/favicons?sz=32&domain={item.link}"
-								alt="{item?.title ?? item.link} favicon"
-								class="size-3.5"
+							<WebSourceAvatar
+								url={item.link}
+								title={item?.title ?? item.link}
+								className="size-3.5 rounded-full"
 							/>
 						</div>
 
@@ -105,11 +106,7 @@
 				>
 					<div class=" flex justify-center items-center gap-3">
 						<div class="w-fit">
-							<img
-								src="https://www.google.com/s2/favicons?sz=32&domain={url}"
-								alt="{url} favicon"
-								class="size-3.5"
-							/>
+							<WebSourceAvatar url={url} title={url} className="size-3.5 rounded-full" />
 						</div>
 
 						<div class="w-full text-sm line-clamp-1">

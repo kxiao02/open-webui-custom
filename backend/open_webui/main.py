@@ -59,6 +59,7 @@ from starsessions.stores.redis import RedisStore
 
 from open_webui.utils import logger
 from open_webui.utils.audit import AuditLevel, AuditLoggingMiddleware
+from open_webui.utils.knowflow import get_knowflow_public_config
 from open_webui.utils.logger import start_logger
 from open_webui.socket.main import (
     MODELS,
@@ -67,6 +68,15 @@ from open_webui.socket.main import (
     periodic_session_pool_cleanup,
     get_event_emitter,
     get_models_in_use,
+)
+from open_webui.routers.retrieval import (
+    get_ef,
+    get_rf,
+    initialize_retrieval_runtime,
+)
+from open_webui.retrieval.utils import (
+    get_embedding_function,
+    get_reranking_function,
 )
 from open_webui.routers import (
     analytics,
@@ -84,11 +94,13 @@ from open_webui.routers import (
     folders,
     configs,
     groups,
+    generated_artifacts,
     files,
     functions,
     memories,
     models,
     knowledge,
+    knowflow,
     prompts,
     evaluations,
     skills,
@@ -98,14 +110,6 @@ from open_webui.routers import (
     scim,
     terminals,
 )
-
-from open_webui.routers.retrieval import (
-    get_embedding_function,
-    get_reranking_function,
-    get_ef,
-    get_rf,
-)
-
 
 from sqlalchemy.orm import Session
 from open_webui.internal.db import ScopedSession, engine, get_session
@@ -189,6 +193,7 @@ from open_webui.config import (
     # Audio
     AUDIO_STT_ENGINE,
     AUDIO_STT_MODEL,
+    AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL,
     AUDIO_STT_SUPPORTED_CONTENT_TYPES,
     AUDIO_STT_OPENAI_API_BASE_URL,
     AUDIO_STT_OPENAI_API_KEY,
@@ -231,6 +236,7 @@ from open_webui.config import (
     RAG_FULL_CONTEXT,
     BYPASS_EMBEDDING_AND_RETRIEVAL,
     RAG_EMBEDDING_MODEL,
+    RAG_EMBEDDING_FALLBACK_MODEL,
     RAG_EMBEDDING_MODEL_AUTO_UPDATE,
     RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
     RAG_RERANKING_ENGINE,
@@ -244,6 +250,7 @@ from open_webui.config import (
     RAG_EMBEDDING_BATCH_SIZE,
     ENABLE_ASYNC_EMBEDDING,
     RAG_EMBEDDING_CONCURRENT_REQUESTS,
+    RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL,
     RAG_TOP_K,
     RAG_TOP_K_RERANKER,
     RAG_RELEVANCE_THRESHOLD,
@@ -381,8 +388,17 @@ from open_webui.config import (
     FOLDER_MAX_FILE_COUNT,
     ENABLE_CHANNELS,
     ENABLE_NOTES,
+    ENABLE_KNOWLEDGE,
+    KNOWFLOW_SITE_URL,
+    KNOWFLOW_SERVER_BASE_URL,
+    KNOWFLOW_RAGFLOW_BASE_URL,
+    KNOWFLOW_SERVICE_API_KEY,
+    KNOWFLOW_PUBLIC_READ_ONLY_API_KEY,
+    KNOWFLOW_TIMEOUT_SECONDS,
+    KNOWFLOW_MANAGED_LOOKUP_ENABLED,
+    KNOWFLOW_MANUAL_BINDING_ENABLED,
+    KNOWFLOW_READ_ONLY,
     ENABLE_USER_STATUS,
-    ENABLE_COMMUNITY_SHARING,
     ENABLE_MESSAGE_RATING,
     ENABLE_USER_WEBHOOKS,
     ENABLE_EVALUATION_ARENA_MODELS,
@@ -408,6 +424,28 @@ from open_webui.config import (
     OAUTH_USERNAME_CLAIM,
     OAUTH_ALLOWED_ROLES,
     OAUTH_ADMIN_ROLES,
+    # Enterprise OAuth (non oauth.*)
+    ENTERPRISE_OAUTH_ENABLED,
+    ENTERPRISE_OAUTH_PROVIDER_NAME,
+    ENTERPRISE_OAUTH_CLIENT_ID,
+    ENTERPRISE_OAUTH_CLIENT_SECRET,
+    ENTERPRISE_OAUTH_AUTHORIZE_URL,
+    ENTERPRISE_OAUTH_TOKEN_URL,
+    ENTERPRISE_OAUTH_PROFILE_URL,
+    ENTERPRISE_OAUTH_CHECK_TOKEN_URL,
+    ENTERPRISE_OAUTH_LOGOUT_URL,
+    ENTERPRISE_OAUTH_REDIRECT_URI,
+    ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM,
+    ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM,
+    ENTERPRISE_OAUTH_ID_CLAIM,
+    ENTERPRISE_OAUTH_ACCOUNT_NO_PATH,
+    ENTERPRISE_OAUTH_EMAIL_CLAIM,
+    ENTERPRISE_OAUTH_EMAIL_DOMAIN,
+    PORTAL_SSO_APP_INITIATED_ENABLED,
+    PORTAL_SSO_ENABLED,
+    PORTAL_SSO_PROVIDER_NAME,
+    WECOM_SSO_ENABLED,
+    WECOM_SSO_PROVIDER_NAME,
     # WebUI (LDAP)
     ENABLE_LDAP,
     LDAP_SERVER_LABEL,
@@ -527,7 +565,11 @@ from open_webui.utils.middleware import (
     process_chat_payload,
     process_chat_response,
 )
-from open_webui.utils.tools import set_tool_servers, set_terminal_servers
+from open_webui.utils.tools import (
+    is_image_generation_tool_available,
+    set_terminal_servers,
+    set_tool_servers,
+)
 
 from open_webui.utils.auth import (
     get_license_data,
@@ -546,6 +588,8 @@ from open_webui.utils.oauth import (
     OAuthClientManager,
     OAuthClientInformationFull,
 )
+from open_webui.utils.portal_sso import PortalSSOManager
+from open_webui.utils.wecom_sso import WeComSSOManager
 from open_webui.utils.security_headers import SecurityHeadersMiddleware
 from open_webui.utils.redis import get_redis_connection
 
@@ -555,6 +599,8 @@ from open_webui.tasks import (
     create_task,
     stop_task,
     list_tasks,
+    redis_mark_instance_alive,
+    task_instance_heartbeat,
 )  # Import from tasks.py
 
 from open_webui.utils.redis import get_sentinels_from_env
@@ -571,16 +617,42 @@ log = logging.getLogger(__name__)
 
 
 class SPAStaticFiles(StaticFiles):
+    IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+    HTML_CACHE_CONTROL = "no-cache"
+    DEFAULT_ASSET_CACHE_CONTROL = "public, max-age=3600"
+
+    def _apply_cache_headers(self, path: str, response):
+        normalized_path = (path or "").lstrip("/")
+
+        if normalized_path in {"", ".", "index.html"}:
+            response.headers["Cache-Control"] = self.HTML_CACHE_CONTROL
+            return response
+
+        if normalized_path == "_app/version.json":
+            response.headers["Cache-Control"] = self.HTML_CACHE_CONTROL
+            return response
+
+        if normalized_path.startswith("_app/immutable/"):
+            response.headers["Cache-Control"] = self.IMMUTABLE_CACHE_CONTROL
+            return response
+
+        if "." in normalized_path.rsplit("/", 1)[-1]:
+            response.headers["Cache-Control"] = self.DEFAULT_ASSET_CACHE_CONTROL
+
+        return response
+
     async def get_response(self, path: str, scope):
         try:
-            return await super().get_response(path, scope)
+            response = await super().get_response(path, scope)
+            return self._apply_cache_headers(path, response)
         except (HTTPException, StarletteHTTPException) as ex:
             if ex.status_code == 404:
                 if path.endswith(".js"):
                     # Return 404 for javascript files
                     raise ex
                 else:
-                    return await super().get_response("index.html", scope)
+                    response = await super().get_response("index.html", scope)
+                    return self._apply_cache_headers("index.html", response)
             else:
                 raise ex
 
@@ -616,11 +688,19 @@ async def lifespan(app: FastAPI):
     if LICENSE_KEY:
         get_license_data(app, LICENSE_KEY)
 
-    # Create admin account from env vars if specified and no users exist
+    # Create admin account from env vars only for initial bootstrap
     if WEBUI_ADMIN_EMAIL and WEBUI_ADMIN_PASSWORD:
-        if create_admin_user(WEBUI_ADMIN_EMAIL, WEBUI_ADMIN_PASSWORD, WEBUI_ADMIN_NAME):
-            # Disable signup since we now have an admin
-            app.state.config.ENABLE_SIGNUP = False
+        user_count = Users.get_num_users()
+        if user_count == 0:
+            if create_admin_user(
+                WEBUI_ADMIN_EMAIL, WEBUI_ADMIN_PASSWORD, WEBUI_ADMIN_NAME
+            ):
+                # Disable signup since we now have an admin
+                app.state.config.ENABLE_SIGNUP = False
+        elif user_count is None:
+            log.warning(
+                "Skipping admin bootstrap: unable to determine existing user count."
+            )
 
     # This should be blocking (sync) so functions are not deactivated on first /get_models calls
     # when the first user lands on the / route.
@@ -637,8 +717,12 @@ async def lifespan(app: FastAPI):
     )
 
     if app.state.redis is not None:
+        await redis_mark_instance_alive(app.state.redis, app.state.instance_id)
         app.state.redis_task_command_listener = asyncio.create_task(
             redis_task_command_listener(app)
+        )
+        app.state.redis_task_instance_heartbeat = asyncio.create_task(
+            task_instance_heartbeat(app.state.redis, app.state.instance_id)
         )
 
     if THREAD_POOL_SIZE and THREAD_POOL_SIZE > 0:
@@ -671,6 +755,11 @@ async def lifespan(app: FastAPI):
             )
         except Exception as e:
             log.warning(f"Failed to pre-fetch models at startup: {e}")
+
+    try:
+        await prewarm_runtime_dependencies(app)
+    except Exception as e:
+        log.warning(f"Failed to prewarm runtime dependencies at startup: {e}")
 
     # Pre-fetch tool server specs so the first request doesn't pay the latency cost
     if len(app.state.config.TOOL_SERVER_CONNECTIONS) > 0:
@@ -705,6 +794,48 @@ async def lifespan(app: FastAPI):
 
     if hasattr(app.state, "redis_task_command_listener"):
         app.state.redis_task_command_listener.cancel()
+    if hasattr(app.state, "redis_task_instance_heartbeat"):
+        app.state.redis_task_instance_heartbeat.cancel()
+
+
+def _should_prewarm_retrieval(app: FastAPI) -> bool:
+    return bool(
+        app.state.config.RAG_EMBEDDING_MODEL
+        and not app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
+    )
+
+
+async def prewarm_runtime_dependencies(app: FastAPI):
+    if _should_prewarm_retrieval(app):
+        try:
+            log.info("Prewarming retrieval runtime...")
+            await asyncio.to_thread(initialize_retrieval_runtime, app)
+        except Exception as e:
+            log.warning(f"Failed to prewarm retrieval runtime: {e}")
+    else:
+        log.info("Skipping retrieval runtime prewarm.")
+
+    try:
+        import tiktoken
+
+        encoding_name = str(app.state.config.TIKTOKEN_ENCODING_NAME)
+        if encoding_name:
+            log.info(f"Prewarming tiktoken encoding: {encoding_name}")
+            await asyncio.to_thread(tiktoken.get_encoding, encoding_name)
+    except Exception as e:
+        log.warning(f"Failed to prewarm tiktoken encoding: {e}")
+
+    whisper_model = str(app.state.config.WHISPER_MODEL).strip()
+    if whisper_model and app.state.faster_whisper_model is None:
+        try:
+            log.info(f"Prewarming whisper model: {whisper_model}")
+            app.state.faster_whisper_model = await asyncio.to_thread(
+                audio.set_faster_whisper_model,
+                whisper_model,
+                WHISPER_MODEL_AUTO_UPDATE,
+            )
+        except Exception as e:
+            log.warning(f"Failed to prewarm whisper model: {e}")
 
 
 app = FastAPI(
@@ -718,6 +849,10 @@ app = FastAPI(
 # For Open WebUI OIDC/OAuth2
 oauth_manager = OAuthManager(app)
 app.state.oauth_manager = oauth_manager
+portal_sso_manager = PortalSSOManager(app)
+app.state.portal_sso_manager = portal_sso_manager
+wecom_sso_manager = WeComSSOManager(app)
+app.state.wecom_sso_manager = wecom_sso_manager
 
 # For Integrations
 oauth_client_manager = OAuthClientManager(app)
@@ -865,7 +1000,16 @@ app.state.config.ENABLE_FOLDERS = ENABLE_FOLDERS
 app.state.config.FOLDER_MAX_FILE_COUNT = FOLDER_MAX_FILE_COUNT
 app.state.config.ENABLE_CHANNELS = ENABLE_CHANNELS
 app.state.config.ENABLE_NOTES = ENABLE_NOTES
-app.state.config.ENABLE_COMMUNITY_SHARING = ENABLE_COMMUNITY_SHARING
+app.state.config.ENABLE_KNOWLEDGE = ENABLE_KNOWLEDGE
+app.state.config.KNOWFLOW_SITE_URL = KNOWFLOW_SITE_URL
+app.state.config.KNOWFLOW_SERVER_BASE_URL = KNOWFLOW_SERVER_BASE_URL
+app.state.config.KNOWFLOW_RAGFLOW_BASE_URL = KNOWFLOW_RAGFLOW_BASE_URL
+app.state.config.KNOWFLOW_SERVICE_API_KEY = KNOWFLOW_SERVICE_API_KEY
+app.state.config.KNOWFLOW_PUBLIC_READ_ONLY_API_KEY = KNOWFLOW_PUBLIC_READ_ONLY_API_KEY
+app.state.config.KNOWFLOW_TIMEOUT_SECONDS = KNOWFLOW_TIMEOUT_SECONDS
+app.state.config.KNOWFLOW_MANAGED_LOOKUP_ENABLED = KNOWFLOW_MANAGED_LOOKUP_ENABLED
+app.state.config.KNOWFLOW_MANUAL_BINDING_ENABLED = KNOWFLOW_MANUAL_BINDING_ENABLED
+app.state.config.KNOWFLOW_READ_ONLY = KNOWFLOW_READ_ONLY
 app.state.config.ENABLE_MESSAGE_RATING = ENABLE_MESSAGE_RATING
 app.state.config.ENABLE_USER_WEBHOOKS = ENABLE_USER_WEBHOOKS
 app.state.config.ENABLE_USER_STATUS = ENABLE_USER_STATUS
@@ -896,6 +1040,28 @@ app.state.config.ENABLE_OAUTH_ROLE_MANAGEMENT = ENABLE_OAUTH_ROLE_MANAGEMENT
 app.state.config.OAUTH_ROLES_CLAIM = OAUTH_ROLES_CLAIM
 app.state.config.OAUTH_ALLOWED_ROLES = OAUTH_ALLOWED_ROLES
 app.state.config.OAUTH_ADMIN_ROLES = OAUTH_ADMIN_ROLES
+
+# Enterprise OAuth (non oauth.* prefix)
+app.state.config.ENTERPRISE_OAUTH_ENABLED = ENTERPRISE_OAUTH_ENABLED
+app.state.config.ENTERPRISE_OAUTH_PROVIDER_NAME = ENTERPRISE_OAUTH_PROVIDER_NAME
+app.state.config.ENTERPRISE_OAUTH_CLIENT_ID = ENTERPRISE_OAUTH_CLIENT_ID
+app.state.config.ENTERPRISE_OAUTH_CLIENT_SECRET = ENTERPRISE_OAUTH_CLIENT_SECRET
+app.state.config.ENTERPRISE_OAUTH_AUTHORIZE_URL = ENTERPRISE_OAUTH_AUTHORIZE_URL
+app.state.config.ENTERPRISE_OAUTH_TOKEN_URL = ENTERPRISE_OAUTH_TOKEN_URL
+app.state.config.ENTERPRISE_OAUTH_PROFILE_URL = ENTERPRISE_OAUTH_PROFILE_URL
+app.state.config.ENTERPRISE_OAUTH_CHECK_TOKEN_URL = ENTERPRISE_OAUTH_CHECK_TOKEN_URL
+app.state.config.ENTERPRISE_OAUTH_LOGOUT_URL = ENTERPRISE_OAUTH_LOGOUT_URL
+app.state.config.ENTERPRISE_OAUTH_REDIRECT_URI = ENTERPRISE_OAUTH_REDIRECT_URI
+app.state.config.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM = (
+    ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM
+)
+app.state.config.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM = (
+    ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM
+)
+app.state.config.ENTERPRISE_OAUTH_ID_CLAIM = ENTERPRISE_OAUTH_ID_CLAIM
+app.state.config.ENTERPRISE_OAUTH_ACCOUNT_NO_PATH = ENTERPRISE_OAUTH_ACCOUNT_NO_PATH
+app.state.config.ENTERPRISE_OAUTH_EMAIL_CLAIM = ENTERPRISE_OAUTH_EMAIL_CLAIM
+app.state.config.ENTERPRISE_OAUTH_EMAIL_DOMAIN = ENTERPRISE_OAUTH_EMAIL_DOMAIN
 
 app.state.config.ENABLE_LDAP = ENABLE_LDAP
 app.state.config.LDAP_SERVER_LABEL = LDAP_SERVER_LABEL
@@ -1004,9 +1170,13 @@ app.state.config.CHUNK_OVERLAP = CHUNK_OVERLAP
 
 app.state.config.RAG_EMBEDDING_ENGINE = RAG_EMBEDDING_ENGINE
 app.state.config.RAG_EMBEDDING_MODEL = RAG_EMBEDDING_MODEL
+app.state.config.RAG_EMBEDDING_FALLBACK_MODEL = RAG_EMBEDDING_FALLBACK_MODEL
 app.state.config.RAG_EMBEDDING_BATCH_SIZE = RAG_EMBEDDING_BATCH_SIZE
 app.state.config.ENABLE_ASYNC_EMBEDDING = ENABLE_ASYNC_EMBEDDING
 app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS = RAG_EMBEDDING_CONCURRENT_REQUESTS
+app.state.config.RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL = (
+    RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL
+)
 
 app.state.config.RAG_RERANKING_ENGINE = RAG_RERANKING_ENGINE
 app.state.config.RAG_RERANKING_MODEL = RAG_RERANKING_MODEL
@@ -1106,70 +1276,78 @@ app.state.EMBEDDING_FUNCTION = None
 app.state.RERANKING_FUNCTION = None
 app.state.ef = None
 app.state.rf = None
+app.state._retrieval_runtime_signature = None
 
 app.state.YOUTUBE_LOADER_TRANSLATION = None
 
+retrieval_bootstrap_enabled = (
+    app.state.config.ENABLE_KNOWLEDGE or app.state.config.ENABLE_WEB_SEARCH
+)
 
-try:
-    app.state.ef = get_ef(
-        app.state.config.RAG_EMBEDDING_ENGINE, app.state.config.RAG_EMBEDDING_MODEL
+if retrieval_bootstrap_enabled:
+    try:
+        app.state.ef = get_ef(
+            app.state.config.RAG_EMBEDDING_ENGINE, app.state.config.RAG_EMBEDDING_MODEL
+        )
+        if (
+            app.state.config.ENABLE_RAG_HYBRID_SEARCH
+            and not app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
+        ):
+            app.state.rf = get_rf(
+                app.state.config.RAG_RERANKING_ENGINE,
+                app.state.config.RAG_RERANKING_MODEL,
+                app.state.config.RAG_EXTERNAL_RERANKER_URL,
+                app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
+                app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
+            )
+        else:
+            app.state.rf = None
+    except Exception as e:
+        log.error(f"Error updating models: {e}")
+
+    app.state.EMBEDDING_FUNCTION = get_embedding_function(
+        app.state.config.RAG_EMBEDDING_ENGINE,
+        app.state.config.RAG_EMBEDDING_MODEL,
+        embedding_function=app.state.ef,
+        url=(
+            app.state.config.RAG_OPENAI_API_BASE_URL
+            if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else (
+                app.state.config.RAG_OLLAMA_BASE_URL
+                if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
+                else app.state.config.RAG_AZURE_OPENAI_BASE_URL
+            )
+        ),
+        key=(
+            app.state.config.RAG_OPENAI_API_KEY
+            if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else (
+                app.state.config.RAG_OLLAMA_API_KEY
+                if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
+                else app.state.config.RAG_AZURE_OPENAI_API_KEY
+            )
+        ),
+        embedding_batch_size=app.state.config.RAG_EMBEDDING_BATCH_SIZE,
+        azure_api_version=(
+            app.state.config.RAG_AZURE_OPENAI_API_VERSION
+            if app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
+            else None
+        ),
+        enable_async=app.state.config.ENABLE_ASYNC_EMBEDDING,
+        concurrent_requests=app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
+        fallback_to_local=app.state.config.RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL,
+        fallback_embedding_model=app.state.config.RAG_EMBEDDING_FALLBACK_MODEL,
     )
-    if (
-        app.state.config.ENABLE_RAG_HYBRID_SEARCH
-        and not app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL
-    ):
-        app.state.rf = get_rf(
-            app.state.config.RAG_RERANKING_ENGINE,
-            app.state.config.RAG_RERANKING_MODEL,
-            app.state.config.RAG_EXTERNAL_RERANKER_URL,
-            app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
-            app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
-        )
-    else:
-        app.state.rf = None
-except Exception as e:
-    log.error(f"Error updating models: {e}")
-    pass
 
-
-app.state.EMBEDDING_FUNCTION = get_embedding_function(
-    app.state.config.RAG_EMBEDDING_ENGINE,
-    app.state.config.RAG_EMBEDDING_MODEL,
-    embedding_function=app.state.ef,
-    url=(
-        app.state.config.RAG_OPENAI_API_BASE_URL
-        if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-        else (
-            app.state.config.RAG_OLLAMA_BASE_URL
-            if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-            else app.state.config.RAG_AZURE_OPENAI_BASE_URL
-        )
-    ),
-    key=(
-        app.state.config.RAG_OPENAI_API_KEY
-        if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-        else (
-            app.state.config.RAG_OLLAMA_API_KEY
-            if app.state.config.RAG_EMBEDDING_ENGINE == "ollama"
-            else app.state.config.RAG_AZURE_OPENAI_API_KEY
-        )
-    ),
-    embedding_batch_size=app.state.config.RAG_EMBEDDING_BATCH_SIZE,
-    azure_api_version=(
-        app.state.config.RAG_AZURE_OPENAI_API_VERSION
-        if app.state.config.RAG_EMBEDDING_ENGINE == "azure_openai"
-        else None
-    ),
-    enable_async=app.state.config.ENABLE_ASYNC_EMBEDDING,
-    concurrent_requests=app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
-)
-
-app.state.RERANKING_FUNCTION = get_reranking_function(
-    app.state.config.RAG_RERANKING_ENGINE,
-    app.state.config.RAG_RERANKING_MODEL,
-    reranking_function=app.state.rf,
-)
-
+    app.state.RERANKING_FUNCTION = get_reranking_function(
+        app.state.config.RAG_RERANKING_ENGINE,
+        app.state.config.RAG_RERANKING_MODEL,
+        reranking_function=app.state.rf,
+    )
+else:
+    log.info(
+        "Skipping retrieval model bootstrap because knowledge and web search are disabled."
+    )
 ########################################
 #
 # CODE EXECUTION
@@ -1257,6 +1435,9 @@ app.state.config.IMAGES_EDIT_COMFYUI_WORKFLOW_NODES = IMAGES_EDIT_COMFYUI_WORKFL
 
 app.state.config.STT_ENGINE = AUDIO_STT_ENGINE
 app.state.config.STT_MODEL = AUDIO_STT_MODEL
+app.state.config.AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL = (
+    AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL
+)
 app.state.config.STT_SUPPORTED_CONTENT_TYPES = AUDIO_STT_SUPPORTED_CONTENT_TYPES
 
 app.state.config.STT_OPENAI_API_BASE_URL = AUDIO_STT_OPENAI_API_BASE_URL
@@ -1524,8 +1705,11 @@ app.add_middleware(
 app.mount("/ws", socket_app)
 
 
+app.include_router(knowflow.asset_router, prefix="/openai", tags=["knowflow-assets"])
 app.include_router(ollama.router, prefix="/ollama", tags=["ollama"])
 app.include_router(openai.router, prefix="/openai", tags=["openai"])
+app.include_router(knowflow.asset_router, tags=["knowflow-assets"])
+app.include_router(knowflow.api_asset_router, tags=["knowflow-assets"])
 
 
 app.include_router(pipelines.router, prefix="/api/v1/pipelines", tags=["pipelines"])
@@ -1547,7 +1731,9 @@ app.include_router(notes.router, prefix="/api/v1/notes", tags=["notes"])
 
 
 app.include_router(models.router, prefix="/api/v1/models", tags=["models"])
-app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["knowledge"])
+if ENABLE_KNOWLEDGE.value:
+    app.include_router(knowledge.router, prefix="/api/v1/knowledge", tags=["knowledge"])
+    app.include_router(knowflow.router, prefix="/api/v1/knowflow", tags=["knowflow"])
 app.include_router(prompts.router, prefix="/api/v1/prompts", tags=["prompts"])
 app.include_router(tools.router, prefix="/api/v1/tools", tags=["tools"])
 app.include_router(skills.router, prefix="/api/v1/skills", tags=["skills"])
@@ -1555,6 +1741,11 @@ app.include_router(skills.router, prefix="/api/v1/skills", tags=["skills"])
 app.include_router(memories.router, prefix="/api/v1/memories", tags=["memories"])
 app.include_router(folders.router, prefix="/api/v1/folders", tags=["folders"])
 app.include_router(groups.router, prefix="/api/v1/groups", tags=["groups"])
+app.include_router(
+    generated_artifacts.router,
+    prefix="/api/v1/generated-artifacts",
+    tags=["generated-artifacts"],
+)
 app.include_router(files.router, prefix="/api/v1/files", tags=["files"])
 app.include_router(functions.router, prefix="/api/v1/functions", tags=["functions"])
 app.include_router(
@@ -1722,13 +1913,12 @@ async def chat_completion(
         default_model_params = (
             getattr(request.app.state.config, "DEFAULT_MODEL_PARAMS", None) or {}
         )
+        model_params = (
+            model_info.params.model_dump() if model_info and model_info.params else {}
+        )
         model_info_params = {
             **default_model_params,
-            **(
-                model_info.params.model_dump()
-                if model_info and model_info.params
-                else {}
-            ),
+            **model_params,
         }
 
         # Check base model existence for custom models
@@ -1763,8 +1953,34 @@ async def chat_completion(
         reasoning_tags = form_data.get("params", {}).get("reasoning_tags")
 
         # Model Params
-        if model_info_params.get("stream_response") is not None:
-            form_data["stream"] = model_info_params.get("stream_response")
+        stream_response_override = None
+        client_requested_stream = "stream" in form_data
+        if (
+            "stream_response" in model_params
+            and model_params.get("stream_response") is not None
+            and not client_requested_stream
+        ):
+            stream_response_override = model_params.get("stream_response")
+        elif (
+            "stream_response" in default_model_params
+            and default_model_params.get("stream_response") is not None
+            and not client_requested_stream
+        ):
+            stream_response_override = default_model_params.get("stream_response")
+
+        if stream_response_override is not None:
+            form_data["stream"] = stream_response_override
+
+        # If the client did not supply a stream flag, derive it from params or UI capabilities.
+        if "stream" not in form_data:
+            stream_candidate = None
+            params_payload = form_data.get("params")
+            if isinstance(params_payload, dict):
+                stream_candidate = params_payload.get("stream_response")
+            if stream_candidate is not None:
+                form_data["stream"] = bool(stream_candidate)
+            elif form_data.get("session_id") or form_data.get("client_capabilities"):
+                form_data["stream"] = True
 
         if model_info_params.get("stream_delta_chunk_size"):
             stream_delta_chunk_size = model_info_params.get("stream_delta_chunk_size")
@@ -1772,6 +1988,9 @@ async def chat_completion(
         if model_info_params.get("reasoning_tags") is not None:
             reasoning_tags = model_info_params.get("reasoning_tags")
 
+        client_metadata = (
+            form_data.get("metadata") if isinstance(form_data.get("metadata"), dict) else {}
+        )
         metadata = {
             "user_id": user.id,
             "chat_id": form_data.pop("chat_id", None),
@@ -1784,6 +2003,7 @@ async def chat_completion(
             "tool_servers": form_data.pop("tool_servers", None),
             "files": form_data.get("files", None),
             "features": form_data.get("features", {}),
+            "client_capabilities": form_data.pop("client_capabilities", {}),
             "variables": form_data.get("variables", {}),
             "model": model,
             "direct": model_item.get("direct", False),
@@ -1800,6 +2020,22 @@ async def chat_completion(
                 ),
             },
         }
+        for key in (
+            "active_source_scope",
+            "bridge_execution_profile",
+            "deepagent_execution_profile",
+            "executionProfile",
+            "execution_profile",
+            "provider_thinking",
+            "resolved_execution_profile",
+            "task",
+            "thinking",
+            "thinkingMode",
+            "thinking_mode",
+        ):
+            value = client_metadata.get(key)
+            if value is not None:
+                metadata[key] = value
 
         if metadata.get("chat_id") and user:
             if not metadata["chat_id"].startswith(
@@ -1847,7 +2083,53 @@ async def chat_completion(
         )
 
     async def process_chat(request, form_data, user, metadata, model):
+        async def emit_waiting_status():
+            if (
+                metadata.get("waiting_status_active")
+                or not metadata.get("chat_id")
+                or not metadata.get("message_id")
+            ):
+                return
+
+            event_emitter = get_event_emitter(metadata)
+            if not event_emitter:
+                return
+
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "chat",
+                        "description": "处理中",
+                        "done": False,
+                    },
+                }
+            )
+            metadata["waiting_status_active"] = True
+
+        async def clear_waiting_status():
+            if not metadata.get("waiting_status_active"):
+                return
+
+            metadata["waiting_status_active"] = False
+            event_emitter = get_event_emitter(metadata)
+            if not event_emitter:
+                return
+
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "action": "chat",
+                        "description": "处理中",
+                        "done": True,
+                        "hidden": True,
+                    },
+                }
+            )
+
         try:
+            await emit_waiting_status()
             form_data, metadata, events = await process_chat_payload(
                 request, form_data, user, metadata, model
             )
@@ -1856,10 +2138,27 @@ async def chat_completion(
             if metadata.get("chat_id") and metadata.get("message_id"):
                 try:
                     if not metadata["chat_id"].startswith("local:"):
+                        parent_message_id = str(
+                            metadata.get("parent_message_id") or ""
+                        ).strip()
+                        parent_message = metadata.get("parent_message")
+                        if parent_message_id and isinstance(parent_message, dict):
+                            Chats.upsert_message_to_chat_by_id_and_message_id(
+                                metadata["chat_id"],
+                                parent_message_id,
+                                {
+                                    **parent_message,
+                                    "id": parent_message_id,
+                                    "role": parent_message.get("role") or "user",
+                                },
+                            )
+
                         Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata["chat_id"],
                             metadata["message_id"],
                             {
+                                "id": metadata["message_id"],
+                                "role": "assistant",
                                 "parentId": metadata.get("parent_message_id", None),
                                 "model": model_id,
                             },
@@ -1875,6 +2174,7 @@ async def chat_completion(
         except asyncio.CancelledError:
             log.info("Chat processing was cancelled")
             try:
+                await clear_waiting_status()
                 event_emitter = get_event_emitter(metadata)
                 await asyncio.shield(
                     event_emitter(
@@ -1886,10 +2186,11 @@ async def chat_completion(
             finally:
                 raise  # re-raise to ensure proper task cancellation handling
         except Exception as e:
-            log.debug(f"Error processing chat payload: {e}")
+            log.exception("Error processing chat payload")
             if metadata.get("chat_id") and metadata.get("message_id"):
                 # Update the chat message with the error
                 try:
+                    await clear_waiting_status()
                     if not metadata["chat_id"].startswith("local:"):
                         Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata["chat_id"],
@@ -1914,6 +2215,10 @@ async def chat_completion(
                 except Exception:
                     pass
         finally:
+            try:
+                await clear_waiting_status()
+            except Exception as e:
+                log.debug(f"Error clearing chat waiting status: {e}")
             try:
                 if mcp_clients := metadata.get("mcp_clients"):
                     for client in reversed(mcp_clients.values()):
@@ -1942,6 +2247,7 @@ async def chat_completion(
             request.app.state.redis,
             process_chat(request, form_data, user, metadata, model),
             id=metadata["chat_id"],
+            instance_id=request.app.state.instance_id,
         )
         # Emit chat:active=true when task starts
         event_emitter = get_event_emitter(metadata, update_db=False)
@@ -2070,7 +2376,11 @@ async def stop_task_endpoint(
 
 @app.get("/api/tasks")
 async def list_tasks_endpoint(request: Request, user=Depends(get_verified_user)):
-    return {"tasks": await list_tasks(request.app.state.redis)}
+    return {
+        "tasks": await list_tasks(
+            request.app.state.redis, request.app.state.instance_id
+        )
+    }
 
 
 @app.get("/api/tasks/chat/{chat_id}")
@@ -2081,7 +2391,9 @@ async def list_tasks_by_chat_id_endpoint(
     if chat is None or chat.user_id != user.id:
         return {"task_ids": []}
 
-    task_ids = await list_task_ids_by_item_id(request.app.state.redis, chat_id)
+    task_ids = await list_task_ids_by_item_id(
+        request.app.state.redis, chat_id, request.app.state.instance_id
+    )
 
     log.debug(f"Task IDs for chat {chat_id}: {task_ids}")
     return {"task_ids": task_ids}
@@ -2138,6 +2450,16 @@ async def get_app_config(request: Request):
                 for name, config in OAUTH_PROVIDERS.items()
             }
         },
+        "portal_sso": {
+            "enabled": PORTAL_SSO_ENABLED.value,
+            "app_initiated_enabled": PORTAL_SSO_APP_INITIATED_ENABLED.value,
+            "provider_name": PORTAL_SSO_PROVIDER_NAME.value,
+        },
+        "wecom_sso": {
+            "enabled": WECOM_SSO_ENABLED.value,
+            "provider_name": WECOM_SSO_PROVIDER_NAME.value,
+        },
+        "knowflow": get_knowflow_public_config(app.state.config),
         "features": {
             "auth": WEBUI_AUTH,
             "auth_trusted_header": bool(app.state.AUTH_TRUSTED_EMAIL_HEADER),
@@ -2157,12 +2479,17 @@ async def get_app_config(request: Request):
                     "folder_max_file_count": app.state.config.FOLDER_MAX_FILE_COUNT,
                     "enable_channels": app.state.config.ENABLE_CHANNELS,
                     "enable_notes": app.state.config.ENABLE_NOTES,
+                    "enable_knowledge": app.state.config.ENABLE_KNOWLEDGE,
+                    "enable_knowflow": get_knowflow_public_config(app.state.config)[
+                        "enabled"
+                    ],
                     "enable_web_search": app.state.config.ENABLE_WEB_SEARCH,
                     "enable_code_execution": app.state.config.ENABLE_CODE_EXECUTION,
                     "enable_code_interpreter": app.state.config.ENABLE_CODE_INTERPRETER,
-                    "enable_image_generation": app.state.config.ENABLE_IMAGE_GENERATION,
+                    "enable_image_generation": is_image_generation_tool_available(
+                        app.state.config
+                    ),
                     "enable_autocomplete_generation": app.state.config.ENABLE_AUTOCOMPLETE_GENERATION,
-                    "enable_community_sharing": app.state.config.ENABLE_COMMUNITY_SHARING,
                     "enable_message_rating": app.state.config.ENABLE_MESSAGE_RATING,
                     "enable_user_webhooks": app.state.config.ENABLE_USER_WEBHOOKS,
                     "enable_user_status": app.state.config.ENABLE_USER_STATUS,
@@ -2292,6 +2619,7 @@ async def get_app_version():
     return {
         "version": VERSION,
         "deployment_id": DEPLOYMENT_ID,
+        "build_hash": WEBUI_BUILD_HASH,
     }
 
 
@@ -2527,6 +2855,32 @@ async def oauth_client_callback(
 @app.get("/oauth/{provider}/login")
 async def oauth_login(provider: str, request: Request):
     return await oauth_manager.handle_login(request, provider)
+
+
+@app.get("/sso/portal/login")
+async def portal_sso_login(request: Request):
+    return await portal_sso_manager.handle_login(request)
+
+
+@app.get("/sso/wecom/login")
+async def wecom_sso_login(request: Request):
+    return await wecom_sso_manager.handle_login(request)
+
+
+@app.get("/sso/wecom/callback")
+async def wecom_sso_callback(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    return await wecom_sso_manager.handle_callback(request, db=db)
+
+
+@app.get("/sso/portal/callback")
+async def portal_sso_callback(
+    request: Request,
+    db: Session = Depends(get_session),
+):
+    return await portal_sso_manager.handle_callback(request, db=db)
 
 
 # OAuth login logic is as follows:

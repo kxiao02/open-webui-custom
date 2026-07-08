@@ -31,7 +31,7 @@
 	} from '$lib/stores';
 	import { onMount, getContext, tick, onDestroy } from 'svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import {
 		getChatList,
@@ -93,6 +93,8 @@
 	let folderRegistry = {};
 
 	let newFolderId = null;
+
+	$: hasWorkspaceAccess = !!$user;
 
 	$: if ($selectedFolder) {
 		initFolders();
@@ -571,6 +573,14 @@
 		}, 0);
 	};
 
+	const newChatNavigationHandler = async (event?: MouseEvent) => {
+		event?.stopImmediatePropagation();
+		event?.preventDefault();
+
+		await goto('/');
+		await newChatHandler();
+	};
+
 	const itemClickHandler = async () => {
 		selectedChatId = null;
 		chatId.set('');
@@ -665,11 +675,9 @@
 <button
 	id="sidebar-new-chat-button"
 	class="hidden"
-	on:click={() => {
-		goto('/');
-		newChatHandler();
-	}}
-/>
+	on:click={newChatNavigationHandler}
+	aria-label={$i18n.t('New Chat')}
+></button>
 
 <svelte:window
 	on:mousemove={(e) => {
@@ -683,7 +691,7 @@
 
 {#if !$mobile && !$showSidebar}
 	<div
-		class=" pt-[7px] pb-2 px-2 flex flex-col justify-between text-black dark:text-white hover:bg-gray-50/30 dark:hover:bg-gray-950/30 h-full z-10 transition-all border-e-[0.5px] border-gray-50 dark:border-gray-850/30"
+		class="sidebar-glass sidebar-glass-collapsed pt-[7px] pb-2 px-2 flex flex-col justify-between text-black dark:text-white hover:bg-gray-50/30 dark:hover:bg-gray-950/30 h-full z-10 transition-all border-e-[0.5px] border-gray-50 dark:border-gray-850/30"
 		id="sidebar"
 	>
 		<button
@@ -706,7 +714,12 @@
 						<div class=" self-center flex items-center justify-center size-9">
 							<img
 								src="{WEBUI_BASE_URL}/static/favicon.png"
-								class="sidebar-new-chat-icon size-6 rounded-full group-hover:hidden"
+								class="sidebar-new-chat-icon size-6 rounded-full group-hover:hidden dark:hidden"
+								alt=""
+							/>
+							<img
+								src="{WEBUI_BASE_URL}/static/favicon-dark.png"
+								class="sidebar-new-chat-icon size-6 rounded-full group-hover:hidden hidden dark:block"
 								alt=""
 							/>
 
@@ -723,13 +736,7 @@
 							class=" cursor-pointer flex rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 transition group"
 							href="/"
 							draggable="false"
-							on:click={async (e) => {
-								e.stopImmediatePropagation();
-								e.preventDefault();
-
-								goto('/');
-								newChatHandler();
-							}}
+							on:click={newChatNavigationHandler}
 							aria-label={$i18n.t('New Chat')}
 						>
 							<div class=" self-center flex items-center justify-center size-9">
@@ -783,7 +790,7 @@
 					</div>
 				{/if}
 
-				{#if $user?.role === 'admin' || $user?.permissions?.workspace?.models || $user?.permissions?.workspace?.knowledge || $user?.permissions?.workspace?.prompts || $user?.permissions?.workspace?.tools}
+				{#if hasWorkspaceAccess}
 					<div class="">
 						<Tooltip content={$i18n.t('Workspace')} placement="right">
 							<a
@@ -875,7 +882,7 @@
 	<div
 		bind:this={navElement}
 		id="sidebar"
-		class="h-screen max-h-[100dvh] min-h-screen select-none {$showSidebar
+		class="sidebar-glass sidebar-glass-expanded h-screen max-h-[100dvh] min-h-screen select-none {$showSidebar
 			? `${$mobile ? 'bg-gray-50 dark:bg-gray-950' : 'bg-gray-50/70 dark:bg-gray-950/70'} z-50`
 			: ' bg-transparent z-0 '} {$isApp
 			? `ml-[4.5rem] md:ml-0 `
@@ -885,7 +892,7 @@
 		data-state={$showSidebar}
 	>
 		<div
-			class=" my-auto flex flex-col justify-between h-screen max-h-[100dvh] w-[var(--sidebar-width)] overflow-x-hidden scrollbar-hidden z-50 {$showSidebar
+			class="sidebar-glass-panel my-auto flex flex-col justify-between h-screen max-h-[100dvh] w-[var(--sidebar-width)] overflow-x-hidden scrollbar-hidden z-50 {$showSidebar
 				? ''
 				: 'invisible'}"
 		>
@@ -896,17 +903,23 @@
 					class="flex items-center rounded-xl size-8.5 h-full justify-center hover:bg-gray-100/50 dark:hover:bg-gray-850/50 transition no-drag-region"
 					href="/"
 					draggable="false"
-					on:click={newChatHandler}
+					on:click={newChatNavigationHandler}
 				>
 					<img
 						crossorigin="anonymous"
 						src="{WEBUI_BASE_URL}/static/favicon.png"
-						class="sidebar-new-chat-icon size-6 rounded-full"
+						class="sidebar-new-chat-icon size-6 rounded-full dark:hidden"
+						alt=""
+					/>
+					<img
+						crossorigin="anonymous"
+						src="{WEBUI_BASE_URL}/static/favicon-dark.png"
+						class="sidebar-new-chat-icon size-6 rounded-full hidden dark:block"
 						alt=""
 					/>
 				</a>
 
-				<a href="/" class="flex flex-1 px-1.5" on:click={newChatHandler}>
+				<a href="/" class="flex flex-1 px-1.5" on:click={newChatNavigationHandler}>
 					<div
 						id="sidebar-webui-name"
 						class=" self-center font-medium text-gray-850 dark:text-white font-primary"
@@ -957,7 +970,7 @@
 							class="group grow flex items-center space-x-3 rounded-2xl px-2.5 py-2 hover:bg-gray-100 dark:hover:bg-gray-900 transition outline-none"
 							href="/"
 							draggable="false"
-							on:click={newChatHandler}
+							on:click={newChatNavigationHandler}
 							aria-label={$i18n.t('New Chat')}
 						>
 							<div class="self-center">
@@ -1014,7 +1027,7 @@
 						</div>
 					{/if}
 
-					{#if $user?.role === 'admin' || $user?.permissions?.workspace?.models || $user?.permissions?.workspace?.knowledge || $user?.permissions?.workspace?.prompts || $user?.permissions?.workspace?.tools}
+					{#if hasWorkspaceAccess}
 						<div class="px-[0.4375rem] flex justify-center text-gray-800 dark:text-gray-200">
 							<a
 								id="sidebar-workspace-button"
@@ -1450,3 +1463,67 @@
 		</div>
 	{/if}
 {/if}
+
+<style>
+	.sidebar-glass {
+		backdrop-filter: blur(18px) saturate(145%);
+		-webkit-backdrop-filter: blur(18px) saturate(145%);
+	}
+
+	.sidebar-glass-collapsed {
+		background: rgba(248, 250, 252, 0.62);
+		box-shadow:
+			inset 0 1px 0 rgba(255, 255, 255, 0.42),
+			0 12px 28px -20px rgba(15, 23, 42, 0.35);
+	}
+
+	:global(.dark) .sidebar-glass-collapsed {
+		background: rgba(9, 12, 19, 0.6);
+		box-shadow:
+			inset 0 1px 0 rgba(255, 255, 255, 0.08),
+			0 16px 32px -20px rgba(0, 0, 0, 0.55);
+	}
+
+	.sidebar-glass-expanded {
+		background: rgba(246, 249, 255, 0.58) !important;
+		border-right: 1px solid rgba(255, 255, 255, 0.42);
+		box-shadow: 14px 0 34px -28px rgba(15, 23, 42, 0.45);
+	}
+
+	:global(.dark) .sidebar-glass-expanded {
+		background: rgba(7, 10, 16, 0.56) !important;
+		border-right: 1px solid rgba(255, 255, 255, 0.12);
+		box-shadow: 14px 0 34px -28px rgba(0, 0, 0, 0.72);
+	}
+
+	.sidebar-glass-panel {
+		position: relative;
+	}
+
+	.sidebar-glass-panel::before {
+		content: '';
+		position: absolute;
+		inset: 0;
+		pointer-events: none;
+		border-radius: inherit;
+		background:
+			linear-gradient(
+				165deg,
+				rgba(255, 255, 255, 0.32) 0%,
+				rgba(255, 255, 255, 0.18) 24%,
+				rgba(255, 255, 255, 0.05) 62%,
+				rgba(255, 255, 255, 0) 100%
+			);
+	}
+
+	:global(.dark) .sidebar-glass-panel::before {
+		background:
+			linear-gradient(
+				165deg,
+				rgba(166, 194, 255, 0.12) 0%,
+				rgba(112, 154, 255, 0.07) 22%,
+				rgba(255, 255, 255, 0.03) 55%,
+				rgba(255, 255, 255, 0) 100%
+			);
+	}
+</style>

@@ -7,7 +7,7 @@
 	import LineSpace from '$lib/components/icons/LineSpace.svelte';
 	import LineSpaceSmaller from '$lib/components/icons/LineSpaceSmaller.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let onRegenerate: Function = (prompt = null) => {};
 	export let onClose: Function = () => {};

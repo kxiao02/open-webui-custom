@@ -5,19 +5,18 @@
 	import Models from '$lib/components/workspace/Models.svelte';
 
 	onMount(async () => {
-		await Promise.all([
-			(async () => {
-				models.set(
-					await getModels(
-						localStorage.token,
-						$config?.features?.enable_direct_connections && ($settings?.directConnections ?? null)
-					)
-				);
-			})()
-		]);
+		try {
+			models.set(
+				await getModels(
+					localStorage.token,
+					$config?.features?.enable_direct_connections && ($settings?.directConnections ?? null)
+				)
+			);
+		} catch (error) {
+			console.error(error);
+			models.set([]);
+		}
 	});
 </script>
 
-{#if $models !== null}
-	<Models />
-{/if}
+<Models />

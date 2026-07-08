@@ -33,7 +33,6 @@
 	import GarbageBin from '../icons/GarbageBin.svelte';
 	import Search from '../icons/Search.svelte';
 	import Plus from '../icons/Plus.svelte';
-	import ChevronRight from '../icons/ChevronRight.svelte';
 	import XMark from '../icons/XMark.svelte';
 	import AddFunctionMenu from './Functions/AddFunctionMenu.svelte';
 	import ImportModal from '../ImportModal.svelte';
@@ -42,7 +41,7 @@
 	import { capitalizeFirstLetter } from '$lib/utils';
 	import Spinner from '../common/Spinner.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	let shiftKey = false;
 
@@ -98,32 +97,6 @@
 						(viewOption === 'shared' && f.user_id !== $user?.id))
 			)
 			.sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name));
-	};
-	const shareHandler = async (func) => {
-		const item = await getFunctionById(localStorage.token, func.id).catch((error) => {
-			toast.error(`${error}`);
-			return null;
-		});
-
-		toast.success($i18n.t('Redirecting you to Open WebUI Community'));
-
-		const url = 'https://openwebui.com';
-
-		const tab = await window.open(`${url}/functions/create`, '_blank');
-
-		// Define the event handler function
-		const messageHandler = (event) => {
-			if (event.origin !== url) return;
-			if (event.data === 'loaded') {
-				tab.postMessage(JSON.stringify(item), '*');
-
-				// Remove the event listener after handling the message
-				window.removeEventListener('message', messageHandler);
-			}
-		};
-
-		window.addEventListener('message', messageHandler, false);
-		console.log(item);
 	};
 
 	const cloneHandler = async (func) => {
@@ -531,9 +504,6 @@
 										editHandler={() => {
 											goto(`/admin/functions/edit?id=${encodeURIComponent(func.id)}`);
 										}}
-										shareHandler={() => {
-											shareHandler(func);
-										}}
 										cloneHandler={() => {
 											cloneHandler(func);
 										}}
@@ -583,15 +553,14 @@
 						</div>
 					{/each}
 				</div>
-			{:else}
-				<div class=" w-full h-full flex flex-col justify-center items-center my-16 mb-24">
-					<div class="max-w-md text-center">
-						<div class=" text-3xl mb-3">😕</div>
-						<div class=" text-lg font-medium mb-1">{$i18n.t('No functions found')}</div>
-						<div class=" text-gray-500 text-center text-xs">
-							{$i18n.t('Try adjusting your search or filter to find what you are looking for.')}
+				{:else}
+					<div class=" w-full h-full flex flex-col justify-center items-center my-16 mb-24">
+						<div class="max-w-md text-center">
+							<div class=" text-lg font-medium mb-1">{$i18n.t('No functions found')}</div>
+							<div class=" text-gray-500 text-center text-xs">
+								{$i18n.t('Try adjusting your search or filter to find what you are looking for.')}
+							</div>
 						</div>
-					</div>
 				</div>
 			{/if}
 		</div>
@@ -602,32 +571,6 @@
 	)}
 </div> -->
 
-		{#if $config?.features.enable_community_sharing}
-			<div class=" my-16">
-				<div class=" text-xl font-medium mb-1 line-clamp-1">
-					{$i18n.t('Made by Open WebUI Community')}
-				</div>
-
-				<a
-					class=" flex cursor-pointer items-center justify-between hover:bg-gray-50 dark:hover:bg-gray-850 w-full mb-2 px-3.5 py-1.5 rounded-xl transition"
-					href="https://openwebui.com/functions"
-					target="_blank"
-				>
-					<div class=" self-center">
-						<div class=" font-semibold line-clamp-1">{$i18n.t('Discover a function')}</div>
-						<div class=" text-sm line-clamp-1">
-							{$i18n.t('Discover, download, and explore custom functions')}
-						</div>
-					</div>
-
-					<div>
-						<div>
-							<ChevronRight />
-						</div>
-					</div>
-				</a>
-			</div>
-		{/if}
 	</div>
 
 	<DeleteConfirmDialog
@@ -670,7 +613,7 @@
 
 				for (let func of _functions) {
 					if ('function' in func) {
-						// Required for Community JSON import
+						// Support wrapped function export payloads.
 						func = func.function;
 					}
 

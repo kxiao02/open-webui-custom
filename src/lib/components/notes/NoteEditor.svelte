@@ -1,10 +1,11 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { getContext, onDestroy, onMount, tick } from 'svelte';
 	import { v4 as uuidv4 } from 'uuid';
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { marked } from 'marked';
 	import { toast } from 'svelte-sonner';
@@ -249,11 +250,12 @@
 	const generateTitleHandler = async () => {
 		const content = note.data.content.md;
 		const DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE = `### Task:
-Generate a concise, 3-5 word title with an emoji summarizing the content in the content's primary language.
+Generate a concise, 3-5 word Simplified Chinese title with an emoji summarizing the content.
 ### Guidelines:
 - The title should clearly represent the main theme or subject of the content.
 - Use emojis that enhance understanding of the topic, but avoid quotation marks or special formatting.
-- Write the title in the content's primary language.
+- Always write the title in Simplified Chinese.
+- Preserve product names, code identifiers, APIs, and acronyms in their original form when translating them would be awkward or misleading.
 - Prioritize accuracy over excessive creativity; keep it clear and simple.
 - Your entire response must consist solely of the JSON object, without any introductory or concluding text.
 - The output must be a single, raw JSON object, without any markdown code fences or other encapsulating text.
@@ -261,12 +263,12 @@ Generate a concise, 3-5 word title with an emoji summarizing the content in the 
 ### Output:
 JSON format: { "title": "your concise title here" }
 ### Examples:
-- { "title": "📉 Stock Market Trends" },
-- { "title": "🍪 Perfect Chocolate Chip Recipe" },
-- { "title": "Evolution of Music Streaming" },
-- { "title": "Remote Work Productivity Tips" },
-- { "title": "Artificial Intelligence in Healthcare" },
-- { "title": "🎮 Video Game Development Insights" }
+- { "title": "📉 股市走势分析" },
+- { "title": "🍪 巧克力曲奇配方" },
+- { "title": "🎵 音乐流媒体演变" },
+- { "title": "💼 远程办公提效" },
+- { "title": "🧠 AI 医疗应用" },
+- { "title": "🎮 游戏开发洞察" }
 ### Content:
 <content>
 ${content}

@@ -1,10 +1,11 @@
 <script lang="ts">
+	// @ts-nocheck
 	import DOMPurify from 'dompurify';
 
 	import { onMount, getContext, createEventDispatcher, onDestroy, tick } from 'svelte';
 	import * as FocusTrap from 'focus-trap';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 	const dispatch = createEventDispatcher();
 
 	import { fade } from 'svelte/transition';
@@ -41,12 +42,22 @@
 	};
 
 	const handleKeyDown = (event: KeyboardEvent) => {
+		const target = event.target as HTMLElement | null;
+
 		if (event.key === 'Escape') {
 			console.log('Escape');
 			show = false;
 		}
 
 		if (event.key === 'Enter') {
+			if (
+				target instanceof HTMLTextAreaElement ||
+				target instanceof HTMLSelectElement ||
+				target?.isContentEditable
+			) {
+				return;
+			}
+
 			console.log('Enter');
 			event.preventDefault();
 			event.stopPropagation();
@@ -170,7 +181,7 @@
 						{cancelLabel}
 					</button>
 					<button
-						class="text-sm bg-gray-900 hover:bg-gray-850 text-gray-100 dark:bg-gray-100 dark:hover:bg-white dark:text-gray-800 font-medium w-full py-2 rounded-3xl transition"
+						class="text-sm bg-black hover:bg-gray-900 text-white dark:bg-white dark:text-black dark:hover:bg-gray-100 font-medium w-full py-2 rounded-3xl transition"
 						on:click={() => {
 							confirmHandler();
 						}}

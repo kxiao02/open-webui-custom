@@ -1,5 +1,6 @@
 fastapi==0.135.1
 uvicorn[standard]==0.41.0
+typer==0.20.0
 pydantic==2.12.5
 python-multipart==0.0.22
 itsdangerous==2.2.0
@@ -97,7 +98,7 @@ youtube-transcript-api==1.2.4
 pytube==15.0.0
 
 pydub
-ddgs==9.11.2
+ddgs==9.11.4
 
 azure-ai-documentintelligence==1.0.2
 azure-identity==1.25.2

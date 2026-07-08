@@ -9,7 +9,7 @@
 	import UserStatus from '$lib/components/channel/Messages/Message/UserStatus.svelte';
 	import UserStatusLinkPreview from '$lib/components/channel/Messages/Message/UserStatusLinkPreview.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let token: Token;
 

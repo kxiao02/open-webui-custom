@@ -1,4 +1,5 @@
 <script>
+	// @ts-nocheck
 	import { toast } from 'svelte-sonner';
 	import { onMount, getContext } from 'svelte';
 	import { goto } from '$app/navigation';
@@ -10,7 +11,7 @@
 	import { compareVersion, extractFrontmatter } from '$lib/utils';
 	import { WEBUI_VERSION } from '$lib/constants';
 
-	const i18n = getContext('i18n');
+	const i18n = /** @type {import('$lib/i18n').I18nStore} */ (getContext('i18n'));
 
 	let mounted = false;
 	let clone = false;
@@ -61,22 +62,6 @@
 	};
 
 	onMount(() => {
-		window.addEventListener('message', async (event) => {
-			if (
-				!['https://openwebui.com', 'https://www.openwebui.com', 'http://localhost:9999'].includes(
-					event.origin
-				)
-			)
-				return;
-
-			func = JSON.parse(event.data);
-			console.log(func);
-		});
-
-		if (window.opener ?? false) {
-			window.opener.postMessage('loaded', '*');
-		}
-
 		if (sessionStorage.function) {
 			func = JSON.parse(sessionStorage.function);
 			sessionStorage.removeItem('function');

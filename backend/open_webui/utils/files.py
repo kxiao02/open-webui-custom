@@ -13,7 +13,7 @@ from fastapi import (
 from typing import Optional
 from pathlib import Path
 
-from open_webui.storage.provider import Storage
+from open_webui.storage.provider import Storage, cleanup_ephemeral_storage_file
 
 from open_webui.models.chats import Chats
 from open_webui.models.files import Files
@@ -29,6 +29,16 @@ import requests
 
 BASE64_IMAGE_URL_PREFIX = re.compile(r"data:image/\w+;base64,", re.IGNORECASE)
 MARKDOWN_IMAGE_URL_PATTERN = re.compile(r"!\[(.*?)\]\((.+?)\)", re.IGNORECASE)
+FILE_CONTENT_PATH_PATTERN = re.compile(
+    r"^/?api/v1/files/([^/]+)/content/?(?:\?.*)?$", re.IGNORECASE
+)
+
+
+def _resolve_file_id_from_url(url: str) -> str:
+    match = FILE_CONTENT_PATH_PATTERN.match(url)
+    if match:
+        return match.group(1)
+    return url
 
 
 def get_image_base64_from_url(url: str) -> Optional[str]:
@@ -44,21 +54,27 @@ def get_image_base64_from_url(url: str) -> Optional[str]:
             content_type = response.headers.get("Content-Type", "image/png")
             return f"data:{content_type};base64,{encoded_string}"
         else:
-            file = Files.get_file_by_id(url)
+            file_id = _resolve_file_id_from_url(url)
+            file = Files.get_file_by_id(file_id)
 
             if not file:
                 return None
 
             file_path = Storage.get_file(file.path)
-            file_path = Path(file_path)
+            try:
+                file_path = Path(file_path)
 
-            if file_path.is_file():
-                with open(file_path, "rb") as image_file:
-                    encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-                    content_type, _ = mimetypes.guess_type(file_path.name)
-                    return f"data:{content_type};base64,{encoded_string}"
-            else:
-                return None
+                if file_path.is_file():
+                    with open(file_path, "rb") as image_file:
+                        encoded_string = base64.b64encode(image_file.read()).decode(
+                            "utf-8"
+                        )
+                        content_type, _ = mimetypes.guess_type(file_path.name)
+                        return f"data:{content_type};base64,{encoded_string}"
+                else:
+                    return None
+            finally:
+                cleanup_ephemeral_storage_file(file_path)
 
     except Exception as e:
         return None
@@ -164,17 +180,22 @@ def get_image_base64_from_file_id(id: str) -> Optional[str]:
 
     try:
         file_path = Storage.get_file(file.path)
-        file_path = Path(file_path)
+        try:
+            file_path = Path(file_path)
 
-        # Check if the file already exists in the cache
-        if file_path.is_file():
-            import base64
+            # Check if the file already exists in the cache
+            if file_path.is_file():
+                import base64
 
-            with open(file_path, "rb") as image_file:
-                encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-                content_type, _ = mimetypes.guess_type(file_path.name)
-                return f"data:{content_type};base64,{encoded_string}"
-        else:
-            return None
+                with open(file_path, "rb") as image_file:
+                    encoded_string = base64.b64encode(image_file.read()).decode(
+                        "utf-8"
+                    )
+                    content_type, _ = mimetypes.guess_type(file_path.name)
+                    return f"data:{content_type};base64,{encoded_string}"
+            else:
+                return None
+        finally:
+            cleanup_ephemeral_storage_file(file_path)
     except Exception as e:
         return None

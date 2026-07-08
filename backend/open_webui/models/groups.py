@@ -25,6 +25,7 @@ from sqlalchemy import (
     or_,
     select,
 )
+from sqlalchemy.exc import IntegrityError
 
 log = logging.getLogger(__name__)
 
@@ -142,7 +143,11 @@ class GroupTable:
         return group_data
 
     def insert_new_group(
-        self, user_id: str, form_data: GroupForm, db: Optional[Session] = None
+        self,
+        user_id: str,
+        form_data: GroupForm,
+        db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[GroupModel]:
         with get_db_context(db) as db:
             group_data = self._ensure_default_share_config(
@@ -161,8 +166,12 @@ class GroupTable:
             try:
                 result = Group(**group.model_dump())
                 db.add(result)
-                db.commit()
-                db.refresh(result)
+                if commit:
+                    db.commit()
+                    db.refresh(result)
+                else:
+                    db.flush()
+                    db.refresh(result)
                 if result:
                     return GroupModel.model_validate(result)
                 else:
@@ -436,6 +445,7 @@ class GroupTable:
         form_data: GroupUpdateForm,
         overwrite: bool = False,
         db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[GroupModel]:
         try:
             with get_db_context(db) as db:
@@ -445,7 +455,10 @@ class GroupTable:
                         "updated_at": int(time.time()),
                     }
                 )
-                db.commit()
+                if commit:
+                    db.commit()
+                else:
+                    db.flush()
                 return self.get_group_by_id(id=id, db=db)
         except Exception as e:
             log.exception(e)
@@ -604,6 +617,7 @@ class GroupTable:
         id: str,
         user_ids: Optional[list[str]] = None,
         db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[GroupModel]:
         try:
             with get_db_context(db) as db:
@@ -615,24 +629,27 @@ class GroupTable:
 
                 for user_id in user_ids or []:
                     try:
-                        db.add(
-                            GroupMember(
-                                id=str(uuid.uuid4()),
-                                group_id=id,
-                                user_id=user_id,
-                                created_at=now,
-                                updated_at=now,
+                        with db.begin_nested():
+                            db.add(
+                                GroupMember(
+                                    id=str(uuid.uuid4()),
+                                    group_id=id,
+                                    user_id=user_id,
+                                    created_at=now,
+                                    updated_at=now,
+                                )
                             )
-                        )
-                        db.flush()  # Detect unique constraint violation early
-                    except Exception:
-                        db.rollback()  # Clear failed INSERT
-                        db.begin()  # Start a new transaction
+                            db.flush()  # Detect unique constraint violation early
+                    except IntegrityError:
                         continue  # Duplicate → ignore
 
                 group.updated_at = now
-                db.commit()
-                db.refresh(group)
+                if commit:
+                    db.commit()
+                    db.refresh(group)
+                else:
+                    db.flush()
+                    db.refresh(group)
 
                 return GroupModel.model_validate(group)
 
@@ -645,6 +662,7 @@ class GroupTable:
         id: str,
         user_ids: Optional[list[str]] = None,
         db: Optional[Session] = None,
+        commit: bool = True,
     ) -> Optional[GroupModel]:
         try:
             with get_db_context(db) as db:
@@ -663,8 +681,12 @@ class GroupTable:
                 # Update group timestamp
                 group.updated_at = int(time.time())
 
-                db.commit()
-                db.refresh(group)
+                if commit:
+                    db.commit()
+                    db.refresh(group)
+                else:
+                    db.flush()
+                    db.refresh(group)
                 return GroupModel.model_validate(group)
 
         except Exception as e:

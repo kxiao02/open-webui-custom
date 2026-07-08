@@ -6,6 +6,7 @@ from typing import Optional
 
 from open_webui.models.memories import Memories, MemoryModel
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+from open_webui.routers.retrieval import ensure_retrieval_runtime
 from open_webui.utils.auth import get_verified_user
 from open_webui.internal.db import get_session
 from sqlalchemy.orm import Session
@@ -16,6 +17,12 @@ from open_webui.constants import ERROR_MESSAGES
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+@router.get("/ef")
+async def get_embeddings(request: Request):
+    ensure_retrieval_runtime(request.app)
+    return {"result": await request.app.state.EMBEDDING_FUNCTION("hello world")}
 
 
 ############################
@@ -85,6 +92,7 @@ async def add_memory(
 
     memory = Memories.insert_new_memory(user.id, form_data.content)
 
+    ensure_retrieval_runtime(request.app)
     vector = await request.app.state.EMBEDDING_FUNCTION(memory.content, user=user)
 
     VECTOR_DB_CLIENT.upsert(
@@ -140,6 +148,7 @@ async def query_memory(
     if not memories:
         raise HTTPException(status_code=404, detail="No memories found for user")
 
+    ensure_retrieval_runtime(request.app)
     vector = await request.app.state.EMBEDDING_FUNCTION(form_data.content, user=user)
 
     results = VECTOR_DB_CLIENT.search(
@@ -186,6 +195,7 @@ async def reset_memory_from_vector_db(
     memories = Memories.get_memories_by_user_id(user.id)
 
     # Generate vectors in parallel
+    ensure_retrieval_runtime(request.app)
     vectors = await asyncio.gather(
         *[
             request.app.state.EMBEDDING_FUNCTION(memory.content, user=user)
@@ -286,6 +296,7 @@ async def update_memory_by_id(
         raise HTTPException(status_code=404, detail="Memory not found")
 
     if form_data.content is not None:
+        ensure_retrieval_runtime(request.app)
         vector = await request.app.state.EMBEDDING_FUNCTION(memory.content, user=user)
 
         VECTOR_DB_CLIENT.upsert(

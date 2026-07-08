@@ -12,8 +12,11 @@
 			const videoId = params.get('v');
 
 			// Redirect to root with 'youtube' parameter
-
-			goto(`/?youtube=${encodeURIComponent(videoId)}`);
+			if (videoId) {
+				goto(`/?youtube=${encodeURIComponent(videoId)}`);
+			} else {
+				goto('/');
+			}
 		} else {
 			// Redirect to root if 'v' parameter doesn't exist
 			goto('/');

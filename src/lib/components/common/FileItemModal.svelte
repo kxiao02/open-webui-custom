@@ -5,15 +5,22 @@
 	import { getContext, onMount, tick } from 'svelte';
 
 	import { formatFileSize, getLineCount } from '$lib/utils';
-	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import { settings } from '$lib/stores';
 	import { getKnowledgeById } from '$lib/apis/knowledge';
 	import { getFileById, getFileContentById } from '$lib/apis/files';
+	import { extractOpenWebUiFileId, normalizeOpenWebUiFileUrl } from '$lib/utils/generated-files';
+	import {
+		isMarkdownPreviewContentType,
+		isMarkdownPreviewPath,
+		isMermaidPreviewContentType,
+		isMermaidPreviewPath,
+		prepareMarkdownPreviewSource
+	} from '$lib/utils/markdownPreview';
 
 	import CodeBlock from '$lib/components/chat/Messages/CodeBlock.svelte';
 	import Markdown from '$lib/components/chat/Messages/Markdown.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	const CONTENT_PREVIEW_LIMIT = 10000;
 	let expandedContent = false;
@@ -42,6 +49,7 @@
 	let isExcel = false;
 	let isDocx = false;
 	let isPptx = false;
+	let isMermaid = false;
 
 	let selectedTab = '';
 	let excelWorkbook: WorkBook | null = null;
@@ -50,6 +58,34 @@
 	let excelHtml = '';
 	let excelError = '';
 	let rowCount = 0;
+	let itemRef: string | null = null;
+	let itemUrl: string | null = null;
+	let itemName: string | null = null;
+
+	const normalizeFileRef = (value: unknown): string | null => {
+		if (typeof value !== 'string') {
+			return null;
+		}
+
+		const normalized = value.trim();
+		if (normalized === '') {
+			return null;
+		}
+
+		const lowered = normalized.toLowerCase();
+		if (lowered === 'null' || lowered === 'undefined') {
+			return null;
+		}
+
+		return normalized;
+	};
+
+	$: {
+		const rawUrl = normalizeFileRef(item?.url);
+		const rawId = normalizeFileRef(item?.id);
+		itemUrl = rawUrl ? normalizeOpenWebUiFileUrl(rawUrl) : rawId ? normalizeOpenWebUiFileUrl(rawId) : null;
+		itemRef = extractOpenWebUiFileId(rawUrl ?? '') ?? extractOpenWebUiFileId(rawId ?? '') ?? rawId;
+	}
 
 	// DOCX state
 	let docxHtml = '';
@@ -81,9 +117,16 @@
 		item?.meta?.content_type === 'application/pdf' ||
 		(item?.name && item?.name.toLowerCase().endsWith('.pdf'));
 
+	$: itemName =
+		item?.name ?? item?.filename ?? item?.file?.filename ?? item?.file?.meta?.name ?? null;
+
+	$: isMermaid =
+		isMermaidPreviewContentType(item?.meta?.content_type) || isMermaidPreviewPath(itemName);
+
 	$: isMarkdown =
-		item?.meta?.content_type === 'text/markdown' ||
-		(item?.name && item?.name.toLowerCase().endsWith('.md'));
+		isMermaid ||
+		isMarkdownPreviewContentType(item?.meta?.content_type) ||
+		isMarkdownPreviewPath(itemName);
 
 	$: isCode =
 		item?.name &&
@@ -152,8 +195,12 @@
 	const loadExcelContent = async () => {
 		try {
 			excelError = '';
+			if (!itemRef) {
+				excelError = $i18n.t('File reference is unavailable.');
+				return;
+			}
 			const [arrayBuffer, { read }] = await Promise.all([
-				getFileContentById(item.id),
+				getFileContentById(itemRef),
 				import('xlsx')
 			]);
 			excelWorkbook = read(arrayBuffer, { type: 'array' });
@@ -186,7 +233,7 @@
 		try {
 			docxError = '';
 			const [arrayBuffer, mammoth] = await Promise.all([
-				getFileContentById(item.id),
+				getFileContentById(itemRef ?? item.id),
 				import('mammoth')
 			]);
 			const result = await mammoth.convertToHtml({ arrayBuffer });
@@ -201,7 +248,7 @@
 		try {
 			pptxError = '';
 			const [arrayBuffer, { pptxToImages }] = await Promise.all([
-				getFileContentById(item.id),
+				getFileContentById(itemRef ?? item.id),
 				import('$lib/utils/pptxToHtml')
 			]);
 			const result = await pptxToImages(arrayBuffer);
@@ -228,17 +275,28 @@
 				item.files = knowledge.files || [];
 			}
 			loading = false;
-		} else if (item?.type === 'file') {
-			loading = true;
+			} else if (item?.type === 'file') {
+				loading = true;
+				if (!itemRef) {
+					item.file = item?.file ?? {};
+					loading = false;
+					return;
+				}
 
-			const file = await getFileById(localStorage.token, item.id).catch((e) => {
-				console.error('Error fetching file:', e);
-				return null;
-			});
+				const file = await getFileById(localStorage.token, itemRef).catch((e) => {
+					console.error('Error fetching file:', e);
+					return null;
+				});
 
-			if (file) {
-				item.file = file || {};
-			}
+				if (file) {
+					item.file = file || {};
+					if (!item.id) {
+						item.id = itemRef;
+					}
+					if (!item.url) {
+						item.url = itemUrl ?? itemRef;
+					}
+				}
 
 			// Load Excel content if it's an Excel file
 			if (isExcel) {
@@ -279,21 +337,17 @@
 			<div class="flex items-start justify-between">
 				<div>
 					<div class=" font-medium text-lg dark:text-gray-100">
-						<a
-							href="#"
-							class="hover:underline line-clamp-1"
-							on:click|preventDefault={() => {
-								if (!isPDF && item.url) {
-									window.open(
-										item.type === 'file'
-											? item?.url?.startsWith('http')
-												? item.url
-												: `${WEBUI_API_BASE_URL}/files/${item.url}/content`
-											: item.url,
-										'_blank'
-									);
-								}
-							}}
+							<a
+								href="#"
+								class="hover:underline line-clamp-1"
+								on:click|preventDefault={() => {
+									if (!isPDF && itemUrl) {
+										window.open(
+											item.type === 'file' ? itemUrl ?? '' : itemRef ?? '',
+											'_blank'
+										);
+									}
+								}}
 						>
 							{item?.name ?? 'File'}
 						</a>
@@ -447,7 +501,7 @@
 						</div>
 						<div use:initImagePanzoom>
 							<img
-								src={`${WEBUI_API_BASE_URL}/files/${item.id}/content`}
+								src={itemUrl ?? ''}
 								alt={item?.name ?? 'Image'}
 								class="w-full object-contain rounded-lg"
 								loading="lazy"
@@ -467,7 +521,10 @@
 								class="max-h-96 overflow-scroll scrollbar-hidden text-sm prose dark:prose-invert max-w-full"
 							>
 								<Markdown
-									content={isTruncated ? rawContent.slice(0, CONTENT_PREVIEW_LIMIT) : rawContent}
+									content={prepareMarkdownPreviewSource(
+										isTruncated ? rawContent.slice(0, CONTENT_PREVIEW_LIMIT) : rawContent,
+										{ mermaid: isMermaid }
+									)}
 									id="file-preview"
 								/>
 							</div>
@@ -499,7 +556,10 @@
 								class="max-h-96 overflow-scroll scrollbar-hidden text-sm prose dark:prose-invert max-w-full"
 							>
 								<Markdown
-									content={isTruncated ? rawContent.slice(0, CONTENT_PREVIEW_LIMIT) : rawContent}
+									content={prepareMarkdownPreviewSource(
+										isTruncated ? rawContent.slice(0, CONTENT_PREVIEW_LIMIT) : rawContent,
+										{ mermaid: isMermaid }
+									)}
 									id="file-preview-content"
 								/>
 							</div>
@@ -522,16 +582,18 @@
 						{/if}
 					{/if}
 				{:else if selectedTab === 'preview'}
-					{#if isAudio}
+					{#if !itemRef}
+						<div class="text-gray-500 text-sm p-4">{$i18n.t('File reference is unavailable.')}</div>
+					{:else if isAudio}
 						<audio
-							src={`${WEBUI_API_BASE_URL}/files/${item.id}/content`}
+							src={itemUrl ?? ''}
 							class="w-full border-0 rounded-lg mb-2"
 							controls
 							playsinline
 						/>
 					{:else if isPDF}
 						<PDFViewer
-							url={`${WEBUI_API_BASE_URL}/files/${item.id}/content`}
+							url={itemUrl ?? ''}
 							className="w-full h-[70vh] border-0 rounded-lg"
 						/>
 					{:else if isExcel}
@@ -581,7 +643,12 @@
 						<div
 							class="max-h-[60vh] overflow-scroll scrollbar-hidden text-sm prose dark:prose-invert max-w-full"
 						>
-							<Markdown content={item.file.data.content} id="markdown-viewer" />
+							<Markdown
+								content={prepareMarkdownPreviewSource(item.file.data.content, {
+									mermaid: isMermaid
+								})}
+								id="markdown-viewer"
+							/>
 						</div>
 					{:else if isDocx}
 						{#if docxError}

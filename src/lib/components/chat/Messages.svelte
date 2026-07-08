@@ -22,28 +22,30 @@
 
 	import ChatPlaceholder from './ChatPlaceholder.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let className = 'h-full flex pt-8';
 
 	export let chatId = '';
-	export let user = $_user;
+	export let user: any = $_user;
 
-	export let prompt;
-	export let history = {};
-	export let selectedModels;
-	export let atSelectedModel;
+	export let prompt: any = null;
+	export let history: any = {};
+	export let historyMeta: any = null;
+	export let selectedModels: any[] = [];
+	export let atSelectedModel: any = undefined;
+	export let processing = '';
 
-	let messages = [];
+	export let messages: any[] = [];
 
 	export let setInputText: Function = () => {};
 
-	export let sendMessage: Function;
-	export let continueResponse: Function;
-	export let regenerateResponse: Function;
-	export let mergeResponses: Function;
+	export let sendMessage: Function = () => {};
+	export let continueResponse: Function = () => {};
+	export let regenerateResponse: Function = () => {};
+	export let mergeResponses: Function = () => {};
 
-	export let chatActionHandler: Function;
+	export let chatActionHandler: Function = () => {};
 	export let showMessage: Function = () => {};
 	export let submitMessage: Function = () => {};
 	export let addMessages: Function = () => {};
@@ -53,37 +55,153 @@
 
 	export let topPadding = false;
 	export let bottomPadding = false;
-	export let autoScroll;
+	export let autoScroll: boolean = true;
 
-	export let onSelect = (e) => {};
+	export let onSelect = (e: any) => {};
 
 	export let messagesCount: number | null = 20;
+	export let loadMoreHistory: Function | null = null;
+	export let ensureHistoryLoaded: Function = async () => true;
 	let messagesLoading = false;
+	const INITIAL_VISIBLE_MESSAGES = 4;
+	const VISIBLE_MESSAGE_STEP = 4;
+	let visibleMessageCount = 0;
+	let renderedMessages: any[] = [];
+	let pendingVisibleReveal: number | null = null;
+	let revealRunId = 0;
+	let messageLogElement: HTMLUListElement | null = null;
+	let messageLogResizeObserver: ResizeObserver | null = null;
+	let pendingBottomAnchor: number | null = null;
+
+	const usesExternalHistoryPagination = () => typeof loadMoreHistory === 'function';
+	const usesLocalWindowing = () => messagesCount !== null && !usesExternalHistoryPagination();
+
+	const canLoadMoreHistory = () =>
+		Boolean(
+			historyMeta?.canLoadMore ??
+				historyMeta?.can_load_more ??
+				historyMeta?.truncated ??
+				historyMeta?.is_truncated ??
+				false
+		);
 
 	const loadMoreMessages = async () => {
-		// scroll slightly down to disable continuous loading
 		const element = document.getElementById('messages-container');
-		element.scrollTop = element.scrollTop + 100;
+		if (!element) return;
+		const previousMessageCount = messages.length;
+		const previousVisibleMessageCount = visibleMessageCount;
+		const previousScrollTop = element.scrollTop;
+		const previousScrollHeight = element.scrollHeight;
 
 		messagesLoading = true;
-		messagesCount += 20;
+		if (canLoadMoreHistory() && typeof loadMoreHistory === 'function') {
+			await loadMoreHistory();
+		}
+		if (usesLocalWindowing() && messagesCount !== null) {
+			messagesCount += 20;
+		}
 		buildMessages();
 
+		if (messages.length > previousMessageCount) {
+			cancelVisibleReveal();
+			revealRunId += 1;
+			if (usesExternalHistoryPagination()) {
+				visibleMessageCount = messages.length;
+			} else {
+				const addedMessages = messages.length - previousMessageCount;
+				visibleMessageCount = Math.min(
+					messages.length,
+					Math.max(previousVisibleMessageCount + addedMessages, INITIAL_VISIBLE_MESSAGES)
+				);
+			}
+		}
+
 		await tick();
+		if (messages.length > previousMessageCount) {
+			const heightDelta = element.scrollHeight - previousScrollHeight;
+			element.scrollTop = Math.max(0, previousScrollTop + heightDelta);
+		}
 
 		messagesLoading = false;
 	};
 
-	let pendingRebuild = null;
-	let lastCurrentId = null;
+	let pendingRebuild: number | null = null;
+	let lastCurrentId: any = null;
+
+	const cancelVisibleReveal = () => {
+		if (pendingVisibleReveal) {
+			cancelAnimationFrame(pendingVisibleReveal);
+			pendingVisibleReveal = null;
+		}
+	};
+
+	const scheduleVisibleReveal = () => {
+		cancelVisibleReveal();
+
+		const runId = ++revealRunId;
+		const revealNextBatch = async () => {
+			if (runId !== revealRunId || visibleMessageCount >= messages.length) {
+				pendingVisibleReveal = null;
+				return;
+			}
+
+			const element = document.getElementById('messages-container');
+			const previousBottomOffset = element ? element.scrollHeight - element.scrollTop : 0;
+
+			visibleMessageCount = Math.min(messages.length, visibleMessageCount + VISIBLE_MESSAGE_STEP);
+			await tick();
+
+			if (runId !== revealRunId) {
+				pendingVisibleReveal = null;
+				return;
+			}
+
+			if (element) {
+				element.scrollTop = Math.max(0, element.scrollHeight - previousBottomOffset);
+			}
+
+			if (visibleMessageCount < messages.length) {
+				pendingVisibleReveal = requestAnimationFrame(() => {
+					void revealNextBatch();
+				});
+			} else {
+				pendingVisibleReveal = null;
+			}
+		};
+
+		if (visibleMessageCount < messages.length) {
+			pendingVisibleReveal = requestAnimationFrame(() => {
+				void revealNextBatch();
+			});
+		}
+	};
+
+	const resetVisibleMessages = () => {
+		cancelVisibleReveal();
+		revealRunId += 1;
+
+		if (usesExternalHistoryPagination()) {
+			visibleMessageCount = messages.length;
+			return;
+		}
+
+		if (messages.length <= INITIAL_VISIBLE_MESSAGES) {
+			visibleMessageCount = messages.length;
+			return;
+		}
+
+		visibleMessageCount = INITIAL_VISIBLE_MESSAGES;
+		scheduleVisibleReveal();
+	};
 
 	const buildMessages = () => {
-		let _messages = [];
+		let _messages: any[] = [];
+		const windowSize = usesLocalWindowing() ? messagesCount : null;
 
 		let message = history.messages[history.currentId];
 		const visitedMessageIds = new Set();
 
-		while (message && (messagesCount !== null ? _messages.length <= messagesCount : true)) {
+		while (message && (windowSize !== null ? _messages.length <= windowSize : true)) {
 			if (visitedMessageIds.has(message.id)) {
 				console.warn('Circular dependency detected in message history', message.id);
 				break;
@@ -99,9 +217,12 @@
 
 	// Throttle message list rebuilds to once per animation frame during streaming.
 	// Structural changes (currentId change) always rebuild immediately.
-	const handleHistoryChange = (currentId, _messages) => {
+	const handleHistoryChange = (currentId: any, _messages: any) => {
 		if (!currentId) {
 			messages = [];
+			visibleMessageCount = 0;
+			renderedMessages = [];
+			cancelVisibleReveal();
 			return;
 		}
 
@@ -110,9 +231,12 @@
 
 		if (currentIdChanged) {
 			// Structural change: new chat, navigation, new message — rebuild immediately
-			cancelAnimationFrame(pendingRebuild);
+			if (pendingRebuild !== null) {
+				cancelAnimationFrame(pendingRebuild);
+			}
 			pendingRebuild = null;
 			buildMessages();
+			resetVisibleMessages();
 		} else if (_messages) {
 			// Content update (streaming) — throttle to once per frame
 			if (!pendingRebuild) {
@@ -125,6 +249,10 @@
 	};
 
 	$: handleHistoryChange(history.currentId, history.messages);
+	$: renderedMessages =
+		visibleMessageCount >= messages.length
+			? messages
+			: messages.slice(Math.max(messages.length - visibleMessageCount, 0));
 
 	$: if (autoScroll && bottomPadding) {
 		(async () => {
@@ -135,11 +263,62 @@
 
 	const scrollToBottom = () => {
 		const element = document.getElementById('messages-container');
+		if (!element) return;
 		element.scrollTop = element.scrollHeight;
 	};
 
+	const cancelPendingBottomAnchor = () => {
+		if (pendingBottomAnchor !== null) {
+			cancelAnimationFrame(pendingBottomAnchor);
+			pendingBottomAnchor = null;
+		}
+	};
+
+	const disconnectMessageLogObserver = () => {
+		if (messageLogResizeObserver) {
+			messageLogResizeObserver.disconnect();
+			messageLogResizeObserver = null;
+		}
+		cancelPendingBottomAnchor();
+	};
+
+	const scheduleBottomAnchor = () => {
+		if (!autoScroll || pendingBottomAnchor !== null) {
+			return;
+		}
+
+		pendingBottomAnchor = requestAnimationFrame(async () => {
+			pendingBottomAnchor = null;
+			await tick();
+			if (autoScroll) {
+				scrollToBottom();
+			}
+		});
+	};
+
+	$: {
+		disconnectMessageLogObserver();
+		if (messageLogElement && typeof ResizeObserver !== 'undefined') {
+			messageLogResizeObserver = new ResizeObserver(() => {
+				scheduleBottomAnchor();
+			});
+			messageLogResizeObserver.observe(messageLogElement);
+		}
+	}
+
+	const hasMoreLocalHistory = () => {
+		const first = messages.at(0);
+		if (!first) return false;
+		const parentId = first.parentId;
+		if (parentId === null || parentId === undefined) return false;
+		return Boolean(history?.messages?.[parentId]);
+	};
+
+	const shouldShowHistoryLoader = () => hasMoreLocalHistory() || canLoadMoreHistory();
+
 	const updateChat = async () => {
 		if (!$temporaryChatEnabled) {
+			await ensureHistoryLoaded();
 			history = history;
 			await tick();
 			await updateChatById(localStorage.token, chatId, {
@@ -152,7 +331,7 @@
 		}
 	};
 
-	const gotoMessage = async (message, idx) => {
+	const gotoMessage = async (message: any, idx: number) => {
 		// Determine the correct sibling list (either parent's children or root messages)
 		let siblings;
 		if (message.parentId !== null) {
@@ -193,7 +372,7 @@
 		}
 	};
 
-	const showPreviousMessage = async (message) => {
+	const showPreviousMessage = async (message: any) => {
 		if (message.parentId !== null) {
 			let messageId =
 				history.messages[message.parentId].childrenIds[
@@ -427,7 +606,11 @@
 	};
 
 	onDestroy(() => {
-		cancelAnimationFrame(pendingRebuild);
+		if (pendingRebuild !== null) {
+			cancelAnimationFrame(pendingRebuild);
+		}
+		cancelVisibleReveal();
+		disconnectMessageLogObserver();
 	});
 
 	const triggerScroll = () => {
@@ -449,10 +632,9 @@
 			{#key chatId}
 				<section class="w-full" aria-labelledby="chat-conversation">
 					<h2 class="sr-only" id="chat-conversation">{$i18n.t('Chat Conversation')}</h2>
-					{#if messages.at(0)?.parentId !== null}
+					{#if shouldShowHistoryLoader()}
 						<Loader
 							on:visible={(e) => {
-								console.log('visible');
 								if (!messagesLoading) {
 									loadMoreMessages();
 								}
@@ -464,8 +646,14 @@
 							</div>
 						</Loader>
 					{/if}
-					<ul role="log" aria-live="polite" aria-relevant="additions" aria-atomic="false">
-						{#each messages as message, messageIdx (message.id)}
+					<ul
+						bind:this={messageLogElement}
+						role="log"
+						aria-live="polite"
+						aria-relevant="additions"
+						aria-atomic="false"
+					>
+						{#each renderedMessages as message, messageIdx (message.id)}
 							<Message
 								{chatId}
 								bind:history

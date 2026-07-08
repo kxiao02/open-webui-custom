@@ -23,6 +23,7 @@ from open_webui.utils.plugin import (
     get_function_module_from_cache,
 )
 from open_webui.utils.access_control import has_access
+from open_webui.utils.model_access import is_model_always_allowed
 
 
 from open_webui.config import (
@@ -404,6 +405,9 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
 
 
 def check_model_access(user, model, db=None):
+    if is_model_always_allowed(model.get("id")):
+        return
+
     if model.get("arena"):
         meta = model.get("info", {}).get("meta", {})
         access_grants = meta.get("access_grants", [])
@@ -417,7 +421,8 @@ def check_model_access(user, model, db=None):
     else:
         model_info = Models.get_model_by_id(model.get("id"), db=db)
         if not model_info:
-            raise Exception("Model not found")
+            # Base/provider models without a custom DB record are shared chat targets.
+            return
         elif not (
             user.id == model_info.user_id
             or AccessGrants.has_access(
@@ -461,6 +466,10 @@ def get_filtered_models(models, user, db=None):
 
         filtered_models = []
         for model in models:
+            if is_model_always_allowed(model.get("id")):
+                filtered_models.append(model)
+                continue
+
             if model.get("arena"):
                 meta = model.get("info", {}).get("meta", {})
                 access_grants = meta.get("access_grants", [])
@@ -481,6 +490,9 @@ def get_filtered_models(models, user, db=None):
                     or model["id"] in accessible_model_ids
                 ):
                     filtered_models.append(model)
+            else:
+                # Provider/base models without a custom model record remain readable.
+                filtered_models.append(model)
 
         return filtered_models
     else:

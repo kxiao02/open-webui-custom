@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Optional
+from typing import Literal, Optional
 
 from sqlalchemy.orm import Session
 from open_webui.internal.db import Base, get_db, get_db_context
@@ -34,7 +34,12 @@ class Skill(Base):
 
 
 class SkillMeta(BaseModel):
-    tags: Optional[list[str]] = []
+    tags: list[str] = Field(default_factory=list)
+    published: bool = False
+    category: Optional[str] = None
+    visibility: Literal["public", "restricted", "hidden"] = "public"
+    dependencies: list[str] = Field(default_factory=list)
+    is_default: bool = False
 
 
 class SkillModel(BaseModel):

@@ -7,7 +7,7 @@
 	import ArrowForward from '$lib/components/icons/ArrowForward.svelte';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let id: string;
 	export let content: string;

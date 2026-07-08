@@ -303,13 +303,16 @@ class ModelsTable:
                 elif view_option == "shared":
                     query = query.filter(Model.user_id != user_id)
 
-                # Apply access control filtering
-                query = self._has_permission(
-                    db,
-                    query,
-                    filter,
-                    permission="read",
-                )
+                if filter.get("owner_only"):
+                    query = query.filter(Model.user_id == user_id)
+                else:
+                    # Apply access control filtering
+                    query = self._has_permission(
+                        db,
+                        query,
+                        filter,
+                        permission="read",
+                    )
 
                 tag = filter.get("tag")
                 if tag:

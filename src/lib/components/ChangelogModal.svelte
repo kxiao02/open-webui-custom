@@ -1,4 +1,5 @@
 <script lang="ts">
+	// @ts-nocheck
 	import DOMPurify from 'dompurify';
 
 	import { onMount, getContext } from 'svelte';
@@ -13,7 +14,7 @@
 	import { updateUserSettings } from '$lib/apis/users';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let show = false;
 

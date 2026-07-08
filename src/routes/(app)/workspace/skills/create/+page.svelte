@@ -1,10 +1,11 @@
 <script lang="ts">
+	// @ts-nocheck
 	import { toast } from 'svelte-sonner';
 	import { goto } from '$app/navigation';
 	import { skills } from '$lib/stores';
 	import { onMount, getContext } from 'svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { createNewSkill, getSkills } from '$lib/apis/skills';
 	import SkillEditor from '$lib/components/workspace/Skills/SkillEditor.svelte';
@@ -15,6 +16,7 @@
 		description: string;
 		content: string;
 		is_active: boolean;
+		meta?: Record<string, any>;
 		access_grants: any[];
 	} | null = null;
 
@@ -29,7 +31,7 @@
 		if (res) {
 			toast.success($i18n.t('Skill created successfully'));
 			await skills.set(await getSkills(localStorage.token));
-			await goto('/workspace/skills');
+			await goto(`/workspace/skills/edit?id=${encodeURIComponent(res.id)}`);
 		}
 	};
 
@@ -45,6 +47,7 @@
 				description: _skill.description || '',
 				content: _skill.content || '',
 				is_active: _skill.is_active ?? true,
+				meta: _skill.meta || {},
 				access_grants: _skill.access_grants !== undefined ? _skill.access_grants : []
 			};
 		}

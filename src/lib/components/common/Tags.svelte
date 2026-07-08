@@ -3,10 +3,15 @@
 	import { getContext, createEventDispatcher } from 'svelte';
 	const dispatch = createEventDispatcher();
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
-	export let tags = [];
-	export let suggestionTags = [];
+	type Tag = {
+		name: string;
+		[key: string]: any;
+	};
+
+	export let tags: Tag[] = [];
+	export let suggestionTags: Tag[] = [];
 	export let disabled = false;
 
 	let inputValue = '';

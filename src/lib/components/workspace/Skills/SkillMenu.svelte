@@ -3,44 +3,64 @@
 	import { flyAndScale } from '$lib/utils/transitions';
 	import { getContext } from 'svelte';
 
-	import Dropdown from '$lib/components/common/Dropdown.svelte';
 	import GarbageBin from '$lib/components/icons/GarbageBin.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import DocumentDuplicate from '$lib/components/icons/DocumentDuplicate.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
+	import EllipsisHorizontal from '$lib/components/icons/EllipsisHorizontal.svelte';
 	import { user } from '$lib/stores';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let editHandler: Function;
 	export let cloneHandler: Function;
 	export let exportHandler: Function;
 	export let deleteHandler: Function;
 	export let onClose: Function;
+	export let writeAccess: boolean = true;
 
 	let show = false;
+	let canEdit = true;
+	let canDelete = true;
+
+	$: canEdit = writeAccess;
+	$: canDelete = writeAccess;
 </script>
 
-<Dropdown
-	bind:show
-	on:change={(e) => {
-		if (e.detail === false) {
+<DropdownMenu.Root
+	bind:open={show}
+	closeFocus={false}
+	onOpenChange={(state) => {
+		if (state === false) {
 			onClose();
 		}
 	}}
+	typeahead={false}
 >
 	<Tooltip content={$i18n.t('More')}>
-		<slot />
+		<DropdownMenu.Trigger
+			class="self-center w-fit text-sm p-1.5 dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
+			type="button"
+			aria-label={$i18n.t('More')}
+			on:click={(event) => {
+				event.stopPropagation();
+			}}
+			on:keydown={(event) => {
+				event.stopPropagation();
+			}}
+		>
+			<EllipsisHorizontal className="size-5" />
+		</DropdownMenu.Trigger>
 	</Tooltip>
 
-	<div slot="content">
-		<DropdownMenu.Content
-			class="w-full max-w-[170px] rounded-2xl px-1 py-1 border border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
-			sideOffset={-2}
-			side="bottom"
-			align="start"
-			transition={flyAndScale}
-		>
+	<DropdownMenu.Content
+		class="w-full max-w-[170px] rounded-2xl px-1 py-1 border border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg"
+		sideOffset={-2}
+		side="bottom"
+		align="start"
+		transition={flyAndScale}
+	>
+		{#if canEdit}
 			<DropdownMenu.Item
 				class="select-none flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800  rounded-xl"
 				on:click={() => {
@@ -64,33 +84,35 @@
 
 				<div class="flex items-center">{$i18n.t('Edit')}</div>
 			</DropdownMenu.Item>
+		{/if}
 
+		<DropdownMenu.Item
+			class="select-none flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
+			on:click={() => {
+				cloneHandler();
+			}}
+		>
+			<DocumentDuplicate />
+
+			<div class="flex items-center">{$i18n.t('Clone')}</div>
+		</DropdownMenu.Item>
+
+		{#if $user?.role === 'admin' || $user?.permissions?.workspace?.skills}
 			<DropdownMenu.Item
 				class="select-none flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
 				on:click={() => {
-					cloneHandler();
+					exportHandler();
 				}}
 			>
-				<DocumentDuplicate />
+				<Download />
 
-				<div class="flex items-center">{$i18n.t('Clone')}</div>
+				<div class="flex items-center">{$i18n.t('Export')}</div>
 			</DropdownMenu.Item>
+		{/if}
 
-			{#if $user?.role === 'admin' || $user?.permissions?.workspace?.skills}
-				<DropdownMenu.Item
-					class="select-none flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
-					on:click={() => {
-						exportHandler();
-					}}
-				>
-					<Download />
+		<hr class="border-gray-50 dark:border-gray-850/30 my-1" />
 
-					<div class="flex items-center">{$i18n.t('Export')}</div>
-				</DropdownMenu.Item>
-			{/if}
-
-			<hr class="border-gray-50 dark:border-gray-850/30 my-1" />
-
+		{#if canDelete}
 			<DropdownMenu.Item
 				class="select-none flex  gap-2  items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
 				on:click={() => {
@@ -100,6 +122,6 @@
 				<GarbageBin />
 				<div class="flex items-center">{$i18n.t('Delete')}</div>
 			</DropdownMenu.Item>
-		</DropdownMenu.Content>
-	</div>
-</Dropdown>
+		{/if}
+	</DropdownMenu.Content>
+</DropdownMenu.Root>

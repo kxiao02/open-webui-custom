@@ -1,5 +1,7 @@
 <script lang="ts">
-	const i18n = getContext('i18n');
+	import type { HTMLInputAttributes } from 'svelte/elements';
+
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 	import { getContext } from 'svelte';
 	import { settings } from '$lib/stores';
 	export let id = 'password-input';
@@ -12,7 +14,8 @@
 	export let inputClassName = 'w-full text-sm py-0.5 bg-transparent';
 	export let showButtonClassName = 'pl-1.5  transition bg-transparent';
 	export let screenReader = true;
-	export let autocomplete = 'off';
+	export let autocomplete: HTMLInputAttributes['autocomplete'] = 'off';
+	export { inputClassName as class };
 
 	let show = false;
 </script>

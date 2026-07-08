@@ -12,7 +12,6 @@
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import DocumentArrowUp from '$lib/components/icons/DocumentArrowUp.svelte';
-	import Camera from '$lib/components/icons/Camera.svelte';
 	import Note from '$lib/components/icons/Note.svelte';
 	import Clip from '$lib/components/icons/Clip.svelte';
 	import ChatBubbleOval from '$lib/components/icons/ChatBubbleOval.svelte';
@@ -29,22 +28,23 @@
 	import AttachWebpageModal from './AttachWebpageModal.svelte';
 	import GlobeAlt from '$lib/components/icons/GlobeAlt.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
-	export let files = [];
+	export let files: any[] = [];
 
 	export let selectedModels: string[] = [];
 	export let fileUploadCapableModels: string[] = [];
 
-	export let screenCaptureHandler: Function;
 	export let uploadFilesHandler: Function;
-	export let inputFilesHandler: Function;
 
 	export let uploadGoogleDriveHandler: Function;
 	export let uploadOneDriveHandler: Function;
 
 	export let onUpload: Function;
 	export let onClose: Function;
+	export let initialTab = '';
+	export let knowledgeOnly = false;
+	export let tooltipContent = '';
 
 	let show = false;
 	let tab = '';
@@ -54,7 +54,7 @@
 	let fileUploadEnabled = true;
 	$: fileUploadEnabled =
 		fileUploadCapableModels.length === selectedModels.length &&
-		($user?.role === 'admin' || $user?.permissions?.chat?.file_upload);
+		($user?.role === 'admin' || ($user?.permissions?.chat?.file_upload ?? true));
 
 	let webUploadEnabled = true;
 	$: webUploadEnabled = $user?.role === 'admin' || ($user?.permissions?.chat?.web_upload ?? true);
@@ -63,20 +63,7 @@
 		files = [];
 	}
 
-	const detectMobile = () => {
-		const userAgent = navigator.userAgent || navigator.vendor || window.opera;
-		return /android|iphone|ipad|ipod|windows phone/i.test(userAgent);
-	};
-
-	const handleFileChange = (event) => {
-		const inputFiles = Array.from(event.target?.files);
-		if (inputFiles && inputFiles.length > 0) {
-			console.log(inputFiles);
-			inputFilesHandler(inputFiles);
-		}
-	};
-
-	const onSelect = (item) => {
+	const onSelect = (item: any) => {
 		if (files.find((f) => f.id === item.id)) {
 			return;
 		}
@@ -90,6 +77,11 @@
 
 		show = false;
 	};
+
+	const openUploadFilesPicker = () => {
+		if (!fileUploadEnabled) return;
+		uploadFilesHandler?.();
+	};
 </script>
 
 <AttachWebpageModal
@@ -99,25 +91,18 @@
 	}}
 />
 
-<!-- Hidden file input used to open the camera on mobile -->
-<input
-	id="camera-input"
-	type="file"
-	accept="image/*"
-	capture="environment"
-	on:change={handleFileChange}
-	style="display: none;"
-/>
-
 <Dropdown
 	bind:show
 	on:change={(e) => {
+		if (e.detail === true) {
+			tab = initialTab;
+		}
 		if (e.detail === false) {
 			onClose();
 		}
 	}}
 >
-	<Tooltip content={$i18n.t('More')}>
+	<Tooltip content={tooltipContent || $i18n.t('More')}>
 		<slot />
 	</Tooltip>
 
@@ -130,7 +115,11 @@
 			align="start"
 			transition={flyAndScale}
 		>
-			{#if tab === ''}
+			{#if knowledgeOnly && tab === 'knowledge' && ($config?.features?.enable_knowledge ?? true)}
+				<div in:fly={{ x: 20, duration: 150 }}>
+					<Knowledge {onSelect} />
+				</div>
+			{:else if tab === ''}
 				<div in:fly={{ x: -20, duration: 150 }}>
 					<Tooltip
 						content={fileUploadCapableModels.length !== selectedModels.length
@@ -144,65 +133,30 @@
 							class="flex gap-2 items-center px-3 py-1.5 text-sm select-none cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 rounded-xl {!fileUploadEnabled
 								? 'opacity-50'
 								: ''}"
-							on:click={() => {
-								if (fileUploadEnabled) {
-									uploadFilesHandler();
-								}
-							}}
+							on:click={openUploadFilesPicker}
 						>
 							<Clip />
 
 							<div class="line-clamp-1">{$i18n.t('Upload Files')}</div>
 						</DropdownMenu.Item>
-					</Tooltip>
+						</Tooltip>
 
-					<Tooltip
-						content={fileUploadCapableModels.length !== selectedModels.length
-							? $i18n.t('Model(s) do not support file upload')
-							: !fileUploadEnabled
-								? $i18n.t('You do not have permission to upload files.')
+						<Tooltip
+							content={!webUploadEnabled
+								? $i18n.t('You do not have permission to upload web content.')
 								: ''}
-						className="w-full"
-					>
-						<DropdownMenu.Item
-							class="flex gap-2 items-center px-3 py-1.5 text-sm select-none cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50  rounded-xl {!fileUploadEnabled
-								? 'opacity-50'
-								: ''}"
-							on:click={() => {
-								if (fileUploadEnabled) {
-									if (!detectMobile()) {
-										screenCaptureHandler();
-									} else {
-										const cameraInputElement = document.getElementById('camera-input');
-
-										if (cameraInputElement) {
-											cameraInputElement.click();
-										}
+							className="w-full"
+						>
+							<DropdownMenu.Item
+								class="flex gap-2 items-center px-3 py-1.5 text-sm select-none cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl {!webUploadEnabled
+									? 'opacity-50'
+									: ''}"
+								on:click={() => {
+									if (webUploadEnabled) {
+										showAttachWebpageModal = true;
 									}
-								}
-							}}
-						>
-							<Camera />
-							<div class=" line-clamp-1">{$i18n.t('Capture')}</div>
-						</DropdownMenu.Item>
-					</Tooltip>
-
-					<Tooltip
-						content={!webUploadEnabled
-							? $i18n.t('You do not have permission to upload web content.')
-							: ''}
-						className="w-full"
-					>
-						<DropdownMenu.Item
-							class="flex gap-2 items-center px-3 py-1.5 text-sm select-none cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl {!webUploadEnabled
-								? 'opacity-50'
-								: ''}"
-							on:click={() => {
-								if (webUploadEnabled) {
-									showAttachWebpageModal = true;
-								}
-							}}
-						>
+								}}
+							>
 							<GlobeAlt />
 							<div class="line-clamp-1">{$i18n.t('Attach Webpage')}</div>
 						</DropdownMenu.Item>
@@ -240,35 +194,37 @@
 						</Tooltip>
 					{/if}
 
-					<Tooltip
-						content={fileUploadCapableModels.length !== selectedModels.length
-							? $i18n.t('Model(s) do not support file upload')
-							: !fileUploadEnabled
-								? $i18n.t('You do not have permission to upload files.')
-								: ''}
-						className="w-full"
-					>
-						<button
-							class="flex gap-2 w-full items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 rounded-xl {!fileUploadEnabled
-								? 'opacity-50'
-								: ''}"
-							on:click={() => {
-								tab = 'knowledge';
-							}}
+					{#if ($config?.features?.enable_knowledge ?? true) && !knowledgeOnly}
+						<Tooltip
+							content={fileUploadCapableModels.length !== selectedModels.length
+								? $i18n.t('Model(s) do not support file upload')
+								: !fileUploadEnabled
+									? $i18n.t('You do not have permission to upload files.')
+									: ''}
+							className="w-full"
 						>
-							<Database />
+							<button
+								class="flex gap-2 w-full items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 rounded-xl {!fileUploadEnabled
+									? 'opacity-50'
+									: ''}"
+								on:click={() => {
+									tab = 'knowledge';
+								}}
+							>
+								<Database />
 
-							<div class="flex items-center w-full justify-between">
-								<div class=" line-clamp-1">
-									{$i18n.t('Attach Knowledge')}
-								</div>
+								<div class="flex items-center w-full justify-between">
+									<div class=" line-clamp-1">
+										{$i18n.t('Attach Knowledge')}
+									</div>
 
-								<div class="text-gray-500">
-									<ChevronRight />
+									<div class="text-gray-500">
+										<ChevronRight />
+									</div>
 								</div>
-							</div>
-						</button>
-					</Tooltip>
+							</button>
+						</Tooltip>
+					{/if}
 
 					<Tooltip
 						content={fileUploadCapableModels.length !== selectedModels.length
@@ -446,7 +402,7 @@
 						{/if}
 					{/if}
 				</div>
-			{:else if tab === 'knowledge'}
+			{:else if tab === 'knowledge' && ($config?.features?.enable_knowledge ?? true)}
 				<div in:fly={{ x: 20, duration: 150 }}>
 					<button
 						class="flex w-full justify-between gap-2 items-center px-3 py-1.5 text-sm select-none cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800/50"

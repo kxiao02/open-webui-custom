@@ -1,22 +1,28 @@
 <script lang="ts">
 	import { getContext, onDestroy, tick } from 'svelte';
 	import panzoom, { type PanZoom } from 'panzoom';
-	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 	import { settings } from '$lib/stores';
 	import { isCodeFile } from '$lib/utils/codeHighlight';
 	import { initMermaid, renderMermaidDiagram } from '$lib/utils';
+	import {
+		isMarkdownPreviewPath,
+		isMermaidPreviewPath,
+		prepareMarkdownPreviewSource,
+		renderMarkdownPreviewHtml
+	} from '$lib/utils/markdownPreview';
 	import Spinner from '../../common/Spinner.svelte';
 	import PDFViewer from '../../common/PDFViewer.svelte';
 	import JsonTreeView from './JsonTreeView.svelte';
 	import NotebookView from './NotebookView.svelte';
 	import SqliteView from './SqliteView.svelte';
 	import FileCodeEditor from './FileCodeEditor.svelte';
+	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 
 	let pdfViewerRef: PDFViewer;
 	let fileCodeEditorRef: FileCodeEditor;
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	export let selectedFile: string | null = null;
 	export let fileLoading = false;
@@ -89,13 +95,13 @@
 
 	$: isTextFile = fileContent !== null && fileImageUrl === null && filePdfData === null;
 
-	const MD_EXTS = new Set(['md', 'markdown', 'mdx']);
 	const CSV_EXTS = new Set(['csv', 'tsv']);
 	const HTML_EXTS = new Set(['html', 'htm']);
 	const JSON_EXTS = new Set(['json', 'jsonc', 'jsonl', 'json5']);
 	const getExt = (path: string | null) => path?.split('.').pop()?.toLowerCase() ?? '';
 
-	$: isMarkdown = MD_EXTS.has(getExt(selectedFile));
+	$: isMermaid = isMermaidPreviewPath(selectedFile);
+	$: isMarkdown = isMarkdownPreviewPath(selectedFile) || isMermaid;
 	$: isCsv = CSV_EXTS.has(getExt(selectedFile));
 	$: isHtml = HTML_EXTS.has(getExt(selectedFile));
 	$: isJson = JSON_EXTS.has(getExt(selectedFile));
@@ -105,7 +111,9 @@
 	$: csvDelimiter = getExt(selectedFile) === 'tsv' ? '\t' : ',';
 	$: renderedHtml =
 		isMarkdown && fileContent
-			? DOMPurify.sanitize(marked.parse(fileContent, { async: false }) as string)
+			? renderMarkdownPreviewHtml(
+					prepareMarkdownPreviewSource(fileContent, { mermaid: isMermaid })
+				)
 			: '';
 
 	let markdownEl: HTMLDivElement;
@@ -123,17 +131,18 @@
 		for (const codeEl of codeEls) {
 			const pre = codeEl.parentElement;
 			if (!pre || pre.tagName !== 'PRE' || pre.dataset.mermaidRendered) continue;
-			pre.dataset.mermaidRendered = 'true';
 
 			try {
 				const svg = await renderMermaidDiagram(mermaidInstance, codeEl.textContent ?? '');
 				if (svg) {
+					pre.dataset.mermaidRendered = 'true';
 					const wrapper = document.createElement('div');
 					wrapper.className = 'mermaid-diagram flex justify-center py-2';
 					wrapper.innerHTML = svg;
 					pre.replaceWith(wrapper);
 				}
 			} catch (e) {
+				delete pre.dataset.mermaidRendered;
 				console.error('Mermaid render error:', e);
 			}
 		}
@@ -403,13 +412,12 @@
 			{#if overlay}
 				<div class="absolute top-0 left-0 right-0 bottom-0 z-10"></div>
 			{/if}
-			<iframe
-				srcdoc={fileContent}
-				sandbox="allow-scripts allow-downloads{($settings?.iframeSandboxAllowForms ?? false)
-					? ' allow-forms'
-					: ''}{($settings?.iframeSandboxAllowSameOrigin ?? false) ? ' allow-same-origin' : ''}"
-				class="w-full h-full border-none bg-white"
+			<FullHeightIframe
+				src={fileContent}
 				title="HTML Preview"
+				iframeClassName="w-full h-full border-none bg-white"
+				allowForms={$settings?.iframeSandboxAllowForms ?? false}
+				allowSameOrigin={$settings?.iframeSandboxAllowSameOrigin ?? false}
 			/>
 		{:else if isHtml && showRaw}
 			<div class="h-full">

@@ -5,6 +5,7 @@
 		showSidebar,
 		functions,
 		user,
+		config,
 		mobile,
 		models,
 		knowledge,
@@ -15,28 +16,62 @@
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Sidebar from '$lib/components/icons/Sidebar.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	let loaded = false;
 
+	const isDirectSkillEditorRoute = () =>
+		$page.url.pathname.startsWith('/workspace/skills/edit') ||
+		$page.url.pathname.startsWith('/workspace/skills/create');
+
+	const getWorkspaceFallbackPath = () => {
+		if ($user?.role === 'admin') {
+			return '/workspace/models';
+		}
+
+		if (
+			($config?.features?.enable_knowledge ?? true) &&
+			$user?.role === 'user' &&
+			$user?.permissions?.workspace?.knowledge
+		) {
+			return '/workspace/knowledge';
+		}
+
+		if ($user?.permissions?.workspace?.models) {
+			return '/workspace/models';
+		}
+		if (($config?.features?.enable_knowledge ?? true) && $user?.permissions?.workspace?.knowledge) {
+			return '/workspace/knowledge';
+		}
+		if ($user?.permissions?.workspace?.prompts) {
+			return '/workspace/prompts';
+		}
+		if ($user?.permissions?.workspace?.skills) {
+			return '/workspace/skills';
+		}
+		if ($user?.permissions?.workspace?.tools) {
+			return '/workspace/tools';
+		}
+
+		return '/';
+	};
+
 	onMount(async () => {
 		if ($user?.role !== 'admin') {
-			if ($page.url.pathname.includes('/models') && !$user?.permissions?.workspace?.models) {
-				goto('/');
+			if ($page.url.pathname.includes('/models')) {
+				goto(getWorkspaceFallbackPath());
 			} else if (
 				$page.url.pathname.includes('/knowledge') &&
-				!$user?.permissions?.workspace?.knowledge
+				(!(($config?.features?.enable_knowledge ?? true) && $user?.permissions?.workspace?.knowledge))
 			) {
-				goto('/');
+				goto(getWorkspaceFallbackPath());
 			} else if (
 				$page.url.pathname.includes('/prompts') &&
 				!$user?.permissions?.workspace?.prompts
 			) {
-				goto('/');
-			} else if ($page.url.pathname.includes('/tools') && !$user?.permissions?.workspace?.tools) {
-				goto('/');
-			} else if ($page.url.pathname.includes('/skills') && !$user?.permissions?.workspace?.skills) {
-				goto('/');
+				goto(getWorkspaceFallbackPath());
+			} else if ($page.url.pathname.includes('/skills') && !$user && !isDirectSkillEditorRoute()) {
+				goto(getWorkspaceFallbackPath());
 			}
 		}
 
@@ -84,18 +119,18 @@
 					<div
 						class="flex gap-1 scrollbar-none overflow-x-auto w-fit text-center text-sm font-medium rounded-full bg-transparent py-1 touch-auto pointer-events-auto"
 					>
-						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.models}
+						{#if $user?.role === 'admin'}
 							<a
 								draggable="false"
 								aria-current={$page.url.pathname.includes('/workspace/models') ? 'page' : null}
 								class="min-w-fit p-1.5 {$page.url.pathname.includes('/workspace/models')
 									? ''
 									: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition select-none"
-								href="/workspace/models">{$i18n.t('Models')}</a
+								href="/workspace/models">模型</a
 							>
 						{/if}
 
-						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.knowledge}
+						{#if ($config?.features?.enable_knowledge ?? true) && ($user?.role === 'admin' || $user?.permissions?.workspace?.knowledge)}
 							<a
 								draggable="false"
 								aria-current={$page.url.pathname.includes('/workspace/knowledge') ? 'page' : null}
@@ -104,7 +139,7 @@
 									: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition select-none"
 								href="/workspace/knowledge"
 							>
-								{$i18n.t('Knowledge')}
+								知识库
 							</a>
 						{/if}
 
@@ -115,11 +150,11 @@
 								class="min-w-fit p-1.5 {$page.url.pathname.includes('/workspace/prompts')
 									? ''
 									: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition select-none"
-								href="/workspace/prompts">{$i18n.t('Prompts')}</a
+								href="/workspace/prompts">提示词</a
 							>
 						{/if}
 
-						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.skills}
+						{#if $user}
 							<a
 								draggable="false"
 								aria-current={$page.url.pathname.includes('/workspace/skills') ? 'page' : null}
@@ -128,11 +163,11 @@
 									: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition select-none"
 								href="/workspace/skills"
 							>
-								{$i18n.t('Skills')}
+								技能
 							</a>
 						{/if}
 
-						{#if $user?.role === 'admin' || $user?.permissions?.workspace?.tools}
+						{#if $user}
 							<a
 								draggable="false"
 								aria-current={$page.url.pathname.includes('/workspace/tools') ? 'page' : null}
@@ -141,7 +176,7 @@
 									: 'text-gray-300 dark:text-gray-600 hover:text-gray-700 dark:hover:text-white'} transition select-none"
 								href="/workspace/tools"
 							>
-								{$i18n.t('Tools')}
+								工具
 							</a>
 						{/if}
 					</div>

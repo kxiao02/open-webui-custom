@@ -6,12 +6,14 @@
 	import { getContext } from 'svelte';
 	import { goto } from '$app/navigation';
 
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import { WEBUI_BASE_URL } from '$lib/constants';
+	import { settings } from '$lib/stores';
 	import { copyToClipboard, unescapeHtml } from '$lib/utils';
 
 	import Image from '$lib/components/common/Image.svelte';
+	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import KatexRenderer from './KatexRenderer.svelte';
 	import Source from './Source.svelte';
 	import HtmlToken from './HTMLToken.svelte';
@@ -65,6 +67,14 @@
 			// Invalid URL, let browser handle it
 		}
 	};
+
+	const normalizeFileRef = (value) => {
+		const normalized = typeof value === 'string' ? value.trim() : String(value ?? '').trim();
+		if (!normalized) return null;
+		const lowered = normalized.toLowerCase();
+		if (lowered === 'null' || lowered === 'undefined') return null;
+		return normalized;
+	};
 </script>
 
 {#each tokens as token, tokenIdx (tokenIdx)}
@@ -96,7 +106,12 @@
 			>
 		{/if}
 	{:else if token.type === 'image'}
-		<Image src={token.href} alt={token.text} />
+		<Image
+			src={token.href}
+			alt={token.text}
+			className={`block max-w-full ${($settings?.highContrastMode ?? false) ? '' : 'outline-hidden focus:outline-hidden'}`}
+			imageClassName="h-auto max-w-full w-auto rounded-lg object-contain bg-white dark:bg-gray-950"
+		/>
 	{:else if token.type === 'strong'}
 		<strong><svelte:self id={`${id}-strong`} tokens={token.tokens} {onSourceClick} /></strong>
 	{:else if token.type === 'em'}
@@ -112,18 +127,16 @@
 			<KatexRenderer content={token.text} displayMode={false} />
 		{/if}
 	{:else if token.type === 'iframe'}
-		<iframe
-			src="{WEBUI_BASE_URL}/api/v1/files/{token.fileId}/content"
-			title={token.fileId}
-			width="100%"
-			frameborder="0"
-			on:load={(e) => {
-				try {
-					e.currentTarget.style.height =
-						e.currentTarget.contentWindow.document.body.scrollHeight + 20 + 'px';
-				} catch {}
-			}}
-		></iframe>
+		{@const iframeFileRef = normalizeFileRef(token?.fileId)}
+		{#if iframeFileRef}
+			<FullHeightIframe
+				src={`${WEBUI_BASE_URL}/api/v1/files/${iframeFileRef}/content`}
+				title={iframeFileRef}
+				iframeClassName="w-full"
+				allowSameOrigin={true}
+				useSandbox={false}
+			/>
+		{/if}
 	{:else if token.type === 'mention'}
 		<MentionToken {token} />
 	{:else if token.type === 'footnote'}

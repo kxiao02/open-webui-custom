@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { createEventDispatcher, getContext } from 'svelte';
 	const dispatch = createEventDispatcher();
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import XMark from '$lib/components/icons/XMark.svelte';
 	import AdvancedParams from '../Settings/Advanced/AdvancedParams.svelte';
@@ -57,26 +57,29 @@
 				>
 					<div class="flex flex-col gap-1 mt-1.5" slot="content">
 						{#each chatFiles as file, fileIdx}
-							<FileItem
-								className="w-full"
-								item={file}
-								edit={true}
-								url={file?.url ? file.url : null}
-								name={file.name}
-								type={file.type}
-								size={file?.size}
-								dismissible={true}
-								small={true}
-								on:dismiss={() => {
-									// Remove the file from the chatFiles array
+							{@const fileRef = (file?.url ?? file?.id ?? '').toString().trim()}
+							{#if fileRef !== '' && fileRef !== 'null' && fileRef !== 'undefined'}
+								<FileItem
+									className="w-full"
+									item={{ ...file, url: fileRef }}
+									edit={true}
+									url={fileRef}
+									name={file.name}
+									type={file.type}
+									size={file?.size}
+									dismissible={true}
+									small={true}
+									on:dismiss={() => {
+										// Remove the file from the chatFiles array
 
-									chatFiles.splice(fileIdx, 1);
-									chatFiles = chatFiles;
-								}}
-								on:click={() => {
-									console.log(file);
-								}}
-							/>
+										chatFiles.splice(fileIdx, 1);
+										chatFiles = chatFiles;
+									}}
+									on:click={() => {
+										console.log(file);
+									}}
+								/>
+							{/if}
 						{/each}
 					</div>
 				</Collapsible>

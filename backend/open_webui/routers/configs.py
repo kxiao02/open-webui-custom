@@ -1,14 +1,19 @@
 import logging
 import copy
 from fastapi import APIRouter, Depends, Request, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import aiohttp
 
 from typing import Optional
 
 from open_webui.env import AIOHTTP_CLIENT_TIMEOUT
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.config import get_config, save_config
+from open_webui.config import (
+    get_config,
+    save_config,
+    is_enterprise_oauth_deployment_managed,
+    _enterprise_oauth_missing_fields,
+)
 from open_webui.config import BannerModel
 
 from open_webui.utils.tools import (
@@ -35,6 +40,17 @@ router = APIRouter()
 log = logging.getLogger(__name__)
 
 
+def _contains_enterprise_oauth_config(config: dict) -> bool:
+    if not isinstance(config, dict):
+        return False
+    if "enterprise_oauth" in config:
+        return True
+    oauth = config.get("oauth")
+    if isinstance(oauth, dict) and "enterprise_oauth" in oauth:
+        return True
+    return False
+
+
 ############################
 # ImportConfig
 ############################
@@ -46,6 +62,16 @@ class ImportConfigForm(BaseModel):
 
 @router.post("/import", response_model=dict)
 async def import_config(form_data: ImportConfigForm, user=Depends(get_admin_user)):
+    if is_enterprise_oauth_deployment_managed() and _contains_enterprise_oauth_config(
+        form_data.config
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Enterprise OAuth is deployment-managed; import cannot override "
+                "enterprise OAuth settings."
+            ),
+        )
     save_config(form_data.config)
     return get_config()
 
@@ -132,6 +158,205 @@ async def register_oauth_client(
             status_code=400,
             detail=f"Failed to register OAuth client",
         )
+
+
+############################
+# Enterprise OAuth Config
+############################
+
+
+class EnterpriseOAuthConfigForm(BaseModel):
+    ENTERPRISE_OAUTH_ENABLED: Optional[bool] = Field(
+        None, alias="ENABLE_ENTERPRISE_OAUTH"
+    )
+    ENTERPRISE_OAUTH_PROVIDER_NAME: Optional[str] = Field(
+        None, alias="PROVIDER_NAME"
+    )
+    ENTERPRISE_OAUTH_CLIENT_ID: Optional[str] = Field(
+        None, alias="CLIENT_ID"
+    )
+    ENTERPRISE_OAUTH_CLIENT_SECRET: Optional[str] = Field(
+        None, alias="CLIENT_SECRET"
+    )
+    ENTERPRISE_OAUTH_AUTHORIZE_URL: Optional[str] = Field(
+        None, alias="AUTHORIZE_REQUEST_URL"
+    )
+    ENTERPRISE_OAUTH_TOKEN_URL: Optional[str] = Field(
+        None, alias="TOKEN_REQUEST_URL"
+    )
+    ENTERPRISE_OAUTH_PROFILE_URL: Optional[str] = Field(
+        None, alias="USERINFO_REQUEST_URL"
+    )
+    ENTERPRISE_OAUTH_CHECK_TOKEN_URL: Optional[str] = Field(
+        None, alias="TOKEN_VALIDATE_URL"
+    )
+    ENTERPRISE_OAUTH_LOGOUT_URL: Optional[str] = Field(
+        None, alias="TOKEN_LOGOUT_URL"
+    )
+    ENTERPRISE_OAUTH_REDIRECT_URI: Optional[str] = Field(
+        None, alias="REDIRECT_URI"
+    )
+    ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM: Optional[str] = None
+    ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM: Optional[str] = None
+    ENTERPRISE_OAUTH_ID_CLAIM: Optional[str] = None
+    ENTERPRISE_OAUTH_ACCOUNT_NO_PATH: Optional[str] = None
+    ENTERPRISE_OAUTH_EMAIL_CLAIM: Optional[str] = None
+    ENTERPRISE_OAUTH_EMAIL_DOMAIN: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class EnterpriseOAuthConfigResponse(EnterpriseOAuthConfigForm):
+    ENTERPRISE_OAUTH_DEPLOYMENT_MANAGED: Optional[bool] = Field(
+        None, alias="DEPLOYMENT_MANAGED"
+    )
+    ENTERPRISE_OAUTH_MISSING_REQUIRED_ENV: Optional[list[str]] = Field(
+        None, alias="MISSING_REQUIRED_ENV"
+    )
+    ENTERPRISE_OAUTH_EFFECTIVE_REDIRECT_URI: Optional[str] = Field(
+        None, alias="EFFECTIVE_REDIRECT_URI"
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+@router.get("/enterprise_oauth", response_model=EnterpriseOAuthConfigResponse)
+async def get_enterprise_oauth_config(
+    request: Request, user=Depends(get_admin_user)
+):
+    deployment_managed = is_enterprise_oauth_deployment_managed()
+    missing_required_env = _enterprise_oauth_missing_fields(deployment_managed)
+    effective_redirect_uri = request.app.state.config.ENTERPRISE_OAUTH_REDIRECT_URI
+    if not effective_redirect_uri:
+        webui_url = request.app.state.config.WEBUI_URL
+        if webui_url:
+            effective_redirect_uri = (
+                f"{webui_url.rstrip('/')}/oauth/enterprise/callback"
+            )
+
+    return EnterpriseOAuthConfigResponse(
+        ENTERPRISE_OAUTH_ENABLED=request.app.state.config.ENTERPRISE_OAUTH_ENABLED,
+        ENTERPRISE_OAUTH_PROVIDER_NAME=request.app.state.config.ENTERPRISE_OAUTH_PROVIDER_NAME,
+        ENTERPRISE_OAUTH_CLIENT_ID=request.app.state.config.ENTERPRISE_OAUTH_CLIENT_ID,
+        ENTERPRISE_OAUTH_CLIENT_SECRET=request.app.state.config.ENTERPRISE_OAUTH_CLIENT_SECRET,
+        ENTERPRISE_OAUTH_AUTHORIZE_URL=request.app.state.config.ENTERPRISE_OAUTH_AUTHORIZE_URL,
+        ENTERPRISE_OAUTH_TOKEN_URL=request.app.state.config.ENTERPRISE_OAUTH_TOKEN_URL,
+        ENTERPRISE_OAUTH_PROFILE_URL=request.app.state.config.ENTERPRISE_OAUTH_PROFILE_URL,
+        ENTERPRISE_OAUTH_CHECK_TOKEN_URL=request.app.state.config.ENTERPRISE_OAUTH_CHECK_TOKEN_URL,
+        ENTERPRISE_OAUTH_LOGOUT_URL=request.app.state.config.ENTERPRISE_OAUTH_LOGOUT_URL,
+        ENTERPRISE_OAUTH_REDIRECT_URI=request.app.state.config.ENTERPRISE_OAUTH_REDIRECT_URI,
+        ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM=request.app.state.config.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM,
+        ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM=request.app.state.config.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM,
+        ENTERPRISE_OAUTH_ID_CLAIM=request.app.state.config.ENTERPRISE_OAUTH_ID_CLAIM,
+        ENTERPRISE_OAUTH_ACCOUNT_NO_PATH=request.app.state.config.ENTERPRISE_OAUTH_ACCOUNT_NO_PATH,
+        ENTERPRISE_OAUTH_EMAIL_CLAIM=request.app.state.config.ENTERPRISE_OAUTH_EMAIL_CLAIM,
+        ENTERPRISE_OAUTH_EMAIL_DOMAIN=request.app.state.config.ENTERPRISE_OAUTH_EMAIL_DOMAIN,
+        ENTERPRISE_OAUTH_DEPLOYMENT_MANAGED=deployment_managed,
+        ENTERPRISE_OAUTH_MISSING_REQUIRED_ENV=missing_required_env,
+        ENTERPRISE_OAUTH_EFFECTIVE_REDIRECT_URI=effective_redirect_uri or None,
+    ).model_dump(by_alias=True)
+
+
+@router.post("/enterprise_oauth", response_model=EnterpriseOAuthConfigForm)
+async def set_enterprise_oauth_config(
+    request: Request,
+    form_data: EnterpriseOAuthConfigForm,
+    user=Depends(get_admin_user),
+):
+    if is_enterprise_oauth_deployment_managed():
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Enterprise OAuth is deployment-managed; runtime updates are disabled."
+            ),
+        )
+    if form_data.ENTERPRISE_OAUTH_ENABLED is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_ENABLED = (
+            form_data.ENTERPRISE_OAUTH_ENABLED
+        )
+    if form_data.ENTERPRISE_OAUTH_PROVIDER_NAME is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_PROVIDER_NAME = (
+            form_data.ENTERPRISE_OAUTH_PROVIDER_NAME
+        )
+    if form_data.ENTERPRISE_OAUTH_CLIENT_ID is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_CLIENT_ID = (
+            form_data.ENTERPRISE_OAUTH_CLIENT_ID
+        )
+    if form_data.ENTERPRISE_OAUTH_CLIENT_SECRET is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_CLIENT_SECRET = (
+            form_data.ENTERPRISE_OAUTH_CLIENT_SECRET
+        )
+    if form_data.ENTERPRISE_OAUTH_AUTHORIZE_URL is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_AUTHORIZE_URL = (
+            form_data.ENTERPRISE_OAUTH_AUTHORIZE_URL
+        )
+    if form_data.ENTERPRISE_OAUTH_TOKEN_URL is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_TOKEN_URL = (
+            form_data.ENTERPRISE_OAUTH_TOKEN_URL
+        )
+    if form_data.ENTERPRISE_OAUTH_PROFILE_URL is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_PROFILE_URL = (
+            form_data.ENTERPRISE_OAUTH_PROFILE_URL
+        )
+    if form_data.ENTERPRISE_OAUTH_CHECK_TOKEN_URL is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_CHECK_TOKEN_URL = (
+            form_data.ENTERPRISE_OAUTH_CHECK_TOKEN_URL
+        )
+    if form_data.ENTERPRISE_OAUTH_LOGOUT_URL is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_LOGOUT_URL = (
+            form_data.ENTERPRISE_OAUTH_LOGOUT_URL
+        )
+    if form_data.ENTERPRISE_OAUTH_REDIRECT_URI is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_REDIRECT_URI = (
+            form_data.ENTERPRISE_OAUTH_REDIRECT_URI
+        )
+    if form_data.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM = (
+            form_data.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM
+        )
+    if form_data.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM = (
+            form_data.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM
+        )
+    if form_data.ENTERPRISE_OAUTH_ID_CLAIM is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_ID_CLAIM = (
+            form_data.ENTERPRISE_OAUTH_ID_CLAIM
+        )
+    if form_data.ENTERPRISE_OAUTH_ACCOUNT_NO_PATH is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_ACCOUNT_NO_PATH = (
+            form_data.ENTERPRISE_OAUTH_ACCOUNT_NO_PATH
+        )
+    if form_data.ENTERPRISE_OAUTH_EMAIL_CLAIM is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_EMAIL_CLAIM = (
+            form_data.ENTERPRISE_OAUTH_EMAIL_CLAIM
+        )
+    if form_data.ENTERPRISE_OAUTH_EMAIL_DOMAIN is not None:
+        request.app.state.config.ENTERPRISE_OAUTH_EMAIL_DOMAIN = (
+            form_data.ENTERPRISE_OAUTH_EMAIL_DOMAIN
+        )
+
+    import open_webui.config as config_module
+
+    config_module.load_oauth_providers()
+
+    return EnterpriseOAuthConfigForm(
+        ENTERPRISE_OAUTH_ENABLED=request.app.state.config.ENTERPRISE_OAUTH_ENABLED,
+        ENTERPRISE_OAUTH_PROVIDER_NAME=request.app.state.config.ENTERPRISE_OAUTH_PROVIDER_NAME,
+        ENTERPRISE_OAUTH_CLIENT_ID=request.app.state.config.ENTERPRISE_OAUTH_CLIENT_ID,
+        ENTERPRISE_OAUTH_CLIENT_SECRET=request.app.state.config.ENTERPRISE_OAUTH_CLIENT_SECRET,
+        ENTERPRISE_OAUTH_AUTHORIZE_URL=request.app.state.config.ENTERPRISE_OAUTH_AUTHORIZE_URL,
+        ENTERPRISE_OAUTH_TOKEN_URL=request.app.state.config.ENTERPRISE_OAUTH_TOKEN_URL,
+        ENTERPRISE_OAUTH_PROFILE_URL=request.app.state.config.ENTERPRISE_OAUTH_PROFILE_URL,
+        ENTERPRISE_OAUTH_CHECK_TOKEN_URL=request.app.state.config.ENTERPRISE_OAUTH_CHECK_TOKEN_URL,
+        ENTERPRISE_OAUTH_LOGOUT_URL=request.app.state.config.ENTERPRISE_OAUTH_LOGOUT_URL,
+        ENTERPRISE_OAUTH_REDIRECT_URI=request.app.state.config.ENTERPRISE_OAUTH_REDIRECT_URI,
+        ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM=request.app.state.config.ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM,
+        ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM=request.app.state.config.ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM,
+        ENTERPRISE_OAUTH_ID_CLAIM=request.app.state.config.ENTERPRISE_OAUTH_ID_CLAIM,
+        ENTERPRISE_OAUTH_ACCOUNT_NO_PATH=request.app.state.config.ENTERPRISE_OAUTH_ACCOUNT_NO_PATH,
+        ENTERPRISE_OAUTH_EMAIL_CLAIM=request.app.state.config.ENTERPRISE_OAUTH_EMAIL_CLAIM,
+        ENTERPRISE_OAUTH_EMAIL_DOMAIN=request.app.state.config.ENTERPRISE_OAUTH_EMAIL_DOMAIN,
+    ).model_dump(by_alias=True)
 
 
 ############################

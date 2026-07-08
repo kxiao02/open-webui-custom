@@ -24,6 +24,7 @@ from open_webui.env import (
     ENABLE_DB_MIGRATIONS,
     ENV,
     REDIS_URL,
+    STRICT_EXTERNAL_STATE,
     REDIS_KEY_PREFIX,
     REDIS_SENTINEL_HOSTS,
     REDIS_SENTINEL_PORT,
@@ -35,6 +36,7 @@ from open_webui.env import (
     WEBUI_NAME,
     log,
 )
+from open_webui.constants import MINERU_LOCAL_API_URL_DEFAULT
 from open_webui.internal.db import Base, get_db
 from open_webui.utils.redis import get_redis_connection
 
@@ -65,7 +67,9 @@ def run_migrations():
         migrations_path = OPEN_WEBUI_DIR / "migrations"
         alembic_cfg.set_main_option("script_location", str(migrations_path))
 
-        command.upgrade(alembic_cfg, "head")
+        # This branch currently carries multiple alembic heads, so upgrade all
+        # branch tips instead of assuming a single linear head.
+        command.upgrade(alembic_cfg, "heads")
     except Exception as e:
         log.exception(f"Error running migrations: {e}")
 
@@ -84,6 +88,16 @@ class Config(Base):
     updated_at = Column(DateTime, nullable=True, onupdate=func.now())
 
 
+def _get_latest_config_entry(db):
+    return db.query(Config).order_by(Config.id.desc()).first()
+
+
+def _prune_stale_config_entries(db, keep_id: Optional[int]) -> None:
+    if keep_id is None:
+        return
+    db.query(Config).filter(Config.id != keep_id).delete()
+
+
 def load_json_config():
     with open(f"{DATA_DIR}/config.json", "r") as file:
         return json.load(file)
@@ -91,14 +105,17 @@ def load_json_config():
 
 def save_to_db(data):
     with get_db() as db:
-        existing_config = db.query(Config).first()
-        if not existing_config:
+        existing_config = _get_latest_config_entry(db)
+        if existing_config is None:
             new_config = Config(data=data, version=0)
             db.add(new_config)
+            db.flush()
+            _prune_stale_config_entries(db, new_config.id)
         else:
             existing_config.data = data
             existing_config.updated_at = datetime.now()
             db.add(existing_config)
+            _prune_stale_config_entries(db, existing_config.id)
         db.commit()
 
 
@@ -122,22 +139,30 @@ DEFAULT_CONFIG = {
 
 def get_config():
     with get_db() as db:
-        config_entry = db.query(Config).order_by(Config.id.desc()).first()
+        config_entry = _get_latest_config_entry(db)
         return config_entry.data if config_entry else DEFAULT_CONFIG
 
 
 CONFIG_DATA = get_config()
 
 
-def get_config_value(config_path: str):
+def _get_config_value_from_data(config_path: str, data: dict):
     path_parts = config_path.split(".")
-    cur_config = CONFIG_DATA
+    cur_config = data
     for key in path_parts:
         if key in cur_config:
             cur_config = cur_config[key]
         else:
             return None
     return cur_config
+
+
+def get_config_value(config_path: str):
+    value = _get_config_value_from_data(config_path, CONFIG_DATA)
+    if value is None and config_path.startswith("enterprise_oauth."):
+        legacy_path = f"oauth.{config_path}"
+        value = _get_config_value_from_data(legacy_path, CONFIG_DATA)
+    return value
 
 
 PERSISTENT_CONFIG_REGISTRY = []
@@ -147,16 +172,65 @@ def save_config(config):
     global CONFIG_DATA
     global PERSISTENT_CONFIG_REGISTRY
     try:
+        if (
+            is_enterprise_oauth_deployment_managed()
+            and _contains_enterprise_oauth_config(config)
+        ):
+            log.warning(
+                "Enterprise OAuth is deployment-managed; ignoring persisted enterprise OAuth config."
+            )
+            config = _strip_enterprise_oauth_config(config)
         save_to_db(config)
         CONFIG_DATA = config
 
         # Trigger updates on all registered PersistentConfig entries
         for config_item in PERSISTENT_CONFIG_REGISTRY:
             config_item.update()
+
+        # Refresh OAuth providers to keep runtime config in sync.
+        load_oauth_providers()
     except Exception as e:
         log.exception(e)
         return False
     return True
+
+
+def _should_reload_oauth_providers(config_path: str) -> bool:
+    if config_path.startswith("oauth."):
+        return True
+    if not config_path.startswith("enterprise_oauth."):
+        return False
+    try:
+        deployment_managed = is_enterprise_oauth_deployment_managed()
+        missing = _enterprise_oauth_missing_fields(deployment_managed)
+        return len(missing) == 0
+    except Exception:
+        return False
+
+
+def _contains_enterprise_oauth_config(config: dict) -> bool:
+    if not isinstance(config, dict):
+        return False
+    if "enterprise_oauth" in config:
+        return True
+    oauth = config.get("oauth")
+    if isinstance(oauth, dict) and "enterprise_oauth" in oauth:
+        return True
+    return False
+
+
+def _strip_enterprise_oauth_config(config: dict) -> dict:
+    if not isinstance(config, dict):
+        return config
+    updated = dict(config)
+    if "enterprise_oauth" in updated:
+        updated.pop("enterprise_oauth", None)
+    oauth = updated.get("oauth")
+    if isinstance(oauth, dict) and "enterprise_oauth" in oauth:
+        oauth = dict(oauth)
+        oauth.pop("enterprise_oauth", None)
+        updated["oauth"] = oauth
+    return updated
 
 
 T = TypeVar("T")
@@ -167,13 +241,23 @@ ENABLE_PERSISTENT_CONFIG = (
 
 
 class PersistentConfig(Generic[T]):
-    def __init__(self, env_name: str, config_path: str, env_value: T):
+    def __init__(
+        self,
+        env_name: str,
+        config_path: str,
+        env_value: T,
+        prefer_env: bool = False,
+    ):
         self.env_name = env_name
         self.config_path = config_path
         self.env_value = env_value
+        self.prefer_env = prefer_env
+        self.env_present = env_name in os.environ
         self.config_value = get_config_value(config_path)
 
-        if self.config_value is not None and ENABLE_PERSISTENT_CONFIG:
+        if self.prefer_env and self.env_present:
+            self.value = env_value
+        elif self.config_value is not None and ENABLE_PERSISTENT_CONFIG:
             if (
                 self.config_path.startswith("oauth.")
                 and not ENABLE_OAUTH_PERSISTENT_CONFIG
@@ -207,6 +291,9 @@ class PersistentConfig(Generic[T]):
         return super().__getattribute__(item)
 
     def update(self):
+        if self.prefer_env and self.env_present:
+            self.value = self.env_value
+            return
         new_value = get_config_value(self.config_path)
         if new_value is not None:
             self.value = new_value
@@ -223,6 +310,8 @@ class PersistentConfig(Generic[T]):
         sub_config[path_parts[-1]] = self.value
         save_to_db(CONFIG_DATA)
         self.config_value = self.value
+        if _should_reload_oauth_providers(self.config_path):
+            load_oauth_providers()
 
 
 class AppConfig:
@@ -280,6 +369,10 @@ class AppConfig:
                     if self._state[key].value != decoded_value:
                         self._state[key].value = decoded_value
                         log.info(f"Updated {key} from Redis: {decoded_value}")
+                        if _should_reload_oauth_providers(
+                            self._state[key].config_path
+                        ):
+                            load_oauth_providers()
 
                 except json.JSONDecodeError:
                     log.error(f"Invalid JSON format in Redis for {key}: {redis_value}")
@@ -677,8 +770,392 @@ OAUTH_AUDIENCE = PersistentConfig(
     os.environ.get("OAUTH_AUDIENCE", ""),
 )
 
+# Enterprise OAuth uses a dedicated config path (non oauth.*) and prefers
+# deployment-provided env vars when present.
+ENTERPRISE_OAUTH_ENABLED = PersistentConfig(
+    "ENTERPRISE_OAUTH_ENABLED",
+    "enterprise_oauth.enabled",
+    os.environ.get("ENTERPRISE_OAUTH_ENABLED", "False").lower() == "true",
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_PROVIDER_NAME = PersistentConfig(
+    "ENTERPRISE_OAUTH_PROVIDER_NAME",
+    "enterprise_oauth.provider_name",
+    os.environ.get("ENTERPRISE_OAUTH_PROVIDER_NAME", "Enterprise SSO"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_CLIENT_ID = PersistentConfig(
+    "ENTERPRISE_OAUTH_CLIENT_ID",
+    "enterprise_oauth.client_id",
+    os.environ.get("ENTERPRISE_OAUTH_CLIENT_ID", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_CLIENT_SECRET = PersistentConfig(
+    "ENTERPRISE_OAUTH_CLIENT_SECRET",
+    "enterprise_oauth.client_secret",
+    os.environ.get("ENTERPRISE_OAUTH_CLIENT_SECRET", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_AUTHORIZE_URL = PersistentConfig(
+    "ENTERPRISE_OAUTH_AUTHORIZE_URL",
+    "enterprise_oauth.authorize_url",
+    os.environ.get("ENTERPRISE_OAUTH_AUTHORIZE_URL", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_TOKEN_URL = PersistentConfig(
+    "ENTERPRISE_OAUTH_TOKEN_URL",
+    "enterprise_oauth.token_url",
+    os.environ.get("ENTERPRISE_OAUTH_TOKEN_URL", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_PROFILE_URL = PersistentConfig(
+    "ENTERPRISE_OAUTH_PROFILE_URL",
+    "enterprise_oauth.profile_url",
+    os.environ.get("ENTERPRISE_OAUTH_PROFILE_URL", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_CHECK_TOKEN_URL = PersistentConfig(
+    "ENTERPRISE_OAUTH_CHECK_TOKEN_URL",
+    "enterprise_oauth.check_token_url",
+    os.environ.get("ENTERPRISE_OAUTH_CHECK_TOKEN_URL", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_LOGOUT_URL = PersistentConfig(
+    "ENTERPRISE_OAUTH_LOGOUT_URL",
+    "enterprise_oauth.logout_url",
+    os.environ.get("ENTERPRISE_OAUTH_LOGOUT_URL", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_REDIRECT_URI = PersistentConfig(
+    "ENTERPRISE_OAUTH_REDIRECT_URI",
+    "enterprise_oauth.redirect_uri",
+    os.environ.get("ENTERPRISE_OAUTH_REDIRECT_URI", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM = PersistentConfig(
+    "ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM",
+    "enterprise_oauth.authorize_redirect_param",
+    os.environ.get("ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM", "redirect_uri"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM = PersistentConfig(
+    "ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM",
+    "enterprise_oauth.token_redirect_param",
+    os.environ.get("ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM", "redirect_uri"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_ID_CLAIM = PersistentConfig(
+    "ENTERPRISE_OAUTH_ID_CLAIM",
+    "enterprise_oauth.id_claim",
+    os.environ.get("ENTERPRISE_OAUTH_ID_CLAIM", "id"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_ACCOUNT_NO_PATH = PersistentConfig(
+    "ENTERPRISE_OAUTH_ACCOUNT_NO_PATH",
+    "enterprise_oauth.account_no_path",
+    os.environ.get("ENTERPRISE_OAUTH_ACCOUNT_NO_PATH", "attributes.account_no"),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_EMAIL_CLAIM = PersistentConfig(
+    "ENTERPRISE_OAUTH_EMAIL_CLAIM",
+    "enterprise_oauth.email_claim",
+    os.environ.get("ENTERPRISE_OAUTH_EMAIL_CLAIM", ""),
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_EMAIL_DOMAIN = PersistentConfig(
+    "ENTERPRISE_OAUTH_EMAIL_DOMAIN",
+    "enterprise_oauth.email_domain",
+    os.environ.get("ENTERPRISE_OAUTH_EMAIL_DOMAIN", "local"),
+    prefer_env=True,
+)
+
+PORTAL_SSO_ENABLED = PersistentConfig(
+    "PORTAL_SSO_ENABLED",
+    "portal_sso.enabled",
+    os.environ.get("PORTAL_SSO_ENABLED", "False").lower() == "true",
+    prefer_env=True,
+)
+
+PORTAL_SSO_PROVIDER_NAME = PersistentConfig(
+    "PORTAL_SSO_PROVIDER_NAME",
+    "portal_sso.provider_name",
+    os.environ.get("PORTAL_SSO_PROVIDER_NAME", "AI 门户"),
+    prefer_env=True,
+)
+
+PORTAL_SSO_APP_INITIATED_ENABLED = PersistentConfig(
+    "PORTAL_SSO_APP_INITIATED_ENABLED",
+    "portal_sso.app_initiated_enabled",
+    os.environ.get("PORTAL_SSO_APP_INITIATED_ENABLED", "False").lower() == "true",
+    prefer_env=True,
+)
+
+PORTAL_SSO_VALIDATE_URL = PersistentConfig(
+    "PORTAL_SSO_VALIDATE_URL",
+    "portal_sso.validate_url",
+    os.environ.get("PORTAL_SSO_VALIDATE_URL", ""),
+    prefer_env=True,
+)
+
+PORTAL_SSO_ENTRY_URL_TEMPLATE = PersistentConfig(
+    "PORTAL_SSO_ENTRY_URL_TEMPLATE",
+    "portal_sso.entry_url_template",
+    os.environ.get("PORTAL_SSO_ENTRY_URL_TEMPLATE", ""),
+    prefer_env=True,
+)
+
+PORTAL_SSO_TIMEOUT_SECONDS = PersistentConfig(
+    "PORTAL_SSO_TIMEOUT_SECONDS",
+    "portal_sso.timeout_seconds",
+    int(os.environ.get("PORTAL_SSO_TIMEOUT_SECONDS", "10")),
+    prefer_env=True,
+)
+
+PORTAL_SSO_AUTO_SIGNUP = PersistentConfig(
+    "PORTAL_SSO_AUTO_SIGNUP",
+    "portal_sso.auto_signup",
+    os.environ.get("PORTAL_SSO_AUTO_SIGNUP", "True").lower() == "true",
+    prefer_env=True,
+)
+
+PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN = PersistentConfig(
+    "PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN",
+    "portal_sso.synthetic_email_domain",
+    os.environ.get("PORTAL_SSO_SYNTHETIC_EMAIL_DOMAIN", "portal.local"),
+    prefer_env=True,
+)
+
+WECOM_SSO_ENABLED = PersistentConfig(
+    "WECOM_SSO_ENABLED",
+    "wecom_sso.enabled",
+    os.environ.get("WECOM_SSO_ENABLED", "False").lower() == "true",
+    prefer_env=True,
+)
+
+WECOM_SSO_PROVIDER_NAME = PersistentConfig(
+    "WECOM_SSO_PROVIDER_NAME",
+    "wecom_sso.provider_name",
+    os.environ.get("WECOM_SSO_PROVIDER_NAME", "企业微信"),
+    prefer_env=True,
+)
+
+WECOM_SSO_CORP_ID = PersistentConfig(
+    "WECOM_SSO_CORP_ID",
+    "wecom_sso.corp_id",
+    os.environ.get("WECOM_SSO_CORP_ID", ""),
+    prefer_env=True,
+)
+
+WECOM_SSO_AGENT_ID = PersistentConfig(
+    "WECOM_SSO_AGENT_ID",
+    "wecom_sso.agent_id",
+    os.environ.get("WECOM_SSO_AGENT_ID", ""),
+    prefer_env=True,
+)
+
+WECOM_SSO_CORP_SECRET = PersistentConfig(
+    "WECOM_SSO_CORP_SECRET",
+    "wecom_sso.corp_secret",
+    os.environ.get("WECOM_SSO_CORP_SECRET", ""),
+    prefer_env=True,
+)
+
+WECOM_SSO_CALLBACK_URL = PersistentConfig(
+    "WECOM_SSO_CALLBACK_URL",
+    "wecom_sso.callback_url",
+    os.environ.get("WECOM_SSO_CALLBACK_URL", ""),
+    prefer_env=True,
+)
+
+WECOM_SSO_PUBLIC_URL = PersistentConfig(
+    "WECOM_SSO_PUBLIC_URL",
+    "wecom_sso.public_url",
+    os.environ.get("WECOM_SSO_PUBLIC_URL", ""),
+    prefer_env=True,
+)
+
+WECOM_SSO_SCOPE = PersistentConfig(
+    "WECOM_SSO_SCOPE",
+    "wecom_sso.scope",
+    os.environ.get("WECOM_SSO_SCOPE", "snsapi_base"),
+    prefer_env=True,
+)
+
+WECOM_SSO_TIMEOUT_SECONDS = PersistentConfig(
+    "WECOM_SSO_TIMEOUT_SECONDS",
+    "wecom_sso.timeout_seconds",
+    int(os.environ.get("WECOM_SSO_TIMEOUT_SECONDS", "10")),
+    prefer_env=True,
+)
+
+WECOM_SSO_AUTO_SIGNUP = PersistentConfig(
+    "WECOM_SSO_AUTO_SIGNUP",
+    "wecom_sso.auto_signup",
+    os.environ.get("WECOM_SSO_AUTO_SIGNUP", "True").lower() == "true",
+    prefer_env=True,
+)
+
+WECOM_SSO_FETCH_USER_DETAIL = PersistentConfig(
+    "WECOM_SSO_FETCH_USER_DETAIL",
+    "wecom_sso.fetch_user_detail",
+    os.environ.get("WECOM_SSO_FETCH_USER_DETAIL", "True").lower() == "true",
+    prefer_env=True,
+)
+
+WECOM_SSO_ACCOUNT_NO_FIELD = PersistentConfig(
+    "WECOM_SSO_ACCOUNT_NO_FIELD",
+    "wecom_sso.account_no_field",
+    os.environ.get("WECOM_SSO_ACCOUNT_NO_FIELD", "userid"),
+    prefer_env=True,
+)
+
+WECOM_SSO_SYNTHETIC_EMAIL_DOMAIN = PersistentConfig(
+    "WECOM_SSO_SYNTHETIC_EMAIL_DOMAIN",
+    "wecom_sso.synthetic_email_domain",
+    os.environ.get("WECOM_SSO_SYNTHETIC_EMAIL_DOMAIN", "wecom.local"),
+    prefer_env=True,
+)
+
+KNOWFLOW_SITE_URL = PersistentConfig(
+    "KNOWFLOW_SITE_URL",
+    "knowflow.site_url",
+    os.environ.get("KNOWFLOW_SITE_URL", ""),
+    prefer_env=True,
+)
+
+KNOWFLOW_SERVER_BASE_URL = PersistentConfig(
+    "KNOWFLOW_SERVER_BASE_URL",
+    "knowflow.server_base_url",
+    os.environ.get("KNOWFLOW_SERVER_BASE_URL", ""),
+    prefer_env=True,
+)
+
+KNOWFLOW_RAGFLOW_BASE_URL = PersistentConfig(
+    "KNOWFLOW_RAGFLOW_BASE_URL",
+    "knowflow.ragflow_base_url",
+    os.environ.get("KNOWFLOW_RAGFLOW_BASE_URL", ""),
+    prefer_env=True,
+)
+
+KNOWFLOW_SERVICE_API_KEY = PersistentConfig(
+    "KNOWFLOW_SERVICE_API_KEY",
+    "knowflow.service_api_key",
+    os.environ.get("KNOWFLOW_SERVICE_API_KEY", ""),
+    prefer_env=True,
+)
+
+KNOWFLOW_PUBLIC_READ_ONLY_API_KEY = PersistentConfig(
+    "KNOWFLOW_PUBLIC_READ_ONLY_API_KEY",
+    "knowflow.public_read_only_api_key",
+    os.environ.get("KNOWFLOW_PUBLIC_READ_ONLY_API_KEY", ""),
+    prefer_env=True,
+)
+
+KNOWFLOW_TIMEOUT_SECONDS = PersistentConfig(
+    "KNOWFLOW_TIMEOUT_SECONDS",
+    "knowflow.timeout_seconds",
+    int(os.environ.get("KNOWFLOW_TIMEOUT_SECONDS", "10")),
+    prefer_env=True,
+)
+
+KNOWFLOW_MANAGED_LOOKUP_ENABLED = PersistentConfig(
+    "KNOWFLOW_MANAGED_LOOKUP_ENABLED",
+    "knowflow.managed_lookup_enabled",
+    os.environ.get("KNOWFLOW_MANAGED_LOOKUP_ENABLED", "True").lower() == "true",
+    prefer_env=True,
+)
+
+KNOWFLOW_MANUAL_BINDING_ENABLED = PersistentConfig(
+    "KNOWFLOW_MANUAL_BINDING_ENABLED",
+    "knowflow.manual_binding_enabled",
+    os.environ.get("KNOWFLOW_MANUAL_BINDING_ENABLED", "True").lower() == "true",
+    prefer_env=True,
+)
+
+KNOWFLOW_READ_ONLY = PersistentConfig(
+    "KNOWFLOW_READ_ONLY",
+    "knowflow.read_only",
+    os.environ.get("KNOWFLOW_READ_ONLY", "True").lower() == "true",
+    prefer_env=True,
+)
+
+ENTERPRISE_OAUTH_REQUIRED_FIELDS = (
+    ("ENTERPRISE_OAUTH_CLIENT_ID", ENTERPRISE_OAUTH_CLIENT_ID),
+    ("ENTERPRISE_OAUTH_CLIENT_SECRET", ENTERPRISE_OAUTH_CLIENT_SECRET),
+    ("ENTERPRISE_OAUTH_AUTHORIZE_URL", ENTERPRISE_OAUTH_AUTHORIZE_URL),
+    ("ENTERPRISE_OAUTH_TOKEN_URL", ENTERPRISE_OAUTH_TOKEN_URL),
+    ("ENTERPRISE_OAUTH_PROFILE_URL", ENTERPRISE_OAUTH_PROFILE_URL),
+    ("ENTERPRISE_OAUTH_REDIRECT_URI", ENTERPRISE_OAUTH_REDIRECT_URI),
+)
+
+
+ENTERPRISE_OAUTH_ENV_FIELDS = (
+    ENTERPRISE_OAUTH_ENABLED,
+    ENTERPRISE_OAUTH_PROVIDER_NAME,
+    ENTERPRISE_OAUTH_CLIENT_ID,
+    ENTERPRISE_OAUTH_CLIENT_SECRET,
+    ENTERPRISE_OAUTH_AUTHORIZE_URL,
+    ENTERPRISE_OAUTH_TOKEN_URL,
+    ENTERPRISE_OAUTH_PROFILE_URL,
+    ENTERPRISE_OAUTH_CHECK_TOKEN_URL,
+    ENTERPRISE_OAUTH_LOGOUT_URL,
+    ENTERPRISE_OAUTH_REDIRECT_URI,
+    ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM,
+    ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM,
+    ENTERPRISE_OAUTH_ID_CLAIM,
+    ENTERPRISE_OAUTH_ACCOUNT_NO_PATH,
+    ENTERPRISE_OAUTH_EMAIL_CLAIM,
+    ENTERPRISE_OAUTH_EMAIL_DOMAIN,
+)
+
+
+def is_enterprise_oauth_deployment_managed() -> bool:
+    return any(cfg.env_present for cfg in ENTERPRISE_OAUTH_ENV_FIELDS)
+
+
+def _enterprise_oauth_missing_fields(require_env: bool) -> list[str]:
+    missing: list[str] = []
+    for env_name, cfg in ENTERPRISE_OAUTH_REQUIRED_FIELDS:
+        if require_env:
+            if not cfg.env_present or not str(cfg.env_value).strip():
+                missing.append(env_name)
+        else:
+            if not str(cfg.value).strip():
+                missing.append(env_name)
+    return missing
+
 
 def load_oauth_providers():
+    if ENTERPRISE_OAUTH_ENABLED.value:
+        deployment_managed = is_enterprise_oauth_deployment_managed()
+        missing = _enterprise_oauth_missing_fields(deployment_managed)
+        if missing:
+            missing_list = ", ".join(missing)
+            if deployment_managed:
+                raise RuntimeError(
+                    "ENTERPRISE_OAUTH_ENABLED is true but required deployment environment "
+                    f"variables are missing or empty: {missing_list}"
+                )
+            raise RuntimeError(
+                "ENTERPRISE_OAUTH_ENABLED is true but required configuration values are missing: "
+                f"{missing_list}"
+            )
+
     OAUTH_PROVIDERS.clear()
     if GOOGLE_CLIENT_ID.value and GOOGLE_CLIENT_SECRET.value:
 
@@ -840,6 +1317,51 @@ def load_oauth_providers():
             "sub_claim": "user_id",
         }
 
+    if (
+        ENTERPRISE_OAUTH_ENABLED.value
+        and ENTERPRISE_OAUTH_CLIENT_ID.value
+        and ENTERPRISE_OAUTH_CLIENT_SECRET.value
+        and ENTERPRISE_OAUTH_AUTHORIZE_URL.value
+        and ENTERPRISE_OAUTH_TOKEN_URL.value
+        and ENTERPRISE_OAUTH_PROFILE_URL.value
+        and ENTERPRISE_OAUTH_REDIRECT_URI.value
+    ):
+
+        def enterprise_oauth_register(oauth: OAuth):
+            client = oauth.register(
+                name="enterprise",
+                client_id=ENTERPRISE_OAUTH_CLIENT_ID.value,
+                client_secret=ENTERPRISE_OAUTH_CLIENT_SECRET.value,
+                authorize_url=ENTERPRISE_OAUTH_AUTHORIZE_URL.value,
+                access_token_url=ENTERPRISE_OAUTH_TOKEN_URL.value,
+                userinfo_endpoint=ENTERPRISE_OAUTH_PROFILE_URL.value,
+                redirect_uri=ENTERPRISE_OAUTH_REDIRECT_URI.value,
+            )
+            return client
+
+        OAUTH_PROVIDERS["enterprise"] = {
+            "name": ENTERPRISE_OAUTH_PROVIDER_NAME.value,
+            "redirect_uri": ENTERPRISE_OAUTH_REDIRECT_URI.value,
+            "register": enterprise_oauth_register,
+            "type": "enterprise",
+            "enterprise": {
+                "client_id": ENTERPRISE_OAUTH_CLIENT_ID.value,
+                "client_secret": ENTERPRISE_OAUTH_CLIENT_SECRET.value,
+                "authorize_url": ENTERPRISE_OAUTH_AUTHORIZE_URL.value,
+                "token_url": ENTERPRISE_OAUTH_TOKEN_URL.value,
+                "profile_url": ENTERPRISE_OAUTH_PROFILE_URL.value,
+                "check_token_url": ENTERPRISE_OAUTH_CHECK_TOKEN_URL.value,
+                "logout_url": ENTERPRISE_OAUTH_LOGOUT_URL.value,
+                "redirect_uri": ENTERPRISE_OAUTH_REDIRECT_URI.value,
+                "authorize_redirect_param": ENTERPRISE_OAUTH_AUTHORIZE_REDIRECT_PARAM.value,
+                "token_redirect_param": ENTERPRISE_OAUTH_TOKEN_REDIRECT_PARAM.value,
+                "id_claim": ENTERPRISE_OAUTH_ID_CLAIM.value,
+                "account_no_path": ENTERPRISE_OAUTH_ACCOUNT_NO_PATH.value,
+                "email_claim": ENTERPRISE_OAUTH_EMAIL_CLAIM.value,
+                "email_domain": ENTERPRISE_OAUTH_EMAIL_DOMAIN.value,
+            },
+        }
+
     configured_providers = []
     if GOOGLE_CLIENT_ID.value:
         configured_providers.append("Google")
@@ -968,6 +1490,11 @@ if CUSTOM_NAME:
 ####################################
 
 STORAGE_PROVIDER = os.environ.get("STORAGE_PROVIDER", "local")  # defaults to local, s3
+
+if STRICT_EXTERNAL_STATE and STORAGE_PROVIDER == "local":
+    raise ValueError(
+        "STRICT_EXTERNAL_STATE does not allow STORAGE_PROVIDER=local. Configure S3-compatible object storage."
+    )
 
 S3_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID", None)
 S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY", None)
@@ -1266,35 +1793,33 @@ except Exception as e:
 if default_prompt_suggestions == []:
     default_prompt_suggestions = [
         {
-            "title": ["Help me study", "vocabulary for a college entrance exam"],
-            "content": "Help me study vocabulary: write a sentence for me to fill in the blank, and I'll try to pick the correct option.",
+            "title": ["核查政策真伪", "电价条款是否有效"],
+            "content": "请核查这条电价政策是否仍然有效，并给出最新官方依据与发布时间。",
         },
         {
-            "title": ["Give me ideas", "for what to do with my kids' art"],
-            "content": "What are 5 creative things I could do with my kids' art? I don't want to throw them away, but it's also so much clutter.",
+            "title": ["对照合规要求", "EPC合同条款审查"],
+            "content": "请根据电力工程相关法规，逐条检查这份EPC合同的合规风险与整改建议。",
         },
         {
-            "title": ["Tell me a fun fact", "about the Roman Empire"],
-            "content": "Tell me a random fun fact about the Roman Empire",
+            "title": ["会计处理判断", "变电站成本归类"],
+            "content": "请帮我把这批变电站项目费用划分为资本化与费用化，并给出会计分录示例。",
         },
         {
-            "title": ["Show me a code snippet", "of a website's sticky header"],
-            "content": "Show me a code snippet of a website's sticky header in CSS and JavaScript.",
+            "title": ["审核进度款", "工程量与税额复核"],
+            "content": "请复核这笔电力施工进度款：工程量、单价、税率和质保金是否一致。",
         },
         {
-            "title": [
-                "Explain options trading",
-                "if I'm familiar with buying and selling stocks",
-            ],
-            "content": "Explain options trading in simple terms if I'm familiar with buying and selling stocks.",
+            "title": ["分析超预算原因", "输电项目成本偏差"],
+            "content": "请对比预算与实际，找出输电项目超支前三项并说明可能原因。",
         },
         {
-            "title": ["Overcome procrastination", "give me tips"],
-            "content": "Could you start by asking me about instances when I procrastinate the most and then give me some suggestions to overcome it?",
+            "title": ["核验税务口径", "设备采购增值税处理"],
+            "content": "请判断电力设备采购与安装的增值税可抵扣范围，并列出高风险点。",
         },
     ]
 
 DEFAULT_PROMPT_SUGGESTIONS = PersistentConfig(
+
     "DEFAULT_PROMPT_SUGGESTIONS",
     "ui.prompt_suggestions",
     default_prompt_suggestions,
@@ -1351,12 +1876,12 @@ RESPONSE_WATERMARK = PersistentConfig(
 
 
 USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS = (
-    os.environ.get("USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS", "False").lower()
+    os.environ.get("USER_PERMISSIONS_WORKSPACE_MODELS_ACCESS", "True").lower()
     == "true"
 )
 
 USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS = (
-    os.environ.get("USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS", "False").lower()
+    os.environ.get("USER_PERMISSIONS_WORKSPACE_KNOWLEDGE_ACCESS", "True").lower()
     == "true"
 )
 
@@ -1711,6 +2236,14 @@ ENABLE_NOTES = PersistentConfig(
     os.environ.get("ENABLE_NOTES", "True").lower() == "true",
 )
 
+ENABLE_KNOWLEDGE = PersistentConfig(
+    "ENABLE_KNOWLEDGE",
+    "knowledge.enable",
+    os.environ.get("ENABLE_KNOWLEDGE", "True").lower() == "true",
+)
+if "ENABLE_KNOWLEDGE" in os.environ:
+    ENABLE_KNOWLEDGE.value = os.environ["ENABLE_KNOWLEDGE"].lower() == "true"
+
 ENABLE_USER_STATUS = PersistentConfig(
     "ENABLE_USER_STATUS",
     "users.enable_status",
@@ -1762,12 +2295,6 @@ ENABLE_ADMIN_CHAT_ACCESS = (
 
 ENABLE_ADMIN_ANALYTICS = (
     os.environ.get("ENABLE_ADMIN_ANALYTICS", "True").lower() == "true"
-)
-
-ENABLE_COMMUNITY_SHARING = PersistentConfig(
-    "ENABLE_COMMUNITY_SHARING",
-    "ui.enable_community_sharing",
-    os.environ.get("ENABLE_COMMUNITY_SHARING", "True").lower() == "true",
 )
 
 ENABLE_MESSAGE_RATING = PersistentConfig(
@@ -1889,11 +2416,12 @@ TITLE_GENERATION_PROMPT_TEMPLATE = PersistentConfig(
 )
 
 DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE = """### Task:
-Generate a concise, 3-5 word title with an emoji summarizing the chat history.
+Generate a concise, 3-5 word Simplified Chinese title with an emoji summarizing the chat history.
 ### Guidelines:
 - The title should clearly represent the main theme or subject of the conversation.
 - Use emojis that enhance understanding of the topic, but avoid quotation marks or special formatting.
-- Write the title in the chat's primary language; default to English if multilingual.
+- Always write the title in Simplified Chinese.
+- Preserve product names, code identifiers, APIs, and acronyms in their original form when translating them would be awkward or misleading.
 - Prioritize accuracy over excessive creativity; keep it clear and simple.
 - Your entire response must consist solely of the JSON object, without any introductory or concluding text.
 - The output must be a single, raw JSON object, without any markdown code fences or other encapsulating text.
@@ -1901,12 +2429,12 @@ Generate a concise, 3-5 word title with an emoji summarizing the chat history.
 ### Output:
 JSON format: { "title": "your concise title here" }
 ### Examples:
-- { "title": "📉 Stock Market Trends" },
-- { "title": "🍪 Perfect Chocolate Chip Recipe" },
-- { "title": "Evolution of Music Streaming" },
-- { "title": "Remote Work Productivity Tips" },
-- { "title": "Artificial Intelligence in Healthcare" },
-- { "title": "🎮 Video Game Development Insights" }
+- { "title": "📉 股市走势分析" },
+- { "title": "🍪 巧克力曲奇配方" },
+- { "title": "🎵 音乐流媒体演变" },
+- { "title": "💼 远程办公提效" },
+- { "title": "🧠 AI 医疗应用" },
+- { "title": "🎮 游戏开发洞察" }
 ### Chat History:
 <chat_history>
 {{MESSAGES:END:2}}
@@ -1976,7 +2504,9 @@ Suggest 3-5 relevant follow-up questions or prompts that the user might naturall
 - Make questions concise, clear, and directly related to the discussed topic(s).
 - Only suggest follow-ups that make sense given the chat content and do not repeat what was already covered.
 - If the conversation is very short or not specific, suggest more general (but relevant) follow-ups the user might ask.
-- Use the conversation's primary language; default to English if multilingual.
+- Use the conversation's primary language.
+- If the visible chat history is primarily Chinese, every follow-up must be written fully in Simplified Chinese. Do not output English follow-ups in that case, except unavoidable proper nouns, product names, or API names.
+- If the conversation is multilingual, prefer the language used in the latest user message.
 - Response must be a JSON object with a "follow_ups" key containing an array of strings, no extra text or formatting.
 ### Output:
 JSON format: { "follow_ups": ["Question 1?", "Question 2?", "Question 3?"] }
@@ -2024,7 +2554,7 @@ QUERY_GENERATION_PROMPT_TEMPLATE = PersistentConfig(
 )
 
 DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE = """### Task:
-Analyze the chat history to determine the necessity of generating search queries, in the given language. By default, **prioritize generating 1-3 broad and relevant search queries** unless it is absolutely certain that no additional information is required. The aim is to retrieve comprehensive, updated, and valuable information even with minimal uncertainty. If no search is unequivocally needed, return an empty list.
+Analyze the chat history to determine the necessity of generating search queries, in the given language. By default, **generate the smallest useful set of distinct search queries** unless it is absolutely certain that no additional information is required. For ordinary requests, 1-3 queries is usually enough; for explicit research, comparison, multi-entity, or report-style requests, generate up to 5 focused queries when the extra coverage is useful. The aim is to retrieve comprehensive, updated, and valuable information even with minimal uncertainty. If no search is unequivocally needed, return an empty list.
 
 ### Guidelines:
 - Respond **EXCLUSIVELY** with a JSON object. Any form of extra commentary, explanation, or additional text is strictly prohibited.
@@ -2033,7 +2563,7 @@ Analyze the chat history to determine the necessity of generating search queries
 - Err on the side of suggesting search queries if there is **any chance** they might provide useful or updated information.
 - Be concise and focused on composing high-quality search queries, avoiding unnecessary elaboration, commentary, or assumptions.
 - Today's date is: {{CURRENT_DATE}}.
-- Always prioritize providing actionable and broad queries that maximize informational coverage.
+- Always prioritize actionable queries that maximize informational coverage without duplicate wording or unnecessary breadth.
 
 ### Output:
 Strictly return in JSON format: 
@@ -2344,6 +2874,11 @@ CODE_INTERPRETER_PYODIDE_PROMPT = """
 ####################################
 
 VECTOR_DB = os.environ.get("VECTOR_DB", "chroma")
+
+if STRICT_EXTERNAL_STATE and VECTOR_DB == "chroma":
+    raise ValueError(
+        "STRICT_EXTERNAL_STATE does not allow VECTOR_DB=chroma. Configure pgvector or another external vector service."
+    )
 
 # Chroma
 CHROMA_DATA_PATH = f"{DATA_DIR}/vector_db"
@@ -2836,7 +3371,7 @@ MINERU_API_MODE = PersistentConfig(
 MINERU_API_URL = PersistentConfig(
     "MINERU_API_URL",
     "rag.mineru_api_url",
-    os.environ.get("MINERU_API_URL", "http://localhost:8000"),
+    os.environ.get("MINERU_API_URL", MINERU_LOCAL_API_URL_DEFAULT),
 )
 
 MINERU_API_TIMEOUT = PersistentConfig(
@@ -3056,6 +3591,15 @@ RAG_EMBEDDING_MODEL = PersistentConfig(
 )
 log.info(f"Embedding model set: {RAG_EMBEDDING_MODEL.value}")
 
+RAG_EMBEDDING_FALLBACK_MODEL = PersistentConfig(
+    "RAG_EMBEDDING_FALLBACK_MODEL",
+    "rag.embedding_fallback_model",
+    os.environ.get(
+        "RAG_EMBEDDING_FALLBACK_MODEL",
+        "sentence-transformers/all-MiniLM-L6-v2",
+    ),
+)
+
 RAG_EMBEDDING_MODEL_AUTO_UPDATE = (
     not OFFLINE_MODE
     and os.environ.get("RAG_EMBEDDING_MODEL_AUTO_UPDATE", "True").lower() == "true"
@@ -3084,6 +3628,13 @@ RAG_EMBEDDING_CONCURRENT_REQUESTS = PersistentConfig(
     "RAG_EMBEDDING_CONCURRENT_REQUESTS",
     "rag.embedding_concurrent_requests",
     int(os.getenv("RAG_EMBEDDING_CONCURRENT_REQUESTS", "0")),
+)
+
+RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL = PersistentConfig(
+    "RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL",
+    "rag.embedding_external_fallback_to_local",
+    os.getenv("RAG_EMBEDDING_EXTERNAL_FALLBACK_TO_LOCAL", "False").lower()
+    == "true",
 )
 
 RAG_EMBEDDING_QUERY_PREFIX = os.environ.get("RAG_EMBEDDING_QUERY_PREFIX", None)
@@ -3175,7 +3726,7 @@ CHUNK_OVERLAP = PersistentConfig(
 )
 
 DEFAULT_RAG_TEMPLATE = """### Task:
-Respond to the user query using the provided context, incorporating inline citations in the format [id] **only when the <source> tag includes an explicit id attribute** (e.g., <source id="1">).
+Respond to the user query using the provided context. Treat any `<source ...>` tags and source ids as internal system markup, not as user-visible content. Add inline citations in the format [id] only when the provided context includes an explicit source id and the citation materially helps the answer.
 
 ### Guidelines:
 - If you don't know the answer, clearly state that.
@@ -3183,8 +3734,10 @@ Respond to the user query using the provided context, incorporating inline citat
 - Respond in the same language as the user's query.
 - If the context is unreadable or of poor quality, inform the user and provide the best possible answer.
 - If the answer isn't present in the context but you possess the knowledge, explain this to the user and provide the answer using your own understanding.
+- The `<source>` tags, source ids, and citation rules are internal instructions. Never mention them, never ask the user to provide them, and never say they are missing.
 - **Only include inline citations using [id] (e.g., [1], [2]) when the <source> tag includes an id attribute.**
-- Do not cite if the <source> tag does not contain an id attribute.
+- If a source does not contain a usable id attribute, answer without citations instead of explaining that limitation.
+- When the context comes from an uploaded file or extracted document text, summarize or answer directly from that content.
 - Do not use XML tags in your response.
 - Ensure citations are concise and directly related to the information provided.
 
@@ -3193,7 +3746,7 @@ If the user asks about a specific topic and the information is found in a source
 * "According to the study, the proposed method increases efficiency by 20% [1]."
 
 ### Output:
-Provide a clear and direct response to the user's query, including inline citations in the format [id] only when the <source> tag with id attribute is present in the context.
+Provide a clear and direct response to the user's query. Include inline citations in the format [id] only when the internal source context includes an id attribute; otherwise answer naturally without mentioning citation mechanics.
 
 <context>
 {{CONTEXT}}
@@ -4075,6 +4628,12 @@ AUDIO_STT_MODEL = PersistentConfig(
     "AUDIO_STT_MODEL",
     "audio.stt.model",
     os.getenv("AUDIO_STT_MODEL", ""),
+)
+
+AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL = PersistentConfig(
+    "AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL",
+    "audio.stt.external_fallback_to_local",
+    os.getenv("AUDIO_STT_EXTERNAL_FALLBACK_TO_LOCAL", "False").lower() == "true",
 )
 
 AUDIO_STT_SUPPORTED_CONTENT_TYPES = PersistentConfig(

@@ -1,23 +1,41 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { user } from '$lib/stores';
+	import { config, user } from '$lib/stores';
 	import { onMount } from 'svelte';
 
-	onMount(() => {
-		if ($user?.role !== 'admin') {
-			if ($user?.permissions?.workspace?.models) {
-				goto('/workspace/models');
-			} else if ($user?.permissions?.workspace?.knowledge) {
-				goto('/workspace/knowledge');
-			} else if ($user?.permissions?.workspace?.prompts) {
-				goto('/workspace/prompts');
-			} else if ($user?.permissions?.workspace?.tools) {
-				goto('/workspace/tools');
-			} else {
-				goto('/');
-			}
-		} else {
-			goto('/workspace/models');
+	const getWorkspaceHome = () => {
+		if ($user?.role === 'admin') {
+			return '/workspace/models';
 		}
+
+		if (
+			($config?.features?.enable_knowledge ?? true) &&
+			$user?.role === 'user' &&
+			$user?.permissions?.workspace?.knowledge
+		) {
+			return '/workspace/knowledge';
+		}
+
+		if ($user?.permissions?.workspace?.models) {
+			return '/workspace/models';
+		}
+		if (($config?.features?.enable_knowledge ?? true) && $user?.permissions?.workspace?.knowledge) {
+			return '/workspace/knowledge';
+		}
+		if ($user?.permissions?.workspace?.prompts) {
+			return '/workspace/prompts';
+		}
+		if ($user?.permissions?.workspace?.skills) {
+			return '/workspace/skills';
+		}
+		if ($user?.permissions?.workspace?.tools) {
+			return '/workspace/tools';
+		}
+
+		return '/';
+	};
+
+	onMount(() => {
+		goto(getWorkspaceHome());
 	});
 </script>

@@ -1,10 +1,16 @@
 import { browser, dev } from '$app/environment';
+import { env } from '$env/dynamic/public';
 // import { version } from '../../package.json';
 
-export const APP_NAME = 'Open WebUI';
+export const APP_NAME = '中电慧语';
 
-export const WEBUI_HOSTNAME = browser ? (dev ? `${location.hostname}:8080` : ``) : '';
-export const WEBUI_BASE_URL = browser ? (dev ? `http://${WEBUI_HOSTNAME}` : ``) : ``;
+const CONFIGURED_WEBUI_BASE_URL = (env.PUBLIC_WEBUI_BASE_URL || '').replace(/\/+$/, '');
+const DEFAULT_WEBUI_BASE_URL = browser && dev ? `http://${location.hostname}:8080` : '';
+export const WEBUI_BASE_URL = browser
+	? CONFIGURED_WEBUI_BASE_URL || DEFAULT_WEBUI_BASE_URL
+	: '';
+export const WEBUI_HOSTNAME =
+	browser && WEBUI_BASE_URL ? new URL(WEBUI_BASE_URL, location.origin).host : '';
 export const WEBUI_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1`;
 
 export const OLLAMA_API_BASE_URL = `${WEBUI_BASE_URL}/ollama`;
@@ -12,6 +18,8 @@ export const OPENAI_API_BASE_URL = `${WEBUI_BASE_URL}/openai`;
 export const AUDIO_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1/audio`;
 export const IMAGES_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1/images`;
 export const RETRIEVAL_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1/retrieval`;
+export const MINERU_CLOUD_API_URL = 'https://mineru.net/api/v4';
+export const MINERU_LOCAL_API_URL_EXAMPLE = 'http://localhost:8000';
 
 export const WEBUI_VERSION = APP_VERSION;
 export const WEBUI_BUILD_HASH = APP_BUILD_HASH;

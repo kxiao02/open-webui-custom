@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 import asyncio
+from starlette.background import BackgroundTask
 
 from fastapi import (
     BackgroundTasks,
@@ -44,7 +45,11 @@ from open_webui.models.access_grants import AccessGrants
 from open_webui.routers.retrieval import ProcessFileForm, process_file
 from open_webui.routers.audio import transcribe
 
-from open_webui.storage.provider import Storage
+from open_webui.storage.provider import (
+    Storage,
+    cleanup_ephemeral_storage_file,
+    is_ephemeral_storage_file,
+)
 
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
@@ -70,6 +75,7 @@ def _is_text_file(file_path: str, chunk_size: int = 8192) -> bool:
     This catches files whose extensions are mis-mapped by mimetypes/browsers
     (e.g. TypeScript .ts → video/mp2t) without maintaining an extension whitelist.
     """
+    resolved = None
     try:
         resolved = Storage.get_file(file_path)
         with open(resolved, "rb") as f:
@@ -83,6 +89,23 @@ def _is_text_file(file_path: str, chunk_size: int = 8192) -> bool:
         return True
     except (UnicodeDecodeError, Exception):
         return False
+    finally:
+        cleanup_ephemeral_storage_file(resolved)
+
+
+def _file_response(
+    file_path: Path, *, headers: Optional[dict] = None, media_type: Optional[str] = None
+):
+    background = None
+    if is_ephemeral_storage_file(file_path):
+        background = BackgroundTask(cleanup_ephemeral_storage_file, str(file_path))
+
+    return FileResponse(
+        file_path,
+        headers=headers,
+        media_type=media_type,
+        background=background,
+    )
 
 
 def process_uploaded_file(
@@ -95,7 +118,13 @@ def process_uploaded_file(
     db: Optional[Session] = None,
 ):
     def _process_handler(db_session):
+        completed = False
         try:
+            Files.update_file_data_by_id(
+                file_item.id,
+                {"status": "processing", "error": None},
+                db=db_session,
+            )
             content_type = file.content_type
 
             # Detect mis-labeled text files (e.g. .ts → video/mp2t)
@@ -110,9 +139,12 @@ def process_uploaded_file(
 
                 if strict_match_mime_type(stt_supported_content_types, content_type):
                     file_path_processed = Storage.get_file(file_path)
-                    result = transcribe(
-                        request, file_path_processed, file_metadata, user
-                    )
+                    try:
+                        result = transcribe(
+                            request, file_path_processed, file_metadata, user
+                        )
+                    finally:
+                        cleanup_ephemeral_storage_file(file_path_processed)
 
                     process_file(
                         request,
@@ -146,6 +178,7 @@ def process_uploaded_file(
                     db=db_session,
                 )
 
+            completed = True
         except Exception as e:
             log.error(f"Error processing file: {file_item.id}")
             Files.update_file_data_by_id(
@@ -156,6 +189,24 @@ def process_uploaded_file(
                 },
                 db=db_session,
             )
+        finally:
+            if completed:
+                file_status = None
+                try:
+                    file_snapshot = Files.get_file_by_id(file_item.id, db=db_session)
+                    file_status = (
+                        (file_snapshot.data or {}).get("status")
+                        if file_snapshot
+                        else None
+                    )
+                except Exception:
+                    file_status = None
+                if file_status not in ("completed", "failed"):
+                    Files.update_file_data_by_id(
+                        file_item.id,
+                        {"status": "completed"},
+                        db=db_session,
+                    )
 
     if db:
         _process_handler(db)
@@ -301,7 +352,17 @@ def upload_file_handler(
                     user,
                     db=db,
                 )
-                return {"status": True, **file_item.model_dump()}
+                refreshed_file = Files.get_file_by_id(file_item.id, db=db)
+                if refreshed_file and (
+                    refreshed_file.user_id == user.id
+                    or user.role == "admin"
+                    or has_access_to_file(file_item.id, "read", user, db=db)
+                ):
+                    return {"status": True, **refreshed_file.model_dump()}
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
+                )
         else:
             if file_item:
                 return file_item
@@ -495,12 +556,15 @@ async def get_file_process_status(
 
                             yield f"data: {json.dumps(event)}\n\n"
                             if status in ("completed", "failed"):
+                                yield "data: [DONE]\n\n"
                                 break
                         else:
                             # Legacy
+                            yield "data: [DONE]\n\n"
                             break
                     else:
                         yield f"data: {json.dumps({'status': 'not_found'})}\n\n"
+                        yield "data: [DONE]\n\n"
                         break
 
                     await asyncio.sleep(1)
@@ -646,6 +710,7 @@ async def get_file_content_by_id(
         or user.role == "admin"
         or has_access_to_file(id, "read", user, db=db)
     ):
+        file_path = None
         try:
             file_path = Storage.get_file(file.path)
             file_path = Path(file_path)
@@ -678,9 +743,12 @@ async def get_file_content_by_id(
                             f"attachment; filename*=UTF-8''{encoded_filename}"
                         )
 
-                return FileResponse(file_path, headers=headers, media_type=content_type)
+                return _file_response(
+                    file_path, headers=headers, media_type=content_type
+                )
 
             else:
+                cleanup_ephemeral_storage_file(file_path)
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=ERROR_MESSAGES.NOT_FOUND,
@@ -688,6 +756,7 @@ async def get_file_content_by_id(
         except HTTPException as e:
             raise e
         except Exception as e:
+            cleanup_ephemeral_storage_file(file_path)
             log.exception(e)
             log.error("Error getting file content")
             raise HTTPException(
@@ -725,6 +794,7 @@ async def get_html_file_content_by_id(
         or user.role == "admin"
         or has_access_to_file(id, "read", user, db=db)
     ):
+        file_path = None
         try:
             file_path = Storage.get_file(file.path)
             file_path = Path(file_path)
@@ -732,8 +802,9 @@ async def get_html_file_content_by_id(
             # Check if the file already exists in the cache
             if file_path.is_file():
                 log.info(f"file_path: {file_path}")
-                return FileResponse(file_path)
+                return _file_response(file_path)
             else:
+                cleanup_ephemeral_storage_file(file_path)
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=ERROR_MESSAGES.NOT_FOUND,
@@ -741,6 +812,7 @@ async def get_html_file_content_by_id(
         except HTTPException as e:
             raise e
         except Exception as e:
+            cleanup_ephemeral_storage_file(file_path)
             log.exception(e)
             log.error("Error getting file content")
             raise HTTPException(
@@ -786,8 +858,9 @@ async def get_file_content_by_id(
 
             # Check if the file already exists in the cache
             if file_path.is_file():
-                return FileResponse(file_path, headers=headers)
+                return _file_response(file_path, headers=headers)
             else:
+                cleanup_ephemeral_storage_file(file_path)
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=ERROR_MESSAGES.NOT_FOUND,

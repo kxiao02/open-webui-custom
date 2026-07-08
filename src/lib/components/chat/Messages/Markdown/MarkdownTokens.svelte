@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { decode } from 'html-entities';
 	import { onMount, getContext } from 'svelte';
-	const i18n = getContext('i18n');
+	const i18n: import('$lib/i18n').I18nStore = getContext('i18n');
 
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
@@ -19,7 +19,11 @@
 	import Collapsible from '$lib/components/common/Collapsible.svelte';
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
+	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
 	import Download from '$lib/components/icons/Download.svelte';
+	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
+	import ChevronUp from '$lib/components/icons/ChevronUp.svelte';
+	import Spinner from '$lib/components/common/Spinner.svelte';
 
 	import HtmlToken from './HTMLToken.svelte';
 	import Clipboard from '$lib/components/icons/Clipboard.svelte';
@@ -88,10 +92,101 @@
 		// Use FileSaver.js's saveAs function to save the generated CSV file.
 		saveAs(blob, `table-${id}-${tokenIdx}.csv`);
 	};
+
+	const normalizeFileRef = (value) => {
+		const normalized = typeof value === 'string' ? value.trim() : String(value ?? '').trim();
+		if (!normalized) return null;
+		const lowered = normalized.toLowerCase();
+		if (lowered === 'null' || lowered === 'undefined') return null;
+		return normalized;
+	};
+
+	type ReasoningPanelState = {
+		open: boolean;
+		done: boolean;
+	};
+
+	let reasoningPanels: Record<string, ReasoningPanelState> = {};
+	let tokenList: Token[] = [];
+
+	$: tokenList = Array.isArray(tokens) ? tokens : [];
+
+	$: {
+		const nextReasoningPanels = { ...reasoningPanels };
+		let changed = false;
+
+		for (const [tokenIdx, token] of tokenList.entries()) {
+			if (token?.attributes?.type !== 'reasoning') {
+				continue;
+			}
+
+			const panelId = `${id}-${tokenIdx}-reasoning`;
+			const isDone = token?.attributes?.done === 'true' || done;
+			const existingPanel = nextReasoningPanels[panelId];
+
+			if (!existingPanel) {
+				nextReasoningPanels[panelId] = {
+					open: !isDone,
+					done: isDone
+				};
+				changed = true;
+				continue;
+			}
+
+			if (!existingPanel.done && isDone) {
+				nextReasoningPanels[panelId] = {
+					...existingPanel,
+					open: false,
+					done: true
+				};
+				changed = true;
+				continue;
+			}
+
+			if (existingPanel.done !== isDone) {
+				nextReasoningPanels[panelId] = {
+					...existingPanel,
+					done: isDone
+				};
+				changed = true;
+			}
+		}
+
+		if (changed) {
+			reasoningPanels = nextReasoningPanels;
+		}
+	}
+
+	const getReasoningPanelOpen = (panelId: string, isDone: boolean): boolean =>
+		reasoningPanels[panelId]?.open ?? !isDone;
+
+	const setReasoningPanelOpen = (panelId: string, isDone: boolean) => (open: boolean) => {
+		const currentPanel = reasoningPanels[panelId];
+		if (currentPanel?.open === open) {
+			return;
+		}
+
+		reasoningPanels = {
+			...reasoningPanels,
+			[panelId]: {
+				open,
+				done: currentPanel?.done ?? isDone
+			}
+		};
+	};
+
+	const isStandaloneImageParagraph = (token: Token): boolean => {
+		if (token?.type !== 'paragraph' || !Array.isArray(token?.tokens)) {
+			return false;
+		}
+
+		const nonSpaceTokens = token.tokens.filter((item) => item?.type !== 'space');
+		return nonSpaceTokens.length === 1 && nonSpaceTokens[0]?.type === 'image';
+	};
 </script>
 
 <!-- {JSON.stringify(tokens)} -->
-{#each tokens as token, tokenIdx (tokenIdx)}
+{#each tokenList as token, tokenIdx (tokenIdx)}
 	{#if token.type === 'hr'}
 		<hr class=" border-gray-100/30 dark:border-gray-850/30" />
 	{:else if token.type === 'heading'}
@@ -332,6 +427,50 @@
 				open={false}
 				className="w-full space-y-1"
 			/>
+		{:else if token?.attributes?.type === 'reasoning'}
+			{@const reasoningKey = `${id}-${tokenIdx}-reasoning`}
+			{@const reasoningDone = token?.attributes?.done === 'true' || done}
+			{@const reasoningOpen = getReasoningPanelOpen(reasoningKey, reasoningDone)}
+			<Collapsible
+				open={reasoningOpen}
+				onChange={setReasoningPanelOpen(reasoningKey, reasoningDone)}
+				className="my-2 w-full overflow-hidden rounded-2xl border border-slate-200/70 bg-gradient-to-br from-[#ef5b6d]/[0.07] via-white to-[#4a87ff]/[0.10] shadow-xs dark:border-white/10 dark:from-[#ef5b6d]/[0.12] dark:via-gray-900 dark:to-[#4a87ff]/[0.12]"
+				buttonClassName="w-full text-inherit hover:text-inherit dark:hover:text-inherit transition"
+				grow={true}
+			>
+				<div
+					class="flex w-full items-center justify-between gap-3 px-3 py-2 text-sm font-medium text-slate-700 dark:text-slate-100 {reasoningOpen
+						? 'border-b border-slate-200/70 dark:border-white/10'
+						: ''}"
+				>
+					<div class="flex min-w-0 items-center gap-2">
+						{#if !reasoningDone}
+							<Spinner className="size-4 text-[#4a87ff]" />
+						{/if}
+						<span>{!reasoningDone ? $i18n.t('Thinking...') : token.summary || $i18n.t('Thinking')}</span>
+					</div>
+
+					<div class="flex shrink-0 self-center text-slate-400 dark:text-slate-300">
+						{#if reasoningOpen}
+							<ChevronUp strokeWidth="3.5" className="size-3.5" />
+						{:else}
+							<ChevronDown strokeWidth="3.5" className="size-3.5" />
+						{/if}
+					</div>
+				</div>
+				<div slot="content" class="px-3 pb-3 pt-3 text-sm leading-6 text-gray-700 dark:text-gray-200">
+					<svelte:self
+						id={`${id}-${tokenIdx}-r`}
+						tokens={marked.lexer(decode(token.text))}
+						attributes={token?.attributes}
+						done={reasoningDone}
+						{editCodeBlock}
+						{onTaskClick}
+						{sourceIds}
+						{onSourceClick}
+					/>
+				</div>
+			</Collapsible>
 		{:else if textContent.length > 0}
 			<Collapsible
 				title={token.summary}
@@ -366,20 +505,28 @@
 	{:else if token.type === 'html'}
 		<HtmlToken {id} {token} {onSourceClick} />
 	{:else if token.type === 'iframe'}
-		<iframe
-			src="{WEBUI_BASE_URL}/api/v1/files/{token.fileId}/content"
-			title={token.fileId}
-			width="100%"
-			frameborder="0"
-			on:load={(e) => {
-				try {
-					e.currentTarget.style.height =
-						e.currentTarget.contentWindow.document.body.scrollHeight + 20 + 'px';
-				} catch {}
-			}}
-		></iframe>
+		{@const iframeFileRef = normalizeFileRef(token?.fileId)}
+		{#if iframeFileRef}
+			<FullHeightIframe
+				src={`${WEBUI_BASE_URL}/api/v1/files/${iframeFileRef}/content`}
+				title={iframeFileRef}
+				iframeClassName="w-full"
+				allowSameOrigin={true}
+				useSandbox={false}
+			/>
+		{/if}
 	{:else if token.type === 'paragraph'}
-		{#if paragraphTag == 'span'}
+		{#if isStandaloneImageParagraph(token)}
+			<div dir="auto" class="max-w-full">
+				<MarkdownInlineTokens
+					id={`${id}-${tokenIdx}-p`}
+					tokens={token.tokens ?? []}
+					{done}
+					{sourceIds}
+					{onSourceClick}
+				/>
+			</div>
+		{:else if paragraphTag == 'span'}
 			<span dir="auto">
 				<MarkdownInlineTokens
 					id={`${id}-${tokenIdx}-p`}
