@@ -39,6 +39,7 @@ ARG PYTORCH_INDEX_URL_CUDA
 ARG APT_MIRROR
 ARG APT_SECURITY_MIRROR
 ARG SKIP_NLTK_PRELOAD
+ARG CYPRESS_INSTALL_BINARY=0
 
 ######## WebUI frontend ########
 FROM ${NODE_IMAGE} AS build
@@ -47,6 +48,7 @@ ARG GITHUB_MIRROR_PREFIX
 ARG NODE_MAX_OLD_SPACE_SIZE
 ARG SKIP_PYODIDE_FETCH
 ARG ONNXRUNTIME_NODE_INSTALL_CUDA=skip
+ARG CYPRESS_INSTALL_BINARY
 
 ENV NODE_MAX_OLD_SPACE_SIZE=${NODE_MAX_OLD_SPACE_SIZE}
 
@@ -60,6 +62,7 @@ COPY open-webui/scripts/github-mirror.js /app/scripts/github-mirror.js
 COPY open-webui/package.json open-webui/package-lock.json ./
 RUN if [ -n "$NPM_CONFIG_REGISTRY" ]; then npm config set registry "$NPM_CONFIG_REGISTRY"; fi
 ENV NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE} --require /app/scripts/github-mirror.js"
+ENV CYPRESS_INSTALL_BINARY=${CYPRESS_INSTALL_BINARY}
 RUN npm ci --force
 
 # Copy only the frontend inputs so backend-only changes keep the prebaked
